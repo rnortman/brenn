@@ -177,6 +177,12 @@ pub const DEFAULT_FETCH_BYTES: u64 = 1 << 20;
 /// binding may state, so a single attachment always fits.
 pub const PAGE_BLOB_BYTES: u64 = 64 << 20;
 
+/// The most bytes of blobs the page made that one page holds at once, across
+/// open writers, sealed blobs and whatever holds them: 64 MiB. A separate bound
+/// from [`PAGE_BLOB_BYTES`]: page-made bytes are the only copy and cannot be
+/// dropped to make room for a fetch.
+pub const PAGE_MADE_BLOB_BYTES: u64 = 64 << 20;
+
 /// One declared component instance: its routing `instance` id and the component
 /// `kind` that backs it. Several instances may share a kind — one compiled
 /// module, N instantiations.

@@ -13,6 +13,7 @@ import { REPO_ROOT } from "../test-helpers/transpiled-processor.js";
 import { Failures, type ParkedTimer, type RigTimers, installGlobals, tick } from "./globals.js";
 import {
     type BlobFrame,
+    type CreateRefusal,
     type Kit,
     type KitPage,
     type Parked,
@@ -32,6 +33,7 @@ const REPORT_SHAPES: Readonly<Record<string, Report["shape"]>> = {
     "processor-page-bytes-test": "bytes",
     "processor-sdk-bytes-test": "bytes",
     "processor-page-blobs-test": "blobs",
+    "processor-blobs-test": "script",
 };
 
 /** One report `processor-page-test` published, attributed to its instance. */
@@ -109,8 +111,16 @@ export interface BlobsReport {
     sync: string | null;
 }
 
+/** One report `processor-blobs-test` published, attributed to its instance. */
+export interface ScriptReport {
+    instance: string;
+    shape: "script";
+    /** One word per command of the scripts on `in`. */
+    results: string[];
+}
+
 /** A report from any fixture kind, told apart by the shape its instance's kind publishes. */
-export type Report = StringReport | BytesReport | BlobsReport;
+export type Report = StringReport | BytesReport | BlobsReport | ScriptReport;
 
 /**
  * Parse one report body from `instance`, of the shape its kind publishes,
@@ -151,8 +161,8 @@ export function bytesReport(report: Report): BytesReport {
 
 /** The windows of `report`, which must be a string or a bytes report. */
 export function windowsOf(report: Report): StringReport["windows"] | BytesReport["windows"] {
-    if (report.shape === "blobs") {
-        throw new Error(`'${report.instance}' published a blobs report, which carries no windows`);
+    if (report.shape === "blobs" || report.shape === "script") {
+        throw new Error(`'${report.instance}' published a ${report.shape} report, which carries no windows`);
     }
     return report.windows;
 }
@@ -161,6 +171,14 @@ export function windowsOf(report: Report): StringReport["windows"] | BytesReport
 export function blobsReport(report: Report): BlobsReport {
     if (report.shape !== "blobs") {
         throw new Error(`'${report.instance}' published a ${report.shape} report, not a blobs one`);
+    }
+    return report;
+}
+
+/** `report`, which must be a `processor-blobs-test` report. */
+export function scriptReport(report: Report): ScriptReport {
+    if (report.shape !== "script") {
+        throw new Error(`'${report.instance}' published a ${report.shape} report, not a script one`);
     }
     return report;
 }
@@ -209,6 +227,8 @@ export interface Page {
     refuseNextOpen(): void;
     /** Answer the next `BlobRead` as a storage failure. */
     failNextRead(): void;
+    /** Refuse the next `BlobCreate` with `reason`. */
+    refuseNextCreate(reason: CreateRefusal): void;
     /** Every report `instance` has published, oldest first. */
     reports(instance: string): Report[];
     /** Every body the kernel published to the wire on `channel`, oldest first. */
@@ -439,6 +459,7 @@ export async function openPage(name: string): Promise<Page> {
         blobFrames: () => [...peer.blobFrames],
         refuseNextOpen: () => peer.refuseNextOpen(),
         failNextRead: () => peer.failNextRead(),
+        refuseNextCreate: (reason) => peer.refuseNextCreate(reason),
         reports: reportsOf,
         wire: (channel) => peer.published.filter((p) => p.channel === channel),
         parked: (channel, instance) => peer.parked(channel, instance),

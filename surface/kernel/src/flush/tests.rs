@@ -9,8 +9,8 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::TimerChange;
 use brenn_attach_client::router::{RouteOutcome, RouteRequest};
 use brenn_attach_client::subs::Subscriptions;
-use brenn_attach_proto::{ClientFrame, DeferredOpKind, MessageBody};
-use brenn_envelope::Urgency;
+use brenn_attach_proto::{BatchEntry, ClientFrame, DeferredOpKind, MessageBody};
+use brenn_envelope::{BlobRef, Urgency};
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::{
     Binding, LOCAL_OVERLAY_STATE_CHANNEL, NoiseLevel, Urgency as SchemaUrgency,
@@ -18,6 +18,8 @@ use brenn_surface_schema::{
 use uuid::Uuid;
 
 use crate::activation::DropAnnouncement;
+use crate::blob_scope::{Blob, BlobScope, largest_made_blob};
+use crate::page_bytes::MadeLedger;
 use crate::planes::SurfacePlanes;
 use crate::publish_buffer::OutputSpec;
 use crate::registry::{BindingKey, new_stores, reconcile_stores};
@@ -111,6 +113,9 @@ struct Page {
     schedules: Schedules,
     router: LocalRouter<SurfacePlanes>,
     outbound: SurfaceOutbound,
+    page_blobs: PageBlobs,
+    stage: Stage,
+    plane: PagePlane,
 }
 
 impl Page {
@@ -150,6 +155,9 @@ impl Page {
             schedules,
             router,
             outbound,
+            page_blobs: PageBlobs::new(),
+            stage: Stage::new(),
+            plane: PagePlane::new(),
         }
     }
 
@@ -163,8 +171,11 @@ impl Page {
             bindings: &self.bindings,
             facts: self.facts.as_ref(),
             stores: &mut self.stores,
+            page_blobs: &mut self.page_blobs,
             router: &mut self.router,
             outbound: &mut self.outbound,
+            stage: &mut self.stage,
+            plane: &mut self.plane,
             registrations: &mut self.registrations,
             schedules: &mut self.schedules,
             now_ms: NOW_MS,
@@ -938,4 +949,169 @@ fn a_confined_publish_before_the_page_has_an_identity_panics() {
         .publish("notes", brenn_envelope::GuestBody::Text("here".to_string()))
         .expect("bound");
     flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
+}
+
+/// A blob of `bytes` made in `scope`, counted in `ledger`; answers its handle.
+fn made_blob(scope: &mut BlobScope, ledger: &MadeLedger, bytes: &[u8]) -> u32 {
+    let writer = scope
+        .create(ledger, "application/octet-stream")
+        .expect("room for a fixture blob");
+    scope
+        .write(writer, 0, bytes, largest_made_blob(None))
+        .expect("a fixture writer")
+        .expect("a fixture write fits");
+    scope
+        .seal(writer)
+        .expect("a fixture writer")
+        .expect("a fixture blob has no gap")
+}
+
+#[test]
+fn a_confined_attachment_comes_to_rest_naming_the_pages_own_bytes() {
+    let mut page = Page::standard();
+    let ledger = MadeLedger::new();
+    let mut scope = BlobScope::empty();
+    let handle = made_blob(&mut scope, &ledger, b"pattern");
+    let mut buffer = page.buffer("p1", HashMap::new());
+    buffer
+        .publish_attached(
+            &scope,
+            crate::publish_buffer::GrantVerdict::Held,
+            None,
+            "notes",
+            brenn_envelope::GuestBody::Text("with a blob".to_string()),
+            &[("pic".to_string(), handle), ("same".to_string(), handle)],
+            None,
+            None,
+        )
+        .expect("the handle is the activation's")
+        .expect("a page-local attachment needs no door");
+    drop(scope);
+
+    let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
+
+    assert!(report.steps.frames.is_empty());
+    assert!(page.owed("p2", "notes"));
+    let store = page.stores.get(NOTES).expect("the fixture hosts NOTES");
+    let (envelope, _) = store.retained().next().expect("the message is retained");
+    let names: Vec<(String, BlobRef)> = envelope
+        .attachments
+        .iter()
+        .map(|(name, blob)| (name.as_str().to_string(), blob.clone()))
+        .collect();
+    let [(_, first), (_, second)] = &names[..] else {
+        panic!("two attachments: {names:?}")
+    };
+    assert!(first.id.as_str().starts_with("page-"));
+    assert_eq!(first.size, 7);
+    // Each attachment gets its own page id; both share one buffer.
+    let Some(Blob::Bytes(bytes)) = page.page_blobs.get(&first.id) else {
+        panic!("the table holds page bytes for {:?}", first.id)
+    };
+    let Some(Blob::Bytes(again)) = page.page_blobs.get(&second.id) else {
+        panic!("the table holds page bytes for {:?}", second.id)
+    };
+    assert!(bytes.same_blob(again));
+    assert_eq!(bytes.bytes(), b"pattern");
+    assert_eq!(ledger.held(), 7, "the table holds the only copy");
+
+    // A later publish evicts it from the depth-1 channel; the sweep frees it.
+    let mut buffer = page.buffer("p1", HashMap::new());
+    buffer
+        .publish(
+            "notes",
+            brenn_envelope::GuestBody::Text("plain".to_string()),
+        )
+        .expect("bound");
+    flush_ok(&mut page.ctx(), "p1", buffer, vec![stamp(0x200)]);
+    page.page_blobs.sweep(&page.stores);
+    assert!(page.page_blobs.is_empty());
+    assert_eq!(ledger.held(), 0);
+}
+
+#[test]
+fn a_confined_attachment_whose_body_the_plane_refuses_is_swept() {
+    let mut page = Page::standard();
+    let ledger = MadeLedger::new();
+    let mut scope = BlobScope::empty();
+    let handle = made_blob(&mut scope, &ledger, b"refused");
+    let mut buffer = page.buffer("p1", HashMap::new());
+    buffer
+        .publish_attached(
+            &scope,
+            crate::publish_buffer::GrantVerdict::Held,
+            None,
+            "over",
+            brenn_envelope::GuestBody::Text(r#"{"v":1,"holder":"p1","since_stamp":0}"#.to_string()),
+            &[("pic".to_string(), handle)],
+            None,
+            None,
+        )
+        .expect("the handle is the activation's")
+        .expect("a page-local attachment needs no door");
+    drop(scope);
+
+    let report = flush_ok(&mut page.ctx(), "p1", buffer, stamps(1));
+
+    assert_eq!(report.refusals.len(), 1);
+    assert_eq!(page.page_blobs.len(), 1, "committed before the route");
+    page.page_blobs.sweep(&page.stores);
+    assert!(page.page_blobs.is_empty());
+    assert_eq!(ledger.held(), 0);
+}
+
+#[test]
+fn a_parked_confined_attachment_is_kept_through_an_edit_and_freed_by_a_cancel() {
+    let mut page = Page::standard();
+    let ledger = MadeLedger::new();
+    let mut scope = BlobScope::empty();
+    let handle = made_blob(&mut scope, &ledger, b"later");
+    let mut buffer = page.buffer("p1", HashMap::new());
+    buffer
+        .publish_attached(
+            &scope,
+            crate::publish_buffer::GrantVerdict::Held,
+            None,
+            "notes",
+            brenn_envelope::GuestBody::Text("parked".to_string()),
+            &[("pic".to_string(), handle)],
+            None,
+            Some(9_000),
+        )
+        .expect("the handle is the activation's")
+        .expect("a page-local attachment needs no door");
+    drop(scope);
+    flush_ok(&mut page.ctx(), "p1", buffer, vec![stamp(0x300)]);
+    let parked = Uuid::from_u128(0x300);
+    assert_eq!(page.parked_bodies("p1"), vec!["parked".to_string()]);
+    page.page_blobs.sweep(&page.stores);
+    assert_eq!(page.page_blobs.len(), 1, "the parked message names it");
+    assert_eq!(ledger.held(), 5);
+
+    let mut buffer = page.buffer("p1", HashMap::from([("notes".to_string(), vec![parked])]));
+    buffer
+        .defer_edit(
+            "notes",
+            0,
+            Some(brenn_envelope::GuestBody::Text("rewritten".to_string())),
+            None,
+        )
+        .expect("in the window");
+    flush_ok(&mut page.ctx(), "p1", buffer, stamps(0));
+    assert_eq!(page.parked_bodies("p1"), vec!["rewritten".to_string()]);
+    page.page_blobs.sweep(&page.stores);
+    assert_eq!(
+        page.page_blobs.len(),
+        1,
+        "the edited message still names it"
+    );
+    assert_eq!(ledger.held(), 5);
+
+    let mut buffer = page.buffer("p1", HashMap::from([("notes".to_string(), vec![parked])]));
+    buffer.defer_cancel("notes", 0).expect("in the window");
+    flush_ok(&mut page.ctx(), "p1", buffer, stamps(0));
+    assert!(page.parked_bodies("p1").is_empty());
+    page.page_blobs.sweep(&page.stores);
+    assert!(page.page_blobs.is_empty());
+    assert_eq!(ledger.held(), 0, "the cancel let the last holder go");
 }

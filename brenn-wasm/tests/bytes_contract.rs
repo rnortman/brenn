@@ -647,25 +647,36 @@ fn the_surface_check_refuses_a_string_contract_component_by_name() {
     );
 }
 
-/// The backend blobs fixture imports the producing half of `blobs`, which a
-/// surface does not serve: refused at the member stage, naming a member
-/// outside the read side.
+/// The backend blobs fixture reads, makes and publishes blobs, which a surface
+/// serves: it passes every stage of the surface check.
 #[test]
-fn the_surface_check_refuses_the_backend_blobs_fixture_by_member() {
+fn the_surface_check_passes_the_backend_blobs_fixture() {
     let bytes = artifact_bytes("brenn_processor_blobs_test");
-    let refusal = brenn_wasm::check_surface_component(&bytes)
-        .expect_err("a blobs producer is refused on a surface");
-    let brenn_wasm::SurfaceComponentStage::Member {
-        interface, member, ..
-    } = &refusal.stage
-    else {
-        panic!("refused at the wrong stage: {refusal}");
-    };
-    assert_eq!(interface, "brenn:processor/blobs@0.3.0", "{refusal}");
-    assert!(
-        !brenn_envelope::grants::SURFACE_BLOBS_MEMBERS.contains(&member.as_str()),
-        "{refusal}"
-    );
+    brenn_wasm::check_surface_component(&bytes)
+        .unwrap_or_else(|refusal| panic!("a blobs producer is a surface kind: {refusal}"));
+}
+
+/// The blob-carrying tool fixtures import `tools`, which a surface does not
+/// link, so they are refused by name before their `call-async`,
+/// `call-async-for` and `complete` reach the member stage.
+#[test]
+fn the_surface_check_refuses_the_blob_tool_call_fixtures_by_name() {
+    for stem in [
+        "brenn_processor_blob_caller_test",
+        "brenn_processor_blob_provider_test",
+    ] {
+        let refusal = brenn_wasm::check_surface_component(&artifact_bytes(stem))
+            .expect_err("a tool-call fixture is refused on a surface");
+        assert_eq!(
+            refusal.stage,
+            brenn_wasm::SurfaceComponentStage::Name,
+            "{stem}: {refusal}"
+        );
+        assert!(
+            refusal.detail.contains("brenn:processor/tools"),
+            "{stem}: {refusal}"
+        );
+    }
 }
 
 #[test]
@@ -858,36 +869,71 @@ fn the_surface_check_passes_a_read_only_blobs_importer_under_an_alias() {
     )));
 }
 
+/// The members a surface does not serve, each refused at the member stage by
+/// name, under the served name and under an alias an exact-name check would let
+/// through to a type stage that links them.
 #[test]
-fn the_surface_check_refuses_a_blobs_create_importer_by_member() {
+fn the_surface_check_refuses_each_blobs_tool_call_form_by_member() {
+    for name in ["brenn:processor/blobs@0.3.0", "brenn:processor/blobs@0.3.1"] {
+        for member in ["call-async", "call-async-for", "complete"] {
+            let bytes = surface_fixture(&blobs_import(
+                name,
+                READ_ERROR,
+                &format!(r#"(export "{member}" (func))"#),
+            ));
+            refused_on_member(&bytes, name, member);
+        }
+    }
+}
+
+/// `create` imported with a type the host does not have is refused at the type
+/// stage, under the served name and an alias.
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_blobs_create_by_type() {
+    for name in ["brenn:processor/blobs@0.3.0", "brenn:processor/blobs@0.3.1"] {
+        let bytes = surface_fixture(&blobs_import(
+            name,
+            READ_ERROR,
+            r#"(export "create" (func))"#,
+        ));
+        let refusal = refused_on_import_type(&bytes);
+        assert!(refusal.detail.contains("create"), "{refusal}");
+    }
+}
+
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_writer_write_by_type() {
     let bytes = surface_fixture(&blobs_import(
         "brenn:processor/blobs@0.3.0",
         READ_ERROR,
-        r#"(export "create" (func))"#,
+        r#"(export "writer" (type $writer (sub resource)))
+           (type $writer-borrow (borrow $writer))
+           (export "[method]writer.write" (func (param "self" $writer-borrow)))"#,
     ));
-    refused_on_member(&bytes, "brenn:processor/blobs@0.3.0", "create");
+    let refusal = refused_on_import_type(&bytes);
+    assert!(refusal.detail.contains("writer.write"), "{refusal}");
 }
 
-/// An exact-name member check would let this through to a type stage that
-/// links `create`.
 #[test]
-fn the_surface_check_refuses_a_blobs_create_importer_under_an_alias_by_member() {
+fn the_surface_check_refuses_a_wrong_typed_blobs_publish_by_type() {
     let bytes = surface_fixture(&blobs_import(
-        "brenn:processor/blobs@0.3.1",
+        "brenn:processor/blobs@0.3.0",
         READ_ERROR,
-        r#"(export "create" (func))"#,
+        r#"(export "publish" (func (param "port" string)))"#,
     ));
-    refused_on_member(&bytes, "brenn:processor/blobs@0.3.1", "create");
+    let refusal = refused_on_import_type(&bytes);
+    assert!(refusal.detail.contains("publish"), "{refusal}");
 }
 
+/// The `writer` resource is served: importing it alone passes every import
+/// stage.
 #[test]
-fn the_surface_check_refuses_an_unserved_blobs_resource_by_member() {
-    let bytes = surface_fixture(&blobs_import(
+fn the_surface_check_passes_a_blobs_writer_resource_importer() {
+    passes_every_import_stage(&surface_fixture(&blobs_import(
         "brenn:processor/blobs@0.3.0",
         READ_ERROR,
         r#"(export "writer" (type (sub resource)))"#,
-    ));
-    refused_on_member(&bytes, "brenn:processor/blobs@0.3.0", "writer");
+    )));
 }
 
 /// An artifact built against `read-error` before `unavailable` has a

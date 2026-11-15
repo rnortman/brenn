@@ -134,6 +134,40 @@ impl fmt::Display for AttachmentName {
     }
 }
 
+/// Why a guest's list of attachment names was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachmentListError {
+    /// More than [`MAX_ATTACHMENTS_PER_MESSAGE`] names.
+    TooMany,
+    /// A name outside the grammar; the diagnostic.
+    InvalidName(String),
+    /// A name an earlier one already gave; the name.
+    DuplicateName(String),
+}
+
+/// The names of a guest's attachment list, checked in the order every host
+/// answers them: the count first, then each name in list order, its grammar
+/// and then whether an earlier name was the same. The first name at fault
+/// decides, so `["a", "a", "!"]` is a duplicate and `["!", "a", "a"]` is an
+/// invalid name.
+pub fn check_attachment_list<'a>(
+    names: impl ExactSizeIterator<Item = &'a str>,
+) -> Result<Vec<AttachmentName>, AttachmentListError> {
+    if names.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(AttachmentListError::TooMany);
+    }
+    let mut checked: Vec<AttachmentName> = Vec::with_capacity(names.len());
+    for name in names {
+        let name = AttachmentName::new(name)
+            .map_err(|e| AttachmentListError::InvalidName(e.to_string()))?;
+        if checked.contains(&name) {
+            return Err(AttachmentListError::DuplicateName(name.to_string()));
+        }
+        checked.push(name);
+    }
+    Ok(checked)
+}
+
 /// A message's attachments, ordered by name so every serialization is
 /// deterministic. Empty on a message that carries none.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +250,33 @@ mod tests {
                 byte: 0xc3
             })
         );
+    }
+
+    #[test]
+    fn an_attachment_list_is_judged_count_first_then_name_by_name() {
+        let list = |names: &[&str]| check_attachment_list(names.iter().copied());
+        assert_eq!(
+            list(&["b", "a"]),
+            Ok(vec![name("b"), name("a")]),
+            "names come back in list order"
+        );
+        assert_eq!(list(&[]), Ok(Vec::new()));
+        let full: Vec<String> = (0..MAX_ATTACHMENTS_PER_MESSAGE)
+            .map(|i| format!("n{i}"))
+            .collect();
+        let full_refs: Vec<&str> = full.iter().map(String::as_str).collect();
+        assert_eq!(list(&full_refs).map(|names| names.len()), Ok(full.len()));
+        let mut over = full_refs.clone();
+        over.push("!");
+        assert_eq!(list(&over), Err(AttachmentListError::TooMany));
+        assert_eq!(
+            list(&["a", "a", "!"]),
+            Err(AttachmentListError::DuplicateName("a".to_owned()))
+        );
+        assert!(matches!(
+            list(&["!", "a", "a"]),
+            Err(AttachmentListError::InvalidName(_))
+        ));
     }
 
     #[test]

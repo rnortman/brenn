@@ -850,3 +850,89 @@ fn a_parked_body_is_viewed_as_it_is() {
         assert_eq!(entries[0].body, body);
     }
 }
+
+fn attachments(id: &str) -> Attachments {
+    let name = brenn_envelope::AttachmentName::new("photo").expect("a valid name");
+    let blob = brenn_envelope::BlobRef {
+        id: brenn_envelope::BlobId::new(id.to_string()),
+        size: 3,
+        content_type: "image/png".to_string(),
+    };
+    Attachments::from_map([(name, blob)].into_iter().collect())
+}
+
+#[test]
+fn route_attached_mints_the_given_attachments_and_route_mints_none() {
+    let mut stores = stores(4);
+    let mut router = router(TestPlanes::default());
+    routed(router.route_attached(
+        &mut stores,
+        req(PLANE, Origin::Sub("widget-7"), "with", 1),
+        attachments("page-1"),
+    ));
+    routed(router.route(
+        &mut stores,
+        req(PLANE, Origin::Sub("widget-7"), "without", 2),
+    ));
+    let held = retained(&stores, PLANE);
+    assert_eq!(held[0].attachments, attachments("page-1"));
+    assert!(held[1].attachments.is_empty());
+}
+
+#[test]
+fn a_parked_message_keeps_its_attachments_through_an_edit_and_releases_with_them() {
+    let mut stores = stores(4);
+    let mut router = router(TestPlanes::default());
+    parked_until(router.route_attached(
+        &mut stores,
+        scheduled(PLANE, Origin::Sub("widget-7"), "draft", 7, LATER),
+        attachments("page-1"),
+    ));
+    let answer = router.apply_op(
+        &mut stores,
+        DeferOpRequest {
+            channel: PLANE,
+            origin: Origin::Sub("widget-7"),
+            message_id: Uuid::from_u128(7),
+            op: DeferOp::Edit {
+                body: Some("final".into()),
+                deliver_after: Some(SOON),
+            },
+            now: NOW,
+        },
+    );
+    assert_eq!(answer, DeferOpAnswer::Applied);
+    let parked: Vec<_> = stores
+        .get(PLANE)
+        .expect("the fixture hosts this channel")
+        .parked()
+        .map(|(envelope, _)| envelope.attachments.clone())
+        .collect();
+    assert_eq!(parked, [attachments("page-1")]);
+    let swept = router.release_due(&mut stores, SOON);
+    assert_eq!(swept[0].released[0].attachments, attachments("page-1"));
+}
+
+#[test]
+fn a_cancelled_message_gives_up_its_attachments() {
+    let mut stores = stores(4);
+    let mut router = router(TestPlanes::default());
+    parked_until(router.route_attached(
+        &mut stores,
+        scheduled(PLANE, Origin::Sub("widget-7"), "regret", 7, SOON),
+        attachments("page-1"),
+    ));
+    router.apply_op(
+        &mut stores,
+        DeferOpRequest {
+            channel: PLANE,
+            origin: Origin::Sub("widget-7"),
+            message_id: Uuid::from_u128(7),
+            op: DeferOp::Cancel,
+            now: NOW,
+        },
+    );
+    let store = stores.get(PLANE).expect("the fixture hosts this channel");
+    assert_eq!(store.parked().count(), 0);
+    assert_eq!(store.retained().count(), 0);
+}

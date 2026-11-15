@@ -46,8 +46,8 @@ const PROCESSOR_PACKAGE: &str = "brenn:processor";
 /// The WIT interfaces a surface-hosted processor may import: the transpilable
 /// profile. `store`/`mqtt`/`tools`/`provides` are backend-only; `dom`/`page-dom` run
 /// the other way and are surface-only, because only a page has a DOM. `blobs` is served
-/// in part: its read side, which `check_surface_component` holds a kind's imported members
-/// to.
+/// in part: everything but its tool-call forms, which `check_surface_component` holds a
+/// kind's imported members to.
 ///
 /// `types` and `bus` are in the set but are not capabilities: they define the
 /// record and enum shapes the other interfaces speak, so a processor imports

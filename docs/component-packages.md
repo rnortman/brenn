@@ -126,32 +126,46 @@ the 0.2.0 world with `blobs` imported. A kind that does not name `blobs` in
 `requires` does not import it, and its artifact, its record and its spec are
 what they were. A kind that does needs a brenn new enough to link it, by the
 same ordering rule as `calls`. The backend serves the whole interface. A
-surface serves the read side — `limits`, `open` and a blob's `size`,
-`content-type` and `read` — and a kind that imports any other function of it,
-`create`, `writer` or `publish` among them, is refused when its artifact is
-checked at boot, naming the function; a kind that only reads may be placed on
-a surface with the `blobs` grant. On a page `open` succeeds for any attachment
-of a message in the activation's windows, and `read` answers `unavailable`
-when the page does not hold that attachment's bytes (`docs/message-bus.md`
-§2.1.2a, "A surface page is a reader by place"); the backend never answers
-`unavailable`.
+surface serves everything but the tool-call forms — `limits`, `open`, a blob's
+`size`, `content-type` and `read`, `create`, the `writer` resource and
+`publish` — and a kind that imports `call-async`, `call-async-for` or
+`complete` is refused when its artifact is checked at boot, naming the
+function. A kind placed on a surface with the `blobs` grant reads, makes and
+forwards blobs there. On a page `open` succeeds for any attachment of a message
+in the activation's windows, and `read` answers `unavailable` when the page
+does not hold that attachment's bytes (`docs/message-bus.md` §2.1.2a, "A
+surface page is a reader by place"); the backend never answers `unavailable`.
+A page holds the blobs it makes in page memory and uploads them only after the
+activation returns `ok`, so the backend store's verdict on one arrives after
+the call: a refused upload, or a forwarded attachment whose message left the
+server's window, loses the activation's wire batch whole and the page announces
+it; the message is never published without its attachments. On a surface
+`budget-exhausted` is the page's own budget (`docs/message-bus.md` §2.1.2a, "A
+surface page makes blobs").
 Publishing with attachments goes through `blobs.publish`, and a class that
 calls it requires `ports` as well as `blobs`, whether or not it also calls
 `ports.publish`: the function's error type wraps `ports@0.2.0`'s
 `publish-error`, so the artifact imports `brenn:processor/ports@0.2.0` for the
 type, which is what the build check and the load check read. `ports.publish`
-still carries none. The interface is **not yet declared
-stable**: a shape changes in place only while no tagged brenn release has
-served it; a shape a tagged release has served changes only as a new version
-of the interface, served beside the old one for at least one release and
-announced in `CHANGELOG.md`; the old version may be removed one release after
-its replacement, and nothing longer is promised. One such in-place change has
-been made: `read-error` gained `unavailable`, last. A component built against
-the earlier shape that calls `blob.read` no longer links and is rebuilt against
-the current `brenn-guest`; one that matches `brenn_guest::blobs::ReadError`
-exhaustively gains an arm for `ReadError::Unavailable`, which the enum carries
-without `#[non_exhaustive]`, so the next variant is a compile error rather than
-a wildcard.
+still carries none. The interface is **declared stable**, with the promise
+`brenn:processor@0.2.0` carries, in the terms its WIT header states: no type or
+function of `blobs@0.3.0` is changed or removed, no case is added to a variant
+or an enum and no field to a record, and each keeps doing what the file says.
+While brenn serves the interface, an artifact built against the shapes in the
+file loads and means what it meant. brenn does not stop serving it without a
+removal period announced in `CHANGELOG.md` and in the file no later than the
+first release the period counts; no length is promised. A breaking change is a
+new version served beside this one through that period. An addition is a
+function no existing component imports, added beside the functions the
+interface has, which keep their shapes and behaviour; a host coming to serve a
+function it refuses today is an addition of the same kind. Bounds stay host
+policy and outside the promise. The promise is to an artifact built against the
+shapes in the file, not at any commit that carried it, because one shape
+changed in place before the declaration: `read-error` gained `unavailable`,
+last. A component built against the earlier shape that calls `blob.read` no
+longer links and is rebuilt against the current `brenn-guest`; one that matches
+`brenn_guest::blobs::ReadError` exhaustively gains an arm for
+`ReadError::Unavailable`.
 
 **Blobs and tool calls.** An asynchronous tool call carries named
 attachments by reference in both directions. Three functions of `blobs` are

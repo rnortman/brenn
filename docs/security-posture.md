@@ -566,12 +566,25 @@ rate never meters it.
 
 ### 6.6 The surface blob door
 
-A surface page speaks attach v6 and reads message attachments through the
-remote's blob door (§9a), read-only. What the door gives a page:
+A surface page speaks attach v6 and reads, makes and attaches blobs through
+the remote's blob door (§9a). What the door gives a page:
 
 - **Who gets a door.** A surface session has one only when an instance on that
-  surface is granted `blobs`. `upload` is false: a `BlobCreate` is a protocol
-  violation.
+  surface is granted `blobs`. The door uploads only when some instance granted
+  `blobs` has a declared wire output — a binding of one of its output ports to
+  a channel that is not `local:`. A surface whose `blobs` instances only read,
+  or publish only page-locally, has a door without upload, on which a
+  `BlobCreate`, a `BlobWrite` and a `BlobSeal` are each a protocol violation.
+  The upload door is derived from the grant and the bindings, never a separate
+  operator word (`SurfaceProfile::blob_grant`).
+- **Who may attach, and where.** A publish naming attachments is admitted only
+  under an attribution granted `blobs`, and only on one of that instance's
+  declared wire outputs (`SurfaceProfile::attribution_may_attach`); under the
+  bare identity, under another instance, or on any other channel it is a
+  protocol violation. The publish ACL still decides the publish; this is one
+  more condition on a non-empty attachment list. The operator's error channel,
+  which every attribution may publish plain reports on, is not a declared
+  output, so no page attaches there unless the operator bound an output to it.
 - **What it reaches.** The bytes of every attachment of every message inside
   the window of a wire channel the surface's own bindings name — the channel's
   window, not the binding's depth, and whether or not the row was delivered to
@@ -584,24 +597,46 @@ remote's blob door (§9a), read-only. What the door gives a page:
   components, not a page that speaks the wire itself. The profile is what
   protects the bytes.
 - **What it could already do and still can.** Read the references. What is new
-  besides bytes: with a door, a `Publish` naming a handle the session opened is
-  admitted onto a channel the surface may publish to, so a hostile page can
-  forward an attachment it can read to a channel it can write. It gains no
-  bytes it could not read and no channel it could not write.
-- **No token bucket.** Blob frames draw on none. The static bounds per session:
-  64 handles, 4 read answers in flight, 256 KiB an answer, 4 × `max_blob_bytes`
-  held; per surface, 64 sessions and 16 a user. Nothing bounds a session's
-  reads over time — the exposure §9a accepts for a remote's transfer frames.
-- **fail2ban.** A blob frame on a session without a door, a `BlobCreate`,
-  a `BlobWrite` or `BlobSeal` naming a handle the session opened, a
-  `BlobOpen` on a channel the surface does not bind, a `BlobRead` over the
-  chunk bound, and a publish naming an attachment twice or more than 32 of
-  them each end the session as `attach_protocol_violation` with the peer's
-  address. An unknown handle, a read out of range and a fifth read in flight
-  are answers, not violations — and so, as §9a's table gives them, are a
-  `BlobWrite` to an unknown handle (dropped, counted) and a `BlobSeal` of one
-  (`UnknownHandle`), although no create can precede either on a door without
-  upload (`attach-blob-upload-frames-without-upload` in `TODO.md`).
+  besides bytes: with a door, a publish naming a handle the session opened is
+  admitted onto a declared wire output of a `blobs`-granted instance, so a
+  hostile page can forward an attachment it can read to such a channel. It
+  gains no bytes it could not read and no channel it could not write.
+- **What an upload door adds.** A hostile page can make blobs in the backend
+  store: one session holds at most 64 handles and 4 × `max_blob_bytes` (256 MiB
+  at the default) of blobs it made or opened; a surface takes 64 sessions, 16 a
+  user. All of it draws on the one pool every blob user shares (1 GiB at the
+  default), which is the only bound across sessions: one user's sessions can
+  exhaust it, and every other maker of blobs is then refused `budget-exhausted`
+  until those sessions end or close their handles. A blob no published message
+  names dies with the session's handle. A blob a published message names lives
+  as long as that message is in its channel's window, so occupancy by published
+  messages is bounded by the windows of the declared wire outputs of the
+  surface's `blobs`-granted instances, times 32 attachments, times
+  `max_blob_bytes`. The per-session cap is not tightened for surfaces: at one
+  blob per session sixteen sessions of one user still reach the default pool,
+  and a tighter cap would take room from the page's own fetches, which count
+  against the same bound. The bound that closes it is a share of the pool per
+  publisher (`blob-budget-per-component` in `TODO.md`).
+- **No token bucket.** Blob frames draw on none, upload frames included; a
+  publish naming a blob draws what a plain publish draws. The static bounds per
+  session: 64 handles, 4 read answers in flight, 256 KiB an answer or a write,
+  4 × `max_blob_bytes` held; per surface, 64 sessions and 16 a user. Nothing
+  bounds a session's transfer frames over time — the exposure §9a accepts for a
+  remote's.
+- **fail2ban.** A blob frame on a session without a door; a `BlobCreate`, a
+  `BlobWrite` or a `BlobSeal` on a door without upload; a `BlobCreate` naming a
+  live handle, a `BlobWrite` or `BlobSeal` naming a held blob; a `BlobOpen` on a
+  channel the surface does not bind; a `BlobRead` over the chunk bound; a
+  publish naming attachments under the bare identity, under an instance not
+  granted `blobs`, or on a channel that is not one of its instance's declared
+  wire outputs — the error channel among them; and a publish naming an
+  attachment twice or more than 32 of them each end the session as
+  `attach_protocol_violation` with the peer's address. An unknown handle, a
+  read out of range and a fifth read in flight are answers, not violations —
+  and so, on a door with upload, as §9a's table gives them, are a `BlobWrite`
+  to an unknown handle (dropped, counted) and a `BlobSeal` of one
+  (`UnknownHandle`), which is what a frame pipelined behind a refused create
+  meets.
 - **On the page.** Fetched bytes are held in the page's memory, at most 64 MiB,
   and only while their message is in the page's window of the channel; a
   component's handle dies with its activation (`docs/message-bus.md` §2.1.2a,
@@ -848,7 +883,8 @@ by reference (`docs/message-bus.md` §2.1.2a).
   forwards, saves and attaches blobs by name (below). A remote on attach v6
   does both — reads an attachment's bytes and, with publish authority, creates
   a blob — through the session's blob door reviewed in §9a; a surface page
-  reads attachments, and only reads, through the same door (§6.6). Host code's
+  reads attachments through the same door and, when the door uploads, creates
+  and forwards blobs through it too (§6.6). Host code's
   `Messenger::publish_from_system_with_attachments` carries the tool
   substrate's requests and results, and `Messenger::publish_with_attachments`
   a conversation's sends. Every later door that admits an outside producer or
@@ -1571,8 +1607,9 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   session's first. `BlobCreate` needs the door's `upload`, granted only to a
   remote with publish authority on some channel; a publish naming handles is
   judged by the existing publish authority for its channel. A surface session
-  uses the same door, read-only, reaching the channels its surface's bindings
-  name (§6.6).
+  uses the same door, reaching the channels its surface's bindings name, with
+  upload only where a `blobs`-granted instance has a declared wire output and
+  attachments only under that instance on those outputs (§6.6).
 - **What a stolen token now reaches.** On v6, the bytes of every attachment of
   every message in the window of every channel the remote may subscribe to,
   the tool channels excepted — where a v5 token reached their references
@@ -1609,8 +1646,8 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   | Frame | absent | writer | held |
   |---|---|---|---|
   | `BlobCreate`, `BlobOpen` | proceeds | violation | violation |
-  | `BlobWrite` | dropped, counted | written | violation |
-  | `BlobSeal` | answer `UnknownHandle` | answer `Ok` or `Incomplete` | violation |
+  | `BlobWrite` | dropped, counted; a violation on a door without upload | written | violation |
+  | `BlobSeal` | answer `UnknownHandle`; a violation on a door without upload | answer `Ok` or `Incomplete` | violation |
   | `BlobRead` | answer `UnknownHandle` | answer `NotSealed` | read |
   | a publish naming it | answer `AttachmentNotHeld` | answer `AttachmentNotHeld` | published |
   | `BlobClose` | no-op, counted | bytes deleted | hold dropped |

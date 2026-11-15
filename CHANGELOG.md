@@ -4,6 +4,45 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **A surface page makes and forwards blobs; `brenn:processor/blobs@0.3.0` is
+  declared stable.** A component on a page granted `blobs` can create a blob,
+  write it by range, seal it and publish a message naming it, and pass along an
+  attachment it opened, by reference — on a wire channel and on a page-local
+  one.
+  - **For operators:** a surface whose instance granted `blobs` has a declared
+    output on a wire channel now gets a blob door that uploads; a surface whose
+    `blobs` instances only read, or publish only page-locally, keeps a
+    read-only door. Nothing new is configured: the door follows from the grant
+    and the bindings (`docs/config-dsl.md`). Such an instance may attach blobs
+    only on its own declared wire outputs, never on the surface error channel
+    unless an output is bound to it. Two new `attach_protocol_violation`s
+    (fail2ban signal) on any attach session: `BlobWrite` or `BlobSeal` on a
+    door without upload, and a publish naming attachments under an
+    attribution, or on a channel, that may not take one. A browser session
+    with an upload door draws on the shared blob pool up to the per-session
+    cap (64 handles, 4 × `max_blob_bytes` held); see
+    `docs/security-posture.md` §6.6. A page holds at most 64 MiB of bytes its
+    components made, beside the 64 MiB of fetched bytes; the other page
+    bounds are in `docs/message-bus.md` §2.1.2a, "A surface page makes blobs".
+  - **For component authors:** a surface serves `create`, the `writer`
+    resource and `publish` of `blobs@0.3.0`; only `call-async`,
+    `call-async-for` and `complete` are refused there, by name. A page uploads
+    a blob it made only after the activation returns `ok`, so the backend
+    store's verdict arrives after the call: a refused upload, or a forwarded
+    attachment whose message left the server's window, loses the activation's
+    wire batch whole — never the message without its attachments — and the
+    page announces it on its error channel. On a surface `budget-exhausted` is
+    the page's own budget. `limits` on a page reports 1 MiB for writes.
+    `processor-blobs-test`'s spec gains an optional `feed` port.
+  - **`brenn:processor/blobs@0.3.0` is STABLE**, with the promise
+    `brenn:processor@0.2.0` carries: no type or function is changed or
+    removed and no case or field is added, while brenn serves it an artifact
+    built against the shapes in the file loads and means what it meant, and
+    it is not removed without a removal period announced here and in the
+    file. An addition is a function no existing component imports, added
+    beside the ones the interface has; a host coming to serve a function it
+    refuses today is an addition of the same kind. Bounds stay host policy.
+    See `brenn-wasm/wit/processor-0.3.wit` and `docs/component-packages.md`.
 - **A surface page reads message attachments.** A component on a page granted
   `blobs` can open an attachment of a message in its windows and read its
   bytes, which cross the surface websocket as binary frames — the camera-frame
@@ -23,16 +62,15 @@ All notable changes to Brenn are documented here.
     once per kind, per channel, per connection.
   - **For component authors:** a surface serves the read side of
     `brenn:processor/blobs@0.3.0` — `limits`, `open` and a blob's `size`,
-    `content-type` and `read` — and a kind that imports `create`, `writer` or
-    `publish` is refused when its artifact is checked at boot, naming the
-    function; the surface check now type-checks the `blobs` import.
+    `content-type` and `read` — and, with the entry above, its producing
+    side; the surface check now type-checks the `blobs` import.
     **BREAKING, in place:** `read-error` gains `unavailable`, which a page
     answers for bytes it does not hold and the backend never answers. A
     component that calls `blob.read` must be rebuilt against this release's
     `brenn-guest` before it links on the backend, and a `match` on
-    `brenn_guest::blobs::ReadError` gains an arm for `Unavailable`. The
-    interface is not yet declared stable, and no tagged release served the
-    earlier shape. See `docs/component-packages.md`, "Contract evolution".
+    `brenn_guest::blobs::ReadError` gains an arm for `Unavailable`. No tagged
+    release served the earlier shape, and the interface is declared stable
+    with this shape (the entry above). See `docs/component-packages.md`, "Contract evolution".
 - **Large files through `api-request`, and a new `GmailAttachment` tool.**
   The host tool `api-request` (the way components and agents call an
   OAuth-protected API) can now send a request body from a blob attachment
@@ -172,8 +210,7 @@ All notable changes to Brenn are documented here.
   or US-ASCII charset if any); binary data goes as an attachment instead. An
   edit replaces body and type together: `body` without `content_type` leaves
   the message untyped, and `content_type` without `body` is refused.
-- **For WASM component authors: a `blobs` interface, backend only, not yet
-  stable.** A new interface, `brenn:processor/blobs@0.3.0`
+- **For WASM component authors: a `blobs` interface.** A new interface, `brenn:processor/blobs@0.3.0`
   (`brenn-wasm/wit/processor-0.3.wit`), under a new grant word, `blobs`, lets
   a component on the backend host open an attachment of a message in its
   windows by port, index and name, read it by byte range, create a blob by
@@ -185,14 +222,8 @@ All notable changes to Brenn are documented here.
   with `blobs` imported, and is still a 0.2.0 component; `brenn-guest` binds
   that world and adds `brenn_guest::blobs`, `publish_with_attachments` and
   `Message::attachments`. A component that does not call the interface
-  imports nothing new. The word is refused on a placed instance, and a
-  surface refuses a component that imports the interface. The interface is
-  not yet declared stable: a shape changes in place only while no tagged
-  brenn release has served it; a shape a tagged release has served changes
-  only as a new version of the interface, served beside the old one for at
-  least one release and announced here; the old version may be removed one
-  release after its replacement, and nothing longer is promised. See
-  `docs/component-packages.md`.
+  imports nothing new. A surface serves the interface too, as the entries
+  above say, and it is declared stable. See `docs/component-packages.md`.
 - **BREAKING for operators: a blob directory records the database it belongs
   to.** The blob directory now holds a file `owner`, mode 0600, holding the
   store generation of its database (`messaging_store_identity.generation`).

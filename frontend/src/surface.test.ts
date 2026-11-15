@@ -18,6 +18,7 @@ import {
     installGlobalHandlers,
     loadKernel,
     activationEntryBytes,
+    type BlobsPublishRefusal,
     type Body,
     type ManifestComponent,
     processorStartInstances,
@@ -888,7 +889,7 @@ describe("surface processor bring-up", () => {
             brenn_processor_withheld: vi.fn((_i: string, _r: string) => {}),
             brenn_blobs_limits: vi.fn((_i: string) => ({
                 maxReadBytes: 1048576,
-                maxWriteBytes: 0,
+                maxWriteBytes: 1048576,
             })),
             brenn_blobs_open: vi.fn(
                 (_i: string, _p: string, _x: number, _n: string) => 7,
@@ -902,6 +903,23 @@ describe("surface processor bring-up", () => {
                     new Uint8Array([0xff, 0x00]),
             ),
             brenn_blobs_drop: vi.fn((_i: string, _h: number) => {}),
+            brenn_blobs_create: vi.fn((_i: string, _c: string) => 4),
+            brenn_blobs_write: vi.fn(
+                (_i: string, _w: number, _o: bigint, _b: Uint8Array) => {},
+            ),
+            brenn_blobs_seal: vi.fn((_i: string, _w: number) => 5),
+            brenn_blobs_drop_writer: vi.fn((_i: string, _w: number) => {}),
+            brenn_blobs_publish: vi.fn(
+                (
+                    _i: string,
+                    _p: string,
+                    _b: Body,
+                    _n: string[],
+                    _h: unknown[],
+                    _u: string | undefined,
+                    _d: bigint | undefined,
+                ) => undefined as BlobsPublishRefusal | undefined,
+            ),
             brenn_dom_root: vi.fn((_i: string) => 1n),
             brenn_dom_create_element: vi.fn((_i: string, _t: string) => 1n),
             brenn_dom_set_attribute: vi.fn(
@@ -1212,7 +1230,7 @@ describe("surface processor bring-up", () => {
         );
     });
 
-    it("offers a 0.2.0 instance the blobs read side, a fresh class per instantiation", async () => {
+    it("offers a 0.2.0 instance the blobs read side, fresh classes per instantiation", async () => {
         const kernel = fakeKernel();
         const tables: Record<string, Record<string, unknown>>[] = [];
         const instantiate = vi.fn(
@@ -1253,9 +1271,16 @@ describe("surface processor bring-up", () => {
         };
         // Each instantiation's glue checks `open`'s answer against its own class.
         expect(first.Blob).not.toBe(second.Blob);
-        expect(Object.keys(first).sort()).toEqual(["Blob", "limits", "open"]);
+        expect(Object.keys(first).sort()).toEqual([
+            "Blob",
+            "Writer",
+            "create",
+            "limits",
+            "open",
+            "publish",
+        ]);
 
-        expect(first.limits()).toEqual({ maxReadBytes: 1048576, maxWriteBytes: 0 });
+        expect(first.limits()).toEqual({ maxReadBytes: 1048576, maxWriteBytes: 1048576 });
         const blob = first.open("feed", 2, "frame") as InstanceType<BlobClass>;
         expect(blob).toBeInstanceOf(first.Blob);
         expect(kernel.brenn_blobs_open).toHaveBeenCalledWith("b1", "feed", 2, "frame");
@@ -1279,6 +1304,100 @@ describe("surface processor bring-up", () => {
         });
         expect(() => first.open("feed", 9, "frame")).toThrow(
             expect.objectContaining({ payload: { tag: "not-permitted" } }),
+        );
+    });
+
+    it("offers a 0.2.0 instance the blobs producing side over handle numbers", async () => {
+        const kernel = fakeKernel();
+        const tables: Record<string, Record<string, unknown>>[] = [];
+        const instantiate = vi.fn(
+            (_g: unknown, table: Record<string, Record<string, unknown>>) => {
+                tables.push(table);
+                return { receive: vi.fn() };
+            },
+        );
+        const importModule = vi.fn(async () => ({ instantiate }));
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            manifest([
+                { ...processorEntry("b1"), contract: "brenn:processor@0.2.0" },
+            ]),
+            ["b1"],
+            importModule as unknown as ModuleImporter,
+        );
+        const entry = kernel.brenn_processor_register.mock
+            .calls[0]?.[1] as unknown as (a: unknown) => unknown;
+        entry({ ports: [], deferred: [], now: undefined, sync: undefined });
+
+        type PageWriter = {
+            write(offset: bigint, bytes: Uint8Array): void;
+            seal(): unknown;
+        };
+        const blobs = tables[0]?.["brenn:processor/blobs"] as {
+            create: (contentType: string) => PageWriter;
+            publish: (
+                port: string,
+                body: Body,
+                attachments: [string, unknown][],
+                options: { urgency?: string; deliverAfter?: bigint },
+            ) => void;
+            Blob: new (handle: number) => unknown;
+            Writer: new (handle: number) => PageWriter;
+        };
+        const disposeKey =
+            (Symbol as unknown as { dispose?: symbol }).dispose ??
+            Symbol.for("dispose");
+
+        const writer = blobs.create("image/png");
+        expect(writer).toBeInstanceOf(blobs.Writer);
+        expect(kernel.brenn_blobs_create).toHaveBeenCalledWith("b1", "image/png");
+        const bytes = new Uint8Array([1, 2, 3]);
+        writer.write(8n, bytes);
+        expect(kernel.brenn_blobs_write).toHaveBeenCalledWith("b1", 4, 8n, bytes);
+        const sealed = writer.seal();
+        // The glue checks `seal`'s answer against the `Blob` class it was given.
+        expect(sealed).toBeInstanceOf(blobs.Blob);
+        expect(kernel.brenn_blobs_seal).toHaveBeenCalledWith("b1", 4);
+        (writer as unknown as Record<symbol, () => void>)[disposeKey]?.();
+        expect(kernel.brenn_blobs_drop_writer).toHaveBeenCalledWith("b1", 4);
+
+        const body: Body = { contentType: undefined, bytes: new Uint8Array([0]) };
+        // A blob the glue fabricated carries no handle number; the kernel judges it.
+        const fabricated = Object.create(blobs.Blob.prototype) as unknown;
+        blobs.publish("out", body, [["a", sealed], ["b", fabricated]], {
+            urgency: "high",
+            deliverAfter: 9n,
+        });
+        expect(kernel.brenn_blobs_publish).toHaveBeenCalledWith(
+            "b1",
+            "out",
+            body,
+            ["a", "b"],
+            [5, undefined],
+            "high",
+            9n,
+        );
+
+        // A refusal is returned by the kernel and thrown as the variant.
+        kernel.brenn_blobs_publish.mockImplementationOnce(() => ({
+            tag: "plain",
+            val: { tag: "not-permitted" },
+        }));
+        expect(() =>
+            blobs.publish("out", body, [], { urgency: undefined, deliverAfter: undefined }),
+        ).toThrow(
+            expect.objectContaining({
+                payload: { tag: "plain", val: { tag: "not-permitted" } },
+            }),
+        );
+        // A writer refusal is the kernel's thrown envelope, passed through.
+        kernel.brenn_blobs_seal.mockImplementationOnce(() => {
+            throw { payload: { tag: "gap", val: { offset: 0n, len: 8n } } };
+        });
+        expect(() => writer.seal()).toThrow(
+            expect.objectContaining({
+                payload: { tag: "gap", val: { offset: 0n, len: 8n } },
+            }),
         );
     });
 

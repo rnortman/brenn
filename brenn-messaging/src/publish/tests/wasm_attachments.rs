@@ -7,7 +7,9 @@ use super::CountingRouter;
 use crate::config::{Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, Sink};
 use crate::db::{init_db_memory, upsert_channels};
 use crate::store::RingStores;
-use crate::testutils::{TempBlobDir, ephemeral_channel_entry, install_blob_store_at, redeem_all};
+use crate::testutils::{
+    TempBlobDir, ephemeral_channel_entry, install_blob_store_at, local_channel_entry, redeem_all,
+};
 use crate::{
     AttachmentName, ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry,
     SubscriberEntryKind, Urgency, WakeMin, WakeRouter, canonical_address,
@@ -32,6 +34,8 @@ struct Fixture {
     capped: String,
     /// A ring of depth 1, fed to [`PAGE`].
     ring: String,
+    /// A `local:` ring of depth 1.
+    local: String,
 }
 
 fn page_subscriber() -> SubscriberEntry {
@@ -75,10 +79,12 @@ async fn fixture() -> Fixture {
     let capped = durable_entry("wasm-blob-capped", Depth::Bounded(1), vec![]);
     let mut ring = ephemeral_channel_entry("wasm-blob-ring", 1);
     ring.subscribers = vec![page_subscriber()];
-    let (durable_addr, capped_addr, ring_addr) = (
+    let local = local_channel_entry("wasm-blob-local", 1);
+    let (durable_addr, capped_addr, ring_addr, local_addr) = (
         durable.address.clone(),
         capped.address.clone(),
         ring.address.clone(),
+        local.address.clone(),
     );
 
     let db = init_db_memory();
@@ -96,12 +102,12 @@ async fn fixture() -> Fixture {
         .acls
         .ephemeral_subscribe
         .push(ChannelMatcher::Prefix(String::new()));
-    let stores = Arc::new(RingStores::build(std::slice::from_ref(&ring)));
+    let stores = Arc::new(RingStores::build(&[ring.clone(), local.clone()]));
     let router = Arc::new(CountingRouter::default());
     let messenger = Messenger::new(
         db,
         Arc::new(MessagingDirectory::with_entries(vec![
-            durable, capped, ring,
+            durable, capped, ring, local,
         ])),
         Arc::from("test"),
         Arc::new(IndexMap::new()),
@@ -121,6 +127,7 @@ async fn fixture() -> Fixture {
         durable: durable_addr,
         capped: capped_addr,
         ring: ring_addr,
+        local: local_addr,
     }
 }
 
@@ -246,6 +253,38 @@ async fn a_ring_wasm_publish_holds_its_blob_in_the_ring_and_eviction_deletes_it(
         !f.blobs.holds_file(&id),
         "a blob no durable row ever named goes with its last holder"
     );
+}
+
+/// A `local:` channel takes attachments as an `ephemeral:` one does: the ring
+/// entry holds the blob, a reader redeems it, and eviction deletes it.
+#[tokio::test]
+async fn a_local_wasm_publish_holds_its_blob_in_the_ring_and_a_reader_opens_it() {
+    let f = fixture().await;
+    let kept = f.seal(b"kept on the host");
+    let id = kept.id().clone();
+    let attachments = held(&[("kept", &kept), ("again", &kept)]);
+    f.m.publish_from_wasm(SLUG, &[entry(&f.local, "kept", None, &attachments)])
+        .await;
+    drop((kept, attachments));
+
+    let stored = f.newest(&f.local).await;
+    assert_eq!(stored.attachments.len(), 2);
+    assert_eq!(stored.attachments.get(&name("kept")).unwrap().id, id);
+    assert_eq!(stored.attachments.get(&name("again")).unwrap().id, id);
+    assert_eq!(redeem_all(&f.m, &id).await.unwrap(), b"kept on the host");
+    assert!(
+        f.rows().await.is_empty(),
+        "a `local:` publish writes no row"
+    );
+
+    let none = HeldAttachments::none();
+    f.m.publish_from_wasm(SLUG, &[entry(&f.local, "evicts", None, &none)])
+        .await;
+    assert!(matches!(
+        redeem_all(&f.m, &id).await,
+        Err(BlobError::NotFound)
+    ));
+    assert!(!f.blobs.holds_file(&id));
 }
 
 /// One blob on a ring entry and a durable entry of the same batch: both

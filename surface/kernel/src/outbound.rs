@@ -35,12 +35,14 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::{
     BatchAnswer, Discarded, FlushBatch, OutboxSteps, Outboxes, PendingPublishes, PublishRequest,
 };
-use brenn_attach_proto::{ClientFrame, PublishBatchOutcome, PublishOutcome};
+use brenn_attach_proto::{BlobHandle, ClientFrame, PublishBatchOutcome, PublishOutcome};
+use brenn_envelope::grants::ComponentGrant;
 use brenn_envelope::{MessageBody, Urgency};
 use brenn_surface_schema::telemetry::ErrorReportDocument;
 use brenn_surface_schema::{LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES};
 
-use crate::bindings::{AppliedBindings, channel_carries};
+use crate::bindings::{AppliedBindings, channel_carries, channel_is_transportable};
+use crate::uploads::{StageGate, StagedFlush};
 
 /// The urgency the kernel states on the documents it writes about itself.
 ///
@@ -522,6 +524,11 @@ impl SurfaceOutbound {
         self.telemetry_dropped
     }
 
+    /// Whether `instance`'s outbox holds nothing, parked or unanswered.
+    pub fn is_idle(&self, instance: &str) -> bool {
+        self.outboxes.is_idle(instance)
+    }
+
     /// Whether `instance` holds an outbox.
     pub fn is_registered(&self, instance: &str) -> bool {
         self.outboxes.is_registered(instance)
@@ -734,7 +741,8 @@ impl SurfaceOutbound {
 }
 
 /// Whether a flush passes every gate the peer answers with a violation. See
-/// [`SurfaceOutbound::on_attached`] for why these four and no others.
+/// [`SurfaceOutbound::on_attached`] for why these four and no others, and
+/// [`may_attach`] for the fifth, asked of an entry that names attachments.
 ///
 /// `facts` of `None` asks the wiring half alone, which is the only half that has
 /// an answer while detached.
@@ -748,14 +756,82 @@ fn survives(
     let carries = |channel: &str, body: &MessageBody| {
         channel_carries(bindings.carries_non_text(channel), body)
     };
-    batch
-        .entries
+    batch.entries.iter().all(|entry| {
+        admits(&entry.channel)
+            && carries(&entry.channel, &entry.body)
+            && (entry.attachments.is_empty() || may_attach(bindings, instance, &entry.channel))
+    }) && batch
+        .ops
         .iter()
-        .all(|entry| admits(&entry.channel) && carries(&entry.channel, &entry.body))
-        && batch.ops.iter().all(|op| {
-            admits(&op.channel) && op.op.body().is_none_or(|body| carries(&op.channel, body))
-        })
+        .all(|op| admits(&op.channel) && op.op.body().is_none_or(|body| carries(&op.channel, body)))
         && facts.is_none_or(|facts| fits_the_caps(instance, batch, facts))
+}
+
+/// Whether `instance` may attach on `channel` under the wiring in force: the
+/// document grants it `blobs`, and the channel is one of its own wire outputs.
+/// These are the server's attach rule read from the same data — the
+/// document's grants and outputs are written from the set the server's rule is
+/// built from, and its outputs never name the error channel.
+///
+/// # Panics
+///
+/// On a `local:` channel: a wire batch entry never names one.
+fn may_attach(bindings: &AppliedBindings, instance: &str, channel: &str) -> bool {
+    assert!(
+        channel_is_transportable(channel),
+        "surface client: {instance}'s wire batch entry names the page-local channel {channel}"
+    );
+    bindings.instance_granted(instance, ComponentGrant::Blobs)
+        && publishes_on(bindings, instance, channel)
+}
+
+/// The handle a held flush's attachments are measured with before their
+/// handles exist: the widest a handle can encode, so a flush that passes with
+/// it passes with the handles it will name.
+const PLACEHOLDER_HANDLE: BlobHandle = BlobHandle(u64::MAX);
+
+/// Whether a flush the stage holds still passes [`survives`], measured with
+/// [`PLACEHOLDER_HANDLE`] for every attachment, and every backend reference it
+/// forwards is opened from a channel this surface subscribes across the wire
+/// under the wiring in force.
+///
+/// The second is the server's `BlobOpen` rule, which answers an open on a
+/// channel the session may not subscribe with a violation. The document's
+/// wire subscriptions are written from the set that rule reads.
+pub fn staged_survives(
+    bindings: &AppliedBindings,
+    instance: &str,
+    flush: &StagedFlush,
+    facts: Option<&AttachmentFacts>,
+) -> bool {
+    flush
+        .origins()
+        .all(|channel| bindings.wire_depths(channel).is_some())
+        && survives(
+            bindings,
+            instance,
+            &flush.batch(|_| PLACEHOLDER_HANDLE),
+            facts,
+        )
+}
+
+/// What the page answers the stage: its outboxes' idleness and the gate a
+/// held flush is judged by, against the wiring and contract in force.
+#[derive(Clone, Copy)]
+pub struct PageGate<'a> {
+    pub bindings: &'a AppliedBindings,
+    pub facts: Option<&'a AttachmentFacts>,
+    pub outbound: &'a SurfaceOutbound,
+}
+
+impl StageGate for PageGate<'_> {
+    fn idle(&self, instance: &str) -> bool {
+        self.outbound.is_idle(instance)
+    }
+
+    fn survives(&self, instance: &str, flush: &StagedFlush) -> bool {
+        staged_survives(self.bindings, instance, flush, self.facts)
+    }
 }
 
 /// Whether a flush clears the attachment's two size caps: the protocol's batch

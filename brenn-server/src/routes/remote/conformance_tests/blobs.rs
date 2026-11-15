@@ -986,6 +986,38 @@ async fn a_subscribe_only_remotes_opens_are_refused_past_the_bytes_held_bound() 
     b.rig.client.close().await;
 }
 
+/// **On a door without upload, `BlobWrite` and `BlobSeal` are violations.** A
+/// subscribe-only remote never had a create to pipeline either behind, so
+/// each ends the session as a protocol violation.
+#[tokio::test]
+async fn a_subscribe_only_remotes_blob_write_or_seal_is_a_violation() {
+    let frames = [
+        ClientFrame::BlobWrite {
+            handle: BlobHandle(RAW),
+            offset: 0,
+            bytes: b"x".to_vec(),
+        },
+        ClientFrame::BlobSeal {
+            handle: BlobHandle(RAW),
+        },
+    ];
+    for frame in frames {
+        let db = crate::test_support::init_db_memory();
+        let mut b = blob_rig(
+            &db,
+            subscribe_only,
+            VersionRange::exactly(6),
+            TEST_BLOB_LIMITS,
+        )
+        .await;
+        let facts = b.rig.client.attach().await;
+        assert!(!facts.blobs().expect("a door").upload);
+        b.rig.client.send_raw(frame).await;
+        expect_blob_detach(&mut b.rig.client).await;
+        expect_one_violation(&b.rig, "an upload frame on a door without upload").await;
+    }
+}
+
 /// **A v5 session on the same host is shown references and no door.**
 #[tokio::test]
 async fn a_v5_session_is_delivered_references_and_has_no_blob_door() {

@@ -113,8 +113,9 @@ pub(crate) fn admit_attribution_or_violate(
 /// nothing.
 ///
 /// The attachment list's shape follows the channel: a list on an attachment
-/// without the blob door, over the per-message bound or naming a name twice is
-/// a violation.
+/// without the blob door, under an attribution the profile does not let attach
+/// on the channel, over the per-message bound or naming a name twice is a
+/// violation.
 ///
 /// Then the body cap (an outcome, metered and escalating — see
 /// [`BODY_TOO_LARGE_VIOLATION_THRESHOLD`]), then the connection's rate bucket
@@ -158,7 +159,9 @@ pub async fn handle_publish(
     if let Err(violation) = assert_publishable(ctx, attribution, channel, "Publish") {
         return violation;
     }
-    if let Err(violation) = check_attachment_shape(ctx, attachments, "Publish") {
+    if let Err(violation) =
+        check_attachment_shape(ctx, attribution, channel, attachments, "Publish")
+    {
         return violation;
     }
 
@@ -471,9 +474,13 @@ pub async fn handle_publish_batch(
         ));
     }
     for entry in publishes {
-        if let Err(violation) =
-            check_attachment_shape(ctx, &entry.attachments, "PublishBatch entry")
-        {
+        if let Err(violation) = check_attachment_shape(
+            ctx,
+            attribution,
+            &entry.channel,
+            &entry.attachments,
+            "PublishBatch entry",
+        ) {
             return violation;
         }
     }

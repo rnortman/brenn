@@ -20,10 +20,12 @@
 //! - **`DeferredView`** restates what one of the page's senders has parked on one
 //!   transportable channel.
 //!
-//! The four blob answers go to the page's fetcher ([`crate::fetch`]), which also
-//! takes every application row a `Deliver` carries: it stores a row at once, or
-//! holds it in the channel's arrival hold until the attachments the page fetches
-//! of it have settled.
+//! The blob answers are settled once on the page's plane and split by who
+//! asked: a fetch's go to the page's fetcher ([`crate::fetch`]), which also
+//! takes every application row a `Deliver` carries — it stores a row at once,
+//! or holds it in the channel's arrival hold until the attachments the page
+//! fetches of it have settled — and an upload's go to the stage
+//! ([`crate::uploads`]).
 //!
 //! # One frame, one pass
 //!
@@ -64,9 +66,11 @@ use brenn_attach_proto::{
 
 use crate::activation::DropVerdicts;
 use crate::bindings::channel_carries;
+use crate::blob_plane::PlaneAnswer;
 use crate::fetch::{self, FetchReport, Fetched};
 use crate::outbound::{LostFlush, PublishAnswer};
-use crate::page::{Configured, SurfacePage};
+use crate::page::{Configured, HandOver, SurfacePage};
+use crate::uploads::Lost;
 
 /// A delivery pass discarded as a previous span's straggler.
 ///
@@ -137,6 +141,9 @@ pub struct Inbound {
     pub lost_flushes: Vec<LostFlush>,
     /// What the fetcher reports for the page's error channel.
     pub reports: Vec<FetchReport>,
+    /// Attachment flushes the stage lost to this frame: a refused upload or
+    /// open, or a flush handed over that the contract in force refused.
+    pub staged_lost: Vec<Lost>,
 }
 
 /// Route one server frame the connection handed back.
@@ -189,25 +196,62 @@ fn unreachable_frame(name: &str) -> ! {
     panic!("surface client: the connection consumes {name} itself and routes it to nobody")
 }
 
-/// Settle one blob answer through the page's fetcher. An answer to a request
-/// the page never made — a create or seal result above all, since the page
-/// makes no blob — is fatal on the connection.
+/// Settle one blob answer on the page's plane and hand each event to whoever
+/// asked: the fetcher, then the stage. An answer the plane is not owed is
+/// fatal on the connection, and so is one the stage cannot reconcile with the
+/// reference the server itself delivered.
+///
+/// The stage moves on every blob answer, whoever it was for: a fetch that
+/// finished may have freed the room an upload is waiting for.
 fn on_blob_frame(
     page: &mut SurfacePage,
     frame: ServerFrame,
     now: Millis,
 ) -> Result<Inbound, String> {
+    let PlaneAnswer {
+        frames,
+        fetch,
+        upload,
+    } = page.plane.on_frame(frame)?;
     let Fetched {
         frames,
         drops,
         reports,
-    } = fetch::on_blob_frame(page, frame, now)?;
-    Ok(Inbound {
+    } = fetch::on_blob_events(page, frames, fetch, now)?;
+    let mut inbound = Inbound {
         frames,
         drops,
         reports,
         ..Inbound::default()
-    })
+    };
+    let SurfacePage {
+        connect,
+        outbound,
+        stage,
+        plane,
+        ..
+    } = page;
+    let Some(bindings) = connect.bindings() else {
+        assert!(
+            upload.is_empty(),
+            "surface client: an upload answered before any document was in force"
+        );
+        return Ok(inbound);
+    };
+    HandOver {
+        stage,
+        plane,
+        outbound,
+        bindings,
+        facts: connect.facts(),
+        now,
+    }
+    .try_drive(
+        &mut inbound.steps,
+        &mut inbound.staged_lost,
+        |stage, plane, gate| stage.on_events(plane, upload, gate),
+    )?;
+    Ok(inbound)
 }
 
 /// Settle one channel's `SubscribeResult`.
@@ -433,9 +477,10 @@ fn on_batch_result(
     now: Millis,
 ) -> Result<Inbound, String> {
     // The surface route answers a non-text body offered to a text-only channel
-    // with a protocol close, never with that outcome; and the page names no blob
-    // handle in a publish, so the server has no cause to answer that one. A peer
-    // that sends either is not the server this page was built against.
+    // with a protocol close, never with that outcome; and a batch names only
+    // handles the server answered held on this attachment before it was sent,
+    // so the server has no cause to answer that one. A peer that sends either
+    // is not the server this page was built against.
     if matches!(
         outcome,
         PublishBatchOutcome::TextOnlyChannel | PublishBatchOutcome::AttachmentNotHeld
@@ -451,7 +496,7 @@ fn on_batch_result(
         lost,
         outcome: _,
     } = page.outbound.on_batch_result(correlation, outcome, now)?;
-    Ok(Inbound {
+    let mut inbound = Inbound {
         steps,
         lost_flushes: lost
             .into_iter()
@@ -461,7 +506,33 @@ fn on_batch_result(
             })
             .collect(),
         ..Inbound::default()
-    })
+    };
+    // The answer finishes or re-parks a handed attachment flush, and frees the
+    // instance's outbox for the next one its stage holds.
+    let SurfacePage {
+        connect,
+        outbound,
+        stage,
+        plane,
+        ..
+    } = page;
+    let bindings = connect
+        .bindings()
+        .expect("surface client: a batch was sent under a document in force");
+    HandOver {
+        stage,
+        plane,
+        outbound,
+        bindings,
+        facts: connect.facts(),
+        now,
+    }
+    .drive(
+        &mut inbound.steps,
+        &mut inbound.staged_lost,
+        |stage, plane, gate| stage.on_batch_answer(&registrant, outcome, plane, gate),
+    );
+    Ok(inbound)
 }
 
 /// Take one restatement of what a sender has parked on a transportable channel.

@@ -11,16 +11,24 @@ package brenn:processor@0.3.0;
 /// `blobs` imported.
 ///
 /// Served by the backend host in full. A surface host serves `limits`,
-/// `open` and the `blob` resource, and refuses a component that imports any
-/// other function of this interface.
+/// `open`, the `blob` resource, `create`, the `writer` resource and
+/// `publish`, and refuses a component that imports `call-async`,
+/// `call-async-for` or `complete`.
 ///
-/// NOT YET DECLARED STABLE. Shapes in this file are expected to change. A
-/// shape changes in place only while no tagged brenn release has served it. A
-/// shape a tagged release has served changes only as a new version of this
-/// interface, served beside the old one for at least one release and
-/// announced in `CHANGELOG.md`; the old version may be removed one release
-/// after its replacement, and nothing longer is promised.
-/// TODO(blobs-interface-stable-declaration)
+/// STABLE. No type or function of `blobs@0.3.0` is changed or removed, no
+/// case is added to a variant or an enum and no field to a record, and each
+/// keeps doing what this file says it does. While brenn serves this
+/// interface, an artifact built against the shapes in this file loads and
+/// means what it meant. brenn does not stop serving it without a removal
+/// period, announced in `CHANGELOG.md` and in this file no later than the
+/// first release the period counts; no length is promised. A breaking change
+/// is a new version of this interface, served beside this one through that
+/// period. An addition is a function no existing component imports, added
+/// beside the functions this interface has, which keep their shapes and
+/// their behaviour; a host coming to serve a function it refuses today is an
+/// addition of the same kind. A component that does not call the new
+/// function imports nothing new. Bounds are host policy and outside this
+/// promise.
 ///
 /// Who may name a blob. A component names a blob only by a `blob` handle,
 /// and gets one in exactly two ways: `open`, for an attachment of a message
@@ -38,16 +46,30 @@ package brenn:processor@0.3.0;
 /// exception is `complete`: a completion holds the blobs it names from the
 /// call, so a blob the activation made and completed with survives the
 /// activation's `err` or trap, as the completion does.
-/// On a surface a handle is a place in the activation's windows, not a hold
-/// on the backend's blob.
+/// On a surface a handle to an attachment of a wire message is a place in
+/// the activation's windows, not a hold on the backend's blob: the page takes
+/// the hold when it forwards the blob, at the flush, and a message that left
+/// the server's window in between loses the flush. A page-local message holds
+/// a blob the page made from the flush. A wire-bound message exists only once
+/// the server applies the activation's batch; until then the page holds the
+/// bytes it made, and the message may never exist (see `publish`). So "on
+/// `ok` the messages it published hold the blobs they name" is true on a
+/// surface of page-local messages, and of a wire-bound message if and when
+/// the server applies its batch.
 ///
 /// Bounds. The largest read and write, how many handles an activation may
 /// hold, how many calls it may make and how many bytes it may write are host
 /// policy, not part of any promise; `limits` reports the two per-call sizes.
-/// The refusal a bound draws keeps its variant and its meaning. On this host
-/// the bytes one activation may write come to 64 MiB and a writer does not
-/// outlive its activation, so a component cannot make a larger blob; that is
-/// host policy like every bound here, not a promise of the interface.
+/// The refusal a bound draws keeps its variant and its meaning. On the
+/// backend host the bytes one activation may write come to 64 MiB and a
+/// writer does not outlive its activation, so a component cannot make a
+/// larger blob; that is host policy like every bound here, not a promise of
+/// the interface. A surface page makes no blob larger than the smaller of
+/// its own bound for the bytes it has made and the largest blob its server
+/// accepts, and has no ceiling on blob calls: there `quota-exceeded` is the
+/// handle bound at `create` and `open`, the bytes-written bound at `write`,
+/// and never `seal`'s answer. A page has no filesystem and never answers
+/// `storage-failed`.
 ///
 /// What the other functions do with attachments. `ports.publish`,
 /// `publish-with-urgency` and `publish-deferred` publish a message that
@@ -122,15 +144,19 @@ interface blobs {
         /// A surface page answers it for an attachment it did not fetch: one
         /// larger than its channel's fetch bound, one whose fetch was refused
         /// or failed, one whose bytes the page dropped for room, or one still
-        /// on its way. A later activation may find the bytes.
+        /// on its way. A later activation may find the bytes. It also answers
+        /// it for a backend blob a page-local message names when the page
+        /// does not hold that blob's bytes for the wire message that
+        /// delivered it.
         unavailable,
     }
 
     variant create-error {
         /// Not a well-formed media type of at most 255 bytes, as a body's.
         invalid-content-type(string),
-        /// The host serving the call is over its budget for blob bytes.
-        /// TODO(blobs-surface-store-budget-refusal)
+        /// The host serving the call is over its budget for blob bytes. On
+        /// a surface that is the page's own budget for the bytes it has
+        /// made; the backend store's budget is never answered in a call.
         budget-exhausted,
         /// The host's filesystem refused to create the blob. Nothing was
         /// created. The string is a host diagnostic.
@@ -147,7 +173,8 @@ interface blobs {
         /// serving the call accepts.
         blob-too-large,
         /// The write would take the host serving the call past its budget
-        /// for blob bytes.
+        /// for blob bytes. On a surface that is the page's own budget for
+        /// the bytes it has made.
         budget-exhausted,
         /// The write would leave the blob with more disjoint written ranges
         /// than the host tracks.
@@ -192,7 +219,10 @@ interface blobs {
     ///
     /// On a surface it succeeds for an attachment whose bytes the page does
     /// not hold, and `not-found` is the server's answer that the message left
-    /// the channel's window.
+    /// the channel's window. On a page-local channel it opens what the
+    /// message's attachment names, bytes the page made or a backend blob the
+    /// page forwarded there; `not-found` there means the message left the
+    /// page's window after the activation's windows were read.
     open: func(port: string, index: u32, name: string) -> result<blob, open-error>;
 
     /// A blob being written. Dropped unsealed, its bytes are deleted.
@@ -246,13 +276,23 @@ interface blobs {
     /// behaves as `ports.publish`. The message holds its blobs from this
     /// call; the component may drop its handles.
     ///
+    /// On a surface no attachment is refused for where its blob came from or
+    /// which kind of channel its message goes to. What the page can judge it
+    /// answers in the call; a wire-bound message whose upload or forward the
+    /// server refuses after the activation returned `ok` is lost with the
+    /// rest of the activation's wire batch, never published without its
+    /// attachments, and the page announces the loss.
+    ///
     /// The checks run in a fixed order: the call budget shared with `ports`;
     /// the `ports` grant; the port (undeclared traps); the output ACL; the
     /// body (`invalid-body`, then `text-only-channel`); the attachments
     /// (`too-many-attachments`, `invalid-attachment-name`,
     /// `duplicate-attachment-name`); then the size cap and budgets. A
     /// declared, unwired port checks everything that needs no channel and
-    /// drops the message.
+    /// drops the message. Of the attachments, the count is judged first and
+    /// then each name in list order, its grammar before whether an earlier
+    /// name was the same, so the first name at fault decides. Every function
+    /// here that takes attachments judges them so.
     publish: func(port: string, body: body,
         attachments: list<tuple<string, borrow<blob>>>,
         options: publish-options) -> result<_, publish-error>;

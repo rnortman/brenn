@@ -21,6 +21,12 @@
 // bytes of every attachment it delivered, answers a `BlobOpen` of one with its
 // size and type and each `BlobRead` with the range asked for, and forgets a
 // handle at `BlobClose`. A test can script a refusal of the next open or read.
+// Behind a door with upload it takes a `BlobCreate`, the `BlobWrite`s that fill
+// the declared size in order, and the `BlobSeal` that makes the bytes a held
+// blob, and it records with each batch entry the bytes of every handle it
+// names. A test can script a refusal of the next create; as the server does,
+// the peer then drops the writes to the refused handle and answers its seal
+// with an unknown handle.
 //
 // It is the deferral authority of every transportable channel, as the server
 // is: a batch entry with a release instant is parked under a minted id for its
@@ -113,6 +119,12 @@ export interface KitPage {
     blobs_feed_channel: string;
     /** The fetch bound of `blobs_feed_channel` on the `blobs` page. */
     blobs_fetch_bytes: number;
+    /** The wire channel `p-maker`'s `a` port is bound to on the `make` page. */
+    made_channel: string;
+    /** The page-local channel behind `p-maker`'s `b` port, which wakes `p-reader`. */
+    kept_channel: string;
+    /** The wire channel `p-maker`'s `feed` port holds, which never wakes it. */
+    make_feed_channel: string;
     /** The page-local channel `b-keeper` keeps typed bodies on and `plain` reads. */
     shared_channel: string;
     /** The page-local channel, declared `non_text`, behind `b-keeper`'s `timer` port. */
@@ -150,12 +162,17 @@ export interface Kit {
     deliver_attached: BinaryTemplate & { attachments: string };
     /** One entry of a header's attachment map, by its slots `id`, `size` and `content_type`. */
     attachment_ref: Template;
-    /** The answers to the blob frames a read-only door sends. */
+    /** The answers to the blob frames a door sends. */
     blob_answers: {
         open_ok: Template;
         open_not_retained: Template;
         read_ok: RawTemplate;
         read_storage_failed: RawTemplate;
+        create_ok: Template;
+        create_budget_exhausted: Template;
+        create_storage_failed: Template;
+        seal_ok: Template;
+        seal_unknown_handle: Template;
     };
     /** A bytes-carrying read answer the codec encoded, with what produced it. */
     blob_read_sample: { values: Record<string, Json>; bytes: string; hex: string };
@@ -347,11 +364,18 @@ function child(at: Json, key: string): Json | undefined {
     return undefined;
 }
 
+/** One attachment a publish names: its name and the handle that holds it. */
+export interface NamedHandle {
+    name: string;
+    handle: number;
+}
+
 /** One publish inside a `PublishBatch`. */
 export interface BatchPublish {
     channel: string;
     body: RigBody;
     deliverAfter: number | null;
+    attachments: NamedHandle[];
 }
 
 /** One control op inside a `PublishBatch`. */
@@ -374,6 +398,7 @@ export type ClientFrame =
           channel: string;
           body: RigBody;
           correlation: number | null;
+          attachments: NamedHandle[];
       }
     | {
           type: "PublishBatch";
@@ -384,13 +409,19 @@ export type ClientFrame =
       }
     | { type: "BlobOpen"; handle: number; channel: string; messageId: string; name: string }
     | { type: "BlobRead"; correlation: number; handle: number; offset: number; len: number }
-    | { type: "BlobClose"; handle: number };
+    | { type: "BlobClose"; handle: number }
+    | { type: "BlobCreate"; handle: number; contentType: string; size: number }
+    | { type: "BlobWrite"; handle: number; offset: number; bytes: Uint8Array }
+    | { type: "BlobSeal"; handle: number };
 
 /** A blob frame the kernel sent. */
-export type BlobFrame = Extract<ClientFrame, { type: "BlobOpen" | "BlobRead" | "BlobClose" }>;
+export type BlobFrame = Extract<
+    ClientFrame,
+    { type: "BlobOpen" | "BlobRead" | "BlobClose" | "BlobCreate" | "BlobWrite" | "BlobSeal" }
+>;
 
 /** The client kinds that travel as binary messages. */
-const BINARY_KINDS = new Set(["Publish", "PublishBatch"]);
+const BINARY_KINDS = new Set(["Publish", "PublishBatch", "BlobWrite"]);
 
 /**
  * Read a client frame by field name: a text message as its JSON, a binary
@@ -441,6 +472,13 @@ export function readClientFrame(data: string | Uint8Array): ClientFrame {
     ): T | null => (from[name] === undefined ? null : field(from, name, check, what));
     const optional = <T>(name: string, check: (v: unknown) => v is T): T | null =>
         optionalOf(frame, name, check, type);
+    // Omitted on the wire when empty.
+    const attachments = (from: Record<string, unknown>, what: string): NamedHandle[] =>
+        (optionalOf(from, "attachments", isArray, what) ?? []).map((entry: unknown) => {
+            const a = (entry ?? {}) as Record<string, unknown>;
+            const where = `${what}.attachments[]`;
+            return { name: field(a, "name", isString, where), handle: field(a, "handle", isNumber, where) };
+        });
     // The body section, consumed in descriptor order.
     let at = 0;
     const body = (descriptor: unknown, what: string): RigBody => {
@@ -469,6 +507,7 @@ export function readClientFrame(data: string | Uint8Array): ClientFrame {
                 channel: field(frame, "channel", isString, type),
                 body: body(frame["body"], "Publish.body"),
                 correlation: optional("correlation", isNumber),
+                attachments: attachments(frame, type),
             };
             break;
         case "PublishBatch": {
@@ -479,6 +518,7 @@ export function readClientFrame(data: string | Uint8Array): ClientFrame {
                     channel: field(p, "channel", isString, what),
                     body: body(p["body"], what),
                     deliverAfter: optionalOf(p, "deliver_after", isNumber, what),
+                    attachments: attachments(p, what),
                 };
             });
             const opWhat = "PublishBatch.deferred_ops[]";
@@ -526,6 +566,32 @@ export function readClientFrame(data: string | Uint8Array): ClientFrame {
             };
             break;
         case "BlobClose":
+            read = { type, handle: field(frame, "handle", isNumber, type) };
+            break;
+        case "BlobCreate":
+            read = {
+                type,
+                handle: field(frame, "handle", isNumber, type),
+                contentType: field(frame, "content_type", isString, type),
+                size: field(frame, "size", isNumber, type),
+            };
+            break;
+        case "BlobWrite": {
+            // The body section is the raw bytes, `len` of them.
+            const len = field(frame, "len", isNumber, type);
+            if (len > rest.length) {
+                throw new Error(`client frame BlobWrite states ${len} bytes past the body section`);
+            }
+            read = {
+                type,
+                handle: field(frame, "handle", isNumber, type),
+                offset: field(frame, "offset", isNumber, type),
+                bytes: rest.slice(0, len),
+            };
+            at = len;
+            break;
+        }
+        case "BlobSeal":
             read = { type, handle: field(frame, "handle", isNumber, type) };
             break;
         default:
@@ -579,7 +645,20 @@ export interface WirePublish {
     attribution: string | null;
     /** The client frame that carried it. */
     frame: "Publish" | "PublishBatch";
+    /** Each attachment it names, under its name, with the bytes its handle held. */
+    attachments: RigAttachment[];
 }
+
+/** An upload the peer is taking: its declared size and type, and the bytes so far. */
+interface Upload {
+    contentType: string;
+    bytes: Uint8Array;
+    /** The bytes written, from offset 0: the kernel writes its chunks in order. */
+    written: number;
+}
+
+/** A refusal of the next `BlobCreate` a test can script. */
+export type CreateRefusal = "budget_exhausted" | "storage_failed";
 
 /** One message the peer holds parked, as a `DeferredView` states it. */
 export interface Parked {
@@ -614,8 +693,13 @@ export class Peer {
     readonly blobFrames: BlobFrame[] = [];
     /** Every attachment delivered, keyed by `attachmentKey`. */
     private readonly attachments = new Map<string, RigAttachment>();
-    /** The attachment each open handle holds. */
+    /** The attachment each open or sealed handle holds. */
     private readonly handles = new Map<number, RigAttachment>();
+    /** Each upload created and not yet sealed or closed. */
+    private readonly uploads = new Map<number, Upload>();
+    /** Handles whose create was refused, until their seal is answered. */
+    private readonly refusedCreates = new Set<number>();
+    private refuseCreate: CreateRefusal | null = null;
     private refuseOpen = false;
     private failRead = false;
     private helloSeen = false;
@@ -759,6 +843,11 @@ export class Peer {
         this.failRead = true;
     }
 
+    /** Refuse the next `BlobCreate` with `reason`. */
+    refuseNextCreate(reason: CreateRefusal): void {
+        this.refuseCreate = reason;
+    }
+
     private connect(socket: RigSocket): void {
         if (this.socket !== null) {
             this.failures.fatal(`the kernel opened a second socket (${socket.url}): a reconnect`);
@@ -840,7 +929,12 @@ export class Peer {
                 return;
             }
             case "Publish":
-                this.record(frame.type, frame.channel, frame.body, frame.attribution);
+                if (frame.attachments.length > 0) {
+                    this.failures.fatal(
+                        `a Publish on '${frame.channel}' names attachments: the page names handles only in a batch`,
+                    );
+                }
+                this.record(frame.type, frame.channel, frame.body, frame.attribution, []);
                 if (frame.correlation !== null) {
                     this.sendSoon(fill(answers.publish_result, { correlation: frame.correlation }));
                 }
@@ -862,8 +956,13 @@ export class Peer {
                 }
                 for (const p of frame.publishes) {
                     if (p.deliverAfter === null) {
-                        this.record(frame.type, p.channel, p.body, attribution);
+                        this.record(frame.type, p.channel, p.body, attribution, this.held(p));
                     } else {
+                        if (p.attachments.length > 0) {
+                            this.failures.fatal(
+                                `a parked entry on '${p.channel}' names attachments, which the peer does not park`,
+                            );
+                        }
                         this.park(p.channel, attribution as string, p.body, p.deliverAfter);
                         touched.push(p.channel);
                     }
@@ -880,10 +979,34 @@ export class Peer {
             case "BlobOpen":
             case "BlobRead":
             case "BlobClose":
+            case "BlobCreate":
+            case "BlobWrite":
+            case "BlobSeal":
                 this.blobFrames.push(frame);
                 this.answerBlob(frame);
                 return;
         }
+    }
+
+    /**
+     * The attachments a batch entry names, each with the bytes its handle
+     * holds. A handle the peer does not hold sealed or open is a failure: the
+     * server would answer the batch `AttachmentNotHeld`, which a conforming page
+     * never draws.
+     */
+    private held(entry: BatchPublish): RigAttachment[] {
+        return entry.attachments.map(({ name, handle }) => {
+            const blob = this.handles.get(handle);
+            if (blob === undefined) {
+                this.failures.fatal(`a batch entry on '${entry.channel}' names handle ${handle}, which is not held`);
+            }
+            return { name, bytes: blob.bytes, contentType: blob.contentType };
+        });
+    }
+
+    /** Whether `handle` names anything the peer holds or is taking. */
+    private inUse(handle: number): boolean {
+        return this.handles.has(handle) || this.uploads.has(handle) || this.refusedCreates.has(handle);
     }
 
     /** Answer one blob frame from the attachments delivered. */
@@ -891,7 +1014,7 @@ export class Peer {
         const answers = this.kit.blob_answers;
         switch (frame.type) {
             case "BlobOpen": {
-                if (this.handles.has(frame.handle)) {
+                if (this.inUse(frame.handle)) {
                     this.failures.fatal(`a BlobOpen under handle ${frame.handle}, which is open`);
                 }
                 if (this.refuseOpen) {
@@ -937,10 +1060,80 @@ export class Peer {
                 return;
             }
             case "BlobClose":
-                if (!this.handles.delete(frame.handle)) {
+                if (!this.handles.delete(frame.handle) && !this.uploads.delete(frame.handle)) {
                     this.failures.fatal(`a BlobClose of handle ${frame.handle}, which is not open`);
                 }
                 return;
+            case "BlobCreate": {
+                if (this.inUse(frame.handle)) {
+                    this.failures.fatal(`a BlobCreate under handle ${frame.handle}, which is in use`);
+                }
+                const refusal = this.refuseCreate;
+                if (refusal !== null) {
+                    this.refuseCreate = null;
+                    this.refusedCreates.add(frame.handle);
+                    const template =
+                        refusal === "budget_exhausted" ? answers.create_budget_exhausted : answers.create_storage_failed;
+                    this.sendSoon(fill(template, { handle: frame.handle }));
+                    return;
+                }
+                this.uploads.set(frame.handle, {
+                    contentType: frame.contentType,
+                    bytes: new Uint8Array(frame.size),
+                    written: 0,
+                });
+                this.sendSoon(fill(answers.create_ok, { handle: frame.handle }));
+                return;
+            }
+            case "BlobWrite": {
+                if (this.refusedCreates.has(frame.handle)) {
+                    // The server drops a write naming a handle not in its table.
+                    return;
+                }
+                const upload = this.uploads.get(frame.handle);
+                if (upload === undefined) {
+                    this.failures.fatal(`a BlobWrite to handle ${frame.handle}, which is not an upload`);
+                }
+                if (frame.offset !== upload.written) {
+                    this.failures.fatal(
+                        `a BlobWrite at ${frame.offset} to handle ${frame.handle}, ` +
+                            `whose next unwritten byte is ${upload.written}`,
+                    );
+                }
+                if (frame.bytes.length === 0 || frame.offset + frame.bytes.length > upload.bytes.length) {
+                    this.failures.fatal(
+                        `a BlobWrite of ${frame.bytes.length} bytes at ${frame.offset} to handle ` +
+                            `${frame.handle}, declared ${upload.bytes.length} bytes`,
+                    );
+                }
+                upload.bytes.set(frame.bytes, frame.offset);
+                upload.written += frame.bytes.length;
+                return;
+            }
+            case "BlobSeal": {
+                if (this.refusedCreates.delete(frame.handle)) {
+                    this.sendSoon(fill(answers.seal_unknown_handle, { handle: frame.handle }));
+                    return;
+                }
+                const upload = this.uploads.get(frame.handle);
+                if (upload === undefined) {
+                    this.failures.fatal(`a BlobSeal of handle ${frame.handle}, which is not an upload`);
+                }
+                if (upload.written !== upload.bytes.length) {
+                    this.failures.fatal(
+                        `a BlobSeal of handle ${frame.handle} with ${upload.written} of ` +
+                            `${upload.bytes.length} bytes written`,
+                    );
+                }
+                this.uploads.delete(frame.handle);
+                this.handles.set(frame.handle, {
+                    name: `upload ${frame.handle}`,
+                    bytes: upload.bytes,
+                    contentType: upload.contentType,
+                });
+                this.sendSoon(fill(answers.seal_ok, { handle: frame.handle }));
+                return;
+            }
         }
     }
 
@@ -1004,7 +1197,8 @@ export class Peer {
         channel: string,
         body: RigBody,
         attribution: string | null,
+        attachments: RigAttachment[],
     ): void {
-        this.published.push({ order: this.nextOrder++, channel, body, attribution, frame });
+        this.published.push({ order: this.nextOrder++, channel, body, attribution, frame, attachments });
     }
 }

@@ -42,6 +42,8 @@
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod upload_tests;
 
 use brenn_activation::sync::SyncAnswer;
 use brenn_attach_client::Millis;
@@ -400,23 +402,28 @@ fn on_registered(
 ///
 /// If the instance is not registered, or holds no scheduler state.
 fn on_deregistered(page: &mut SurfacePage, instance: &str, reactions: &mut Reactions) {
-    let (frames, lost) = {
+    let (mut frames, lost, staged) = {
         let SurfacePage {
             stores,
             registrations,
             subs,
             outbound,
             schedules,
+            stage,
+            plane,
             ..
         } = page;
-        let frames = registrations.deregister(instance, stores, subs);
+        let mut frames = registrations.deregister(instance, stores, subs);
         schedules.forget(instance);
-        (frames, outbound.deregister(instance))
+        let lost = outbound.deregister(instance);
+        let (closes, staged) = stage.discard(instance, plane);
+        frames.extend(closes);
+        (frames, lost, staged)
     };
     // The entries were ok'd by the activations that wrote them and never applied,
     // so the loss is real — and nobody is left to answer for it, which is why it
     // is a log line rather than an event.
-    for batch in lost {
+    for batch in &lost {
         tracing::warn!(
             instance,
             entries = batch.entries.len(),
@@ -424,5 +431,14 @@ fn on_deregistered(page: &mut SurfacePage, instance: &str, reactions: &mut React
             "surface client: a queued flush died with the outbox of an unmounted instance"
         );
     }
+    if staged > 0 {
+        tracing::warn!(
+            instance,
+            staged,
+            "surface client: flushes naming attachments died with an unmounted instance"
+        );
+    }
+    let released = lost.iter().flat_map(|batch| batch.handles()).collect();
+    frames.extend(crate::flush::close_released(&mut page.plane, released));
     reactions.frames(page, frames);
 }

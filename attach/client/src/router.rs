@@ -50,7 +50,8 @@
 
 use brenn_attach_proto::DeferredViewEntry;
 use brenn_envelope::{
-    ChannelScheme, MessageBody, MessageEnvelope, Urgency, is_local_channel, surface_sub_identity,
+    Attachments, ChannelScheme, MessageBody, MessageEnvelope, Urgency, is_local_channel,
+    surface_sub_identity,
 };
 use brenn_queue::{CursorOverflow, QuotaExceeded, ReleaseTime};
 use chrono::{DateTime, Utc};
@@ -349,6 +350,25 @@ impl<P: PlanePolicy> LocalRouter<P> {
         stores: &mut ChannelStores<K>,
         req: RouteRequest<'_>,
     ) -> RouteOutcome<K> {
+        self.route_attached(stores, req, Attachments::new())
+    }
+
+    /// [`route`](Self::route), minting the envelope with `attachments`.
+    ///
+    /// The router takes the references as given: what holds the blobs they
+    /// name, and for how long, is the embedder's. A parked message keeps its
+    /// attachments through an edit, which replaces only the body and the
+    /// release time, and gives them up with the envelope at a cancel.
+    ///
+    /// # Panics
+    ///
+    /// As [`route`](Self::route).
+    pub fn route_attached<K: Eq + std::hash::Hash + Clone>(
+        &mut self,
+        stores: &mut ChannelStores<K>,
+        req: RouteRequest<'_>,
+        attachments: Attachments,
+    ) -> RouteOutcome<K> {
         let RouteRequest {
             channel,
             origin,
@@ -392,7 +412,7 @@ impl<P: PlanePolicy> LocalRouter<P> {
             urgency,
             envelope_type: ChannelScheme::Local,
             transport: None,
-            attachments: Default::default(),
+            attachments,
         };
         if let Some(release_at) = deliver_after.filter(|at| *at > epoch_ms(stamp.publish_ts)) {
             let sender = envelope.sender.clone();

@@ -57,6 +57,7 @@ use crate::outbound::truncate_report_field;
 use crate::page::SurfacePage;
 use crate::planes::SurfacePlanes;
 use crate::publish_buffer::PublishBuffer;
+use crate::uploads::{LossReason, Lost};
 
 /// The refusal vocabulary is the facility's, not this page's: both hosts answer
 /// a caller in the same words.
@@ -105,7 +106,13 @@ pub fn dispatch(page: &mut SurfacePage, now_ms: u64) -> Option<ReadyActivation> 
         router,
         views,
         fetch: _,
+        plane: _,
+        page_blobs: _,
+        stage: _,
         body_cap,
+        made: _,
+        blob_door: _,
+        handle_numbers: _,
     } = page;
     let instance = schedules.ready(registrations, stores)?.to_string();
     let generation = registrations
@@ -200,7 +207,13 @@ pub fn dispatch_sync(
         router,
         views,
         fetch: _,
+        plane: _,
+        page_blobs: _,
+        stage: _,
         body_cap,
+        made: _,
+        blob_door: _,
+        handle_numbers: _,
     } = page;
     assert!(
         !chain.iter().any(|caller| caller == instance),
@@ -313,6 +326,8 @@ pub struct Completion {
     /// Plane refusals, in call order — the page wrote a body one of its own
     /// planes rejected, which is worth surfacing either way.
     pub refusals: Vec<PlaneRefusal>,
+    /// Attachment flushes the stage lost while taking this completion's.
+    pub lost: Vec<Lost>,
     /// Set when this completion took the instance terminal: a trap.
     pub killed: Option<Killed>,
     /// Whether the completion was absorbed because the page no longer activates the
@@ -334,6 +349,7 @@ impl Completion {
             steps: OutboxSteps::default(),
             drops: DropVerdicts::default(),
             refusals: Vec::new(),
+            lost: Vec::new(),
             killed: None,
             absorbed: false,
         }
@@ -414,6 +430,7 @@ pub fn on_activation_done(
                 steps: report.steps,
                 drops: report.drops,
                 refusals: report.refusals,
+                lost: report.lost,
                 killed: None,
             }
         }
@@ -430,12 +447,14 @@ pub fn on_activation_done(
         steps,
         drops,
         refusals,
+        lost,
         killed,
     } = flushed;
     Completion {
         steps,
         drops,
         refusals,
+        lost,
         killed,
         ..Completion::nothing(instance, outcome)
     }
@@ -490,6 +509,7 @@ struct Flushed {
     steps: OutboxSteps<String>,
     drops: DropVerdicts,
     refusals: Vec<PlaneRefusal>,
+    lost: Vec<Lost>,
     killed: Option<Killed>,
 }
 
@@ -681,6 +701,44 @@ pub fn parked_drop_notices(dropped: &[String]) -> Vec<ControlPublish> {
         .collect()
 }
 
+/// Announce one flush the stage lost, as a toast on the page's own plane,
+/// which works detached.
+pub fn lost_flush_notice(lost: &Lost) -> ControlPublish {
+    toast(lost_flush_sentence(lost))
+}
+
+/// The sentence a flush the stage lost is announced with, wherever it is read.
+/// The stage holds plain flushes behind an attachment flush, so it names no
+/// attachment.
+pub fn lost_flush_sentence(lost: &Lost) -> String {
+    format!(
+        "{}: a publish batch on {} was lost — {}",
+        lost.instance,
+        lost.channels.join(", "),
+        loss_cause(lost.reason)
+    )
+}
+
+/// What a loss reason means to whoever reads the announcement.
+fn loss_cause(reason: LossReason) -> String {
+    match reason {
+        LossReason::Upload(refusal) => format!("the server refused an upload: {refusal:?}"),
+        LossReason::Open(refusal) => {
+            format!("the server refused to open a forwarded attachment: {refusal:?}")
+        }
+        LossReason::DoorTooSmall => "the server's blob door can never take it".to_string(),
+        LossReason::Revalidation => {
+            "the wiring or contract in force no longer admits it".to_string()
+        }
+        LossReason::Overflow => "the instance held more flushes than its depth".to_string(),
+        LossReason::Unanswered => {
+            "the connection ended before the server answered it; it may have been applied and \
+             is not sent again"
+                .to_string()
+        }
+    }
+}
+
 /// One warning toast, as the page's own confined plane carries it.
 fn toast(text: String) -> ControlPublish {
     ControlPublish {
@@ -712,7 +770,13 @@ fn flush_ctx(page: &mut SurfacePage, now: Millis, now_ms: u64) -> FlushCtx<'_, S
         router,
         views: _,
         fetch: _,
+        plane,
+        page_blobs,
+        stage,
         body_cap: _,
+        made: _,
+        blob_door: _,
+        handle_numbers: _,
     } = page;
     let bindings = connect
         .bindings()
@@ -721,8 +785,11 @@ fn flush_ctx(page: &mut SurfacePage, now: Millis, now_ms: u64) -> FlushCtx<'_, S
         bindings,
         facts: connect.facts(),
         stores,
+        page_blobs,
         router,
         outbound,
+        stage,
+        plane,
         registrations,
         schedules,
         now_ms,

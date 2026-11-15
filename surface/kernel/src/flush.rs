@@ -8,7 +8,9 @@
 //!
 //! - **Ok** — [`flush_ok`] commits the buffer. Confined entries and confined ops
 //!   are applied here and now, through the router; transportable entries and ops
-//!   become one `PublishBatch` offered to the instance's outbox.
+//!   become one wire flush, offered to the instance's stage, which hands a plain
+//!   one straight to its outbox and holds one naming attachments until their
+//!   blobs are held on the live attachment.
 //! - **Err** — [`discard_err`] drops the work and returns the budget. What a
 //!   component *spent* is a fact about the activation that ran, and an err does
 //!   not un-spend it.
@@ -57,20 +59,24 @@ mod tests;
 
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::AttachmentFacts;
-use brenn_attach_client::publish::{Discarded, FlushBatch, OutboxSteps, TimerChange};
+use brenn_attach_client::publish::{Discarded, OutboxSteps, TimerChange};
 use brenn_attach_client::router::{
     DeferOpAnswer, DeferOpRequest, LocalRouter, MessageStamp, Origin, PlanePolicy, RouteOutcome,
     RouteRequest,
 };
 use brenn_attach_client::store::DeferOp;
-use brenn_attach_proto::{BatchDeferredOp, BatchEntry, DeferredOpKind};
-use brenn_envelope::MessageBody;
+use brenn_attach_proto::{BatchDeferredOp, ClientFrame, DeferredOpKind};
+use brenn_envelope::{Attachments, MessageBody};
 
 use crate::activation::{DropVerdicts, Schedules};
 use crate::bindings::{AppliedBindings, channel_carries, channel_is_transportable};
+use crate::blob_plane::PagePlane;
 use crate::outbound::SurfaceOutbound;
-use crate::publish_buffer::{BufferedDeferOp, BufferedPublish, PublishBuffer};
+use crate::page::HandOver;
+use crate::page_blobs::PageBlobs;
+use crate::publish_buffer::{BufferedAttachment, BufferedDeferOp, BufferedPublish, PublishBuffer};
 use crate::registry::{Registrations, SurfaceStores};
+use crate::uploads::{Lost, Stage, StagedEntry, StagedFlush};
 
 /// Everything a completion writes to: the wiring it resolves against, the two
 /// deferral authorities and the retention behind them, the outboxes, and the
@@ -91,8 +97,16 @@ pub struct FlushCtx<'a, P> {
     /// have moved since.
     pub facts: Option<&'a AttachmentFacts>,
     pub stores: &'a mut SurfaceStores,
+    /// What each attachment of a page-local message names. A confined publish's
+    /// attachments are recorded here as it commits.
+    pub page_blobs: &'a mut PageBlobs,
     pub router: &'a mut LocalRouter<P>,
     pub outbound: &'a mut SurfaceOutbound,
+    /// Where a wire flush naming attachments waits for its blobs to be held.
+    pub stage: &'a mut Stage,
+    /// The page's blob plane, which the stage mints handles on and a kill
+    /// closes them on.
+    pub plane: &'a mut PagePlane,
     pub registrations: &'a mut Registrations,
     pub schedules: &'a mut Schedules,
     /// The wall clock this completion is judged at, epoch milliseconds UTC — the
@@ -134,16 +148,21 @@ pub struct FlushReport {
     pub drops: DropVerdicts,
     /// Plane refusals, in call order.
     pub refusals: Vec<PlaneRefusal>,
+    /// Attachment flushes the stage lost while taking this one: its depth
+    /// overflowed, or a head it moved can never reach the wire.
+    pub lost: Vec<Lost>,
 }
 
 /// What a kill took.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Killed {
     /// Whether this call was the transition. `false` for an instance already
     /// terminal, so a caller reports a failure once.
     pub first: bool,
-    /// Whole flushes discarded from its outbox.
+    /// Whole flushes discarded from its outbox and its stage.
     pub discarded: u64,
+    /// The `BlobClose` frames for the handles the discarded flushes held.
+    pub frames: Vec<ClientFrame>,
     /// The retry timer's instruction, when it changed.
     pub retry_wakeup: Option<TimerChange>,
 }
@@ -187,14 +206,29 @@ pub fn flush_ok<P: PlanePolicy>(
         .partition(|op| channel_is_transportable(&op.channel));
     apply_confined_ops(ctx, instance, confined_ops, &mut report);
     let entries = route_publishes(ctx, instance, flushed.publishes, stamps, &mut report);
-    let batch = FlushBatch {
+    let flush = StagedFlush {
         entries,
         ops: wire_ops.into_iter().map(wire_op).collect(),
     };
-    if !batch.is_empty() {
-        report.steps = ctx
-            .outbound
-            .flush(ctx.bindings, ctx.facts, instance, batch, ctx.now);
+    if !flush.entries.is_empty() || !flush.ops.is_empty() {
+        let depth = ctx
+            .bindings
+            .component(instance)
+            .unwrap_or_else(|| {
+                panic!("surface client: {instance} flushed with no component entry in force")
+            })
+            .parked_batch_depth;
+        HandOver {
+            stage: ctx.stage,
+            plane: ctx.plane,
+            outbound: ctx.outbound,
+            bindings: ctx.bindings,
+            facts: ctx.facts,
+            now: ctx.now,
+        }
+        .drive(&mut report.steps, &mut report.lost, |stage, plane, gate| {
+            stage.push(instance, flush, depth, plane, gate)
+        });
     }
     report
 }
@@ -224,6 +258,7 @@ pub fn kill<P>(ctx: &mut FlushCtx<'_, P>, instance: &str) -> Killed {
         return Killed {
             first: false,
             discarded: 0,
+            frames: Vec::new(),
             retry_wakeup: None,
         };
     }
@@ -233,15 +268,28 @@ pub fn kill<P>(ctx: &mut FlushCtx<'_, P>, instance: &str) -> Killed {
         released,
         retry_wakeup,
     } = ctx.outbound.discard_parked(instance, ctx.now);
-    assert!(
-        released.is_empty(),
-        "surface kernel: a flush named a blob handle, and this kernel names none"
-    );
+    let (mut frames, staged) = ctx.stage.discard(instance, ctx.plane);
+    frames.extend(close_released(ctx.plane, released));
     Killed {
         first: true,
-        discarded: flushes,
+        discarded: flushes + staged,
+        frames,
         retry_wakeup,
     }
+}
+
+/// Close each handle a finished flush held, once however many attachments
+/// named it.
+pub(crate) fn close_released(
+    plane: &mut PagePlane,
+    mut released: Vec<brenn_attach_proto::BlobHandle>,
+) -> Vec<ClientFrame> {
+    released.sort_unstable();
+    released.dedup();
+    released
+        .into_iter()
+        .flat_map(|handle| plane.close(handle))
+        .collect()
 }
 
 /// Apply one activation's control ops against confined channels, in call order.
@@ -311,14 +359,15 @@ fn apply_confined_ops<P: PlanePolicy>(
 }
 
 /// Route the confined entries of one activation's buffer and collect the
-/// transportable ones for its batch, in call order.
+/// transportable ones for its wire flush, in call order, each attachment still
+/// the blob its handle held.
 fn route_publishes<P: PlanePolicy>(
     ctx: &mut FlushCtx<'_, P>,
     instance: &str,
     publishes: Vec<BufferedPublish>,
     stamps: Vec<MessageStamp>,
     report: &mut FlushReport,
-) -> Vec<BatchEntry> {
+) -> Vec<StagedEntry> {
     let mut entries = Vec::new();
     for (publish, stamp) in publishes.into_iter().zip(stamps) {
         let BufferedPublish {
@@ -330,18 +379,19 @@ fn route_publishes<P: PlanePolicy>(
             // and the raw override has no reader on this path.
             urgency_override: _,
             deliver_after,
+            attachments,
         } = publish;
         if channel_is_transportable(&channel) {
             // The stamp is discarded: the peer mints the authoritative envelope.
             // The release time rides verbatim — this channel's deferral authority
             // is the peer, so the page states the time and the peer decides
             // park-vs-immediate against its own clock.
-            entries.push(BatchEntry {
+            entries.push(StagedEntry {
                 channel,
                 body,
                 urgency,
                 deliver_after,
-                attachments: Vec::new(),
+                attachments,
             });
             continue;
         }
@@ -349,7 +399,8 @@ fn route_publishes<P: PlanePolicy>(
         // and by that single append every reader bound to the channel woken. It
         // never touches the wire, so a down link is no reason to delay it.
         assert_carried_in_force(ctx.bindings, instance, &port, &channel, &body);
-        let outcome = ctx.router.route(
+        let attachments = commit_attachments(ctx.page_blobs, &attachments);
+        let outcome = ctx.router.route_attached(
             ctx.stores,
             RouteRequest {
                 channel: &channel,
@@ -359,6 +410,7 @@ fn route_publishes<P: PlanePolicy>(
                 urgency,
                 deliver_after,
             },
+            attachments,
         );
         match outcome {
             RouteOutcome::Routed { overflow } => {
@@ -391,6 +443,24 @@ fn route_publishes<P: PlanePolicy>(
         }
     }
     entries
+}
+
+/// Record each attachment of one confined publish in the page's blob table and
+/// answer the references its envelope carries.
+///
+/// An entry the commit does not end up naming — the plane refused the body or
+/// the schedule was dropped — is removed by the table's sweep at the end of the
+/// turn.
+fn commit_attachments(
+    page_blobs: &mut PageBlobs,
+    attachments: &[BufferedAttachment],
+) -> Attachments {
+    Attachments::from_map(
+        attachments
+            .iter()
+            .map(|attachment| (attachment.name.clone(), page_blobs.commit(&attachment.blob)))
+            .collect(),
+    )
 }
 
 /// Assert that the wiring in force lets `channel` carry `body`, for a confined

@@ -1200,6 +1200,25 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                     wire_lost = !self.driver.is_active();
                     self.fold_step(step, &mut queue);
                 }
+                // TODO(surface-upload-pacing): every chunk is handed to the
+                // socket in one stretch, so the page's other traffic waits
+                // behind the whole upload; pace it against the socket's
+                // buffered amount.
+                Effect::DrainUpload(handle) => {
+                    while !wire_lost {
+                        let frames = {
+                            let mut page = self.page.borrow_mut();
+                            let SurfacePage { stage, plane, .. } = &mut *page;
+                            stage.next_chunk_frames(handle, plane)
+                        };
+                        let Some(frames) = frames else {
+                            break;
+                        };
+                        let step = self.driver.send(frames).await;
+                        wire_lost = !self.driver.is_active();
+                        self.fold_step(step, &mut queue);
+                    }
+                }
                 Effect::EmitEvent(event) => {
                     // The two events a document produces are the other thing that
                     // moves the gate: the bound ports it names and the report
@@ -1324,7 +1343,7 @@ pub(crate) fn invoke_shared(
             .connect
             .bindings()
             .expect("surface runner: an activation was assembled with no bindings in force");
-        crate::blob_scope::BlobScope::of(bindings, instance, activation)
+        crate::blob_scope::BlobScope::of(bindings, instance, activation, &page.handle_numbers)
     };
     invoke_wasm(entry, activation, slot, instance, buffer, blobs)
 }

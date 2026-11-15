@@ -390,6 +390,45 @@ fn the_body_cap_survives_a_detach() {
     );
 }
 
+/// The blob door a component's `create`, `write` and `publish` are judged
+/// against is the most recent attachment's, kept through a detach as the body
+/// cap is and replaced by the next attachment's, door or none.
+#[test]
+fn the_blob_door_mirror_survives_a_detach_and_follows_the_next_attachment() {
+    let door = brenn_attach_proto::BlobFacts {
+        max_blob_bytes: 1 << 20,
+        max_chunk_bytes: 1 << 16,
+        max_handles: 8,
+        max_bytes_held: 4 << 20,
+        max_inflight_reads: 2,
+        upload: true,
+    };
+    let mut page = standard();
+    assert_eq!(page.blob_door, None);
+    page.on_detached();
+    page.on_attached(AttachmentFacts {
+        blobs: Some(door),
+        ..pages::facts()
+    });
+    assert_eq!(page.blob_door, Some(door));
+
+    page.on_detached();
+    assert_eq!(page.blob_door, Some(door), "kept while the link is down");
+
+    let reader = brenn_attach_proto::BlobFacts {
+        upload: false,
+        ..door
+    };
+    page.on_attached(AttachmentFacts {
+        blobs: Some(reader),
+        ..pages::facts()
+    });
+    assert_eq!(page.blob_door, Some(reader));
+    page.on_detached();
+    page.on_attached(pages::facts());
+    assert_eq!(page.blob_door, None, "an attachment with no door clears it");
+}
+
 /// Retained is not frozen: the cap is the **most recent** attachment's, so a
 /// reconnect stating a different one replaces it. Judging a later publish against a
 /// dead attachment's cap refuses bodies this peer would take, or — the dangerous

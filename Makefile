@@ -336,14 +336,16 @@ dev-mounts: run-artifacts
 # `e2e-page-blobs-fixtures`, which serve `processor-sdk-bytes-test` and
 # `processor-page-blobs-test` the same way, and `e2e-blobs-fixtures`, whose
 # components root holds the one `processor-blobs-test` package the e2e config
-# places at top level. A mount's surface tree is one stage directory, and a
+# places at top level and whose surface root serves the same kind to the
+# `blobs` page. A mount's surface tree is one stage directory, and a
 # kind may sit under only one mount, so each fixture has its own. Only `make e2e` reads this document, so neither the dev server nor
 # any deployment serves the fixtures. The `modules:` directories are the ones
 # `shipped_module_roots` in `brenn-lib/src/config/test_fixtures.rs` compiles
 # `brenn.e2e.brenn` against under `make check`; nothing checks that the two
 # agree, so move them together.
 E2E_TARGETS := //surface:processor-page-bytes-test_assets //surface:processor-sdk-bytes-test_assets \
-    //surface:processor-page-blobs-test_assets //brenn-wasm/components/processor-blobs-test:e2e_install_tree
+    //surface:processor-page-blobs-test_assets //surface:processor-blobs-test_assets \
+    //brenn-wasm/components/processor-blobs-test:e2e_install_tree
 E2E_MOUNTS_DIR := .e2e-mounts
 E2E_MOUNTS := $(E2E_MOUNTS_DIR)/mounts.brenn
 
@@ -353,7 +355,7 @@ e2e-mounts: run-artifacts
 	    "$(BRENN_MOUNT_SPEC)" \
 	    "e2e-fixtures=surface:$(BAZEL_BIN)/surface/processor-page-bytes-test_assets,modules:brenn-wasm/components/processor-page-bytes-test/spec" \
 	    "e2e-sdk-fixtures=surface:$(BAZEL_BIN)/surface/processor-sdk-bytes-test_assets,modules:brenn-wasm/components/processor-sdk-bytes-test/spec" \
-	    "e2e-blobs-fixtures=components:$(BAZEL_BIN)/brenn-wasm/components/processor-blobs-test/e2e_install_tree,modules:brenn-wasm/components/processor-blobs-test/spec" \
+	    "e2e-blobs-fixtures=components:$(BAZEL_BIN)/brenn-wasm/components/processor-blobs-test/e2e_install_tree,surface:$(BAZEL_BIN)/surface/processor-blobs-test_assets,modules:brenn-wasm/components/processor-blobs-test/spec" \
 	    "e2e-page-blobs-fixtures=surface:$(BAZEL_BIN)/surface/processor-page-blobs-test_assets,modules:brenn-wasm/components/processor-page-blobs-test/spec" \
 	    > /dev/null
 

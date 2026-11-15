@@ -35,17 +35,22 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::{DeferredViews, OutboxSteps};
 use brenn_attach_client::router::LocalRouter;
 use brenn_attach_client::subs::{SubscribeAck, Subscriptions};
-use brenn_attach_proto::ClientFrame;
+use brenn_attach_proto::{BlobFacts, ClientFrame};
 use brenn_envelope::surface_sub_identity;
 use uuid::Uuid;
 
 use crate::activation::{DropVerdicts, Schedules};
 use crate::bindings::AppliedBindings;
+use crate::blob_plane::PagePlane;
+use crate::blob_scope::HandleNumbers;
 use crate::connect::{ConfigApplied, SurfaceConnect};
 use crate::fetch::Fetch;
-use crate::outbound::{LostFlush, PublishAnswer, SurfaceOutbound};
+use crate::outbound::{LostFlush, PageGate, PublishAnswer, SurfaceOutbound};
+use crate::page_blobs::PageBlobs;
+use crate::page_bytes::MadeLedger;
 use crate::planes::SurfacePlanes;
 use crate::registry::{Registrations, StoreReconcile, SurfaceStores, new_stores, reconcile_stores};
+use crate::uploads::{Lost, Stage, StageGate, StageStep};
 
 /// One page's whole state: the attachment it has, the wiring in force, and the
 /// six tables that wiring is enacted over.
@@ -81,6 +86,15 @@ pub struct SurfacePage {
     /// attachment cache, and the blob plane. Fetched bytes and held rows outlive
     /// a detach; fetches in flight do not.
     pub fetch: Fetch,
+    /// The page's one blob plane, which the fetcher and the upload stage
+    /// share: the handles of the live attachment and the size behind each.
+    pub plane: PagePlane,
+    /// What each attachment of a page-local message names. Outlives a detach,
+    /// as the page-local stores do.
+    pub page_blobs: PageBlobs,
+    /// Attachment flushes held per instance until the blobs they name are
+    /// held on the live attachment. Outlives a detach, as the outboxes do.
+    pub stage: Stage,
     /// The publish-body cap the most recent attachment stated, `0` before the
     /// first one.
     ///
@@ -91,6 +105,20 @@ pub struct SurfacePage {
     /// link dropped. What a *transportable* flush is judged against is the live
     /// contract, which is why the outbox reads it from the facts instead.
     pub body_cap: u64,
+    /// The page's count of page-made blob bytes held, which every writer and
+    /// sealed blob debits while it lives. Bounded by `PAGE_MADE_BLOB_BYTES`.
+    pub made: MadeLedger,
+    /// The blob door the most recent attachment advertised, `None` before the
+    /// first one or when it advertised none.
+    ///
+    /// Retained across a detach, as the body cap is: a component's `create`,
+    /// `write` and `publish` are judged against it while the link is down, and
+    /// what it publishes then is staged and judged against the live door before
+    /// it is uploaded.
+    pub blob_door: Option<BlobFacts>,
+    /// The one source every activation's blob scope mints its handle numbers
+    /// from, so a number names one writer or blob in the page's life.
+    pub handle_numbers: HandleNumbers,
 }
 
 /// What a detach left to answer for.
@@ -102,6 +130,9 @@ pub struct Detached {
     /// The outboxes' answer: the retry timer disarmed, and no frames — a queued
     /// flush is still owed the wire and waits for the next attachment.
     pub steps: OutboxSteps<String>,
+    /// Attachment flushes whose batch was on the wire, unanswered: the server
+    /// may have applied them, so they are never sent again.
+    pub lost: Vec<Lost>,
 }
 
 /// What putting a bindings document in force cost and produced.
@@ -127,6 +158,9 @@ pub struct Configured {
     /// longer registered, whose queue nobody is left to answer for. Each names the
     /// instance whose writes vanished.
     pub lost_flushes: Vec<LostFlush>,
+    /// Attachment flushes the stage lost to this document: they no longer pass
+    /// the checks a held flush is judged by, or the door can never take them.
+    pub staged_lost: Vec<Lost>,
 }
 
 impl SurfacePage {
@@ -153,7 +187,13 @@ impl SurfacePage {
             router: LocalRouter::new(SurfacePlanes::new()),
             views: DeferredViews::new(),
             fetch: Fetch::new(),
+            plane: PagePlane::new(),
+            page_blobs: PageBlobs::new(),
+            stage: Stage::new(),
             body_cap: 0,
+            made: MadeLedger::new(),
+            blob_door: None,
+            handle_numbers: HandleNumbers::new(),
         }
     }
 
@@ -166,7 +206,7 @@ impl SurfacePage {
     /// the *nonempty* sets, immediately behind its `Welcome`, so an unmentioned
     /// pair means an empty set — and a retained mirror would show a schedule that
     /// released while the page was away. It hands the attachment's blob door to
-    /// the fetcher, which sends nothing until a pass runs. And it subscribes the
+    /// the page's blob plane; nothing is fetched until a pass runs. And it subscribes the
     /// config channel, which is the one frame this phase sends.
     ///
     /// The wiring from the previous attachment is untouched. The page is still
@@ -180,8 +220,9 @@ impl SurfacePage {
     pub fn on_attached(&mut self, facts: AttachmentFacts) -> Vec<ClientFrame> {
         self.router.set_principal(facts.participant_id.clone());
         self.body_cap = facts.max_body_bytes;
+        self.blob_door = facts.blobs().copied();
         self.views.clear();
-        self.fetch.on_attached(&facts);
+        self.plane.on_attached(&facts);
         self.connect.on_attached(facts, &mut self.subs)
     }
 
@@ -198,10 +239,25 @@ impl SurfacePage {
     /// negotiating reports one, and the page never got a phase 1.
     pub fn on_detached(&mut self) -> Detached {
         self.connect.on_detached(&mut self.subs);
+        self.plane.on_detached();
         self.fetch.on_detached();
+        let answers = self.outbound.fail_pending();
+        let mut steps = self.outbound.on_detached();
+        // The stage takes the outbox's drop of a parked attachment flush back
+        // before it is announced: that flush returns to staged.
+        let StageStep {
+            frames,
+            handed,
+            lost,
+        } = self.stage.on_detached(&mut steps.dropped);
+        assert!(
+            frames.is_empty() && handed.is_empty(),
+            "surface client: a detach composed stage frames or handed a flush over"
+        );
         Detached {
-            answers: self.outbound.fail_pending(),
-            steps: self.outbound.on_detached(),
+            answers,
+            steps,
+            lost,
         }
     }
 
@@ -263,7 +319,13 @@ impl SurfacePage {
             router,
             views: _,
             fetch: _,
+            plane,
+            page_blobs: _,
+            stage,
             body_cap: _,
+            made: _,
+            blob_door: _,
+            handle_numbers: _,
         } = self;
         let bindings = connect
             .bindings()
@@ -293,7 +355,24 @@ impl SurfacePage {
         schedules.wire_mounts();
         frames.extend(subs.resubscribe_survivors());
         let lost_flushes = outbound.reconcile(bindings, registrations.instances());
-        let steps = outbound.on_attached(bindings, facts, now);
+        let mut steps = outbound.on_attached(bindings, facts, now);
+        // Held flushes are judged by this document before anything moves, then
+        // the stage may start: the queued outbox flushes above went first.
+        let mut staged_lost = Vec::new();
+        HandOver {
+            stage,
+            plane,
+            outbound,
+            bindings,
+            facts: Some(facts),
+            now,
+        }
+        .drive(&mut steps, &mut staged_lost, |stage, plane, gate| {
+            let mut step =
+                stage.revalidate(plane, |instance, flush| gate.survives(instance, flush));
+            step.absorb(stage.on_ready(plane, gate));
+            step
+        });
         Ok(Configured {
             first_of_attachment,
             wiring_changed,
@@ -301,12 +380,129 @@ impl SurfacePage {
             steps,
             drops,
             lost_flushes,
+            staged_lost,
         })
     }
 
     /// The wiring in force, or `None` before the page's first document.
     pub fn bindings(&self) -> Option<&AppliedBindings> {
         self.connect.bindings()
+    }
+}
+
+/// One move of the stage and the hand-over of what it answers, judged
+/// throughout by one wiring and one contract: the stage is asked with the gate
+/// built from these fields, and the outboxes are offered its flushes under the
+/// same ones.
+pub struct HandOver<'a> {
+    pub stage: &'a mut Stage,
+    pub plane: &'a mut PagePlane,
+    pub outbound: &'a mut SurfaceOutbound,
+    pub bindings: &'a AppliedBindings,
+    pub facts: Option<&'a AttachmentFacts>,
+    pub now: Millis,
+}
+
+impl HandOver<'_> {
+    /// Run `step` — one stage operation, given the stage, the plane and the
+    /// gate — and enact what it answers with [`hand_over`].
+    pub fn drive(
+        self,
+        steps: &mut OutboxSteps<String>,
+        lost: &mut Vec<Lost>,
+        step: impl FnOnce(&mut Stage, &mut PagePlane, PageGate<'_>) -> StageStep,
+    ) {
+        let Ok(()) = self.try_drive(steps, lost, |stage, plane, gate| {
+            Ok::<_, std::convert::Infallible>(step(stage, plane, gate))
+        });
+    }
+
+    /// [`drive`](Self::drive) for a stage operation that can fail; on `Err`
+    /// nothing is handed over.
+    pub fn try_drive<E>(
+        self,
+        steps: &mut OutboxSteps<String>,
+        lost: &mut Vec<Lost>,
+        step: impl FnOnce(&mut Stage, &mut PagePlane, PageGate<'_>) -> Result<StageStep, E>,
+    ) -> Result<(), E> {
+        let gate = page_gate(self.bindings, self.facts, self.outbound);
+        let step = step(self.stage, self.plane, gate)?;
+        hand_over(self, step, steps, lost);
+        Ok(())
+    }
+}
+
+/// The gate the stage is judged by under `bindings` and `facts`.
+fn page_gate<'g>(
+    bindings: &'g AppliedBindings,
+    facts: Option<&'g AttachmentFacts>,
+    outbound: &'g SurfaceOutbound,
+) -> PageGate<'g> {
+    PageGate {
+        bindings,
+        facts,
+        outbound,
+    }
+}
+
+/// Enact one stage step: its frames are sent ahead of what the outboxes
+/// compose, its losses are collected, and each flush it handed over is offered
+/// to its instance's outbox through [`SurfaceOutbound::flush`].
+///
+/// # Panics
+///
+/// If the outbox refuses an attachment flush as it is offered. The stage
+/// judged the flush by the same `survives` under the same wiring and contract
+/// — every document re-judges each flush not yet handed, and a contract comes
+/// only with an attachment, whose document is applied before the stage moves
+/// — measuring each handle at its widest; and the instance's outbox was idle,
+/// with every later flush of the instance staged behind this one.
+fn hand_over(
+    ctx: HandOver<'_>,
+    step: StageStep,
+    steps: &mut OutboxSteps<String>,
+    lost: &mut Vec<Lost>,
+) {
+    let HandOver {
+        stage: _,
+        plane: _,
+        outbound,
+        bindings,
+        facts,
+        now,
+    } = ctx;
+    let StageStep {
+        frames,
+        handed,
+        lost: lost_here,
+    } = step;
+    steps.frames.extend(frames);
+    lost.extend(lost_here);
+    for (instance, batch) in handed {
+        let names_handles = batch.handles().next().is_some();
+        let offered = outbound.flush(bindings, facts, &instance, batch, now);
+        assert!(
+            !(names_handles && offered.dropped.contains(&instance)),
+            "surface client: the outbox refused {instance}'s attachment flush, which the stage \
+             judged under the same wiring and contract"
+        );
+        merge_steps(steps, offered);
+    }
+}
+
+/// Fold a later outbox answer into an earlier one of the same turn.
+pub fn merge_steps(into: &mut OutboxSteps<String>, later: OutboxSteps<String>) {
+    let OutboxSteps {
+        frames,
+        dropped,
+        released,
+        retry_wakeup,
+    } = later;
+    into.frames.extend(frames);
+    into.dropped.extend(dropped);
+    into.released.extend(released);
+    if retry_wakeup.is_some() {
+        into.retry_wakeup = retry_wakeup;
     }
 }
 

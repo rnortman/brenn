@@ -40,9 +40,11 @@
 //!
 //! # The plane
 //!
-//! One [`BlobPlane`] per page. An entry is opened, read whole, and closed as soon
-//! as its bytes are here, so the server's handles bound fetches in flight, not
-//! attachments cached. A detach returns every fetch in flight to wanted; the next
+//! The page's one [`PagePlane`], shared with the stage that uploads flushes. An
+//! entry is opened, read whole, and closed as soon as its bytes are here, so the
+//! server's handles bound fetches in flight, not attachments cached. A fetch
+//! starts only when the plane's handles and bytes in use, the stage's included,
+//! leave room for it. A detach returns every fetch in flight to wanted; the next
 //! attachment fetches it again.
 //!
 //! Nothing here reads a clock or sends a frame: every pass answers frames to
@@ -57,18 +59,16 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use brenn_attach_client::Millis;
-use brenn_attach_client::blobs::{BlobEvent, BlobPlane, OpenError, OpenRefusal, ReadRefusal};
-use brenn_attach_client::conn::AttachmentFacts;
+use brenn_attach_client::blobs::{BlobEvent, OpenError, OpenRefusal, ReadRefusal};
 use brenn_attach_client::store::CursorOverflow;
-use brenn_attach_proto::{
-    AttachmentName, BLOB_CHUNK_BYTES, BlobFacts, BlobHandle, ClientFrame, ServerFrame,
-};
+use brenn_attach_proto::{AttachmentName, BLOB_CHUNK_BYTES, BlobHandle, ClientFrame};
 use brenn_envelope::MessageEnvelope;
 use brenn_surface_schema::{LogLevel, PAGE_BLOB_BYTES};
 use uuid::Uuid;
 
 use crate::activation::DropVerdicts;
 use crate::bindings::AppliedBindings;
+use crate::blob_plane::{PagePlane, PlaneTag};
 use crate::page::SurfacePage;
 use crate::registry::{BindingKey, SurfaceStores};
 
@@ -103,6 +103,13 @@ pub fn hold_deadline_ms(sizes: impl IntoIterator<Item = u64>) -> u64 {
 /// Names one fetch: an entry's open and read on one attachment. Never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FetchId(u64);
+
+#[cfg(test)]
+impl FetchId {
+    pub(crate) fn for_tests(id: u64) -> Self {
+        Self(id)
+    }
+}
 
 /// A report for the page's error channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,12 +212,8 @@ struct HeldRow {
     phase: Phase,
 }
 
-/// The page's attachment fetching: every hold, the cache, and the plane.
+/// The page's attachment fetching: every hold and the cache.
 pub struct Fetch {
-    plane: BlobPlane<FetchId>,
-    /// The live attachment's blob door; `None` while detached or doorless. A
-    /// copy of the facts the plane keeps privately, set and cleared with them.
-    door: Option<BlobFacts>,
     holds: BTreeMap<String, VecDeque<HeldRow>>,
     entries: BTreeMap<EntryKey, Entry>,
     /// The entry each fetch on the wire fills.
@@ -234,8 +237,6 @@ impl Default for Fetch {
 impl Fetch {
     pub fn new() -> Self {
         Self {
-            plane: BlobPlane::new(),
-            door: None,
             holds: BTreeMap::new(),
             entries: BTreeMap::new(),
             fetches: BTreeMap::new(),
@@ -246,20 +247,11 @@ impl Fetch {
         }
     }
 
-    /// A new attachment is live. Nothing is fetched until a pass runs.
-    pub fn on_attached(&mut self, facts: &AttachmentFacts) {
-        self.plane.on_attached(facts);
-        self.door = facts.blobs;
-    }
-
     /// The attachment went away: every fetch in flight returns to wanted, its
     /// partial bytes discarded. Fetched bytes and held rows stay; trouble still
-    /// present on the next attachment is reported again.
+    /// present on the next attachment is reported again. The page's plane
+    /// forgets every handle on the same detach.
     pub fn on_detached(&mut self) {
-        // Every outstanding open and read is reported `Detached`, which is what
-        // the reset below does to every fetching entry whatever it was owed.
-        self.plane.on_detached();
-        self.door = None;
         self.fetches.clear();
         self.reported.clear();
         for entry in self.entries.values_mut() {
@@ -333,6 +325,7 @@ impl Fetch {
     /// If `channel` has no store.
     pub fn on_rows(
         &mut self,
+        plane: &mut PagePlane,
         stores: &mut SurfaceStores,
         bindings: &AppliedBindings,
         channel: &str,
@@ -355,7 +348,7 @@ impl Fetch {
                 .collect();
             let hold_empty = self.holds.get(channel).is_none_or(VecDeque::is_empty);
             if hold_empty && eligible.is_empty() {
-                self.insert(stores, channel, envelope, &mut step);
+                self.insert(plane, stores, channel, envelope, &mut step);
                 continue;
             }
             let store = store_mut(stores, channel);
@@ -377,7 +370,7 @@ impl Fetch {
                     }
                     None => {
                         let head = hold.pop_front().expect("a full hold has a head");
-                        self.insert(stores, channel, head.envelope, &mut step);
+                        self.insert(plane, stores, channel, head.envelope, &mut step);
                     }
                 }
             }
@@ -397,36 +390,41 @@ impl Fetch {
                     eligible,
                     phase,
                 });
-            self.settle(stores, now, &mut step);
+            self.settle(plane, stores, now, &mut step);
         }
         step
     }
 
-    /// Settle one blob answer.
+    /// Settle the fetcher's share of one blob answer, then run the rules: an
+    /// answer to anyone, the stage's included, can free room for a fetch.
     ///
-    /// `Err` is a peer contract the page cannot reconcile: an answer nothing
-    /// asked for, an open whose facts contradict the delivered reference, or a
-    /// denial of an attachment the server's own delivery named.
-    pub fn on_frame(
+    /// `Err` is a peer contract the page cannot reconcile: an open whose facts
+    /// contradict the delivered reference, or a denial of an attachment the
+    /// server's own delivery named.
+    pub fn on_events(
         &mut self,
+        plane: &mut PagePlane,
         stores: &mut SurfaceStores,
-        frame: ServerFrame,
+        events: Vec<BlobEvent<FetchId>>,
         now: Millis,
     ) -> Result<FetchStep, String> {
         let mut step = FetchStep::default();
-        let blob = self.plane.on_frame(frame)?;
-        step.frames.extend(blob.frames);
-        for event in blob.events {
-            self.on_event(event, &mut step)?;
+        for event in events {
+            self.on_event(plane, event, &mut step)?;
         }
-        self.settle(stores, now, &mut step);
+        self.settle(plane, stores, now, &mut step);
         Ok(step)
     }
 
     /// A deadline fired: release whatever is past its own.
-    pub fn on_due(&mut self, stores: &mut SurfaceStores, now: Millis) -> FetchStep {
+    pub fn on_due(
+        &mut self,
+        plane: &mut PagePlane,
+        stores: &mut SurfaceStores,
+        now: Millis,
+    ) -> FetchStep {
         let mut step = FetchStep::default();
-        self.settle(stores, now, &mut step);
+        self.settle(plane, stores, now, &mut step);
         step
     }
 
@@ -438,11 +436,12 @@ impl Fetch {
     /// opened no blob door: the peer contradicts its own wiring.
     pub fn on_config(
         &mut self,
+        plane: &mut PagePlane,
         stores: &mut SurfaceStores,
         bindings: &AppliedBindings,
         now: Millis,
     ) -> Result<FetchStep, String> {
-        if self.door.is_none()
+        if plane.door().is_none()
             && let Some(channel) = bindings.gated_channels().next()
         {
             return Err(format!(
@@ -462,26 +461,32 @@ impl Fetch {
             .collect();
         for channel in &gone {
             self.holds.remove(channel);
-            self.sweep(stores, channel, &mut step);
+            self.sweep(plane, stores, channel, &mut step);
         }
         let swept: BTreeSet<String> = self.entries.keys().map(|key| key.channel.clone()).collect();
         for channel in &swept {
-            self.sweep(stores, channel, &mut step);
+            self.sweep(plane, stores, channel, &mut step);
         }
-        self.settle(stores, now, &mut step);
+        self.settle(plane, stores, now, &mut step);
         Ok(step)
     }
 
     /// Run the three rules and start fetches until nothing moves.
-    fn settle(&mut self, stores: &mut SurfaceStores, now: Millis, step: &mut FetchStep) {
+    fn settle(
+        &mut self,
+        plane: &mut PagePlane,
+        stores: &mut SurfaceStores,
+        now: Millis,
+        step: &mut FetchStep,
+    ) {
         loop {
             let mut moved = false;
             let channels: Vec<String> = self.holds.keys().cloned().collect();
             for channel in &channels {
-                moved |= self.advance_hold(stores, channel, now, step);
+                moved |= self.advance_hold(plane, stores, channel, now, step);
             }
             self.holds.retain(|_, hold| !hold.is_empty());
-            moved |= self.start_fetches(step);
+            moved |= self.start_fetches(plane, step);
             if !moved {
                 break;
             }
@@ -492,6 +497,7 @@ impl Fetch {
     /// moved.
     fn advance_hold(
         &mut self,
+        plane: &mut PagePlane,
         stores: &mut SurfaceStores,
         channel: &str,
         now: Millis,
@@ -565,7 +571,7 @@ impl Fetch {
             // Back in place before the insert, so the sweep behind it still sees
             // the rows that are held.
             self.holds.insert(channel.to_string(), hold);
-            self.insert(stores, channel, head.envelope, step);
+            self.insert(plane, stores, channel, head.envelope, step);
             hold = self
                 .holds
                 .remove(channel)
@@ -590,6 +596,7 @@ impl Fetch {
     /// and sweep the cache against what the store retains after it.
     fn insert(
         &mut self,
+        plane: &mut PagePlane,
         stores: &mut SurfaceStores,
         channel: &str,
         envelope: MessageEnvelope,
@@ -597,12 +604,18 @@ impl Fetch {
     ) {
         let overflow = store_mut(stores, channel).insert(envelope);
         step.released.push((channel.to_string(), overflow));
-        self.sweep(stores, channel, step);
+        self.sweep(plane, stores, channel, step);
     }
 
     /// Delete every entry on `channel` whose message is neither held nor
     /// retained, closing a fetch still running for it.
-    fn sweep(&mut self, stores: &SurfaceStores, channel: &str, step: &mut FetchStep) {
+    fn sweep(
+        &mut self,
+        plane: &mut PagePlane,
+        stores: &SurfaceStores,
+        channel: &str,
+        step: &mut FetchStep,
+    ) {
         let mut live: BTreeSet<Uuid> = self
             .holds
             .get(channel)
@@ -626,20 +639,23 @@ impl Fetch {
                 .expect("the key came from the map");
             if let State::Fetching { fetch, handle, .. } = entry.state {
                 self.fetches.remove(&fetch);
-                // The reads this ends are reported `Closed` and are this
-                // deletion's own; nothing is left to settle.
-                step.frames.extend(self.plane.close(handle).frames);
+                // The reads this ends are this deletion's own; nothing is left
+                // to settle.
+                step.frames.extend(plane.close(handle));
             }
         }
     }
 
     /// Start wanted entries — held rows' first, then stored messages', oldest
-    /// first — while the door's handles and bytes held and the page's cache
-    /// bound allow. Answers whether anything moved.
-    fn start_fetches(&mut self, step: &mut FetchStep) -> bool {
-        let Some(door) = self.door else {
+    /// first — while the door's handles and bytes held, counted over the whole
+    /// plane, and the page's cache bound allow. Answers whether anything moved.
+    fn start_fetches(&mut self, plane: &mut PagePlane, step: &mut FetchStep) -> bool {
+        let Some(door) = plane.door() else {
             return false;
         };
+        if plane.fetches_held() {
+            return false;
+        }
         let held: BTreeSet<(String, Uuid)> = self
             .holds
             .iter()
@@ -680,13 +696,7 @@ impl Fetch {
                 );
                 continue;
             }
-            let in_flight = self
-                .entries
-                .values()
-                .filter(|entry| matches!(entry.state, State::Fetching { .. }))
-                .map(|entry| entry.size)
-                .fold(0, u64::saturating_add);
-            if !door.admits_bytes_held(in_flight, size) {
+            if !plane.has_room(1, size) {
                 break;
             }
             if !self.make_room(size, &is_held, step) {
@@ -698,10 +708,13 @@ impl Fetch {
                 continue;
             }
             let fetch = FetchId(self.next_fetch);
-            match self
-                .plane
-                .open(fetch, &key.channel, key.message_id, key.name.clone())
-            {
+            match plane.open(
+                PlaneTag::Fetch(fetch),
+                &key.channel,
+                key.message_id,
+                key.name.clone(),
+                size,
+            ) {
                 Ok((handle, frame)) => {
                     self.next_fetch += 1;
                     moved = true;
@@ -785,7 +798,12 @@ impl Fetch {
         }
     }
 
-    fn on_event(&mut self, event: BlobEvent<FetchId>, step: &mut FetchStep) -> Result<(), String> {
+    fn on_event(
+        &mut self,
+        plane: &mut PagePlane,
+        event: BlobEvent<FetchId>,
+        step: &mut FetchStep,
+    ) -> Result<(), String> {
         match event {
             BlobEvent::Opened {
                 tag,
@@ -806,8 +824,7 @@ impl Fetch {
                         key.name, key.message_id, key.channel, entry.size, entry.content_type
                     ));
                 }
-                let (_, frames) = self
-                    .plane
+                let (_, frames) = plane
                     .read(handle, tag, 0, size)
                     .expect("surface client: a handle just opened reads its whole size");
                 step.frames.extend(frames);
@@ -900,7 +917,7 @@ impl Fetch {
                     "surface client: a whole read fills its attachment"
                 );
                 entry.state = State::Fetched(bytes);
-                step.frames.extend(self.plane.close(handle).frames);
+                step.frames.extend(plane.close(handle));
             }
             BlobEvent::ReadRefused {
                 tag,
@@ -940,14 +957,14 @@ impl Fetch {
                                 key.name, key.message_id, key.channel
                             )
                         });
-                        step.frames.extend(self.plane.close(handle).frames);
+                        step.frames.extend(plane.close(handle));
                         State::Unfetched
                     }
                 };
                 self.entry_mut(&key).state = state;
             }
             BlobEvent::Sealed { .. } | BlobEvent::UploadRefused { .. } => {
-                unreachable!("surface client: the page makes no blob")
+                unreachable!("surface client: the plane hands the fetcher no upload event")
             }
         }
         Ok(())
@@ -1030,28 +1047,34 @@ pub fn on_rows(
         connect,
         stores,
         fetch,
+        plane,
         ..
     } = page;
     let bindings = connect
         .bindings()
         .expect("surface client: a subscribed channel implies a document in force");
-    let step = fetch.on_rows(stores, bindings, channel, rows, now);
+    let step = fetch.on_rows(plane, stores, bindings, channel, rows, now);
     charged(page, step)
 }
 
-/// Settle one blob answer on the page. `Err` is fatal on the connection.
-pub fn on_blob_frame(
+/// Give the fetcher its share of one blob answer the page's plane settled,
+/// sending the plane's own `frames` first. `Err` is fatal on the connection.
+pub fn on_blob_events(
     page: &mut SurfacePage,
-    frame: ServerFrame,
+    frames: Vec<ClientFrame>,
+    events: Vec<BlobEvent<FetchId>>,
     now: Millis,
 ) -> Result<Fetched, String> {
-    let step = page.fetch.on_frame(&mut page.stores, frame, now)?;
+    let mut step = page
+        .fetch
+        .on_events(&mut page.plane, &mut page.stores, events, now)?;
+    step.frames.splice(0..0, frames);
     Ok(charged(page, step))
 }
 
 /// The fetch deadline fired.
 pub fn on_due(page: &mut SurfacePage, now: Millis) -> Fetched {
-    let step = page.fetch.on_due(&mut page.stores, now);
+    let step = page.fetch.on_due(&mut page.plane, &mut page.stores, now);
     charged(page, step)
 }
 
@@ -1066,11 +1089,12 @@ pub fn on_config(page: &mut SurfacePage, now: Millis) -> Result<Fetched, String>
         connect,
         stores,
         fetch,
+        plane,
         ..
     } = page;
     let bindings = connect
         .bindings()
         .expect("surface client: the document just applied is in force");
-    let step = fetch.on_config(stores, bindings, now)?;
+    let step = fetch.on_config(plane, stores, bindings, now)?;
     Ok(charged(page, step))
 }

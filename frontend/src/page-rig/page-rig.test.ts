@@ -199,7 +199,7 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         expect(reports.map((r) => r.instance)).toEqual(["responder", "keeper"]);
 
         const responder = only(reports, "responder");
-        expect(responder.sync).toBe("ask");
+        expect(stringReport(responder).sync).toBe("ask");
         expect(responder.results).toEqual([]);
         const ask = windowOf(responder, "ask");
         expect(ask.envelopes).toHaveLength(1);
@@ -282,22 +282,33 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
                 channel: "ephemeral:rig.report",
                 body: body(hexOf("a,b"), "text/csv"),
                 correlation: 1,
+                attachments: [],
             },
             {
                 type: "PublishBatch",
                 attribution: "b-keeper",
                 correlation: 2,
                 publishes: [
-                    { channel: "ephemeral:rig.report", body: body(hexOf("{}"), null), deliverAfter: null },
+                    {
+                        channel: "ephemeral:rig.report",
+                        body: body(hexOf("{}"), null),
+                        deliverAfter: null,
+                        attachments: [
+                            { name: "made.bin", handle: 7 },
+                            { name: "again.bin", handle: 7 },
+                        ],
+                    },
                     {
                         channel: "ephemeral:rig.bytes-out",
                         body: body(hexOf("# é"), "text/markdown"),
                         deliverAfter: null,
+                        attachments: [],
                     },
                     {
                         channel: "ephemeral:rig.bytes-feed",
                         body: body("ff00", "application/octet-stream"),
                         deliverAfter: far,
+                        attachments: [],
                     },
                 ],
                 deferredOps: [
@@ -373,7 +384,7 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         expect(reports.map((r) => r.instance)).toEqual(["b-responder", "b-keeper"]);
 
         const responder = only(reports, "b-responder");
-        expect(responder.sync).toBe("ask");
+        expect(bytesReport(responder).sync).toBe("ask");
         const ask = bytesWindowOf(responder, "ask");
         expect(ask.envelopes.map((e) => [e.content_type, e.hex])).toEqual([
             ["application/octet-stream", NOT_UTF8],

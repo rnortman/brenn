@@ -932,6 +932,19 @@ impl<K: Clone + Ord> Outboxes<K> {
             .map_or(0, |outbox| outbox.parked.len())
     }
 
+    /// Whether `key`'s outbox holds nothing: no flush parked and none on the
+    /// wire unanswered. A flush offered now to an idle outbox on a live
+    /// attachment goes straight out. An unregistered key answers `false`.
+    pub fn is_idle<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.registrants
+            .get(key)
+            .is_some_and(|outbox| outbox.parked.is_empty() && outbox.in_flight.is_none())
+    }
+
     /// Whole flushes `key` has lost, lifetime.
     pub fn dropped_count<Q>(&self, key: &Q) -> u64
     where

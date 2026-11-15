@@ -5,12 +5,14 @@
 
 use std::collections::BTreeMap;
 
+use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::subs::SubscriptionDepths;
-use brenn_attach_proto::{BlobOpenOutcome, BlobReadOutcome};
+use brenn_attach_proto::{BlobFacts, BlobOpenOutcome, BlobReadOutcome, ServerFrame};
 use brenn_envelope::{BlobId, BlobRef, ChannelScheme, Urgency};
 use brenn_surface_schema::WireChannel;
 use brenn_surface_schema::bindings::BindingsDocument;
 
+use crate::blob_plane::PlaneAnswer;
 use crate::registry::BindingKey;
 use crate::session::Effect;
 use crate::test_support::bindings as fixtures;
@@ -156,6 +158,22 @@ fn opened(handle: BlobHandle, size: u64) -> ServerFrame {
             content_type: "image/jpeg".into(),
         },
     }
+}
+
+/// Settle one blob answer on the page's plane and hand the fetcher its share,
+/// as the inbound pass does.
+fn on_blob_frame(
+    page: &mut SurfacePage,
+    frame: ServerFrame,
+    now: Millis,
+) -> Result<Fetched, String> {
+    let PlaneAnswer {
+        frames,
+        fetch,
+        upload,
+    } = page.plane.on_frame(frame)?;
+    assert!(upload.is_empty(), "the fetch suite uploads nothing");
+    on_blob_events(page, frames, fetch, now)
 }
 
 fn answer(page: &mut SurfacePage, frame: ServerFrame, now: Millis) -> Fetched {

@@ -2254,34 +2254,30 @@ mod tests {
         processor_assets::read_processor_record_in(AssetContext::BOOT, dir.path(), "frames");
     }
 
-    /// The backend blobs fixture imports `create`, `writer` and `publish`, the
-    /// producing half a surface does not serve: under a bundle's mount it is
-    /// withheld with a reason naming the member, the interface and the remedy,
-    /// not the rebuild a stale artifact is told to do.
+    /// The backend blobs fixture imports `create`, `writer` and `publish`,
+    /// which a surface serves: under a bundle's mount, placed with the grants
+    /// it imports, it is served like any other kind.
     #[test]
-    fn a_kind_importing_an_unserved_blobs_member_is_withheld_naming_it() {
+    fn a_kind_importing_the_producing_blobs_members_is_served() {
         let brenn = tempfile::tempdir().expect("tempdir");
         let bundle = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(brenn.path());
         write_real_kind(bundle.path(), "maker", BLOBS_ARTIFACT);
+        let mut surface = resolved_with_processor("deskbar", "maker");
+        surface.components[0].grants = [
+            brenn_lib::messaging::ComponentGrant::Ports,
+            brenn_lib::messaging::ComponentGrant::Log,
+            brenn_lib::messaging::ComponentGrant::Blobs,
+        ]
+        .into();
 
         let roots = validate_surface_assets(
             &mount_roots(&[("brenn", brenn.path()), ("maker-bundle", bundle.path())]),
-            &[resolved_with_processor("deskbar", "maker")],
+            &[surface],
         );
 
-        assert_eq!(roots.kind_root("maker"), None);
-        let held = roots.withheld_kind("maker").expect("maker is withheld");
-        assert!(
-            held.reason.contains("\"maker\"")
-                && held.reason.contains("of `brenn:processor/blobs@0.3.0`")
-                && held.reason.contains("which a surface host does not serve")
-                && held.reason.contains("`limits`, `open`")
-                && held.reason.contains("host the kind at top level")
-                && !held.reason.contains("processor-0.2.wit"),
-            "the reason names the kind, the member, the interface and the remedy: {}",
-            held.reason
-        );
+        assert_eq!(roots.withheld_kind("maker"), None);
+        assert_eq!(roots.kind_root("maker"), Some(bundle.path()));
     }
 
     /// The page-local channel the contract cases bind.

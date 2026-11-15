@@ -1,4 +1,3 @@
-use std::ops::Range;
 use std::sync::Arc;
 
 use brenn_envelope::{AttachmentName, BlobId, MAX_ATTACHMENTS_PER_MESSAGE};
@@ -306,28 +305,6 @@ fn a_failed_write_over_written_bytes_must_be_rewritten_before_seal() {
 }
 
 #[test]
-fn remove_range_cuts_and_splits() {
-    assert_eq!(remove_range(&ranges(&[]), 3..5), ranges(&[]));
-    assert_eq!(
-        remove_range(&ranges(&[(0, 10)]), 3..5),
-        ranges(&[(0, 3), (5, 10)])
-    );
-    assert_eq!(
-        remove_range(&ranges(&[(0, 4), (6, 10)]), 2..8),
-        ranges(&[(0, 2), (8, 10)])
-    );
-    assert_eq!(
-        remove_range(&ranges(&[(0, 4), (6, 10)]), 0..10),
-        ranges(&[])
-    );
-    assert_eq!(
-        remove_range(&ranges(&[(0, 4), (6, 10)]), 4..6),
-        ranges(&[(0, 4), (6, 10)])
-    );
-    assert_eq!(remove_range(&ranges(&[(0, 4)]), 2..100), ranges(&[(0, 2)]));
-}
-
-#[test]
 fn range_set_is_bounded() {
     let f = fixture();
     let mut w = f.store.create("text/plain").unwrap();
@@ -341,44 +318,6 @@ fn range_set_is_bounded() {
     // A write that merges ranges is still accepted at the bound.
     w.write(1, b"x").unwrap();
     w.write(MAX_WRITTEN_RANGES as u64 * 2, b"x").unwrap();
-}
-
-/// Ranges from `(start, end)` pairs.
-fn ranges(pairs: &[(u64, u64)]) -> Vec<Range<u64>> {
-    pairs.iter().map(|&(start, end)| start..end).collect()
-}
-
-#[test]
-fn merge_range_merges_overlapping_and_adjacent() {
-    assert_eq!(merge_range(&ranges(&[]), 3..5), ranges(&[(3, 5)]));
-    assert_eq!(
-        merge_range(&ranges(&[(0, 2), (8, 9)]), 4..5),
-        ranges(&[(0, 2), (4, 5), (8, 9)])
-    );
-    assert_eq!(
-        merge_range(&ranges(&[(0, 2), (8, 9)]), 2..8),
-        ranges(&[(0, 9)])
-    );
-    assert_eq!(
-        merge_range(&ranges(&[(0, 2), (4, 6), (8, 9)]), 1..5),
-        ranges(&[(0, 6), (8, 9)])
-    );
-    assert_eq!(
-        merge_range(&ranges(&[(3, 4)]), 0..1),
-        ranges(&[(0, 1), (3, 4)])
-    );
-    assert_eq!(
-        merge_range(&ranges(&[(3, 4)]), 5..6),
-        ranges(&[(3, 4), (5, 6)])
-    );
-}
-
-#[test]
-fn first_gap_finds_the_lowest_uncovered_range() {
-    assert_eq!(first_gap(&ranges(&[]), 0), None);
-    assert_eq!(first_gap(&ranges(&[(0, 5)]), 5), None);
-    assert_eq!(first_gap(&ranges(&[(2, 5)]), 5), Some(0..2));
-    assert_eq!(first_gap(&ranges(&[(0, 2), (3, 5)]), 5), Some(2..3));
 }
 
 #[test]

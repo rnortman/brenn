@@ -599,6 +599,20 @@ async fn blob_harness(
     Arc<brenn_messaging::Messenger>,
     brenn_messaging::testutils::TempBlobDir,
 ) {
+    blob_harness_reporting_to(db, surface, None).await
+}
+
+/// [`blob_harness`] with `error_channel`, a bare `brenn:` name, configured as
+/// the surface error channel.
+async fn blob_harness_reporting_to(
+    db: &brenn_db::Db,
+    surface: brenn_lib::messaging::config::ResolvedSurface,
+    error_channel: Option<&str>,
+) -> (
+    SurfaceTestHarness,
+    Arc<brenn_messaging::Messenger>,
+    brenn_messaging::testutils::TempBlobDir,
+) {
     use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::AppPolicy;
     use brenn_lib::access::acl::ChannelMatcher;
@@ -634,6 +648,7 @@ async fn blob_harness(
             surface,
             vec![],
             vec![ephemeral_channel_entry(EPH_NAME, 4)],
+            error_channel,
             |messenger| {
                 messenger
                     .with_subscriber_registrations([producer].into())
@@ -710,9 +725,18 @@ async fn subscribe_fixture_channel(ws: &mut SurfaceWs) {
     }
 }
 
-/// The `deskbar` loop with its one instance granted `blobs`: the surface whose
-/// sessions have a read-only blob door.
+/// The `deskbar` loop with its one instance granted `blobs` and its output
+/// binding removed: a reader, so the surface's sessions have a read-only blob
+/// door.
 fn deskbar_reading_blobs() -> brenn_lib::messaging::config::ResolvedSurface {
+    let mut surface = deskbar_making_blobs();
+    surface.outputs.clear();
+    surface
+}
+
+/// The `deskbar` loop with its one instance granted `blobs`: an instance with a
+/// declared wire output, so the surface's sessions have a door that uploads.
+fn deskbar_making_blobs() -> brenn_lib::messaging::config::ResolvedSurface {
     let mut surface = deskbar_loop(vec![]);
     surface
         .components
@@ -722,6 +746,280 @@ fn deskbar_reading_blobs() -> brenn_lib::messaging::config::ResolvedSurface {
         .grants
         .insert(brenn_lib::messaging::ComponentGrant::Blobs);
     surface
+}
+
+/// Attach to `deskbar`, asserting `Welcome` advertises a door whose `upload`
+/// is `upload`.
+async fn attach_with_door(base: &str, token: &str, upload: bool) -> SurfaceWs {
+    let url = http_to_ws_url(base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
+    let mut ws = surface_ws_open(&url, token).await;
+    match open_attachment(&mut ws).await {
+        ServerFrame::Welcome { blobs, .. } => {
+            let facts = blobs.expect("an instance holds `blobs`, so the surface has a door");
+            assert_eq!(facts.upload, upload, "{facts:?}");
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+    ws
+}
+
+/// **On a door without upload, `BlobWrite` and `BlobSeal` are violations.** No
+/// `BlobCreate` precedes either from a conforming page, so neither is a frame
+/// pipelined behind a refused create; each tears the attachment down as a
+/// protocol violation.
+#[tokio::test]
+async fn surface_ws_a_blob_write_or_seal_on_a_door_without_upload_is_a_violation() {
+    use brenn_attach_proto::BlobHandle;
+
+    let frames = [
+        ClientFrame::BlobWrite {
+            handle: BlobHandle(1),
+            offset: 0,
+            bytes: vec![0xff, 0x00],
+        },
+        ClientFrame::BlobSeal {
+            handle: BlobHandle(1),
+        },
+    ];
+    for frame in frames {
+        let db = brenn_server::test_support::init_db_memory();
+        let (
+            SurfaceTestHarness {
+                state,
+                alerts,
+                flusher,
+                ..
+            },
+            _messenger,
+            _blob_dir,
+        ) = blob_harness(&db, deskbar_reading_blobs()).await;
+        let (token, _) = setup_authenticated_user(&db).await;
+        let (base, _sd) = spawn_test_server(state).await;
+
+        let mut ws = attach_with_door(&base, &token, false).await;
+        send(&mut ws, &frame).await;
+        assert!(
+            drain_until_closed(&mut ws).await,
+            "{frame:?} on a door without upload tears the attachment down"
+        );
+        assert_single_alert(&flusher, &alerts, "attach_protocol_violation").await;
+    }
+}
+
+/// **A `blobs` instance with a declared wire output gives its surface a door
+/// that uploads.** The page creates, writes and seals a blob, and publishes a
+/// batch naming it under that instance on its output channel; the message
+/// carries the attachment.
+#[tokio::test]
+async fn surface_ws_a_blobs_producer_uploads_and_publishes_an_attachment() {
+    use brenn_attach_proto::{
+        BatchEntry, BlobCreateOutcome, BlobHandle, BlobSealOutcome, MessageBody, PublishAttachment,
+        PublishBatchOutcome,
+    };
+    use brenn_lib::messaging::AttachmentName;
+
+    let db = brenn_server::test_support::init_db_memory();
+    let (SurfaceTestHarness { state, .. }, messenger, _blob_dir) =
+        blob_harness(&db, deskbar_making_blobs()).await;
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+
+    let mut ws = attach_with_door(&base, &token, true).await;
+    let bytes: Vec<u8> = vec![0xff, 0x00, 0xfe, 0x80];
+    send(
+        &mut ws,
+        &ClientFrame::BlobCreate {
+            handle: BlobHandle(1),
+            content_type: "application/octet-stream".to_string(),
+            size: bytes.len() as u64,
+        },
+    )
+    .await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::BlobCreateResult { outcome, .. } => {
+            assert_eq!(outcome, BlobCreateOutcome::Ok)
+        }
+        other => panic!("expected BlobCreateResult, got {other:?}"),
+    }
+    send(
+        &mut ws,
+        &ClientFrame::BlobWrite {
+            handle: BlobHandle(1),
+            offset: 0,
+            bytes: bytes.clone(),
+        },
+    )
+    .await;
+    send(
+        &mut ws,
+        &ClientFrame::BlobSeal {
+            handle: BlobHandle(1),
+        },
+    )
+    .await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::BlobSealResult { outcome, .. } => assert_eq!(outcome, BlobSealOutcome::Ok),
+        other => panic!("expected BlobSealResult, got {other:?}"),
+    }
+
+    let name = AttachmentName::new("photo").unwrap();
+    send(
+        &mut ws,
+        &ClientFrame::PublishBatch {
+            attribution: Some(COMPONENT.to_string()),
+            correlation: 7,
+            publishes: vec![
+                BatchEntry::new(EPH_ADDR, MessageBody::from("made"), Urgency::Normal)
+                    .attachments(vec![PublishAttachment::new(name.clone(), BlobHandle(1))]),
+            ],
+            deferred_ops: vec![],
+        },
+    )
+    .await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::PublishBatchResult {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, 7);
+            assert_eq!(outcome, PublishBatchOutcome::Ok);
+        }
+        other => panic!("expected PublishBatchResult, got {other:?}"),
+    }
+
+    let retained = messenger
+        .store_for_address(EPH_ADDR)
+        .replay_from(None, brenn_lib::messaging::config::Depth::Bounded(4))
+        .await
+        .messages;
+    let [row] = retained.as_slice() else {
+        panic!("one message on the output channel, got {retained:?}");
+    };
+    let reference = row
+        .message
+        .attachments
+        .get(&name)
+        .expect("the message names the upload");
+    assert_eq!(reference.size, bytes.len() as u64);
+}
+
+/// The bare name of the surface error channel the attach-rule test configures.
+const ERRORS_NAME: &str = "surface-errors";
+const ERRORS_ADDR: &str = "brenn:surface-errors";
+
+/// **The surface error channel takes no attachment from a page.** Every
+/// attribution may publish onto it, and a plain publish there is applied; a
+/// batch naming an attachment there, even under an instance that may attach on
+/// its own output, ends the session as a protocol violation.
+#[tokio::test]
+async fn surface_ws_an_attachment_on_the_error_channel_is_a_violation() {
+    use brenn_attach_proto::{
+        BatchEntry, BlobCreateOutcome, BlobHandle, BlobSealOutcome, MessageBody, PublishAttachment,
+        PublishBatchOutcome,
+    };
+    use brenn_lib::messaging::AttachmentName;
+
+    let db = brenn_server::test_support::init_db_memory();
+    let (
+        SurfaceTestHarness {
+            state,
+            alerts,
+            flusher,
+            ..
+        },
+        _messenger,
+        _blob_dir,
+    ) = blob_harness_reporting_to(&db, deskbar_making_blobs(), Some(ERRORS_NAME)).await;
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+
+    let mut ws = attach_with_door(&base, &token, true).await;
+    send(
+        &mut ws,
+        &ClientFrame::PublishBatch {
+            attribution: Some(COMPONENT.to_string()),
+            correlation: 1,
+            publishes: vec![BatchEntry::new(
+                ERRORS_ADDR,
+                MessageBody::from("plain report"),
+                Urgency::Normal,
+            )],
+            deferred_ops: vec![],
+        },
+    )
+    .await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::PublishBatchResult {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, 1);
+            assert_eq!(
+                outcome,
+                PublishBatchOutcome::Ok,
+                "a plain report is applied"
+            );
+        }
+        other => panic!("expected PublishBatchResult, got {other:?}"),
+    }
+
+    let bytes: Vec<u8> = vec![0xff, 0x00];
+    send(
+        &mut ws,
+        &ClientFrame::BlobCreate {
+            handle: BlobHandle(1),
+            content_type: "application/octet-stream".to_string(),
+            size: bytes.len() as u64,
+        },
+    )
+    .await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::BlobCreateResult { outcome, .. } => {
+            assert_eq!(outcome, BlobCreateOutcome::Ok)
+        }
+        other => panic!("expected BlobCreateResult, got {other:?}"),
+    }
+    send(
+        &mut ws,
+        &ClientFrame::BlobWrite {
+            handle: BlobHandle(1),
+            offset: 0,
+            bytes,
+        },
+    )
+    .await;
+    send(
+        &mut ws,
+        &ClientFrame::BlobSeal {
+            handle: BlobHandle(1),
+        },
+    )
+    .await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::BlobSealResult { outcome, .. } => assert_eq!(outcome, BlobSealOutcome::Ok),
+        other => panic!("expected BlobSealResult, got {other:?}"),
+    }
+    send(
+        &mut ws,
+        &ClientFrame::PublishBatch {
+            attribution: Some(COMPONENT.to_string()),
+            correlation: 2,
+            publishes: vec![
+                BatchEntry::new(ERRORS_ADDR, MessageBody::from("report"), Urgency::Normal)
+                    .attachments(vec![PublishAttachment::new(
+                        AttachmentName::new("dump").unwrap(),
+                        BlobHandle(1),
+                    )]),
+            ],
+            deferred_ops: vec![],
+        },
+    )
+    .await;
+    assert!(
+        drain_until_closed(&mut ws).await,
+        "an attachment on the error channel tears the attachment down"
+    );
+    assert_single_alert(&flusher, &alerts, "attach_protocol_violation").await;
 }
 
 /// **A live delivery carries the published message's attachments.** A live
@@ -754,9 +1052,9 @@ async fn surface_ws_a_live_publish_carries_its_attachments_to_the_page() {
     }
 }
 
-/// **A surface with an instance granted `blobs` has a read-only door, and its
-/// page reads an attachment's bytes.** `Welcome` advertises the door without
-/// upload; the page opens an attachment of a message delivered on a channel its
+/// **A surface whose instance granted `blobs` only reads has a read-only door,
+/// and its page reads an attachment's bytes.** `Welcome` advertises the door
+/// without upload; the page opens an attachment of a message delivered on a channel its
 /// bindings name and reads its bytes back, byte-exact and non-UTF-8, as a
 /// binary frame.
 #[tokio::test]
@@ -775,7 +1073,7 @@ async fn surface_ws_a_blobs_grant_opens_a_read_only_door_and_the_page_reads_an_a
     match open_attachment(&mut ws).await {
         ServerFrame::Welcome { blobs, .. } => {
             let facts = blobs.expect("an instance holds `blobs`, so the surface has a door");
-            assert!(!facts.upload, "a page makes no blob: {facts:?}");
+            assert!(!facts.upload, "a reader's page makes no blob: {facts:?}");
         }
         other => panic!("expected Welcome, got {other:?}"),
     }

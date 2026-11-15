@@ -366,6 +366,7 @@ TRANSPILED_TESTS = [
 PAGE_RIG_TESTS = [
     "src/page-rig/page-rig.test.ts",
     "src/page-rig/page-rig-blobs.test.ts",
+    "src/page-rig/page-rig-make.test.ts",
     "src/page-rig/page-rig-measure.test.ts",
     "src/surface-activation-golden.test.ts",
 ]
@@ -437,6 +438,7 @@ vitest_bin.vitest_test(
         "run",
         "src/page-rig/page-rig.test.ts",
         "src/page-rig/page-rig-blobs.test.ts",
+        "src/page-rig/page-rig-make.test.ts",
         "src/surface-activation-golden.test.ts",
     ],
     chdir = package_name() + "/vitest_page_rig_root/frontend",

@@ -274,4 +274,10 @@ impl AttachProfile for RemoteProfile {
             upload: self.may_publish,
         })
     }
+
+    fn attribution_may_attach(&self, _attribution: Option<&str>, _channel: &str) -> bool {
+        // A remote may attach wherever it may publish: its publish ACL is the
+        // whole of its authority, and the door it holds is its own.
+        true
+    }
 }

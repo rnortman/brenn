@@ -11,7 +11,8 @@
 // after `drop`, which empties its slot.
 //
 // Commands (`<msg>` is `self`, the script's own message, or `<port>:<index>`
-// for any message of this activation's windows):
+// for any message of this activation's windows; `feed`, when bound, is the
+// window that holds other components' attachments):
 //
 //   limits                         -> limits:<max-read>:<max-write>
 //   list <msg>                     -> name/size/type,... as `Message::attachments` reads

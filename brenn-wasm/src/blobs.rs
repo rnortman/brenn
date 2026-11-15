@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use brenn_envelope::{AttachmentName, BlobId, BlobRef, MAX_ATTACHMENTS_PER_MESSAGE};
+use brenn_envelope::{BlobId, BlobRef, check_attachment_list};
 use brenn_messaging_store::blob::{BlobError, BlobHold, BlobWriter, HeldAttachments};
 use tracing::error;
 use wasmtime::component::Resource;
@@ -266,18 +266,7 @@ impl ProcessorData {
         &self,
         attachments: &[(String, Resource<BlobHandle>)],
     ) -> Result<HeldAttachments, AttachmentRefusal> {
-        if attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
-            return Err(AttachmentRefusal::TooMany);
-        }
-        let mut names: Vec<AttachmentName> = Vec::with_capacity(attachments.len());
-        for (name, _) in attachments {
-            let name = AttachmentName::new(name.as_str())
-                .map_err(|e| AttachmentRefusal::InvalidName(e.to_string()))?;
-            if names.contains(&name) {
-                return Err(AttachmentRefusal::DuplicateName(name.to_string()));
-            }
-            names.push(name);
-        }
+        let names = check_attachment_list(attachments.iter().map(|(name, _)| name.as_str()))?;
         let entries = names
             .into_iter()
             .zip(attachments)
@@ -479,14 +468,7 @@ impl CompleteRefusal {
 
 /// Why a call's attachments were refused: the three checks
 /// `held_attachments` makes, shared by every form that carries attachments.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AttachmentRefusal {
-    /// A name outside the grammar; the diagnostic.
-    InvalidName(String),
-    /// A name given twice; the name.
-    DuplicateName(String),
-    TooMany,
-}
+pub(crate) use brenn_envelope::AttachmentListError as AttachmentRefusal;
 
 impl From<AttachmentRefusal> for PublishRefusal {
     fn from(refusal: AttachmentRefusal) -> Self {

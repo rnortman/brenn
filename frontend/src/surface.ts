@@ -573,11 +573,12 @@ export interface KernelModule extends WasmModule {
     brenn_processor_load_failed(instance: string, detail: string): void;
     brenn_processor_withheld(instance: string, reason: string): void;
     /**
-     * The read side of `brenn:processor/blobs`. A handle is the kernel's number
-     * for an attachment the activation opened. A refusal is thrown as the
-     * `{ payload: { tag } }` envelope the glue lifts into the WIT error
-     * variant; a handle the kernel does not hold for `instance` is thrown as an
-     * `Error`, the guest's trap.
+     * `brenn:processor/blobs` as a page serves it. A handle is the kernel's
+     * number for a writer or a blob the activation holds. A refusal is thrown as
+     * the `{ payload: variant }` envelope the glue lifts into the WIT error
+     * variant, except `publish`'s, which is returned like a port refusal; a
+     * handle the kernel does not hold for `instance` is thrown as an `Error`,
+     * the guest's trap.
      */
     brenn_blobs_limits(instance: string): BlobLimits;
     brenn_blobs_open(
@@ -595,6 +596,29 @@ export interface KernelModule extends WasmModule {
         len: number,
     ): Uint8Array;
     brenn_blobs_drop(instance: string, handle: number): void;
+    brenn_blobs_create(instance: string, contentType: string): number;
+    brenn_blobs_write(
+        instance: string,
+        writer: number,
+        offset: bigint,
+        bytes: Uint8Array,
+    ): void;
+    brenn_blobs_seal(instance: string, writer: number): number;
+    brenn_blobs_drop_writer(instance: string, writer: number): void;
+    /**
+     * `names[i]` is the attachment name of the blob whose handle is
+     * `handles[i]`, as the glue found it on the object it was lent; the kernel
+     * judges whether it is one.
+     */
+    brenn_blobs_publish(
+        instance: string,
+        port: string,
+        body: Body,
+        names: string[],
+        handles: unknown[],
+        urgency: string | undefined,
+        deliverAfter: bigint | undefined,
+    ): BlobsPublishRefusal | undefined;
     /**
      * The DOM capability seam. Node handles are the WIT `u64`, so they cross as
      * `bigint`. Every one of these throws on a refusal — an unknown handle, a tag
@@ -668,6 +692,21 @@ export interface KernelModule extends WasmModule {
 export interface PortRefusal {
     tag: string;
     val?: string;
+}
+
+/**
+ * A `blobs.publish` refusal as the kernel answers it: the `publish-error`
+ * variant, a `ports.publish` refusal nested under `plain`.
+ */
+export interface BlobsPublishRefusal {
+    tag: string;
+    val?: string | PortRefusal;
+}
+
+/** `blobs.publish-options` as the glue lifts it. */
+interface BlobsPublishOptions {
+    urgency: string | undefined;
+    deliverAfter: bigint | undefined;
 }
 
 /** `blobs.blob-limits` as the glue lowers it. */
@@ -1029,23 +1068,24 @@ const GLUE_DISPOSE: symbol =
     (Symbol as unknown as { dispose?: symbol }).dispose ?? Symbol.for("dispose");
 
 /**
- * The read side of `brenn:processor/blobs`: `limits`, `open` and the `Blob`
- * class, closed over `kernel` and `instance`.
+ * `brenn:processor/blobs` as a page serves it: `limits`, `open`, `create`,
+ * `publish` and the `Blob` and `Writer` classes, closed over `kernel` and
+ * `instance`.
  *
- * Made per instantiation, so each guest instance is handed its own class. The
- * glue requires `open` to return an instance of the class it was given, and
- * reaches the host's drop only through that instance's `Symbol.dispose`. Every
- * answer is the kernel's; this holds the handle number and nothing else.
- *
- * No `Writer`, `create` or `publish`: a kind importing them is refused before
- * it is served.
+ * Made per instantiation, so each guest instance is handed its own classes.
+ * The glue requires `open` and `seal` to return an instance of the `Blob` class
+ * it was given and `create` one of the `Writer` class, and reaches the host's
+ * drop only through an instance's `Symbol.dispose`. Every answer is the
+ * kernel's; this holds handle numbers and nothing else. `publish` hands the
+ * kernel the handle number found on each blob it was lent, and the kernel
+ * decides whether it is one.
  */
 function blobImports(
     kernel: KernelModule,
     instance: string,
 ): Record<string, unknown> {
     class PageBlob {
-        private readonly handle: number;
+        readonly handle: number;
 
         constructor(handle: number) {
             this.handle = handle;
@@ -1067,11 +1107,52 @@ function blobImports(
             kernel.brenn_blobs_drop(instance, this.handle);
         }
     }
+    class PageWriter {
+        private readonly handle: number;
+
+        constructor(handle: number) {
+            this.handle = handle;
+        }
+
+        write(offset: bigint, bytes: Uint8Array): void {
+            kernel.brenn_blobs_write(instance, this.handle, offset, bytes);
+        }
+
+        seal(): PageBlob {
+            return new PageBlob(kernel.brenn_blobs_seal(instance, this.handle));
+        }
+
+        [GLUE_DISPOSE](): void {
+            kernel.brenn_blobs_drop_writer(instance, this.handle);
+        }
+    }
     return {
         limits: () => kernel.brenn_blobs_limits(instance),
         open: (port: string, index: number, name: string) =>
             new PageBlob(kernel.brenn_blobs_open(instance, port, index, name)),
+        create: (contentType: string) =>
+            new PageWriter(kernel.brenn_blobs_create(instance, contentType)),
+        publish: (
+            port: string,
+            body: Body,
+            attachments: [string, PageBlob][],
+            options: BlobsPublishOptions,
+        ) =>
+            refuse(
+                kernel.brenn_blobs_publish(
+                    instance,
+                    port,
+                    body,
+                    attachments.map(([name]) => name),
+                    attachments.map(
+                        ([, blob]) => (blob as { handle?: unknown }).handle,
+                    ),
+                    options.urgency,
+                    options.deliverAfter,
+                ),
+            ),
         Blob: PageBlob,
+        Writer: PageWriter,
     };
 }
 
@@ -1079,9 +1160,9 @@ function blobImports(
  * Throw a port refusal the way the glue lifts an error variant. The kernel
  * answers every port call with `undefined` for ok or the variant itself; which
  * family it belongs to, and what its payload says, are the kernel's, so one
- * thrower serves both contracts.
+ * thrower serves both contracts and `blobs.publish`.
  */
-function refuse(answer: PortRefusal | undefined): void {
+function refuse(answer: PortRefusal | BlobsPublishRefusal | undefined): void {
     if (answer !== undefined) {
         throw { payload: answer };
     }

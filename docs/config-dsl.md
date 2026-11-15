@@ -2160,12 +2160,21 @@ out of the vocabulary.
 `blobs` grants the `brenn:processor/blobs@0.3.0` interface: reading the
 attachments of the messages an activation is handed, creating blobs, and
 publishing messages that name them. On a top-level instance the whole
-interface is served. On a placed instance only the read side is — `limits`,
-`open` and a blob's `size`, `content-type` and `read` — and a kind that imports
-any other function of the interface is refused when its artifact is checked at
-boot. It pairs with no wiring, like `log`: a component that only reads blobs
-binds no output. A component that publishes with attachments also needs
-`ports`.
+interface is served. On a placed instance everything but the tool-call forms
+is — reading, creating and publishing, on the page's wire and page-local
+channels alike — and a kind that imports `call-async`, `call-async-for` or
+`complete` is refused when its artifact is checked at boot. It pairs with no
+wiring, like `log`: a component that only reads blobs binds no output. A
+component that publishes with attachments also needs `ports`.
+
+A surface's blob door follows from these grants and needs no configuration of
+its own. The surface has a door when some placed instance is granted `blobs`;
+the door uploads when some instance granted `blobs` has a declared output on a
+wire channel (not `local:`). Such an instance may attach blobs only on its own
+declared wire outputs; the surface error channel, which every instance may
+report on, takes no attachment unless an instance's output is bound to it. A
+surface whose `blobs` instances only read, or publish only on page-local
+channels, keeps a door that does not upload.
 
 A `surface` or a `remote` — the two attach-route entities, a browser page and
 a native daemon — writes **plane** words instead: `subscribe`, `publish`, and

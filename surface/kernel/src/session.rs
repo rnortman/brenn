@@ -48,7 +48,7 @@ use brenn_attach_client::Millis;
 use brenn_attach_client::conn::{ConnEvent, DetachReason};
 use brenn_attach_client::publish::{OutboxSteps, TimerChange};
 use brenn_attach_client::router::ReleaseTimer;
-use brenn_attach_proto::{ClientFrame, VersionRange};
+use brenn_attach_proto::{BlobHandle, ClientFrame, VersionRange};
 use brenn_surface_schema::LogLevel;
 use brenn_surface_schema::bindings::BindingsDocument;
 
@@ -60,9 +60,13 @@ use crate::inbound::Inbound;
 use crate::outbound::{PublishAnswer, PublishStatus};
 use crate::outward::{self, Completion, ControlPublish, Released};
 use crate::page::{Configured, Detached, SurfacePage};
+use crate::uploads::Lost;
 
 /// The producer the fetcher's reports name on the page's error channel.
 const FETCH_REPORT_SOURCE: &str = "kernel:fetch";
+
+/// The producer the stage's reports name on the page's error channel.
+const UPLOAD_REPORT_SOURCE: &str = "kernel:upload";
 
 /// Something the platform half must know: an attachment's lifecycle, a
 /// component's fate, or the answer to something it asked for.
@@ -191,6 +195,11 @@ pub enum Event {
         /// The plane's own words.
         reason: String,
     },
+    /// An `ok` activation's wire flush the stage held will never reach the
+    /// wire: only the server could judge it, and it refused, or the flush can
+    /// no longer be sent honestly. Lost whole — never a message without its
+    /// attachment — and the instance is alive. Its toast is already composed.
+    FlushLost(Lost),
 }
 
 /// Something the layer that owns the driver must do, in order.
@@ -198,6 +207,12 @@ pub enum Event {
 pub enum Effect {
     /// Send a client frame on the live attachment.
     SendFrame(ClientFrame),
+    /// Send the chunks of the upload of this handle, one at a time, asking the
+    /// page's stage for the next until it has none. Follows the `BlobCreate`
+    /// of that handle, so an upload's chunks reach the wire only behind its
+    /// create, and the page holds a blob once plus one chunk rather than a
+    /// second copy as a list of frames.
+    DrainUpload(BlobHandle),
     /// Hand an event to the platform half.
     EmitEvent(Event),
     /// Publish a body on one of the page's confined planes. Not routed here:
@@ -255,8 +270,9 @@ impl Reactions {
         &self.effects
     }
 
-    /// Close the turn: state the confined-release deadline if the soonest parked
-    /// message moved, and the fetch deadline if the earliest held row's moved.
+    /// Close the turn: free what no page-local message names any more, state the
+    /// confined-release deadline if the soonest parked message moved, and the
+    /// fetch deadline if the earliest held row's moved.
     ///
     /// Stated here rather than at every site that could move one — a park at
     /// flush, a release sweep, a control op and a discarded store all move the
@@ -264,6 +280,7 @@ impl Reactions {
     /// one restatement over the whole page cannot be forgotten at a new site the
     /// way per-site arming can.
     pub fn end_turn(&mut self, page: &mut SurfacePage) {
+        page.page_blobs.sweep(&page.stores);
         if let Some(timer) = outward::release_wakeup(page) {
             self.effects.push(Effect::SetReleaseWakeup(timer));
         }
@@ -339,6 +356,7 @@ impl Reactions {
             gap,
             lost_flushes,
             reports,
+            staged_lost,
         } = inbound;
         self.frames(page, frames);
         for configured in configured {
@@ -349,6 +367,7 @@ impl Reactions {
         }
         self.answers(answers);
         self.steps(page, steps);
+        self.lost(staged_lost);
         self.verdicts(page, drops, now, now_ms);
         if let Some(straggler) = straggler {
             self.emit(Event::StragglerDiscarded {
@@ -448,6 +467,7 @@ impl Reactions {
             steps,
             drops,
             lost_flushes,
+            staged_lost,
         } = configured;
         if first_of_attachment {
             self.emit(connected(page));
@@ -457,7 +477,11 @@ impl Reactions {
         }
         self.frames(page, frames);
         self.steps(page, steps);
+        self.lost(staged_lost);
         self.verdicts(page, drops, now, now_ms);
+        if first_of_attachment {
+            self.unanswered_reports(page, now, now_ms);
+        }
         for lost in lost_flushes {
             tracing::warn!(
                 instance = %lost.instance,
@@ -490,6 +514,7 @@ impl Reactions {
             steps,
             close,
             fatal,
+            lost,
         } = outcome;
         self.frames(page, frames);
         if close {
@@ -505,6 +530,7 @@ impl Reactions {
         }
         self.answers(answers);
         self.steps(page, steps);
+        self.lost(lost);
         self.verdicts(page, drops, now, now_ms);
         if let Some(detail) = fatal {
             self.go_fatal(detail);
@@ -534,6 +560,7 @@ impl Reactions {
             steps,
             drops,
             refusals,
+            lost,
             killed,
             absorbed,
         } = completion;
@@ -541,6 +568,7 @@ impl Reactions {
             return;
         }
         self.steps(page, steps);
+        self.lost(lost);
         for refusal in refusals {
             self.emit(Event::PlaneRefused {
                 instance: instance.clone(),
@@ -567,7 +595,7 @@ impl Reactions {
                     instance: instance.clone(),
                     message: reason.clone(),
                 });
-                self.killed(&instance, reason, killed);
+                self.killed(page, &instance, reason, killed);
             }
         }
         self.verdicts(page, drops, now, now_ms);
@@ -586,25 +614,24 @@ impl Reactions {
         self.verdicts(page, released.drops, now, now_ms);
     }
 
-    /// Fold an outbox pass's answer: the frames it freed, a toast per whole flush
-    /// it lost, and the retry deadline when it moved.
+    /// Fold an outbox pass's answer: the frames it freed, the handles of the
+    /// flushes it finished with closed, a toast per whole flush it lost, and
+    /// the retry deadline when it moved.
     ///
     /// The toast plane and not an alert: a flush can be lost while the link is
     /// down, where an alert composed for one would be written to a socket that is
     /// gone. The per-instance counter carries the total for whoever reconnects
     /// and asks.
-    pub fn steps(&mut self, page: &SurfacePage, steps: OutboxSteps<String>) {
+    pub fn steps(&mut self, page: &mut SurfacePage, steps: OutboxSteps<String>) {
         let OutboxSteps {
             frames,
             dropped,
             released,
             retry_wakeup,
         } = steps;
-        assert!(
-            released.is_empty(),
-            "surface kernel: a flush named a blob handle, and this kernel names none"
-        );
         self.frames(page, frames);
+        let closes = crate::flush::close_released(&mut page.plane, released);
+        self.frames(page, closes);
         for toast in outward::parked_drop_notices(&dropped) {
             self.control(toast);
         }
@@ -650,7 +677,7 @@ impl Reactions {
                 continue;
             }
             let killed = outward::kill(page, &fatal.instance, now, now_ms);
-            self.killed(&fatal.instance, fatal.describe(), killed);
+            self.killed(page, &fatal.instance, fatal.describe(), killed);
         }
     }
 
@@ -692,6 +719,37 @@ impl Reactions {
         }
     }
 
+    /// Announce flushes the stage lost: a toast on the page's own
+    /// plane, which works detached, and the event the kernel reports from.
+    pub fn lost(&mut self, lost: Vec<Lost>) {
+        for lost in lost {
+            self.control(outward::lost_flush_notice(&lost));
+            self.emit(Event::FlushLost(lost));
+        }
+    }
+
+    /// Report, once the attachment is configured, how many attachment flushes
+    /// each instance lost on the wire at the last detach. A report composed
+    /// while detached would be dropped, so the count waits for this.
+    fn unanswered_reports(&mut self, page: &mut SurfacePage, now: Millis, now_ms: u64) {
+        for (instance, count) in page.stage.take_unanswered() {
+            let outcome = command::on_command(
+                page,
+                Command::Report {
+                    level: LogLevel::Warn,
+                    source: UPLOAD_REPORT_SOURCE.to_string(),
+                    message: format!(
+                        "{count} publish batch(es) of {instance}'s naming attachments were on the \
+                         wire unanswered when the connection ended; they may have been applied \
+                         and were not sent again"
+                    ),
+                    subject: Some(instance),
+                },
+            );
+            self.command(page, outcome, now, now_ms);
+        }
+    }
+
     /// Ask the connection to go fatal. The terminal event comes back from it.
     pub fn go_fatal(&mut self, detail: String) {
         self.effects.push(Effect::GoFatal { detail });
@@ -706,14 +764,20 @@ impl Reactions {
     /// itself attached would have nowhere to go. Idempotent — a fatal raised
     /// while already detached asks for nothing.
     fn detach(&mut self, page: &mut SurfacePage) {
-        let Detached { answers, steps } = page.on_detached();
+        let Detached {
+            answers,
+            steps,
+            lost,
+        } = page.on_detached();
         self.answers(answers);
         self.steps(page, steps);
+        self.lost(lost);
     }
 
     /// What a terminal instance asks for: the timer its discarded queue freed,
     /// and the failure — once, however many rungs or traps named it.
-    fn killed(&mut self, instance: &str, reason: String, killed: Killed) {
+    fn killed(&mut self, page: &SurfacePage, instance: &str, reason: String, killed: Killed) {
+        self.frames(page, killed.frames);
         if let Some(change) = killed.retry_wakeup {
             self.effects.push(Effect::SetRetryWakeup(change));
         }
@@ -756,7 +820,14 @@ impl Reactions {
             tracing::debug!("surface client: dropped an alert composed with no attachment");
             return;
         }
+        let starts_upload = match &frame {
+            ClientFrame::BlobCreate { handle, .. } => Some(*handle),
+            _ => None,
+        };
         self.effects.push(Effect::SendFrame(frame));
+        if let Some(handle) = starts_upload {
+            self.effects.push(Effect::DrainUpload(handle));
+        }
     }
 
     fn control(&mut self, publish: ControlPublish) {
@@ -784,11 +855,9 @@ fn frame_class(frame: &ClientFrame) -> &'static str {
         ClientFrame::BlobOpen { .. } => "BlobOpen",
         ClientFrame::BlobRead { .. } => "BlobRead",
         ClientFrame::BlobClose { .. } => "BlobClose",
-        ClientFrame::BlobCreate { .. }
-        | ClientFrame::BlobWrite { .. }
-        | ClientFrame::BlobSeal { .. } => {
-            panic!("surface client: the page makes no blob, so it composes no upload frame")
-        }
+        ClientFrame::BlobCreate { .. } => "BlobCreate",
+        ClientFrame::BlobWrite { .. } => "BlobWrite",
+        ClientFrame::BlobSeal { .. } => "BlobSeal",
     }
 }
 

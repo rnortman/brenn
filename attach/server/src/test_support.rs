@@ -87,6 +87,10 @@ pub struct TestProfile {
     pub runtime_entry: Option<SubscriberEntry>,
     /// The blob door this stub grants; `None` unless a suite states one.
     pub blob_grant: Option<BlobGrant>,
+    /// Attribution (`None` = the attacher itself) → the channels it may name
+    /// attachments on. `None` is the remote's answer, attach anywhere; a suite
+    /// exercising the attach rule states the sets.
+    pub attachable: Option<HashMap<Option<String>, HashSet<String>>>,
 }
 
 impl Default for TestProfile {
@@ -121,6 +125,7 @@ impl TestProfile {
             text_only_posture: TextOnlyPosture::Outcome,
             runtime_entry: None,
             blob_grant: None,
+            attachable: None,
         }
     }
 }
@@ -203,6 +208,15 @@ impl AttachProfile for TestProfile {
 
     fn blob_grant(&self) -> Option<BlobGrant> {
         self.blob_grant
+    }
+
+    fn attribution_may_attach(&self, attribution: Option<&str>, channel: &str) -> bool {
+        match &self.attachable {
+            None => true,
+            Some(sets) => sets
+                .get(&attribution.map(str::to_string))
+                .is_some_and(|channels| channels.contains(channel)),
+        }
     }
 }
 

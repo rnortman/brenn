@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use brenn_envelope::{
     AttachmentName, Attachments, BlobId, BlobRef, BodyError, MAX_ATTACHMENTS_PER_MESSAGE,
-    check_content_type,
+    WrittenRanges, check_content_type,
 };
 use rand::RngExt;
 
@@ -294,7 +294,7 @@ impl BlobStore {
             id,
             file,
             extent: 0,
-            written: Vec::new(),
+            written: WrittenRanges::new(),
             sealed: false,
         })
     }
@@ -442,7 +442,7 @@ pub struct BlobWriter {
     /// Written ranges, sorted, disjoint and non-adjacent. A write that fails
     /// with an I/O error can split one range in two, leaving one more than
     /// [`MAX_WRITTEN_RANGES`].
-    written: Vec<Range<u64>>,
+    written: WrittenRanges,
     sealed: bool,
 }
 
@@ -492,7 +492,7 @@ impl BlobWriter {
         if end > max {
             return Err(BlobError::TooLarge { max });
         }
-        let merged = merge_range(&self.written, offset..end);
+        let merged = self.written.with(offset..end);
         if merged.len() > MAX_WRITTEN_RANGES {
             return Err(BlobError::TooFragmented);
         }
@@ -541,7 +541,7 @@ impl BlobWriter {
                 )
             });
         }
-        self.written = remove_range(&self.written, range);
+        self.written = self.written.without(range);
         self.store
             .recharge(&self.id, new_extent, self.extent)
             .expect("returning a charge cannot pass a bound");
@@ -550,7 +550,7 @@ impl BlobWriter {
     /// Seal the blob if every byte below its extent has been written, making
     /// it immutable and nameable and returning the first hold on it.
     pub fn seal(mut self) -> Result<BlobHold, SealRefused> {
-        if let Some(gap) = first_gap(&self.written, self.extent) {
+        if let Some(gap) = self.written.first_gap(self.extent) {
             return Err(SealRefused { writer: self, gap });
         }
         let hold = {
@@ -579,58 +579,6 @@ impl Drop for BlobWriter {
             self.store.delete(&self.id);
         }
     }
-}
-
-/// `written` with `new` added, merging overlapping and adjacent ranges.
-fn merge_range(written: &[Range<u64>], new: Range<u64>) -> Vec<Range<u64>> {
-    let mut out = Vec::with_capacity(written.len() + 1);
-    let mut pending = new;
-    let mut placed = false;
-    for r in written {
-        if placed || r.end < pending.start {
-            out.push(r.clone());
-        } else if pending.end < r.start {
-            out.push(pending.clone());
-            out.push(r.clone());
-            placed = true;
-        } else {
-            pending = pending.start.min(r.start)..pending.end.max(r.end);
-        }
-    }
-    if !placed {
-        out.push(pending);
-    }
-    out
-}
-
-/// `written` with `gone` taken out of it.
-fn remove_range(written: &[Range<u64>], gone: Range<u64>) -> Vec<Range<u64>> {
-    let mut out = Vec::with_capacity(written.len() + 1);
-    for r in written {
-        if r.end <= gone.start || gone.end <= r.start {
-            out.push(r.clone());
-            continue;
-        }
-        if r.start < gone.start {
-            out.push(r.start..gone.start);
-        }
-        if gone.end < r.end {
-            out.push(gone.end..r.end);
-        }
-    }
-    out
-}
-
-/// The first range below `extent` that `written` does not cover.
-fn first_gap(written: &[Range<u64>], extent: u64) -> Option<Range<u64>> {
-    let mut covered_to = 0;
-    for r in written {
-        if r.start > covered_to {
-            return Some(covered_to..r.start);
-        }
-        covered_to = r.end;
-    }
-    (covered_to < extent).then_some(covered_to..extent)
 }
 
 /// A counted hold on a sealed blob. While any hold exists the blob's bytes

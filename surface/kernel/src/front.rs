@@ -765,6 +765,46 @@ impl SurfaceHandle {
         })
     }
 
+    /// Route a `blobs.publish` into the in-flight activation's buffer, its
+    /// attachments named by the activation's own blob handles, if it belongs
+    /// there. `grants` is the core's verdict on the caller's grants, which the
+    /// buffer answers after charging the call; `door` is the blob door the most
+    /// recent attachment advertised.
+    ///
+    /// The same routing rule and `None` meaning as
+    /// [`try_buffered_publish`](Self::try_buffered_publish). The inner `Err` is
+    /// a handle the activation's scope does not hold as a blob, which the
+    /// caller traps on.
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_blobs_publish(
+        &self,
+        instance: &str,
+        grants: crate::publish_buffer::GrantVerdict,
+        door: Option<&brenn_attach_proto::BlobFacts>,
+        port: &str,
+        body: brenn_envelope::GuestBody,
+        attachments: &[(String, u32)],
+        urgency: Option<Urgency>,
+        deliver_after: Option<u64>,
+    ) -> crate::publish_buffer::BlobsPublishAnswer {
+        self.with_in_flight(instance, |frame| {
+            let buffer = &mut frame.buffer;
+            let before = buffer.dropped();
+            let answered = buffer.publish_attached(
+                &frame.blobs,
+                grants,
+                door,
+                port,
+                body,
+                attachments,
+                urgency,
+                deliver_after,
+            )?;
+            Ok(answered.map(|()| crate::publish_buffer::Admission::of(before, buffer.dropped())))
+        })
+    }
+
     /// Route a deferred publish into the in-flight activation's buffer, if it
     /// belongs there. `deliver_after` is epoch milliseconds UTC.
     ///

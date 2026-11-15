@@ -117,6 +117,9 @@ describe("page rig: a component reads attachments through the page's blob door",
             },
             { type: "BlobRead", correlation: 6, handle: 5, offset: 8_192, len: 4_096 },
             { type: "BlobClose", handle: 5 },
+            { type: "BlobCreate", handle: 7, contentType: OCTETS, size: 300_000 },
+            { type: "BlobWrite", handle: 7, offset: 4_096, bytes: NOT_UTF8 },
+            { type: "BlobSeal", handle: 7 },
         ]);
     });
 
@@ -168,7 +171,7 @@ describe("page rig: a component reads attachments through the page's blob door",
             "limits; repeat 64 open feed:0 small.bin; open feed:0 small.bin; drop 0; open feed:0 small.bin",
         );
         expect(blobsReport(only(reports, "p-blobs")).results).toEqual([
-            "limits:1048576:0",
+            "limits:1048576:1048576",
             "blob*64",
             "quota-exceeded",
             "ok",

@@ -18,7 +18,7 @@
 //!
 //! The kit holds:
 //!
-//! - `pages`: the named pages, `cases`, `measure` and `blobs`. Each states the three
+//! - `pages`: the named pages, `cases`, `measure`, `blobs` and `make`. Each states the three
 //!   page metas, the location, its instances with their kind, contract and
 //!   command channel, the report channel, its state-holding instances per
 //!   contract, its body cap and its opening ladder (`Hello`, `Welcome`, and the
@@ -27,9 +27,10 @@
 //!   in the `Welcome` and in their cast: `cases` has one state-holder and the
 //!   instances that cross the two contracts, `measure` one state-holder per
 //!   measured size on each contract, since a retained state is of one size and
-//!   no page-local channel can be cleared, and `blobs` a reader of attachments
+//!   no page-local channel can be cleared, `blobs` a reader of attachments
 //!   on a gated channel and a caller of it, behind a `Welcome` that opens a
-//!   read-only blob door.
+//!   read-only blob door, and `make` two makers of blobs and a reader of a
+//!   page-local channel, behind a `Welcome` that opens a door with upload.
 //! - `answers`: templates for an accepted `SubscribeResult`, `PublishResult`
 //!   and `PublishBatchResult`.
 //! - `deliver`: a binary template for a one-row `Deliver` on an `ephemeral:`
@@ -39,9 +40,12 @@
 //!   attachments as the header writes them; `attachment_ref`, a template of
 //!   one entry of that map, so the rig names attachments of its own.
 //! - `blob_answers`: templates for the answers to a `BlobOpen` (accepted, and
-//!   refused as not retained) and to a `BlobRead` (bytes, and a storage
-//!   failure). A read answer is binary: its template is the header as the
-//!   codec wrote it and its slots, and the rig appends the bytes.
+//!   refused as not retained), to a `BlobRead` (bytes, and a storage
+//!   failure), to a `BlobCreate` (accepted, and refused for the pool's budget
+//!   or for storage) and to a `BlobSeal` (accepted, and an unknown handle, the
+//!   answer to the seal of a refused create). A read answer is binary: its
+//!   template is the header as the codec wrote it and its slots, and the rig
+//!   appends the bytes.
 //! - `blob_read_sample`: one bytes-carrying read answer the codec encoded,
 //!   with the values and bytes that produced it.
 //! - `deferred_views`: binary templates for a `DeferredView`, the one at index
@@ -52,14 +56,16 @@
 //! - `client_samples`: client frames of each kind the peer reads, a text frame
 //!   as its text and a binary one as hex, so the rig's reader is checked
 //!   against what Rust writes. The binary ones carry typed text, non-text,
-//!   deferred and untyped bodies and every kind of control op; the blob ones
-//!   are the three a read-only door sends.
+//!   deferred and untyped bodies, attachments and every kind of control op;
+//!   the blob ones are the three a read-only door sends and the three an
+//!   upload adds.
 
 use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, BlobFacts, BlobHandle, BlobOpenOutcome, BlobReadOutcome,
-    ClientFrame, Codec, DeferredOpKind, DeferredViewEntry, PublishBatchOutcome, PublishOutcome,
-    ServerFrame, SubscribeOutcome, Urgency, VersionRange, WireMessage,
+    BatchDeferredOp, BatchEntry, BlobCreateOutcome, BlobFacts, BlobHandle, BlobOpenOutcome,
+    BlobReadOutcome, BlobSealOutcome, ClientFrame, Codec, DeferredOpKind, DeferredViewEntry,
+    PublishAttachment, PublishBatchOutcome, PublishOutcome, ServerFrame, SubscribeOutcome, Urgency,
+    VersionRange, WireMessage,
 };
 use brenn_envelope::grants::ProcessorContract;
 use brenn_envelope::{AttachmentName, Attachments, BlobId, BlobRef, MessageBody};
@@ -90,6 +96,9 @@ pub const SDK_BYTES_KIND: &str = "processor-sdk-bytes-test";
 /// The rig's guest-SDK kind on `brenn:processor@0.2.0` granted `blobs`, which
 /// reads the attachments of the messages in its windows.
 pub const BLOBS_KIND: &str = "processor-page-blobs-test";
+/// The backend's `blobs` fixture on `brenn:processor@0.2.0`, granted `blobs`,
+/// which makes, writes, seals and publishes blobs by script.
+pub const MAKER_KIND: &str = "processor-blobs-test";
 /// The channel every instance's report is published on.
 pub const REPORT_CHANNEL: &str = "ephemeral:rig.report";
 /// The wire channel `responder`'s `feed` port is subscribed to.
@@ -121,6 +130,12 @@ pub const BLOBS_FETCH_BYTES: u64 = 65_536;
 /// The chunk the `blobs` page's door reads by: small, so an attachment of a
 /// few kilobytes crosses in several read answers.
 pub const BLOBS_CHUNK_BYTES: u64 = 4_096;
+/// The wire channel the `make` page's `p-maker` publishes on through `a`.
+pub const MADE_CHANNEL: &str = "ephemeral:rig.made";
+/// The page-local channel behind `p-maker`'s `b`, which wakes `p-reader`.
+pub const KEPT_CHANNEL: &str = "local:rig/kept";
+/// The wire channel `p-maker`'s `feed` holds, which never wakes it.
+pub const MAKE_FEED_CHANNEL: &str = "ephemeral:rig.make-feed";
 /// The most entries a `DeferredView` template of the kit holds.
 pub const MAX_VIEW_ENTRIES: usize = 3;
 /// The body cap the `cases` page's `Welcome` states.
@@ -215,22 +230,43 @@ pub const BLOBS_CAST: Cast = Cast {
     crossers: &[("p-blobs", BLOBS_KIND), ("b-asker", BYTES_KIND)],
 };
 
+/// The `make` page's cast:
+///
+/// - `p-maker` makes blobs and publishes them on [`MADE_CHANNEL`] through `a`
+///   and on [`KEPT_CHANNEL`] through `b`, and opens what
+///   [`MAKE_FEED_CHANNEL`] delivers to its `feed` to forward it;
+/// - `p-spent`, of the same kind and wired to nothing but its script and its
+///   report, is the instance a spent writer's trap ends;
+/// - `p-reader` reads every attachment of what [`KEPT_CHANNEL`] holds.
+pub const MAKE_CAST: Cast = Cast {
+    staters: Staters {
+        string: &[],
+        bytes: &[],
+        sdk: &[],
+    },
+    crossers: &[
+        ("p-maker", MAKER_KIND),
+        ("p-spent", MAKER_KIND),
+        ("p-reader", BLOBS_KIND),
+    ],
+};
+
 /// The contract `kind` is built against.
 pub fn kind_contract(kind: &str) -> ProcessorContract {
     match kind {
         STRING_KIND => ProcessorContract::V0_1,
-        BYTES_KIND | SDK_BYTES_KIND | BLOBS_KIND => ProcessorContract::V0_2,
+        BYTES_KIND | SDK_BYTES_KIND | BLOBS_KIND | MAKER_KIND => ProcessorContract::V0_2,
         other => panic!("the rig stages no kind {other:?}"),
     }
 }
 
 /// The grants `kind`'s specification requires: the raw fixtures call, the
-/// guest-SDK kind logs a recovered state, and the `blobs` reader logs and
-/// reads attachments.
+/// guest-SDK kind logs a recovered state, and the two `blobs` kinds log and
+/// read, and make, attachments.
 fn kind_grants(kind: &str) -> &'static [ComponentGrant] {
     match kind {
         SDK_BYTES_KIND => &[ComponentGrant::Ports, ComponentGrant::Log],
-        BLOBS_KIND => &[
+        BLOBS_KIND | MAKER_KIND => &[
             ComponentGrant::Ports,
             ComponentGrant::Log,
             ComponentGrant::Blobs,
@@ -337,6 +373,15 @@ pub fn document(cast: Cast) -> BindingsDocument {
     if crosses("b-asker") {
         calls.push(call("b-asker", "peer", "p-blobs", "ask"));
     }
+    if crosses("p-maker") {
+        outputs.push(output("p-maker", "a", MADE_CHANNEL));
+        outputs.push(output("p-maker", "b", KEPT_CHANNEL));
+        subscriptions.push(subscription("p-maker", "feed", MAKE_FEED_CHANNEL, 0, 1));
+        locals.push(local(KEPT_CHANNEL, 1));
+    }
+    if crosses("p-reader") {
+        subscriptions.push(subscription("p-reader", "feed", KEPT_CHANNEL, 1, 1));
+    }
     for c in &mut components {
         let instance = c.instance.as_str();
         if calls.iter().any(|b| b.instance == instance) {
@@ -370,6 +415,15 @@ pub fn blobs_door() -> BlobFacts {
         max_bytes_held: 4 << 20,
         max_inflight_reads: 4,
         upload: false,
+    }
+}
+
+/// The blob door with upload the `make` page's `Welcome` opens: the `blobs`
+/// page's bounds, and `upload`.
+pub fn make_door() -> BlobFacts {
+    BlobFacts {
+        upload: true,
+        ..blobs_door()
     }
 }
 
@@ -421,6 +475,9 @@ fn page(max_body_bytes: u64, cast: Cast, blobs: Option<BlobFacts>) -> Value {
         "stream_channel": STREAM_CHANNEL,
         "blobs_feed_channel": BLOBS_FEED_CHANNEL,
         "blobs_fetch_bytes": BLOBS_FETCH_BYTES,
+        "made_channel": MADE_CHANNEL,
+        "kept_channel": KEPT_CHANNEL,
+        "make_feed_channel": MAKE_FEED_CHANNEL,
         "shared_channel": SHARED_CHANNEL,
         "bytes_timer_channel": BYTES_TIMER_CHANNEL,
         "state_instances": staters.string,
@@ -753,7 +810,7 @@ fn attachment_ref_template() -> Value {
     json!({ "frame": value, "slots": found })
 }
 
-/// The answers to the blob frames a read-only door sends, by name.
+/// The answers to the blob frames a door sends, by name.
 fn blob_answers() -> Value {
     let handle = BlobHandle(number(HANDLE));
     json!({
@@ -790,7 +847,34 @@ fn blob_answers() -> Value {
             },
             &[CORRELATION],
         ),
+        "create_ok": create_template(BlobCreateOutcome::Ok),
+        "create_budget_exhausted": create_template(BlobCreateOutcome::BudgetExhausted),
+        "create_storage_failed": create_template(BlobCreateOutcome::StorageFailed),
+        "seal_ok": seal_template(BlobSealOutcome::Ok),
+        "seal_unknown_handle": seal_template(BlobSealOutcome::UnknownHandle),
     })
+}
+
+/// The template of a `BlobCreateResult` of `outcome`, by its `handle`.
+fn create_template(outcome: BlobCreateOutcome) -> Value {
+    template(
+        &ServerFrame::BlobCreateResult {
+            handle: BlobHandle(number(HANDLE)),
+            outcome,
+        },
+        &[HANDLE],
+    )
+}
+
+/// The template of a `BlobSealResult` of `outcome`, by its `handle`.
+fn seal_template(outcome: BlobSealOutcome) -> Value {
+    template(
+        &ServerFrame::BlobSealResult {
+            handle: BlobHandle(number(HANDLE)),
+            outcome,
+        },
+        &[HANDLE],
+    )
 }
 
 /// A bytes-carrying read answer the codec encoded, with the values and bytes
@@ -997,7 +1081,16 @@ fn client_frames() -> Vec<ClientFrame> {
                     body: "{}".into(),
                     urgency: Urgency::Normal,
                     deliver_after: None,
-                    attachments: Vec::new(),
+                    attachments: vec![
+                        PublishAttachment::new(
+                            AttachmentName::new("made.bin").expect("a well-formed name"),
+                            BlobHandle(7),
+                        ),
+                        PublishAttachment::new(
+                            AttachmentName::new("again.bin").expect("a well-formed name"),
+                            BlobHandle(7),
+                        ),
+                    ],
                 },
                 BatchEntry {
                     channel: BYTES_OUT_CHANNEL.to_string(),
@@ -1053,6 +1146,19 @@ fn client_frames() -> Vec<ClientFrame> {
         ClientFrame::BlobClose {
             handle: BlobHandle(5),
         },
+        ClientFrame::BlobCreate {
+            handle: BlobHandle(7),
+            content_type: "application/octet-stream".to_string(),
+            size: 300_000,
+        },
+        ClientFrame::BlobWrite {
+            handle: BlobHandle(7),
+            offset: 4_096,
+            bytes: vec![0xff, 0x00, 0xfe, 0x80],
+        },
+        ClientFrame::BlobSeal {
+            handle: BlobHandle(7),
+        },
     ]
 }
 
@@ -1077,6 +1183,7 @@ pub fn kit() -> Value {
             "cases": page(CASES_BODY_CAP, CASES_CAST, None),
             "measure": page(MEASURE_BODY_CAP, MEASURE_CAST, None),
             "blobs": page(CASES_BODY_CAP, BLOBS_CAST, Some(blobs_door())),
+            "make": page(CASES_BODY_CAP, MAKE_CAST, Some(make_door())),
         },
         "answers": answers(),
         "deliver": deliver_template(),
@@ -1386,6 +1493,7 @@ mod tests {
             ("cases", CASES_BODY_CAP, CASES_CAST, None),
             ("measure", MEASURE_BODY_CAP, MEASURE_CAST, None),
             ("blobs", CASES_BODY_CAP, BLOBS_CAST, Some(blobs_door())),
+            ("make", CASES_BODY_CAP, MAKE_CAST, Some(make_door())),
         ] {
             let ladder = &kit["pages"][name]["ladder"];
             let hello: ServerFrame =
@@ -1632,6 +1740,9 @@ mod tests {
                 ClientFrame::BlobOpen { .. } => "blob_open",
                 ClientFrame::BlobRead { .. } => "blob_read",
                 ClientFrame::BlobClose { .. } => "blob_close",
+                ClientFrame::BlobCreate { .. } => "blob_create",
+                ClientFrame::BlobWrite { .. } => "blob_write",
+                ClientFrame::BlobSeal { .. } => "blob_seal",
                 other => panic!("the peer reads no {other:?}"),
             })
             .collect();
@@ -1644,7 +1755,10 @@ mod tests {
                 "publish_batch",
                 "blob_open",
                 "blob_read",
-                "blob_close"
+                "blob_close",
+                "blob_create",
+                "blob_write",
+                "blob_seal"
             ]
         );
     }
@@ -1708,6 +1822,36 @@ mod tests {
                 outcome: BlobReadOutcome::StorageFailed,
             }
         );
+        for (name, outcome) in [
+            ("create_ok", BlobCreateOutcome::Ok),
+            (
+                "create_budget_exhausted",
+                BlobCreateOutcome::BudgetExhausted,
+            ),
+            ("create_storage_failed", BlobCreateOutcome::StorageFailed),
+        ] {
+            assert_eq!(
+                fill(&answers[name], &[("handle", json!(8))]),
+                ServerFrame::BlobCreateResult {
+                    handle: BlobHandle(8),
+                    outcome,
+                },
+                "{name}"
+            );
+        }
+        for (name, outcome) in [
+            ("seal_ok", BlobSealOutcome::Ok),
+            ("seal_unknown_handle", BlobSealOutcome::UnknownHandle),
+        ] {
+            assert_eq!(
+                fill(&answers[name], &[("handle", json!(9))]),
+                ServerFrame::BlobSealResult {
+                    handle: BlobHandle(9),
+                    outcome,
+                },
+                "{name}"
+            );
+        }
     }
 
     /// The read sample is the frame its values and bytes describe, rebuilt
@@ -1814,5 +1958,46 @@ mod tests {
             .expect("the document has p-blobs");
         assert!(reader.grants.contains(&ComponentGrant::Blobs));
         assert_eq!(reader.sync_ports, ["ask"]);
+    }
+
+    /// The `make` page opens a door with upload; `p-maker` publishes on a wire
+    /// channel and a page-local one `p-reader` is woken by, and holds a wire
+    /// window that never wakes it; `p-spent` publishes only its report.
+    #[test]
+    fn the_make_page_wires_its_makers_and_reader_behind_an_upload_door() {
+        assert!(make_door().upload);
+        assert!(!blobs_door().upload);
+        let doc = document(MAKE_CAST);
+        let output_of = |instance: &str, port: &str| {
+            doc.outputs
+                .iter()
+                .find(|o| o.instance == instance && o.port == port)
+                .map(|o| o.channel.clone())
+        };
+        assert_eq!(output_of("p-maker", "a").as_deref(), Some(MADE_CHANNEL));
+        assert_eq!(output_of("p-maker", "b").as_deref(), Some(KEPT_CHANNEL));
+        assert_eq!(output_of("p-spent", "a"), None);
+        let subscribed = |instance: &str, port: &str| {
+            doc.subscriptions
+                .iter()
+                .find(|b| b.instance == instance && b.port == port)
+                .unwrap_or_else(|| panic!("{instance}.{port} is subscribed"))
+                .clone()
+        };
+        let feed = subscribed("p-maker", "feed");
+        assert_eq!(
+            (feed.channel.as_str(), feed.push_depth, feed.retain_depth),
+            (MAKE_FEED_CHANNEL, 0, 1)
+        );
+        assert_eq!(subscribed("p-reader", "feed").channel, KEPT_CHANNEL);
+        assert!(doc.local_channels.iter().any(|l| l.channel == KEPT_CHANNEL));
+        for instance in ["p-maker", "p-spent", "p-reader"] {
+            let entry = doc
+                .components
+                .iter()
+                .find(|c| c.instance == instance)
+                .unwrap_or_else(|| panic!("the document has {instance}"));
+            assert!(entry.grants.contains(&ComponentGrant::Blobs), "{instance}");
+        }
     }
 }

@@ -344,9 +344,9 @@ and answers it as an attachment of the result, and only for a caller that can
 open it — a conversation, or a component granted `blobs`
 (`docs/config-dsl.md`, "The OAuth tools"). Its `body_attachment` sends an
 attachment the call carries as the request body. A remote attacher on attach v6 does, by handle, below. A component on a
-page granted `blobs` reads, and only reads: a surface serves `limits`, `open`
-and a blob's `size`, `content-type` and `read`, from bytes the page fetched
-(below). v4/v5 remotes see references as metadata only. A remote's replay
+page granted `blobs` reads attachments from bytes the page fetched, and makes
+and forwards blobs, which the page uploads or opens on the backend after the
+activation returns `ok` (below, "A surface page makes blobs"). v4/v5 remotes see references as metadata only. A remote's replay
 store and a page's rings do not hold the blob, so a reference there can
 outlive it. `ports.publish` and its siblings
 carry no attachments: a component that republishes a message through them
@@ -464,8 +464,9 @@ and every blob frame names one:
   time.
 
 **A surface page is a reader by place.** A page speaks attach v6. Its session
-has a blob door when an instance on its surface is granted `blobs`, and the
-door is read-only (`Welcome.blobs.upload` is false). The door is the remote's,
+has a blob door when an instance on its surface is granted `blobs`; the door
+uploads (`Welcome.blobs.upload`) only when such an instance has a declared wire
+output (see "A surface page makes blobs" below), and is read-only otherwise. The door is the remote's,
 under the remote's admission: the server asks `Messenger::admit_retained_part`
 at every open, and the channels a page may open on are those its surface's own
 bindings name. An activation on a page is one synchronous stretch, so a
@@ -607,6 +608,98 @@ them before the message reaches a component.
   without its bytes. At the next attach every unfetched entry of a held row or
   a stored message is fetched again; one of a message already handed over wakes
   nobody, and its bytes are there for the next activation that reads them.
+
+**A surface page makes blobs.** A component on a page granted `blobs` creates,
+writes and seals blobs, publishes messages that name them, and forwards
+attachments it opened, through the same interface as on the backend. The page
+is not the store, and one activation is one synchronous stretch, so a page
+holds two kinds of blob, which a component never tells apart:
+
+- **page bytes** — a blob the page made, its bytes in page memory and nowhere
+  else;
+- **a backend reference** — a blob in the backend store, known by the place it
+  was delivered (wire channel, message id, attachment name); the page may or
+  may not hold a fetched copy.
+
+Nothing leaves the page for a blob before its activation returns `ok`. On `err`
+or a trap the activation's publishes are dropped and every buffer it made with
+them; the server never saw any of it.
+
+| the blob | published on a wire channel | published on a page-local channel |
+|---|---|---|
+| made in this activation | uploaded | the message holds the page's bytes |
+| opened from a wire message | forwarded by reference | the message carries the reference |
+| opened from a page-local message, page bytes | uploaded from the page's bytes | shared, no copy |
+| opened from a page-local message, a reference | forwarded by reference | the reference, shared |
+
+No pairing is refused for where its blob came from, and none drops the
+attachment from its message.
+
+- **Page-local attachments.** A page-local (`local:`) message's attachments live
+  in page memory. The bytes a page made live while a retained or parked message
+  of a page-local channel names them, and are freed when none does — this
+  section's lifetime rule with the page as the host. A `defer-edit` keeps them; a
+  `defer-cancel` releases them. Nothing is uploaded and nothing is persisted; a
+  reload loses them with the channel. A page-local attachment is a way to hold
+  bytes above the body cap on a page, not a store for component state: state is
+  a retained channel's body. A backend reference named in a page-local message
+  stays a reference: a reader opens it, and `read` answers the bytes while the
+  page still holds them for the wire message that delivered them and
+  `unavailable` otherwise; published onward to a wire channel it is forwarded
+  by reference. The page copies nothing on its own: a component that needs the
+  bytes to outlive the wire message reads them and makes a blob.
+- **The upload.** A wire flush that names an attachment is held by the page,
+  per instance in completion order, and every later flush of that instance waits
+  behind it. Once the page is attached under a document that still lets the
+  instance attach on that channel (the instance is granted `blobs` and the
+  channel is one of its wire outputs) and still subscribes the channel each
+  forwarded reference was delivered on, and the instance has nothing else in
+  flight, the page creates and writes each blob it made, opens each reference it
+  forwards, waits for every handle to be answered held, and only then sends the
+  batch naming them. The server's per-session bounds (64 handles, 4 ×
+  `max_blob_bytes` held) cover uploads and the page's own fetches together;
+  while an upload waits for room no new fetch starts.
+- **The verdict rule.** What the page can judge it answers in the call: the
+  page's own bounds below, a door without `upload` (`not-permitted` on a wire
+  port), the server's largest blob, handles and bytes held as the last
+  `Welcome` advertised them. What only the server knows arrives after `ok`: a
+  refused create (`BudgetExhausted`, `StorageFailed`, a limit), a refused open
+  (the forwarded message left the server's window), a flush that no longer fits
+  the door or the document of a later attachment. Each **loses the flush
+  whole** — every entry of the activation's wire batch, never the message
+  without its attachment — frees its bytes, and is announced: a toast, a
+  console line, and a `warn` report with the instance as subject on the
+  surface's error channel when the page is attached, the first per instance and
+  kind of loss reported while attached at `warn` and later repeats at `debug`
+  (a loss while detached is at `warn` on the console and demotes nothing).
+  The page stays up and the
+  instance's next flush proceeds. The same activation's page-local publishes
+  were committed at the flush and stay. On a surface `budget-exhausted` from
+  `create` or `write` is the page's own budget; the backend store's budget is
+  never answered in a call.
+- **Detach.** A flush waiting or being uploaded at a detach stays on the page,
+  within its bounds, and is uploaded again from nothing after the next attach,
+  if the new document still lets it. A batch already sent and unanswered at a
+  detach may have been applied, so it is never sent again: it is announced lost
+  by toast and console at once, and the count of such flushes is reported on
+  the error channel after the next attach.
+- **The page's bounds**, each a typed answer:
+
+  | Bound | Value | Refusal |
+  |---|---|---|
+  | Largest write | 1 MiB | `write`: `too-large` |
+  | Largest blob | the smaller of 64 MiB and the door's `max_blob_bytes` | `write`: `blob-too-large` |
+  | Bytes one activation writes | 64 MiB | `write`: `quota-exceeded` |
+  | Page-made bytes held at once | 64 MiB | `create`, `write`: `budget-exhausted` |
+  | Handles one activation holds, writers and blobs | 64 | `create`, `open`: `quota-exceeded` |
+  | Written ranges of one writer | 1,024 | `write`: `too-fragmented` |
+  | Distinct blobs one activation's wire publishes name | 32, and no more than the door's `max_handles` | `publish`: `plain(quota-exceeded)` |
+  | Bytes of those blobs together | the door's `max_bytes_held` | `publish`: `plain(quota-exceeded)` |
+
+  Made and fetched bytes have separate bounds: fetched bytes are a cache the
+  page may drop for room, since the server still has them, while made bytes are
+  the only copy and nothing drops them for room. A page holds at most 128 MiB of
+  attachment bytes.
 
 **Bounds.** Three keys in the `messaging` section (`docs/config-dsl.md`):
 `max_blob_bytes` caps one blob's extent (default 64 MiB), `blob_budget_bytes`
@@ -877,6 +970,15 @@ What follows:
   `max_blob_bytes`), the second round trip (a later client method that reads
   through an opening handle), and the operator's `fetch_bytes` and depths. A
   read answer carries at most 256 KiB, which bounds `c` and not the rule.
+- **Uploads.** A page's upload of a blob it made goes the other way on the
+  same socket: one create, the blob in writes of at most 256 KiB, a seal, then
+  the batch. The page composes one write at a time, but the browser's socket
+  queues the whole upload at once, because the transport exposes no send-side
+  flow information, so everything the page sends after an upload starts — every
+  component's publishes and the upload's own batch — leaves behind it, up to
+  64 MiB later. Inbound frames are not delayed, and each answer the server sends
+  keeps the connection's liveness. A create the server refuses does not stop the
+  writes already queued; the server drops them.
 
 So a camera frame that fits 64 KiB, sent by a remote onto a `non_text`
 `ephemeral:` channel, reaches a 0.2.0 kind on a surface at 1 per second with

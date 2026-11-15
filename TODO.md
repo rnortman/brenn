@@ -62,6 +62,28 @@ an operator action removes a named key profile's `exhausted` flag from
 and `docs/claude-accounts.md` describes the action. The
 `TODO(claude-key-flag-operator-clear)` comment sits in
 `AccountLedger::turn`, where a successful turn removes the flag.
+
+## `correctness-page-blob-table-last-origin-wins`
+
+The surface page's blob table (`surface/kernel/src/page_blobs.rs`)
+records a backend reference committed to a page-local message under the
+backend blob id, and a later commit of the same id from another place of
+delivery replaces the origin. That happens even when the route then
+refuses the second message, because the commit precedes the route. When
+one backend blob reaches the page on two wire channels and both are
+republished page-locally, every page-local message naming that id
+resolves to the newest origin. A `read` then answers `unavailable` while
+the page still caches the bytes under the older origin, and a forward to
+the wire is lost `NotRetained` when opening the older origin would have
+worked. Needs a design, because the replacement is the stated rule today
+and each fix changes what `open` on a page-local port looks up: keep every
+origin per id and try them in turn in `read` and in the stage's open, or
+key the table by the page-local message's own channel, message id and
+name so each message keeps the origin it was committed with. Done = a
+page-local attachment resolves through an origin that delivered it while
+any such origin still holds the bytes, with a test of two origins with
+different windows, and the `TODO(correctness-page-blob-table-last-origin-wins)`
+comment in `PageBlobs::commit` is gone.
 ## `surface-small-row-delivery-latency`
 
 In the Chromium timing run (`make e2e-measure`, `docs/page-rig-timings.md`,
@@ -210,22 +232,34 @@ check then type-checks. Code site (`TODO(surface-check-untyped-imports)`):
 
 ## `byte-body-ceiling-per-activation`
 
-Owner ruling wanted: one activation's publishes are capped at 4 MiB in total
-by the constant `MAX_PUBLISH_BYTES_PER_ACTIVATION`
-(`brenn-budget/src/lib.rs`), and nothing else bounds a non-transportable
-channel's body by size, so under the byte-carrying contract
-`brenn:processor@0.2.0` the binary state a component can hold in one message
-on an `io` port tops out at 4 MiB raw (about 3,000,000 B today as base64), on
-the backend and on the surface. The binary-bus project's spec asks for
-"storing large state in binary" on a surface `io` port and routes large
-objects to blobs; nobody has ruled where one ends and the other begins.
-Options: (a) leave the constant — state above 4 MiB is a blob's job and waits
-for the blob slices; costs nothing now; (b) raise the constant — a larger
-host-memory backstop for every component on both hosts; (c) make it a
-per-channel or operator setting — new configuration surface, and the
-constant's own doc treats it as a fixed backstop. Under (b) or (c) the change
-belongs with the surface host's byte path. Code site
-(`TODO(byte-body-ceiling-per-activation)`): the constant.
+Owner ruling wanted: how large one message of binary state on a component's
+`io` port may be. The binary-bus project's main use case, in the owner's words,
+is 'a surface component can have an `io` port for storing large state in
+binary without having to base64 it and stuff it in json', and that state is a
+byte body, not a blob: 'Obviously the state cannot be zero-copy or a blob; WASM
+is going to force a copy in and out there.' Two ceilings bound it. One
+message's body is capped at `[messaging] max_body_bytes`, 65,536 bytes by
+default: one operator setting for the whole bus, applied to every channel on
+both hosts, a surface's page-local channels included, with no upper bound
+checked, and the attach frame caps and every ring's worst-case weight follow
+it. One activation's publishes are capped at 4 MiB in total by the constant
+`MAX_PUBLISH_BYTES_PER_ACTIVATION` (`brenn-budget/src/lib.rs`). So at default
+configuration binary state in one message tops out at 64 KiB, and under any
+setting at 4 MiB. A surface component granted `blobs` can also publish and read
+an attachment on a page-local channel, by range, held in page memory; that is a
+second way to hold bytes above the body cap, not the route the owner described.
+Nobody has ruled whether the ceilings stand. Options: (a) leave both — an
+operator whose components hold larger state raises `max_body_bytes` for the
+whole bus, and above 4 MiB it is an attachment; costs nothing, and widens every
+wire frame and ring with the setting; (b) raise the default, the constant, or
+both — a larger host-memory backstop for every component on both hosts; (c) a
+body cap per channel, or one for non-transportable channels, so state that
+never leaves a host grows without widening wire frames — new configuration
+surface, and the constant's doc treats it as a fixed backstop. Done = the
+ruling is recorded here or in `docs/message-bus.md` §2.1.4 with the size of
+state it was made for, and under (b) or (c) a surface component publishes and
+reads back one binary message of that size on an `io` port, in the page rig.
+Code site (`TODO(byte-body-ceiling-per-activation)`): the constant.
 
 ## `attach-v4-beside-v5`
 
@@ -395,29 +429,6 @@ remote's reach is the channel's window by decision and why. Code site
 (`TODO(remote-blob-open-without-delivery)`): the `BlobOpen` handler in
 `attach/server/src/blobs.rs`, where subscribe authority is re-derived.
 
-## `attach-blob-upload-frames-without-upload`
-
-On an attachment whose door may not upload — every surface session, and a
-remote granted no upload — the attach server's `BlobWrite` and `BlobSeal`
-handlers treat a frame naming an absent handle as pipelined behind a refused
-create: the write is dropped and counted, the seal answered `UnknownHandle`.
-No create can precede them on such a door, since `BlobCreate` there is a
-violation, so no conforming client sends either frame; a hostile one can send
-them without limit and no security event reaches fail2ban. Both become a
-violation on a door without upload. The change lands in the version 6 server
-in place: it changes no frame shape, and only a non-conforming client can
-observe it. A door with upload keeps both answers, which are what a frame
-pipelined behind a refused create meets there. `BlobRead` and `BlobClose`
-naming handles a session never opened stay answers on every door, so
-unbounded blob frames per session remain the exposure
-`docs/security-posture.md` §9a accepts. Done = both handlers end such a
-session as `attach_protocol_violation`, with a server test of each for a
-surface session and for a remote without upload; §9a's handle-state table
-and §6.6 (the surface blob door) of `docs/security-posture.md` list the
-frames as fail2ban signal. Code sites
-(`TODO(attach-blob-upload-frames-without-upload)`): `handle_blob_write` and
-`handle_blob_seal` in `attach/server/src/blobs.rs`.
-
 ## `attach-blob-write-io-failure-test`
 
 The attach server's `BlobWrite` handler has an arm for a filesystem error from
@@ -467,19 +478,6 @@ the contract and the release that dropped it. Done = no host serves 0.1.0 and
 the texts say which release dropped it. Code sites
 (`TODO(string-contract-removal)`): the two notices in
 `brenn-bootstrap/src/consumers.rs`.
-
-## `blob-attachment-host-sites`
-
-When a surface host serves the `blobs` interface, its attachment-carrying
-publishes must be pushed into the page's one per-activation publish buffer,
-`PublishBuffer::entries`, and not a buffer of their own merged at flush. The
-contract promises the flush in call order, and a second buffer loses the order
-between `ports` and `blobs`. The backend host already pushes `blobs.publish`
-into `ProcessorData::publish_buffer`. Done = the slice serving the interface on
-a surface pushes its attachment-carrying publishes into
-`PublishBuffer::entries`, with a test of the order across the two interfaces.
-Code site (`TODO(blob-attachment-host-sites)`): `PublishBuffer::entries` in
-`surface/kernel/src/publish_buffer.rs`.
 
 ## `blob-handle-integrity`
 
@@ -595,32 +593,6 @@ are named there: `blob` has `read` and no `write`, `size` and `content-type`
 are fixed on a handle, and forwarding shares the blob rather than copying it.
 The build-or-never ruling remains.
 
-## `blobs-interface-stable-declaration`
-
-The `blobs` component interface (`brenn:processor/blobs@0.3.0`) is served by
-the backend host in full and by a surface host on its read side (`limits`,
-`open`, the `blob` resource), and is not yet declared stable: its file says its
-shapes are expected to change, because the producing side — `create`, `writer`
-and `publish` on a surface — is not served, and how a page learns the store's
-verdict on a blob it made is open (`blobs-surface-store-budget-refusal`). (Its other
-reason, that tool calls did not carry blobs, is discharged: `call-async`,
-`call-async-for` and `complete` of the interface carry them.) Until the
-declaration the rule is: a shape changes in place only while no tagged brenn
-release has served it; a shape a tagged release has served changes only as a
-new version of the interface, served beside the old one for at least one
-release and announced in `CHANGELOG.md`, because brenn releases first and
-out-of-tree components follow — there is no lockstep upgrade. The old version
-may be removed one release after its replacement; nothing longer is promised.
-Declare it stable — the same promise `brenn:processor@0.2.0` carries, in its
-WIT header, `docs/component-packages.md` and a `CHANGELOG.md` entry for
-component authors — once a surface host serves the same interface, producing
-side included, and `blobs-surface-store-budget-refusal` is settled, or once it
-is decided that surfaces get a different one. Done = the declaration is in
-those three texts, or this entry records why surfaces take another interface
-and the declaration is made for the backend alone. Code site
-(`TODO(blobs-interface-stable-declaration)`): the status paragraph of
-`brenn-wasm/wit/processor-0.3.wit`.
-
 ## `blobs-on-sync-calls`
 
 `tools.call-fast` and `calls.call` carry no attachments. Both return to the
@@ -675,21 +647,27 @@ publishes; and after a restart an app's inbox holds blobs no conversation can
 name until its window turns over. A remote attacher on attach v6 is a
 producer against the same pool — bounded per session at 64 handles and
 4 × `max_blob_bytes` held, uploads and opened attachments together, across its
-sessions by `max_sessions`, and not over time. `api-request` is a producer
+sessions by `max_sessions`, and not over time. A browser session on a surface
+with an upload door — an authenticated but untrusted page — is a producer
+against the same pool too: it can make blobs up to the per-session cap (64
+handles, 4 × `max_blob_bytes` held), a surface takes 64 sessions and 16 for one
+user, so one user's sessions together can exhaust the pool and every other
+producer is then refused `budget-exhausted`; a share per publisher is the bound
+that closes it. `api-request` is a producer
 against the same pool — an answer it writes into a blob on a caller's behalf
 (`response_attachment`), bounded per call by `max_blob_bytes` and in flight by
 the tool's concurrency (8), and not over time. At rest it is the largest
 contributor named here: an answer stays on the caller's inbox for that inbox's
 window, so a provider instance whose tools ask for attachment answers holds up
 to its result inbox's depth × `max_blob_bytes` — 2 GiB at depth 32, against the
-1 GiB default pool — of blobs it has already read. Decide whether a component or a
-conversation gets a share of the budget, who is charged for a blob that is
+1 GiB default pool — of blobs it has already read. Decide whether a component, a
+conversation or an attached session's publisher gets a share of the budget, who is charged for a blob that is
 forwarded and so held by messages of several producers — a blob handed to a
 tool or returned by one included — and whether the share is operator
 configuration. Done = one
 producer, component or conversation, at its share cannot cause another
 producer's write to be refused, with a test, and `docs/security-posture.md`
-§7.6 no longer states the exposure for either. Code site
+§7.6, §6.6 and §9a no longer state the exposure for either. Code site
 (`TODO(blob-budget-per-component)`):
 `PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION` in `brenn-wasm/src/lib.rs`.
 
@@ -724,28 +702,6 @@ drains, liveness — stops for the sync. Done = no blob fsync runs on an async
 worker thread on any door, with the sync still complete before the row that
 names the blob commits. Code site (`TODO(blob-durable-sync-on-async-task)`):
 `HeldAttachments::make_durable` in `brenn-messaging-store/src/blob/durable.rs`.
-
-## `blobs-surface-store-budget-refusal`
-
-On the backend host `budget-exhausted` from `blobs.create` and `blobs.write` is
-the blob store's own answer, given while the guest runs. A surface host that
-buffers a fresh blob in page memory and uploads it at the flush learns the
-backend store's verdict only after the guest has returned `ok`, where no
-variant of the interface reaches the component, so a refusal there loses the
-flush. The per-blob cap is static and can be mirrored into the kernel as the
-body cap is; the store's budget is a moving total the page cannot know. The
-slice that lets a page make a blob decides between accepting a lost, announced
-flush for a blob the backend refuses and a change of shape that brings the
-verdict back to the component — which the interface's undeclared status
-(`blobs-interface-stable-declaration`) keeps open. The read half is decided: a
-page fetches a gated channel's attachments before a message enters its window,
-`open` succeeds without bytes and `read` answers `unavailable`
-(`docs/message-bus.md` §2.1.2a, "A surface page is a reader by place"). Done =
-the producing slice's documents state which, with a test of a page-made blob
-the backend store refuses, and `blobs-interface-stable-declaration` is not
-discharged before this is. Code
-site (`TODO(blobs-surface-store-budget-refusal)`): the `budget-exhausted` case
-of `create-error` in `brenn-wasm/wit/processor-0.3.wit`.
 
 ## `correctness-brenn-scheme-send-text-shown-to-ephemeral-only-app`
 
@@ -908,7 +864,7 @@ attachments would be its first callers. The bus has a carrier for such a file
 now: an attachment on a message, which a conversation can make from a file
 with `brenn-tool send` and a component through `blobs`, and a component on a
 surface page granted `blobs` reads it. What is missing is a component that
-renders or saves such a file on the user's surface, and a page that makes one.
+renders or saves such a file on the user's surface.
 The delivery path is a message attachment read on the user's surface; its
 shape is not decided. Done is a delivery path for a
 non-markdown file from a tool result or a component to the user's surface.
@@ -1641,6 +1597,32 @@ Code site (`TODO(surface-single-publish-tightening)`):
 
 ---
 
+## `surface-kernel-tracing-has-no-sink`
+
+The browser kernel installs no `tracing` subscriber, so every `tracing` event
+in `surface/kernel` and `attach/client` is discarded on a page. Several are the
+only record of a loss: a refused flush that outlived its outbox, a queued flush
+that died with an outbox a document closed, the flushes discarded from a
+terminal instance, the peer's failure to replay to the resume point. Decide
+which of them a page should surface and where — a console sink with a level
+floor, or kernel events for the ones an operator acts on — and build it. Done =
+each `tracing` event at `warn` or above in the kernel either reaches the
+console or the error channel on a page or is removed, with a test of one. Code
+site (`TODO(surface-kernel-tracing-has-no-sink)`): `start` in
+`surface/kernel/src/entry.rs`.
+
+## `surface-upload-pacing`
+
+A surface page hands a whole blob's upload to the browser's socket in one
+stretch: the attach transport exposes no send-side flow information, so
+everything the page sends after an upload starts waits behind it, up to the
+page's largest blob, and a create the server refuses does not stop the bytes
+already queued. Pace the upload against the socket's buffered amount so the
+page's other traffic interleaves and a refused upload stops. Done = with an
+upload of the largest blob in progress, a plain publish from another instance
+reaches the peer before the upload's last chunk, in the page rig;
+`docs/message-bus.md` §2.1.4 states the new cost.
+
 ## `surface-wasm-test-in-ci`
 
 The browser-side wasm test suites — wasm-bindgen-test, real browser — now have
@@ -1688,7 +1670,11 @@ the five migrated kinds render through and is compiled by nothing in CI. The
 `brenn_processor_call` and `surface/kernel/src/sync_door.rs`'s `SyncDoor::call`
 are wasm32-only compositions — each decision they make is pinned natively, and
 the node rig runs their order for one admitted call between headless kinds; the
-refusal arms and a `dom` peer are run by nothing.
+refusal arms and a `dom` peer are run by nothing. `brenn_blobs_publish` is a
+third: the order of its checks is pinned natively in the buffer, and that it
+hands the buffer the grant verdict the core gave, answers no grant refusal ahead
+of the buffer's charge, and reports only a `not-permitted` answer is run by
+nothing.
 
 ---
 
@@ -2644,9 +2630,8 @@ about how a bus peer acquires and proves ownership of an upload; the schema
 field is already in place so the change is purely additive when that decision
 lands. A candidate answer exists now and is not decided: the command message's
 own bus attachments, which the peer can only name if it made or was handed the
-blobs. The command's attachments come from a page, so this is built with or
-after the work that lets a surface page make a blob and publish a message
-naming it, and not before. Done when a bus `send` with attachments resolves
+blobs. The command's attachments come from a page, and a surface page can now
+make a blob and publish a message naming it, so that answer is buildable. Done when a bus `send` with attachments resolves
 them and reaches the harness with the files attached.
 
 Code sites (`TODO(chat-bus-attachments)`): `brenn-envelope/src/chat.rs`, the

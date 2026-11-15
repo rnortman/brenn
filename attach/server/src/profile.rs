@@ -290,6 +290,16 @@ pub trait AttachProfile: Send + Sync {
     /// [`AttachProfile::subscribable`] of the message's channel, and where it
     /// may publish what it holds is [`AttachProfile::publishable`].
     fn blob_grant(&self) -> Option<BlobGrant>;
+
+    /// Whether a publish under `attribution` (`None` = the attacher itself)
+    /// may name attachments on `channel`.
+    ///
+    /// Asked only of a non-empty attachment list, after
+    /// [`AttachProfile::blob_grant`] admitted the door, and in addition to
+    /// [`AttachProfile::publishable`], which still decides the publish. A
+    /// `false` answer is a violation: a conforming attacher never names an
+    /// attachment where its route does not let it.
+    fn attribution_may_attach(&self, attribution: Option<&str>, channel: &str) -> bool;
 }
 
 #[cfg(test)]

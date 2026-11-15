@@ -2126,7 +2126,7 @@ fn a_page_capability_is_a_placed_instances_to_hold() {
     );
 }
 
-/// A surface serves the read side of `blobs`, so the word is a placed
+/// A surface serves `blobs` without its tool-call forms, so the word is a placed
 /// instance's to hold.
 #[test]
 fn blobs_is_a_placed_instances_to_hold() {
