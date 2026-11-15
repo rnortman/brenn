@@ -1,0 +1,15 @@
+# The page host's `blobs` fixture: reads the attachments of the messages in
+# its windows through the guest SDK. Run in the node page rig.
+# Not listed in brenn-wasm/deployed-components.txt.
+
+[package]
+name = "brenn-processor-page-blobs-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+brenn-guest = { path = "../guest" }

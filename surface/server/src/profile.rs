@@ -75,6 +75,10 @@ pub struct SurfaceProfile {
     /// grant on a surface without the surface-level one, so a name here implies
     /// `alert_granted`.
     component_alertable: HashSet<String>,
+    /// Whether any declared instance is granted `blobs`: the surface's blob
+    /// door, read-only. A surface none of whose components may read an
+    /// attachment has no reason to admit a blob frame.
+    blob_door: bool,
     /// The operator-tuned per-connection publish bucket every session of this
     /// surface starts full with.
     publish_rate: PublishRate,
@@ -214,6 +218,10 @@ impl SurfaceProfile {
                 .filter(|c| c.grants.contains(&ComponentGrant::Alert))
                 .map(|c| c.instance.clone())
                 .collect(),
+            blob_door: resolved
+                .components
+                .iter()
+                .any(|c| c.grants.contains(&ComponentGrant::Blobs)),
             publish_rate: PublishRate {
                 burst: resolved.publish_burst,
                 per_sec: resolved.publish_per_sec,
@@ -360,8 +368,9 @@ impl AttachProfile for SurfaceProfile {
     }
 
     fn blob_grant(&self) -> Option<BlobGrant> {
-        // A surface has no blob door yet: no page drives the blob frames.
-        None
+        // Read-only: a page opens and reads attachments of messages on the
+        // channels its bindings name, and makes no blob.
+        self.blob_door.then_some(BlobGrant { upload: false })
     }
 }
 

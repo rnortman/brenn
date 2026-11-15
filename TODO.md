@@ -141,12 +141,27 @@ when that test refuses it by type at load. Code site
 (`TODO(stale-contract-import-side-fixture)`): `brenn-wasm/src/lib.rs`, the
 `instantiate_pre` step of `ProcessorComponent::load`.
 
+## `surface-blob-partial-read-over-bound`
+
+A surface page fetches an attachment whole or not at all, within the page's
+bound; a component on a surface cannot read a range of an attachment larger
+than that bound, where a backend component can. The owner's requirement is
+read by byte range "so you only access the parts you care about". Serving it
+needs a way for a message a reader has already seen to wake it when bytes
+arrive — a new activation cause — since an activation on a page cannot wait for
+the network. Done = a surface component reads a stated range of an attachment
+larger than the page's bound, with the answer for bytes not yet on the page
+typed and documented, and a test in the page rig. Code site
+(`TODO(surface-blob-partial-read-over-bound)`): `Fetch::on_rows` in
+`surface/kernel/src/fetch.rs`, where an attachment over the channel's fetch
+bound is left out of a row's eligible attachments.
+
 ## `surface-check-untyped-imports`
 
 `brenn_wasm::check_surface_component` type-checks a 0.2.0 surface kind's
-`ports@0.2.0` and `calls@0.2.0` imports (and through them every `bus@0.2.0`
-type they use) and its `receive` export, under any import name the check
-accepts. The functions of every other interface a surface host serves —
+`ports@0.2.0`, `calls@0.2.0` and `blobs@0.3.0` imports (and through them
+every `bus@0.2.0` type they use) and its `receive` export, under any import
+name the check accepts. The functions of every other interface a surface host serves —
 `log`, `alert`, `config`, `dom` and `page-dom`, all at `@0.1.0` — are
 stubbed untyped by the check's stub pass, which accepts any type. The jco
 glue on the page checks nothing against the host, so a kind bound by hand
@@ -183,7 +198,7 @@ that carries types only, `bus@0.2.0` or `types@0.1.0`, is held where a
 function or `receive` uses its types; a type nothing uses crosses no
 boundary and no host compares it); tests pin that refusal with two fixtures
 whose only fault is the type of a function imported from an interface
-outside `ports@0.2.0` and `calls@0.2.0`, one under the served name and one
+outside `ports@0.2.0`, `calls@0.2.0` and `blobs@0.3.0`, one under the served name and one
 under a semver-compatible alias of it; the `CHANGELOG.md` entry for
 component authors in the release that carries the change says which
 artifacts are now refused; and `docs/component-packages.md`, *Contract
@@ -363,7 +378,11 @@ or a stolen remote token, reaches the bytes of every attachment in the window
 of every channel it may subscribe to, including messages it was never
 delivered and messages deeper than its own subscribe depth ceiling
 (`docs/security-posture.md` §9a, "What a stolen token now reaches";
-`CHANGELOG.md`, BREAKING for operators). The second half was read as written
+`CHANGELOG.md`, BREAKING for operators). The same door admits a surface
+session, read-only, bounded to the wire channels its surface's bindings name
+(`SurfaceProfile::subscribable`, `docs/security-posture.md` §6.6), and the same
+reach applies: a hostile page reaches every attachment in the window of those
+channels. Both doors share the code site below. The second half was read as written
 for an LLM conversation's context and not built for remotes. Build, if a
 remote's reach should be what it was handed: admit a `BlobOpen` only for a
 message the session was delivered, or only within the depth the remote's
@@ -375,6 +394,29 @@ states the narrower reach; or `docs/security-posture.md` §9a records that a
 remote's reach is the channel's window by decision and why. Code site
 (`TODO(remote-blob-open-without-delivery)`): the `BlobOpen` handler in
 `attach/server/src/blobs.rs`, where subscribe authority is re-derived.
+
+## `attach-blob-upload-frames-without-upload`
+
+On an attachment whose door may not upload — every surface session, and a
+remote granted no upload — the attach server's `BlobWrite` and `BlobSeal`
+handlers treat a frame naming an absent handle as pipelined behind a refused
+create: the write is dropped and counted, the seal answered `UnknownHandle`.
+No create can precede them on such a door, since `BlobCreate` there is a
+violation, so no conforming client sends either frame; a hostile one can send
+them without limit and no security event reaches fail2ban. Both become a
+violation on a door without upload. The change lands in the version 6 server
+in place: it changes no frame shape, and only a non-conforming client can
+observe it. A door with upload keeps both answers, which are what a frame
+pipelined behind a refused create meets there. `BlobRead` and `BlobClose`
+naming handles a session never opened stay answers on every door, so
+unbounded blob frames per session remain the exposure
+`docs/security-posture.md` §9a accepts. Done = both handlers end such a
+session as `attach_protocol_violation`, with a server test of each for a
+surface session and for a remote without upload; §9a's handle-state table
+and §6.6 (the surface blob door) of `docs/security-posture.md` list the
+frames as fail2ban signal. Code sites
+(`TODO(attach-blob-upload-frames-without-upload)`): `handle_blob_write` and
+`handle_blob_seal` in `attach/server/src/blobs.rs`.
 
 ## `attach-blob-write-io-failure-test`
 
@@ -556,9 +598,11 @@ The build-or-never ruling remains.
 ## `blobs-interface-stable-declaration`
 
 The `blobs` component interface (`brenn:processor/blobs@0.3.0`) is served by
-the backend host and is not yet declared stable: its file says its shapes are
-expected to change, because no surface host serves it and the surface is where
-a synchronous host must answer a range read without the network. (Its other
+the backend host in full and by a surface host on its read side (`limits`,
+`open`, the `blob` resource), and is not yet declared stable: its file says its
+shapes are expected to change, because the producing side — `create`, `writer`
+and `publish` on a surface — is not served, and how a page learns the store's
+verdict on a blob it made is open (`blobs-surface-store-budget-refusal`). (Its other
 reason, that tool calls did not carry blobs, is discharged: `call-async`,
 `call-async-for` and `complete` of the interface carry them.) Until the
 declaration the rule is: a shape changes in place only while no tagged brenn
@@ -569,7 +613,8 @@ out-of-tree components follow — there is no lockstep upgrade. The old version
 may be removed one release after its replacement; nothing longer is promised.
 Declare it stable — the same promise `brenn:processor@0.2.0` carries, in its
 WIT header, `docs/component-packages.md` and a `CHANGELOG.md` entry for
-component authors — once a surface host serves the same interface, or once it
+component authors — once a surface host serves the same interface, producing
+side included, and `blobs-surface-store-budget-refusal` is settled, or once it
 is decided that surfaces get a different one. Done = the declaration is in
 those three texts, or this entry records why surfaces take another interface
 and the declaration is made for the backend alone. Code site
@@ -689,15 +734,16 @@ backend store's verdict only after the guest has returned `ok`, where no
 variant of the interface reaches the component, so a refusal there loses the
 flush. The per-blob cap is static and can be mirrored into the kernel as the
 body cap is; the store's budget is a moving total the page cannot know. The
-slice that serves `blobs` on a surface decides between accepting a lost,
-announced flush for a blob the backend refuses and a change of shape that
-brings the verdict back to the component — which the interface's undeclared
-status (`blobs-interface-stable-declaration`) keeps open — and likewise whether
-a page fetches a binding's attachments before it activates a kind, answering
-`not-found` for one it could not fetch, or fetches lazily, which wants one more
-`open-error` variant. Done = the surface slice's documents state which, with a
-test of a page-made blob the backend store refuses, and
-`blobs-interface-stable-declaration` is not discharged before this is. Code
+slice that lets a page make a blob decides between accepting a lost, announced
+flush for a blob the backend refuses and a change of shape that brings the
+verdict back to the component — which the interface's undeclared status
+(`blobs-interface-stable-declaration`) keeps open. The read half is decided: a
+page fetches a gated channel's attachments before a message enters its window,
+`open` succeeds without bytes and `read` answers `unavailable`
+(`docs/message-bus.md` §2.1.2a, "A surface page is a reader by place"). Done =
+the producing slice's documents state which, with a test of a page-made blob
+the backend store refuses, and `blobs-interface-stable-declaration` is not
+discharged before this is. Code
 site (`TODO(blobs-surface-store-budget-refusal)`): the `budget-exhausted` case
 of `create-error` in `brenn-wasm/wit/processor-0.3.wit`.
 
@@ -860,10 +906,11 @@ legacy TypeScript UI (the upload route) and not on the bus
 in the Fastmail tooling, whose mail-filter export and import route and mail
 attachments would be its first callers. The bus has a carrier for such a file
 now: an attachment on a message, which a conversation can make from a file
-with `brenn-tool send` and a component through `blobs`. What is missing is a
-surface page that reads a blob. The delivery path is a message attachment read
-on the user's surface, built with or after the work that serves `blobs` on a
-surface page; its shape is not decided. Done is a delivery path for a
+with `brenn-tool send` and a component through `blobs`, and a component on a
+surface page granted `blobs` reads it. What is missing is a component that
+renders or saves such a file on the user's surface, and a page that makes one.
+The delivery path is a message attachment read on the user's surface; its
+shape is not decided. Done is a delivery path for a
 non-markdown file from a tool result or a component to the user's surface.
 The `TODO(agent-file-delivery-beyond-markdown)` comment sits at the
 `DisplayFile` handler's read in
@@ -1126,6 +1173,20 @@ and message generalised beyond `server.vault_dir`.
 
 Done = every file kind the posture covers is refused at boot and on reload when
 it lies inside an agent-visible root, with a test per kind.
+
+## `quality-e2e-fixture-roots-hand-synced-in-five-places`
+
+Every e2e fixture's spec directory is listed by hand in five places: the
+`Makefile`'s `E2E_TARGETS` and `e2e-mounts` recipe, `shipped_module_roots` in
+`brenn-lib/src/config/test_fixtures.rs` (the roots `make check` compiles
+`brenn.e2e.brenn` against), and the test `data` of `brenn-lib/BUILD.bazel` and
+`brenn-bootstrap/BUILD.bazel`. Nothing checks that they agree. A mismatch
+shows only under `make e2e`, as a server that does not boot, or under
+`make check`, as a module that does not resolve. Choose one source: a
+checked-in mount-spec file that the `Makefile` reads and `shipped_module_roots`
+parses, or a `brenn-lib` test that compares the `Makefile`'s `modules:` paths
+with `shipped_module_roots("brenn.e2e.brenn")`. The second means maintaining a
+`Makefile` parser in a Rust test. Then delete the "move them together" comments.
 
 ## `quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`
 

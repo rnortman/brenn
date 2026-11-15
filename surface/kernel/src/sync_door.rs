@@ -168,6 +168,15 @@ impl SyncDoor {
         answer
     }
 
+    /// Run `f` against the page's attachment cache: what a component's `open`
+    /// and `read` answer from.
+    ///
+    /// A short shared borrow. The blob exports are called from inside an entry,
+    /// and every driver releases the page before calling one.
+    pub fn with_fetch<R>(&self, f: impl FnOnce(&crate::fetch::Fetch) -> R) -> R {
+        f(&self.page.borrow().fetch)
+    }
+
     /// Invoke one assembled sync activation and fold its completion, appending the
     /// completion turn's effects to what the assembly already asked for.
     ///
@@ -189,6 +198,7 @@ impl SyncDoor {
             drops: _,
         } = ready;
         let (outcome, buffer, called) = invoke_shared(
+            &self.page,
             &self.entries,
             &self.in_flight,
             &instance,

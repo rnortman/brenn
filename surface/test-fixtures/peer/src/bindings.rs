@@ -108,11 +108,12 @@ pub fn imply_wire_channels(mut doc: BindingsDocument) -> BindingsDocument {
     doc
 }
 
-/// One text-only transportable channel declaration.
+/// One text-only transportable channel declaration, fetching no attachment.
 pub fn wire(channel: &str) -> WireChannel {
     WireChannel {
         channel: channel.to_string(),
         non_text: false,
+        fetch_bytes: 0,
     }
 }
 

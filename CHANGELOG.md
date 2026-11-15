@@ -4,6 +4,35 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **A surface page reads message attachments.** A component on a page granted
+  `blobs` can open an attachment of a message in its windows and read its
+  bytes, which cross the surface websocket as binary frames — the camera-frame
+  case of a `remote` publishing a blob per frame and a `surface` rendering it.
+  - **For operators:** `blobs` is now legal on a placed instance. A surface
+    `in` binding takes `fetch_bytes`, the largest attachment the page fetches
+    on that channel (default 1 MiB on an instance granted `blobs`, 0
+    otherwise, at most 64 MiB). Any value above zero makes every reader of
+    that channel on the page wait for the fetch, up to a bound set by the
+    channel's depth (`⌈(depth + 4) / 4⌉ · 30 s` attached, 60 s at depth 1);
+    see `docs/config-dsl.md`, "Instances and bindings", and
+    `docs/message-bus.md` §2.1.2a. The surface route moves to attach v6 and
+    the bindings document to version 8 together; page and server deploy
+    together and a page from an earlier release is refused until it reloads.
+    A page reports a refused or failed fetch, an attachment over the
+    session's bytes held, and bytes dropped for room on its error channel
+    once per kind, per channel, per connection.
+  - **For component authors:** a surface serves the read side of
+    `brenn:processor/blobs@0.3.0` — `limits`, `open` and a blob's `size`,
+    `content-type` and `read` — and a kind that imports `create`, `writer` or
+    `publish` is refused when its artifact is checked at boot, naming the
+    function; the surface check now type-checks the `blobs` import.
+    **BREAKING, in place:** `read-error` gains `unavailable`, which a page
+    answers for bytes it does not hold and the backend never answers. A
+    component that calls `blob.read` must be rebuilt against this release's
+    `brenn-guest` before it links on the backend, and a `match` on
+    `brenn_guest::blobs::ReadError` gains an arm for `Unavailable`. The
+    interface is not yet declared stable, and no tagged release served the
+    earlier shape. See `docs/component-packages.md`, "Contract evolution".
 - **Large files through `api-request`, and a new `GmailAttachment` tool.**
   The host tool `api-request` (the way components and agents call an
   OAuth-protected API) can now send a request body from a blob attachment

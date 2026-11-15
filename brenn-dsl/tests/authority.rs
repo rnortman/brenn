@@ -2104,10 +2104,6 @@ fn a_backend_only_capability_is_refused_on_a_placed_instance() {
             "mqtt",
             "`mqtt` is backend-only in v1; a surface-hosted component cannot be granted it",
         ),
-        (
-            "blobs",
-            "`blobs` is backend-only: no surface host serves blob bytes yet",
-        ),
     ] {
         assert!(
             derive_refusals(&placed_panel(word, "")).contains(&expected.to_string()),
@@ -2127,6 +2123,16 @@ fn a_page_capability_is_a_placed_instances_to_hold() {
             .map(|word| word.value().as_str())
             .collect::<Vec<_>>(),
         ["takeover"]
+    );
+}
+
+/// A surface serves the read side of `blobs`, so the word is a placed
+/// instance's to hold.
+#[test]
+fn blobs_is_a_placed_instances_to_hold() {
+    assert_eq!(
+        granted(&derived(&placed_panel("blobs", "")).surface_components[0][0].grants),
+        ["blobs"]
     );
 }
 

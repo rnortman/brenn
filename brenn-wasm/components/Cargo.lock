@@ -255,6 +255,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-page-blobs-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
 name = "brenn-processor-page-bytes-test"
 version = "0.1.0"
 dependencies = [

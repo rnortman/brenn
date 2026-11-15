@@ -3077,6 +3077,7 @@ struct LoweredIn {
     wake_min: Option<WakeMin>,
     amplification: Option<f64>,
     non_text: bool,
+    fetch_bytes: Option<u64>,
 }
 
 fn in_tail(tail: &InTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIn {
@@ -3087,6 +3088,7 @@ fn in_tail(tail: &InTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIn {
         wake_min,
         amplification,
         non_text,
+        fetch_bytes,
     } = tail;
     LoweredIn {
         push_depth: opt_depth(push_depth.as_ref(), "push_depth", errors),
@@ -3095,6 +3097,7 @@ fn in_tail(tail: &InTail<RVal>, errors: &mut Vec<Diagnostic>) -> LoweredIn {
         wake_min: opt_token(wake_min.as_ref(), "wake_min", errors),
         amplification: opt_flt(amplification.as_ref(), "amplification", errors),
         non_text: opt_bool(non_text.as_ref(), NON_TEXT_KEY, errors).unwrap_or_default(),
+        fetch_bytes: opt_int(fetch_bytes.as_ref(), "fetch_bytes", errors),
     }
 }
 
@@ -3383,7 +3386,8 @@ struct WasmBindings {
 /// `in` and `out` bindings must carry a channel address; only a free `io`
 /// port may name none. A tail is a vocabulary, so each key is a same-name
 /// transcription; the one key a consumer holds and a surface does not —
-/// `amplification` — is read here and refused there.
+/// `amplification` — is read here and refused there, and the one a surface
+/// holds and a consumer does not — `fetch_bytes` — is refused here.
 // TODO(variadic-ports): one binding is one port to one channel; a port
 // bound to a keyed set of channels is not expressible.
 fn wasm_bindings(
@@ -3403,7 +3407,15 @@ fn wasm_bindings(
         let owner = format!("consumer `{}`", instance.slug.value());
         match &binding.tail {
             RTail::In(tail) => {
-                let tail = in_tail(tail, errors);
+                let mut masked = tail.clone();
+                refuse_val(
+                    masked.fetch_bytes.take().as_ref(),
+                    CONSUMER_MASKED_KEY,
+                    &format!("the `{port}` port of {owner}"),
+                    &CONSUMER_IN_KEYS,
+                    errors,
+                );
+                let tail = in_tail(&masked, errors);
                 link_endpoint(
                     endpoints,
                     binding.chan.as_ref(),
@@ -3817,6 +3829,16 @@ struct Placement<'a> {
     owner: &'a str,
 }
 
+/// The `in` tail key a consumer binding has no field for: a backend
+/// component opens an attachment when it reads it, so nothing is fetched
+/// ahead of its activation.
+const CONSUMER_MASKED_KEY: &str = "fetch_bytes";
+
+/// The `in` tail keys a consumer binding reads, for the refusal that says
+/// `fetch_bytes` is not one of them.
+static CONSUMER_IN_KEYS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| keys_without(InTail::<()>::KEYS, &[CONSUMER_MASKED_KEY]));
+
 /// One binding statement per port of one instance, dispatched on direction.
 ///
 /// The surface twin of [`wasm_bindings`], with the instance name carried into
@@ -3881,6 +3903,7 @@ fn surface_bindings(
                     noise: tail.noise,
                     wake_min: tail.wake_min,
                     non_text,
+                    fetch_bytes: tail.fetch_bytes,
                 });
             }
             RTail::Out(tail) => {
@@ -3956,6 +3979,7 @@ fn surface_bindings(
                             noise: tail.noise,
                             wake_min: None,
                             non_text,
+                            fetch_bytes: None,
                         });
                         out.outputs.push(SurfaceOutputRaw {
                             instance: at.instance.to_owned(),

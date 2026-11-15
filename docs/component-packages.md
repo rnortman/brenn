@@ -124,9 +124,17 @@ contract: a component that imports it is a 0.2.0 component, told apart by
 `bus@0.2.0`, and names the world `brenn:processor/processor@0.3.0`, which is
 the 0.2.0 world with `blobs` imported. A kind that does not name `blobs` in
 `requires` does not import it, and its artifact, its record and its spec are
-what they were. A kind that does is backend-only — a surface refuses a
-component that imports it, and the word is refused on a placed instance —
-and needs a brenn new enough to link it, by the same ordering rule as `calls`.
+what they were. A kind that does needs a brenn new enough to link it, by the
+same ordering rule as `calls`. The backend serves the whole interface. A
+surface serves the read side — `limits`, `open` and a blob's `size`,
+`content-type` and `read` — and a kind that imports any other function of it,
+`create`, `writer` or `publish` among them, is refused when its artifact is
+checked at boot, naming the function; a kind that only reads may be placed on
+a surface with the `blobs` grant. On a page `open` succeeds for any attachment
+of a message in the activation's windows, and `read` answers `unavailable`
+when the page does not hold that attachment's bytes (`docs/message-bus.md`
+§2.1.2a, "A surface page is a reader by place"); the backend never answers
+`unavailable`.
 Publishing with attachments goes through `blobs.publish`, and a class that
 calls it requires `ports` as well as `blobs`, whether or not it also calls
 `ports.publish`: the function's error type wraps `ports@0.2.0`'s
@@ -137,7 +145,13 @@ stable**: a shape changes in place only while no tagged brenn release has
 served it; a shape a tagged release has served changes only as a new version
 of the interface, served beside the old one for at least one release and
 announced in `CHANGELOG.md`; the old version may be removed one release after
-its replacement, and nothing longer is promised.
+its replacement, and nothing longer is promised. One such in-place change has
+been made: `read-error` gained `unavailable`, last. A component built against
+the earlier shape that calls `blob.read` no longer links and is rebuilt against
+the current `brenn-guest`; one that matches `brenn_guest::blobs::ReadError`
+exhaustively gains an arm for `ReadError::Unavailable`, which the enum carries
+without `#[non_exhaustive]`, so the next variant is a compile error rather than
+a wildcard.
 
 **Blobs and tool calls.** An asynchronous tool call carries named
 attachments by reference in both directions. Three functions of `blobs` are

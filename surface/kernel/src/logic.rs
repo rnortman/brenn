@@ -1065,6 +1065,24 @@ impl KernelCore {
         }
     }
 
+    /// Whether `instance` may open an attachment, and the refusal to report if
+    /// it may not.
+    ///
+    /// The runtime half of the boot gate that refuses a kind importing `blobs`
+    /// without the word in its grants, as [`component_calls_gate`] is for
+    /// `calls`. An ungranted instance's blob scope is empty as well, so the
+    /// refusal is `not-permitted` either way; this is what writes the
+    /// breadcrumb.
+    ///
+    /// [`component_calls_gate`]: Self::component_calls_gate
+    pub fn component_blobs_gate(&self, instance: &str, what: &str) -> Result<(), KernelAction> {
+        if self.instance_granted(instance, ComponentGrant::Blobs) {
+            Ok(())
+        } else {
+            Err(ungranted_capability(instance, ComponentGrant::Blobs, what))
+        }
+    }
+
     /// Whether `instance` has registered an activation entry. The gate's state,
     /// readable so a caller can assert on it.
     #[cfg(test)]
@@ -3570,6 +3588,36 @@ mod tests {
             assert_eq!(subject.as_deref(), Some(instance));
             assert!(message.contains("calls.call"), "{message}");
             assert!(message.contains("calls capability"), "{message}");
+        }
+    }
+
+    /// `blobs` is its own grant: the ports grant every in-tree instance holds
+    /// opens no attachment.
+    #[test]
+    fn the_blobs_gate_admits_only_the_blobs_grant() {
+        let granted = connect(
+            vec![granted_entry("p1", "protobar", &[ComponentGrant::Blobs])],
+            true,
+        );
+        assert_eq!(granted.component_blobs_gate("p1", "blobs.open"), Ok(()));
+
+        let ports_only = connect(
+            vec![granted_entry("p1", "protobar", &[ComponentGrant::Ports])],
+            true,
+        );
+        for instance in ["p1", "ghost"] {
+            let Err(KernelAction::Report {
+                level,
+                message,
+                subject,
+            }) = ports_only.component_blobs_gate(instance, "blobs.open")
+            else {
+                panic!("a blobs-less instance ({instance}) was admitted");
+            };
+            assert_eq!(level, LogLevel::Warn);
+            assert_eq!(subject.as_deref(), Some(instance));
+            assert!(message.contains("blobs.open"), "{message}");
+            assert!(message.contains("blobs capability"), "{message}");
         }
     }
 

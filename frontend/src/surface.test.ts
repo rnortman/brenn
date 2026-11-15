@@ -886,6 +886,22 @@ describe("surface processor bring-up", () => {
             ),
             brenn_processor_load_failed: vi.fn((_i: string, _d: string) => {}),
             brenn_processor_withheld: vi.fn((_i: string, _r: string) => {}),
+            brenn_blobs_limits: vi.fn((_i: string) => ({
+                maxReadBytes: 1048576,
+                maxWriteBytes: 0,
+            })),
+            brenn_blobs_open: vi.fn(
+                (_i: string, _p: string, _x: number, _n: string) => 7,
+            ),
+            brenn_blobs_size: vi.fn((_i: string, _h: number) => 3n),
+            brenn_blobs_content_type: vi.fn(
+                (_i: string, _h: number) => "image/png",
+            ),
+            brenn_blobs_read: vi.fn(
+                (_i: string, _h: number, _o: bigint, _l: number) =>
+                    new Uint8Array([0xff, 0x00]),
+            ),
+            brenn_blobs_drop: vi.fn((_i: string, _h: number) => {}),
             brenn_dom_root: vi.fn((_i: string) => 1n),
             brenn_dom_create_element: vi.fn((_i: string, _t: string) => 1n),
             brenn_dom_set_attribute: vi.fn(
@@ -1176,6 +1192,7 @@ describe("surface processor bring-up", () => {
         // The interfaces both contracts share are the same entries.
         expect(Object.keys(imports).sort()).toEqual([
             "brenn:processor/alert",
+            "brenn:processor/blobs",
             "brenn:processor/calls",
             "brenn:processor/config",
             "brenn:processor/dom",
@@ -1192,6 +1209,76 @@ describe("surface processor bring-up", () => {
             expect.objectContaining({
                 payload: { tag: "invalid-body", val: "why" },
             }),
+        );
+    });
+
+    it("offers a 0.2.0 instance the blobs read side, a fresh class per instantiation", async () => {
+        const kernel = fakeKernel();
+        const tables: Record<string, Record<string, unknown>>[] = [];
+        const instantiate = vi.fn(
+            (_g: unknown, table: Record<string, Record<string, unknown>>) => {
+                tables.push(table);
+                return { receive: vi.fn() };
+            },
+        );
+        const importModule = vi.fn(async () => ({ instantiate }));
+
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            manifest([
+                { ...processorEntry("b1"), contract: "brenn:processor@0.2.0" },
+            ]),
+            ["b1"],
+            importModule as unknown as ModuleImporter,
+        );
+        const entry = kernel.brenn_processor_register.mock
+            .calls[0]?.[1] as unknown as (a: unknown) => unknown;
+        const activation = { ports: [], deferred: [], now: undefined, sync: undefined };
+        entry(activation);
+        entry(activation);
+        expect(tables).toHaveLength(2);
+
+        type BlobClass = new (handle: number) => {
+            size(): bigint;
+            contentType(): string;
+            read(offset: bigint, len: number): Uint8Array;
+        };
+        const first = tables[0]?.["brenn:processor/blobs"] as {
+            limits: () => unknown;
+            open: (port: string, index: number, name: string) => unknown;
+            Blob: BlobClass;
+        };
+        const second = tables[1]?.["brenn:processor/blobs"] as {
+            Blob: BlobClass;
+        };
+        // Each instantiation's glue checks `open`'s answer against its own class.
+        expect(first.Blob).not.toBe(second.Blob);
+        expect(Object.keys(first).sort()).toEqual(["Blob", "limits", "open"]);
+
+        expect(first.limits()).toEqual({ maxReadBytes: 1048576, maxWriteBytes: 0 });
+        const blob = first.open("feed", 2, "frame") as InstanceType<BlobClass>;
+        expect(blob).toBeInstanceOf(first.Blob);
+        expect(kernel.brenn_blobs_open).toHaveBeenCalledWith("b1", "feed", 2, "frame");
+        expect(blob.size()).toBe(3n);
+        expect(blob.contentType()).toBe("image/png");
+        expect(blob.read(1n, 2)).toEqual(new Uint8Array([0xff, 0x00]));
+        expect(kernel.brenn_blobs_size).toHaveBeenCalledWith("b1", 7);
+        expect(kernel.brenn_blobs_content_type).toHaveBeenCalledWith("b1", 7);
+        expect(kernel.brenn_blobs_read).toHaveBeenCalledWith("b1", 7, 1n, 2);
+
+        // The glue's drop path: `Symbol.dispose`, or its registered fallback.
+        const disposeKey =
+            (Symbol as unknown as { dispose?: symbol }).dispose ??
+            Symbol.for("dispose");
+        (blob as unknown as Record<symbol, () => void>)[disposeKey]?.();
+        expect(kernel.brenn_blobs_drop).toHaveBeenCalledWith("b1", 7);
+
+        // A refusal is the kernel's thrown envelope, passed through untouched.
+        kernel.brenn_blobs_open.mockImplementationOnce(() => {
+            throw { payload: { tag: "not-permitted" } };
+        });
+        expect(() => first.open("feed", 9, "frame")).toThrow(
+            expect.objectContaining({ payload: { tag: "not-permitted" } }),
         );
     });
 

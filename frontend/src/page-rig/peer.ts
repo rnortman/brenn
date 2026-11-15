@@ -17,6 +17,11 @@
 // other client frame, a frame of the wrong message type for its kind, a second
 // socket, or a delivery on a channel the kernel never subscribed is a failure.
 //
+// It is the blob door of a page whose `Welcome` opens one: it remembers the
+// bytes of every attachment it delivered, answers a `BlobOpen` of one with its
+// size and type and each `BlobRead` with the range asked for, and forgets a
+// handle at `BlobClose`. A test can script a refusal of the next open or read.
+//
 // It is the deferral authority of every transportable channel, as the server
 // is: a batch entry with a release instant is parked under a minted id for its
 // `(channel, attribution)`, a control op edits or cancels it, and every set a
@@ -42,6 +47,22 @@ export interface BinaryTemplate {
     header: string;
     slots: Record<string, string[]>;
     bodies: string[];
+}
+
+/**
+ * A binary frame whose body section is raw bytes: its header exactly as the
+ * codec wrote it and the JSON pointers of its variable fields.
+ */
+export interface RawTemplate {
+    header: string;
+    slots: Record<string, string[]>;
+}
+
+/** One attachment the peer delivers and serves: its name, bytes and type. */
+export interface RigAttachment {
+    name: string;
+    bytes: Uint8Array;
+    contentType: string;
 }
 
 /** One body as it crosses the wire: its bytes and its content type, if typed. */
@@ -88,6 +109,10 @@ export interface KitPage {
     bytes_wire_channel: string;
     /** The wire channel, declared `non_text`, that wakes `b-stream` on the `measure` page. */
     stream_channel: string;
+    /** The wire channel `p-blobs` reads on `feed` on the `blobs` page, gated at `blobs_fetch_bytes`. */
+    blobs_feed_channel: string;
+    /** The fetch bound of `blobs_feed_channel` on the `blobs` page. */
+    blobs_fetch_bytes: number;
     /** The page-local channel `b-keeper` keeps typed bodies on and `plain` reads. */
     shared_channel: string;
     /** The page-local channel, declared `non_text`, behind `b-keeper`'s `timer` port. */
@@ -118,8 +143,22 @@ export interface Kit {
         publish_batch_result: Template;
     };
     deliver: BinaryTemplate;
-    /** The same one-row `Deliver`, its row naming the attachments `attached`. */
-    deliver_attached: BinaryTemplate;
+    /**
+     * The same one-row `Deliver`, its row naming the attachments `attached`;
+     * `attachments` is the pointer of the header's attachment map.
+     */
+    deliver_attached: BinaryTemplate & { attachments: string };
+    /** One entry of a header's attachment map, by its slots `id`, `size` and `content_type`. */
+    attachment_ref: Template;
+    /** The answers to the blob frames a read-only door sends. */
+    blob_answers: {
+        open_ok: Template;
+        open_not_retained: Template;
+        read_ok: RawTemplate;
+        read_storage_failed: RawTemplate;
+    };
+    /** A bytes-carrying read answer the codec encoded, with what produced it. */
+    blob_read_sample: { values: Record<string, Json>; bytes: string; hex: string };
     /** The attachments `deliver_attached` names, as the header writes them. */
     attached: Json;
     /** `DeferredView` templates, the one at index `n` holding `n` entries. */
@@ -201,16 +240,29 @@ export function split(message: Uint8Array): { header: string; rest: Uint8Array }
 }
 
 /**
+ * Fill a raw binary `template` with `values` and append `bytes` as its body
+ * section.
+ */
+export function fillRaw(template: RawTemplate, values: Record<string, Json>, bytes: Uint8Array): Uint8Array {
+    const header = JSON.parse(template.header) as Json;
+    fillSlots(header, template.slots, values);
+    return assemble(JSON.stringify(header), [bytes]);
+}
+
+/**
  * Fill a binary `template` with `values`, write a descriptor for each of
- * `bodies` and join them into the message the peer sends.
+ * `bodies` and join them into the message the peer sends. `edit`, when given,
+ * changes the filled header before the descriptors are written.
  */
 export function fillBinary(
     template: BinaryTemplate,
     values: Record<string, Json>,
     bodies: RigBody[],
+    edit?: (header: Json) => void,
 ): Uint8Array {
     const header = JSON.parse(template.header) as Json;
     fillSlots(header, template.slots, values);
+    edit?.(header);
     if (bodies.length !== template.bodies.length) {
         throw new Error(
             `the template carries ${template.bodies.length} bodies and was handed ${bodies.length}`,
@@ -259,7 +311,7 @@ function fillSlots(frame: Json, slots: Record<string, string[]>, values: Record<
     }
 }
 
-function setPointer(root: Json, pointer: string, value: Json): void {
+export function setPointer(root: Json, pointer: string, value: Json): void {
     const path = pointer
         .split("/")
         .slice(1)
@@ -329,7 +381,13 @@ export type ClientFrame =
           correlation: number;
           publishes: BatchPublish[];
           deferredOps: BatchOp[];
-      };
+      }
+    | { type: "BlobOpen"; handle: number; channel: string; messageId: string; name: string }
+    | { type: "BlobRead"; correlation: number; handle: number; offset: number; len: number }
+    | { type: "BlobClose"; handle: number };
+
+/** A blob frame the kernel sent. */
+export type BlobFrame = Extract<ClientFrame, { type: "BlobOpen" | "BlobRead" | "BlobClose" }>;
 
 /** The client kinds that travel as binary messages. */
 const BINARY_KINDS = new Set(["Publish", "PublishBatch"]);
@@ -449,6 +507,27 @@ export function readClientFrame(data: string | Uint8Array): ClientFrame {
             };
             break;
         }
+        case "BlobOpen":
+            read = {
+                type,
+                handle: field(frame, "handle", isNumber, type),
+                channel: field(frame, "channel", isString, type),
+                messageId: field(frame, "message_id", isString, type),
+                name: field(frame, "name", isString, type),
+            };
+            break;
+        case "BlobRead":
+            read = {
+                type,
+                correlation: field(frame, "correlation", isNumber, type),
+                handle: field(frame, "handle", isNumber, type),
+                offset: field(frame, "offset", isNumber, type),
+                len: field(frame, "len", isNumber, type),
+            };
+            break;
+        case "BlobClose":
+            read = { type, handle: field(frame, "handle", isNumber, type) };
+            break;
         default:
             throw new Error(`the peer has no answer for a client frame of type '${type}': ${text.slice(0, 300)}`);
     }
@@ -460,6 +539,10 @@ export function readClientFrame(data: string | Uint8Array): ClientFrame {
 
 function parkKey(channel: string, attribution: string): string {
     return JSON.stringify([channel, attribution]);
+}
+
+function attachmentKey(channel: string, messageId: string, name: string): string {
+    return JSON.stringify([channel, messageId, name]);
 }
 
 /** `set` soonest release first, ties in the order parked, as a view states it. */
@@ -527,6 +610,14 @@ export class Peer {
     private readonly seqs = new Map<string, number>();
     /** Each sender's parked set, keyed by `parkKey`, in the order parked. */
     private readonly parkedSets = new Map<string, Parked[]>();
+    /** Every blob frame the kernel sent, in arrival order. */
+    readonly blobFrames: BlobFrame[] = [];
+    /** Every attachment delivered, keyed by `attachmentKey`. */
+    private readonly attachments = new Map<string, RigAttachment>();
+    /** The attachment each open handle holds. */
+    private readonly handles = new Map<number, RigAttachment>();
+    private refuseOpen = false;
+    private failRead = false;
     private helloSeen = false;
     private nextOrder = 0;
     private readonly socketClass: new (url: string) => RigSocket;
@@ -597,24 +688,75 @@ export class Peer {
      * `attached` attachments.
      */
     deliver(channel: string, body: string | RigBody, attached = false): void {
+        this.sendRow(channel, body, attached ? this.kit.deliver_attached : this.kit.deliver);
+    }
+
+    /**
+     * Deliver `body` on `channel` as one row naming `attachments`, and serve
+     * their bytes to the blob frames that ask for them. Only `ephemeral:`
+     * channels, as `deliver`. Returns the row's message id.
+     */
+    deliverAttached(channel: string, body: string | RigBody, attachments: RigAttachment[]): string {
+        const template = this.kit.deliver_attached;
+        return this.sendRow(channel, body, template, (messageId) => {
+            const map: { [name: string]: Json } = {};
+            for (const attachment of attachments) {
+                this.attachments.set(attachmentKey(channel, messageId, attachment.name), attachment);
+                map[attachment.name] = JSON.parse(
+                    fill(this.kit.attachment_ref, {
+                        id: crypto.randomUUID().replace(/-/g, ""),
+                        size: attachment.bytes.length,
+                        content_type: attachment.contentType,
+                    }),
+                ) as Json;
+            }
+            return (header) => setPointer(header, template.attachments, map);
+        });
+    }
+
+    /**
+     * Send `body` on `channel` as one `Deliver` row of `template`: the
+     * channel's next `seq`, a fresh cursor and message id. `edit`, given the
+     * message id, answers the change to make to the filled header. Returns the
+     * message id.
+     */
+    private sendRow(
+        channel: string,
+        body: string | RigBody,
+        template: BinaryTemplate,
+        edit?: (messageId: string) => (header: Json) => void,
+    ): string {
         if (!this.subscribed.has(channel)) {
             this.failures.fatal(`delivery on '${channel}', which the kernel never subscribed`);
         }
         if (!channel.startsWith("ephemeral:")) {
             this.failures.fatal(
-                `delivery on '${channel}': the kit's deliver template types every envelope ` +
-                    "'ephemeral', so it carries only ephemeral: channels",
+                `delivery on '${channel}': the kit's deliver templates type every envelope ` +
+                    "'ephemeral', so they carry only ephemeral: channels",
             );
         }
         const seq = (this.seqs.get(channel) ?? 0) + 1;
         this.seqs.set(channel, seq);
+        const messageId = crypto.randomUUID();
         this.send(
             fillBinary(
-                attached ? this.kit.deliver_attached : this.kit.deliver,
-                { channel, seq, cursor: `rig-${seq}`, message_id: crypto.randomUUID() },
+                template,
+                { channel, seq, cursor: `rig-${seq}`, message_id: messageId },
                 [typeof body === "string" ? textBody(body) : body],
+                edit?.(messageId),
             ),
         );
+        return messageId;
+    }
+
+    /** Answer the next `BlobOpen` as not retained. */
+    refuseNextOpen(): void {
+        this.refuseOpen = true;
+    }
+
+    /** Answer the next `BlobRead` as a storage failure. */
+    failNextRead(): void {
+        this.failRead = true;
     }
 
     private connect(socket: RigSocket): void {
@@ -735,6 +877,70 @@ export class Peer {
                 );
                 return;
             }
+            case "BlobOpen":
+            case "BlobRead":
+            case "BlobClose":
+                this.blobFrames.push(frame);
+                this.answerBlob(frame);
+                return;
+        }
+    }
+
+    /** Answer one blob frame from the attachments delivered. */
+    private answerBlob(frame: BlobFrame): void {
+        const answers = this.kit.blob_answers;
+        switch (frame.type) {
+            case "BlobOpen": {
+                if (this.handles.has(frame.handle)) {
+                    this.failures.fatal(`a BlobOpen under handle ${frame.handle}, which is open`);
+                }
+                if (this.refuseOpen) {
+                    this.refuseOpen = false;
+                    this.sendSoon(fill(answers.open_not_retained, { handle: frame.handle }));
+                    return;
+                }
+                const attachment = this.attachments.get(attachmentKey(frame.channel, frame.messageId, frame.name));
+                if (attachment === undefined) {
+                    this.failures.fatal(
+                        `a BlobOpen of '${frame.name}' of ${frame.messageId} on '${frame.channel}', ` +
+                            "which the peer never delivered",
+                    );
+                }
+                this.handles.set(frame.handle, attachment);
+                this.sendSoon(
+                    fill(answers.open_ok, {
+                        handle: frame.handle,
+                        size: attachment.bytes.length,
+                        content_type: attachment.contentType,
+                    }),
+                );
+                return;
+            }
+            case "BlobRead": {
+                const attachment = this.handles.get(frame.handle);
+                if (attachment === undefined) {
+                    this.failures.fatal(`a BlobRead through handle ${frame.handle}, which is not open`);
+                }
+                if (this.failRead) {
+                    this.failRead = false;
+                    this.sendSoon(fillRaw(answers.read_storage_failed, { correlation: frame.correlation }, new Uint8Array()));
+                    return;
+                }
+                if (frame.offset + frame.len > attachment.bytes.length) {
+                    this.failures.fatal(
+                        `a BlobRead of [${frame.offset}, +${frame.len}) past '${attachment.name}' ` +
+                            `of ${attachment.bytes.length} bytes`,
+                    );
+                }
+                const bytes = attachment.bytes.slice(frame.offset, frame.offset + frame.len);
+                this.sendSoon(fillRaw(answers.read_ok, { correlation: frame.correlation, len: bytes.length }, bytes));
+                return;
+            }
+            case "BlobClose":
+                if (!this.handles.delete(frame.handle)) {
+                    this.failures.fatal(`a BlobClose of handle ${frame.handle}, which is not open`);
+                }
+                return;
         }
     }
 

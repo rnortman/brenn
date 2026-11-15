@@ -65,6 +65,7 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
             .map(|b| brenn_lib::messaging::config::ResolvedWireChannel {
                 address: b.channel_address.clone(),
                 non_text: false,
+                fetch_bytes: 0,
             })
             .collect(),
         subscriptions,

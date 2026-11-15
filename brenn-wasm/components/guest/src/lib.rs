@@ -1451,8 +1451,11 @@ pub mod blobs {
     //!
     //! **Requires grant:** `"blobs"` in the component's grants. If the grant is
     //! absent the host does not link the `brenn:processor/blobs` interface and
-    //! any import of it causes a load-time panic. Backend only: a placed
-    //! instance cannot hold the grant.
+    //! any import of it causes a load-time panic. The backend host serves the
+    //! whole module. A surface host serves [`limits`], [`open`] and [`Blob`]'s
+    //! reads, and refuses at boot a component that calls anything else here;
+    //! there a [`Blob::read`] answers [`ReadError::Unavailable`] for an
+    //! attachment whose bytes the page did not fetch.
     //!
     //! A component names a blob only by a [`Blob`] handle, and gets one in
     //! exactly two ways: [`open`], for an attachment of a message in this
@@ -1513,6 +1516,11 @@ pub mod blobs {
         StorageFailed(String),
         /// The activation has made as many blob calls as the host allows.
         QuotaExceeded,
+        /// The host does not hold these bytes and cannot fetch them inside the
+        /// call. The backend host never answers this; a surface page answers it
+        /// for an attachment it has not fetched, and a later activation may
+        /// find the bytes.
+        Unavailable,
     }
 
     /// Why [`create`] gave no writer.
@@ -1609,6 +1617,7 @@ pub mod blobs {
                 ReadError::TooLarge => failed("read", "too-large"),
                 ReadError::StorageFailed(m) => failed("read", format_args!("storage-failed: {m}")),
                 ReadError::QuotaExceeded => quota("read"),
+                ReadError::Unavailable => failed("read", "unavailable"),
             }
         }
     }

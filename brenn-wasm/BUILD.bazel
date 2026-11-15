@@ -34,6 +34,7 @@ COMPONENT_NAMES = [
     "processor-mem-exhaust",
     "processor-mqtt-test",
     "processor-multiport",
+    "processor-page-blobs-test",
     "processor-page-bytes-test",
     "processor-page-test",
     "processor-provider-test",

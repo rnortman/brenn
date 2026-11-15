@@ -160,7 +160,22 @@ pub struct LocalChannel {
 pub struct WireChannel {
     pub channel: String,
     pub non_text: bool,
+    /// The largest attachment, in bytes, the page fetches on this channel
+    /// before a delivered message enters its window: the largest `fetch_bytes`
+    /// among the surface's bindings of the channel. `0` fetches nothing. At
+    /// most [`PAGE_BLOB_BYTES`].
+    pub fetch_bytes: u64,
 }
+
+/// The fetch bound a surface binding takes when it states no `fetch_bytes`
+/// and its instance is granted `blobs`: 1 MiB. A binding of any other instance
+/// fetches nothing.
+pub const DEFAULT_FETCH_BYTES: u64 = 1 << 20;
+
+/// The most attachment bytes one page holds, fetched or reserved for a fetch
+/// in flight, across every channel: 64 MiB. Also the largest `fetch_bytes` a
+/// binding may state, so a single attachment always fits.
+pub const PAGE_BLOB_BYTES: u64 = 64 << 20;
 
 /// One declared component instance: its routing `instance` id and the component
 /// `kind` that backs it. Several instances may share a kind — one compiled
@@ -492,7 +507,7 @@ pub const CONTROL_PLANE_VERSION: u8 = 1;
 /// serves. A plain number, so this crate takes no dependency on the protocol
 /// crate; the page offers exactly this version and the route serves exactly
 /// this version, so the two move together.
-pub const SURFACE_ATTACH_VERSION: u32 = 5;
+pub const SURFACE_ATTACH_VERSION: u32 = 6;
 
 /// The link state the kernel reports on [`LOCAL_LINK_STATE_CHANNEL`].
 ///

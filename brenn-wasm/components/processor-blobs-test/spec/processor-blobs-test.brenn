@@ -1,8 +1,8 @@
 /// The `blobs` interface's test fixture. Every new text message on `in` is a
-/// script of commands, one per line, run in order against the blob calls; the
-/// result of each is reported in one untyped JSON message on `report`,
-/// published after every other publish of the activation. `a` and `b` are the
-/// ports its publishes name.
+/// script of commands, separated by newlines or `;`, run in order against the
+/// blob calls; the result of each is reported in one untyped JSON message on
+/// `report`, published after every other publish of the activation. `a` and
+/// `b` are the ports its publishes name.
 component ProcessorBlobsTest {
   abi = processor;
   requires = [ports, log, blobs];

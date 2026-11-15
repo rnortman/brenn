@@ -2363,3 +2363,89 @@ fn a_called_peers_effects_precede_the_callers_own_completion() {
         "and the caller's own buffered publish is behind it, not in front: {effects:?}",
     );
 }
+
+/// A `Welcome` opening a read-only blob door.
+fn blob_welcome() -> WireMessage {
+    let facts = pages::facts();
+    frame(&ServerFrame::Welcome {
+        version: facts.version,
+        participant_id: facts.participant_id,
+        session_id: facts.session_id,
+        heartbeat_secs: facts.heartbeat_secs,
+        max_body_bytes: facts.max_body_bytes,
+        max_frame_bytes: facts.max_frame_bytes,
+        alert_granted: facts.alert_granted,
+        blobs: Some(brenn_attach_proto::BlobFacts {
+            max_blob_bytes: 1 << 20,
+            max_chunk_bytes: 256 * 1024,
+            max_handles: 64,
+            max_bytes_held: 4 << 20,
+            max_inflight_reads: 4,
+            upload: false,
+        }),
+    })
+}
+
+/// `p1` reads `WIRE_ONE`, which fetches attachments up to 1 MiB.
+fn gated_doc() -> BindingsDocument {
+    let mut document = fixtures::doc(
+        vec![
+            fixtures::component("p1"),
+            fixtures::component(fixtures::CHROME),
+        ],
+        vec![fixtures::subscription("p1", "in", WIRE_ONE, 4, 0)],
+        Vec::new(),
+        Vec::new(),
+    );
+    document.wire_channels = vec![brenn_surface_schema::WireChannel {
+        fetch_bytes: 1 << 20,
+        ..fixtures::wire(WIRE_ONE)
+    }];
+    document
+}
+
+/// The peer opens nothing it is asked for, so the row is released by its
+/// deadline alone: 3 s for one 10-byte attachment.
+#[tokio::test(start_paused = true)]
+async fn a_held_row_is_released_by_its_fetch_deadline_with_no_other_input() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach_as(&mut running, &feed, blob_welcome(), &gated_doc()).await;
+
+    let seen = Seen::default();
+    mount(&mut running, "p1", quiet(&seen));
+    ack(&controls, &feed, WIRE_ONE).await;
+    let mut row = crate::test_support::frames::row(WIRE_ONE, "framed", 1, 0x9001);
+    row.envelope.attachments = brenn_envelope::Attachments::from_map(
+        [(
+            brenn_envelope::AttachmentName::new("f").expect("a fixture attachment name"),
+            brenn_envelope::BlobRef {
+                id: brenn_envelope::BlobId::new("b1".to_string()),
+                size: 10,
+                content_type: "image/jpeg".into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    );
+    feed.unbounded_send(TransportEvent::Message(frame(&ServerFrame::Deliver {
+        channel: WIRE_ONE.to_string(),
+        rows: vec![row],
+    })))
+    .unwrap();
+
+    settle_until(|| {
+        controls
+            .frames()
+            .iter()
+            .any(|frame| matches!(frame, ClientFrame::BlobOpen { .. }))
+    })
+    .await;
+    tokio::time::advance(Duration::from_millis(2_999)).await;
+    settle().await;
+    assert!(seen.bodies().is_empty(), "held until its deadline");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    settle_until(|| seen.bodies() == ["framed"]).await;
+    running.task.abort();
+}

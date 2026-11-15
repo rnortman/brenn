@@ -298,6 +298,7 @@ pub fn derive_wire_channels(surface: &mut ResolvedSurface) {
             surface.wire_channels.push(ResolvedWireChannel {
                 address,
                 non_text: false,
+                fetch_bytes: 0,
             });
         }
     }

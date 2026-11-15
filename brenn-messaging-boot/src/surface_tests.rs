@@ -562,13 +562,143 @@ fn the_wire_table_holds_each_bound_transportable_channel_once_in_binding_order()
             ResolvedWireChannel {
                 address: "ephemeral:protobar-demo".to_string(),
                 non_text: false,
+                fetch_bytes: 0,
             },
             ResolvedWireChannel {
                 address: "brenn:alerts".to_string(),
                 non_text: false,
+                fetch_bytes: 0,
             },
         ]
     );
+}
+
+/// [`valid_surface_raw`] with `instance` granted `blobs` beside its `ports`.
+fn with_blobs(
+    mut raw: brenn_lib::messaging::config::SurfaceConfigRaw,
+    instance: &str,
+) -> brenn_lib::messaging::config::SurfaceConfigRaw {
+    raw.components
+        .iter_mut()
+        .find(|c| c.kind == instance)
+        .expect("the fixture declares the instance")
+        .grants
+        .push(ComponentGrant::Blobs);
+    raw
+}
+
+/// The fetch bound each wire entry carries: an unstated binding of an instance
+/// granted `blobs` takes the default, one of any other instance fetches
+/// nothing, and an output contributes nothing.
+#[test]
+fn an_unstated_fetch_bound_defaults_by_the_instances_blobs_grant() {
+    let fetch_of = |raw| {
+        let resolved = resolve_surfaces(&[raw], &surface_dir(), &test_globals());
+        resolved[0]
+            .wire_channels
+            .iter()
+            .map(|w| (w.address.clone(), w.fetch_bytes))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        fetch_of(valid_surface_raw()),
+        vec![
+            ("ephemeral:protobar-demo".to_string(), 0),
+            ("brenn:alerts".to_string(), 0),
+        ],
+        "no instance is granted blobs"
+    );
+    assert_eq!(
+        fetch_of(with_blobs(valid_surface_raw(), "protobar")),
+        vec![
+            (
+                "ephemeral:protobar-demo".to_string(),
+                brenn_surface_schema::DEFAULT_FETCH_BYTES
+            ),
+            ("brenn:alerts".to_string(), 0),
+        ],
+        "the granted reader takes the default; its output fetches nothing"
+    );
+}
+
+/// The channel's bound is the largest among its bindings on the surface, in
+/// either order of statement; an explicit `0` fetches nothing for its own
+/// binding and lowers nothing another binding asked for.
+#[test]
+fn the_channels_fetch_bound_folds_its_bindings_by_max() {
+    let resolve = |first: Option<u64>, second: Option<u64>| {
+        let mut raw = with_blobs(with_blobs(valid_surface_raw(), "protobar"), "sidecar");
+        raw.subscriptions[0].fetch_bytes = first;
+        raw.subscriptions.push(SurfaceSubscriptionRaw {
+            fetch_bytes: second,
+            ..surface_sub_raw("ephemeral:protobar-demo", "sidecar", "messages")
+        });
+        resolve_surfaces(&[raw], &surface_dir(), &test_globals())[0].wire_channels[0].fetch_bytes
+    };
+    assert_eq!(resolve(Some(4096), Some(8 << 20)), 8 << 20);
+    assert_eq!(resolve(Some(8 << 20), Some(4096)), 8 << 20);
+    assert_eq!(resolve(Some(0), Some(4096)), 4096);
+    assert_eq!(resolve(Some(0), Some(0)), 0);
+    assert_eq!(
+        resolve(Some(4096), None),
+        brenn_surface_schema::DEFAULT_FETCH_BYTES,
+        "an unstated binding of a granted instance counts at the default"
+    );
+}
+
+/// The cap itself is legal: a single attachment always fits the page.
+#[test]
+fn a_fetch_bound_at_the_page_cap_is_admitted() {
+    let mut raw = with_blobs(valid_surface_raw(), "protobar");
+    raw.subscriptions[0].fetch_bytes = Some(brenn_surface_schema::PAGE_BLOB_BYTES);
+    let resolved = resolve_surfaces(&[raw], &surface_dir(), &test_globals());
+    assert_eq!(
+        resolved[0].wire_channels[0].fetch_bytes,
+        brenn_surface_schema::PAGE_BLOB_BYTES
+    );
+}
+
+#[test]
+#[should_panic(expected = "sets fetch_bytes to 67108865, over the 67108864 bytes a page holds")]
+fn a_fetch_bound_over_the_page_cap_is_refused() {
+    let mut raw = with_blobs(valid_surface_raw(), "protobar");
+    raw.subscriptions[0].fetch_bytes = Some(brenn_surface_schema::PAGE_BLOB_BYTES + 1);
+    resolve_surfaces(&[raw], &surface_dir(), &test_globals());
+}
+
+/// Only an instance granted `blobs` can read what the page fetches, so a bound
+/// stated on any other instance's binding is dead config — `0` included.
+#[test]
+#[should_panic(
+    expected = "port \"messages\" on channel \"ephemeral:protobar-demo\" sets \
+                           fetch_bytes, but the instance is not granted `blobs`"
+)]
+fn a_fetch_bound_on_an_instance_without_the_blobs_grant_is_refused() {
+    let mut raw = valid_surface_raw();
+    raw.subscriptions[0].fetch_bytes = Some(0);
+    resolve_surfaces(&[raw], &surface_dir(), &test_globals());
+}
+
+/// A page-local message never crosses the wire, so it names nothing the page
+/// could fetch.
+#[test]
+#[should_panic(
+    expected = "on channel \"local:page-bus\" sets fetch_bytes, but a page-local \
+                           channel never crosses the wire"
+)]
+fn a_fetch_bound_on_a_page_local_binding_is_refused() {
+    let mut raw = with_blobs(local_surface_raw(), "protobar");
+    raw.subscriptions[0].fetch_bytes = Some(4096);
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
+}
+
+/// A page-local binding of an instance granted `blobs` fetches nothing and
+/// adds no wire entry.
+#[test]
+fn an_unstated_fetch_bound_on_a_page_local_binding_is_zero() {
+    let raw = with_blobs(local_surface_raw(), "protobar");
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
+    assert!(resolved[0].wire_channels.is_empty());
 }
 
 /// A surface bound only to page-local channels has an empty wire table.
@@ -721,10 +851,12 @@ fn a_surface_bound_to_a_non_text_channel_resolves_with_its_declaration() {
             ResolvedWireChannel {
                 address: "ephemeral:protobar-demo".to_string(),
                 non_text: true,
+                fetch_bytes: 0,
             },
             ResolvedWireChannel {
                 address: "brenn:alerts".to_string(),
                 non_text: false,
+                fetch_bytes: 0,
             },
         ]
     );
@@ -2640,6 +2772,7 @@ fn a_local_channel_is_non_text_iff_any_binding_on_it_says_so() {
         local_sub_raw("local:page-bus", "protobar", "in"),
         SurfaceSubscriptionRaw {
             non_text: true,
+            fetch_bytes: None,
             ..local_sub_raw("local:page-bus", "protobar", "in-too")
         },
         local_sub_raw("local:quiet", "protobar", "hush"),
@@ -2682,6 +2815,7 @@ fn non_text_on_a_reserved_plane_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions.push(SurfaceSubscriptionRaw {
         non_text: true,
+        fetch_bytes: None,
         ..surface_sub_raw("local:brenn/theme", "protobar", "theme")
     });
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());

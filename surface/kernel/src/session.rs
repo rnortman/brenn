@@ -49,15 +49,20 @@ use brenn_attach_client::conn::{ConnEvent, DetachReason};
 use brenn_attach_client::publish::{OutboxSteps, TimerChange};
 use brenn_attach_client::router::ReleaseTimer;
 use brenn_attach_proto::{ClientFrame, VersionRange};
+use brenn_surface_schema::LogLevel;
 use brenn_surface_schema::bindings::BindingsDocument;
 
 use crate::activation::{ActivationOutcome, DropVerdicts};
-use crate::command::CommandOutcome;
+use crate::command::{self, Command, CommandOutcome};
+use crate::fetch::{FetchReport, Fetched};
 use crate::flush::Killed;
 use crate::inbound::Inbound;
 use crate::outbound::{PublishAnswer, PublishStatus};
 use crate::outward::{self, Completion, ControlPublish, Released};
 use crate::page::{Configured, Detached, SurfacePage};
+
+/// The producer the fetcher's reports name on the page's error channel.
+const FETCH_REPORT_SOURCE: &str = "kernel:fetch";
 
 /// Something the platform half must know: an attachment's lifecycle, a
 /// component's fate, or the answer to something it asked for.
@@ -209,6 +214,10 @@ pub enum Effect {
     /// it changed, and stated once per turn rather than at each site that could
     /// move it.
     SetReleaseWakeup(ReleaseTimer),
+    /// Re-arm or disarm the attachment-fetch deadline, on the driver's monotonic
+    /// clock: the earliest deadline of a row held for its attachments. Emitted
+    /// only when it changed, and stated once per turn.
+    SetFetchWakeup(Option<Millis>),
     /// Take the attachment fatal with this diagnosis. The connection answers with
     /// its own terminal event, which is where [`Event::Fatal`] is minted — a
     /// fatal is one thing however it was diagnosed.
@@ -247,15 +256,19 @@ impl Reactions {
     }
 
     /// Close the turn: state the confined-release deadline if the soonest parked
-    /// message moved.
+    /// message moved, and the fetch deadline if the earliest held row's moved.
     ///
     /// Stated here rather than at every site that could move one — a park at
-    /// flush, a release sweep, a control op and a discarded store all move it —
-    /// because one restatement over the whole page cannot be forgotten at a new
-    /// site the way per-site arming can.
+    /// flush, a release sweep, a control op and a discarded store all move the
+    /// first; an arrival, a blob answer and a detach move the second — because
+    /// one restatement over the whole page cannot be forgotten at a new site the
+    /// way per-site arming can.
     pub fn end_turn(&mut self, page: &mut SurfacePage) {
         if let Some(timer) = outward::release_wakeup(page) {
             self.effects.push(Effect::SetReleaseWakeup(timer));
+        }
+        if let Some(deadline) = page.fetch.wakeup_change() {
+            self.effects.push(Effect::SetFetchWakeup(deadline));
         }
     }
 
@@ -325,6 +338,7 @@ impl Reactions {
             straggler,
             gap,
             lost_flushes,
+            reports,
         } = inbound;
         self.frames(page, frames);
         for configured in configured {
@@ -362,6 +376,50 @@ impl Reactions {
                 ops = lost.batch.ops.len(),
                 "surface client: a refused flush outlived the outbox that owed it"
             );
+        }
+        self.fetch_reports(page, reports, now, now_ms);
+    }
+
+    /// Fold what a fetch pass produced outside a routed frame: the frames it
+    /// composed, the losses its insertions caused, and its reports.
+    pub fn fetched(&mut self, page: &mut SurfacePage, fetched: Fetched, now: Millis, now_ms: u64) {
+        let Fetched {
+            frames,
+            drops,
+            reports,
+        } = fetched;
+        self.frames(page, frames);
+        self.verdicts(page, drops, now, now_ms);
+        self.fetch_reports(page, reports, now, now_ms);
+    }
+
+    /// Log each fetch report and publish it on the page's error channel through
+    /// the kernel's own report path, which drops it when the wiring publishes
+    /// none or it falls below the floor.
+    fn fetch_reports(
+        &mut self,
+        page: &mut SurfacePage,
+        reports: Vec<FetchReport>,
+        now: Millis,
+        now_ms: u64,
+    ) {
+        for FetchReport { level, message } in reports {
+            match level {
+                LogLevel::Trace | LogLevel::Debug => tracing::debug!("surface client: {message}"),
+                LogLevel::Info => tracing::info!("surface client: {message}"),
+                LogLevel::Warn => tracing::warn!("surface client: {message}"),
+                LogLevel::Error => tracing::error!("surface client: {message}"),
+            }
+            let outcome = command::on_command(
+                page,
+                Command::Report {
+                    level,
+                    source: FETCH_REPORT_SOURCE.to_string(),
+                    message,
+                    subject: None,
+                },
+            );
+            self.command(page, outcome, now, now_ms);
         }
     }
 
@@ -544,7 +602,7 @@ impl Reactions {
         } = steps;
         assert!(
             released.is_empty(),
-            "surface kernel: a v5 session's flush named a blob handle"
+            "surface kernel: a flush named a blob handle, and this kernel names none"
         );
         self.frames(page, frames);
         for toast in outward::parked_drop_notices(&dropped) {
@@ -723,13 +781,13 @@ fn frame_class(frame: &ClientFrame) -> &'static str {
         ClientFrame::Publish { .. } => "Publish",
         ClientFrame::PublishBatch { .. } => "PublishBatch",
         ClientFrame::Alert { .. } => "Alert",
+        ClientFrame::BlobOpen { .. } => "BlobOpen",
+        ClientFrame::BlobRead { .. } => "BlobRead",
+        ClientFrame::BlobClose { .. } => "BlobClose",
         ClientFrame::BlobCreate { .. }
         | ClientFrame::BlobWrite { .. }
-        | ClientFrame::BlobSeal { .. }
-        | ClientFrame::BlobOpen { .. }
-        | ClientFrame::BlobRead { .. }
-        | ClientFrame::BlobClose { .. } => {
-            panic!("surface client: attach v5, which the page speaks, has no blob frame")
+        | ClientFrame::BlobSeal { .. } => {
+            panic!("surface client: the page makes no blob, so it composes no upload frame")
         }
     }
 }

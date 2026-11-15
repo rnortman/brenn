@@ -342,6 +342,33 @@ fn only_the_instances_granted_alert_are_alertable() {
     );
 }
 
+/// **The blob door follows the instances' grants, and is read-only.** A surface
+/// with no instance granted `blobs` admits no blob frame; one instance granted
+/// it opens the door for the surface's sessions, without upload.
+#[test]
+fn the_blob_door_opens_read_only_when_an_instance_is_granted_blobs() {
+    assert_eq!(profile().blob_grant(), None, "no instance holds `blobs`");
+
+    let resolved = SurfaceFixture::new("deskbar", "chrome")
+        .processor("viewer", "frame-viewer", Default::default())
+        .grant("viewer", ComponentGrant::Alert)
+        .build();
+    assert_eq!(
+        build_profile(&resolved).blob_grant(),
+        None,
+        "a grant other than `blobs` opens no door"
+    );
+
+    let resolved = SurfaceFixture::new("deskbar", "chrome")
+        .processor("viewer", "frame-viewer", Default::default())
+        .grant("viewer", ComponentGrant::Blobs)
+        .build();
+    assert_eq!(
+        build_profile(&resolved).blob_grant(),
+        Some(BlobGrant { upload: false })
+    );
+}
+
 /// The burst must cover a boot-valid maximum-size surface's first-connect
 /// reconcile — one `Subscribe` per bound channel in one burst — or a legitimate
 /// connect becomes a violation. Asserted against the binding maximum, so the

@@ -23,15 +23,15 @@ use serde::{Deserialize, Serialize};
 use brenn_envelope::is_local_channel;
 
 use crate::{
-    Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding, WireChannel,
-    is_reserved_local_namespace, reserved_local_channel, surface_bindable_address,
+    Binding, CallBinding, ComponentEntry, LocalChannel, LogLevel, OutputBinding, PAGE_BLOB_BYTES,
+    WireChannel, is_reserved_local_namespace, reserved_local_channel, surface_bindable_address,
     wire_bound_address,
 };
 
 /// The body-schema version stamped on every bindings document. Bumped whenever
 /// the document's shape changes; a reader that does not recognize the value
 /// refuses the document rather than guessing at its fields.
-pub const BINDINGS_DOCUMENT_VERSION: u32 = 7;
+pub const BINDINGS_DOCUMENT_VERSION: u32 = 8;
 
 /// Lowest admissible [`PlatformSection::status_interval_secs`]. The status
 /// channel is a heartbeat, not a meter: below this the kernel would write
@@ -416,6 +416,13 @@ impl BindingsDocument {
                     wc.channel
                 ));
             }
+            if wc.fetch_bytes > PAGE_BLOB_BYTES {
+                return Err(format!(
+                    "bindings document declares wire channel {} with fetch bound {} bytes, over \
+                     the page's {PAGE_BLOB_BYTES}",
+                    wc.channel, wc.fetch_bytes
+                ));
+            }
         }
         let bound_wire: BTreeSet<&str> = self.bound_wire_channels().collect();
         if let Some(missing) = bound_wire.difference(&wire_addresses).next() {
@@ -648,6 +655,7 @@ mod tests {
         WireChannel {
             channel: channel.to_string(),
             non_text,
+            fetch_bytes: 0,
         }
     }
 
@@ -866,19 +874,19 @@ mod tests {
         assert!(err.contains("non_text"), "unexpected: {err}");
     }
 
-    /// A version-6 document is another build's and is refused whatever it
+    /// A version-7 document is another build's and is refused whatever it
     /// holds.
     #[test]
-    fn rejects_a_version_6_document() {
+    fn rejects_a_version_7_document() {
         let mut doc = doc();
-        doc.v = 6;
-        let err = BindingsDocument::parse(&doc.to_body()).expect_err("version 6 is refused");
-        assert!(err.contains("schema version 6"), "unexpected: {err}");
+        doc.v = 7;
+        let err = BindingsDocument::parse(&doc.to_body()).expect_err("version 7 is refused");
+        assert!(err.contains("schema version 7"), "unexpected: {err}");
     }
 
     #[test]
-    fn the_document_version_is_7() {
-        assert_eq!(BINDINGS_DOCUMENT_VERSION, 7);
+    fn the_document_version_is_8() {
+        assert_eq!(BINDINGS_DOCUMENT_VERSION, 8);
     }
 
     /// [`doc`] with `p1`'s `alt` port publishing onto an `ephemeral:` channel
@@ -899,7 +907,7 @@ mod tests {
         let doc = doc_with_non_text_wire_channel();
         let body = doc.to_body();
         assert!(
-            body.contains(r#""wire_channels":[{"channel":"brenn:site.bar.in","non_text":false},{"channel":"ephemeral:site.bar.frames","non_text":true}]"#),
+            body.contains(r#""wire_channels":[{"channel":"brenn:site.bar.in","non_text":false,"fetch_bytes":0},{"channel":"ephemeral:site.bar.frames","non_text":true,"fetch_bytes":0}]"#),
             "{body}"
         );
         assert_eq!(BindingsDocument::parse(&body).unwrap(), doc);
@@ -910,13 +918,49 @@ mod tests {
     fn a_wire_channel_without_the_flag_fails_the_parse() {
         let body = doc().to_body();
         let stripped = body.replacen(
-            r#"{"channel":"brenn:site.bar.in","non_text":false}"#,
-            r#"{"channel":"brenn:site.bar.in"}"#,
+            r#"{"channel":"brenn:site.bar.in","non_text":false,"fetch_bytes":0}"#,
+            r#"{"channel":"brenn:site.bar.in","fetch_bytes":0}"#,
             1,
         );
         assert_ne!(stripped, body, "the fixture carries a wire entry to strip");
         let err = BindingsDocument::parse(&stripped).expect_err("the flag is required");
         assert!(err.contains("non_text"), "unexpected: {err}");
+    }
+
+    /// The fetch bound has no default: a document without it was written by
+    /// another build.
+    #[test]
+    fn a_wire_channel_without_a_fetch_bound_fails_the_parse() {
+        let body = doc().to_body();
+        let stripped = body.replacen(r#","fetch_bytes":0"#, "", 1);
+        assert_ne!(stripped, body, "the fixture carries a fetch bound to strip");
+        let err = BindingsDocument::parse(&stripped).expect_err("the bound is required");
+        assert!(err.contains("fetch_bytes"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn a_fetch_bound_up_to_the_page_cap_round_trips() {
+        let mut doc = doc();
+        doc.wire_channels[0].fetch_bytes = PAGE_BLOB_BYTES;
+        let body = doc.to_body();
+        assert!(
+            body.contains(&format!(r#""fetch_bytes":{PAGE_BLOB_BYTES}"#)),
+            "{body}"
+        );
+        assert_eq!(BindingsDocument::parse(&body).unwrap(), doc);
+    }
+
+    #[test]
+    fn rejects_a_fetch_bound_over_the_page_cap() {
+        let mut doc = doc();
+        doc.wire_channels[0].fetch_bytes = PAGE_BLOB_BYTES + 1;
+        let err = doc
+            .validate()
+            .expect_err("no binding fetches more than the page holds");
+        assert!(
+            err.contains("brenn:site.bar.in") && err.contains("fetch bound"),
+            "{err}"
+        );
     }
 
     #[test]

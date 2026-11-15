@@ -327,6 +327,19 @@ fn a_text_only_refusal_is_unreconcilable_on_the_surface_route() {
     }
 }
 
+/// The page names no blob handle in a publish, so an `AttachmentNotHeld`
+/// answer is unreconcilable rather than a panic.
+#[test]
+fn an_attachment_not_held_refusal_is_unreconcilable_on_the_surface_route() {
+    let bindings = wiring();
+    let mut outbound = SurfaceOutbound::new();
+    publish(&mut outbound, &bindings, "p1", "out", "a", 5);
+    let err = outbound
+        .on_publish_result(Some(0), PublishOutcome::AttachmentNotHeld)
+        .expect_err("the page names no blob handle");
+    assert!(err.contains("AttachmentNotHeld"), "{err}");
+}
+
 #[test]
 fn a_result_this_attachment_never_asked_for_is_unreconcilable() {
     let mut outbound = SurfaceOutbound::new();

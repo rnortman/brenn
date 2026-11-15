@@ -195,6 +195,7 @@ filegroup(
         "//brenn-wasm/components/processor-mem-exhaust:policy_srcs",
         "//brenn-wasm/components/processor-mqtt-test:policy_srcs",
         "//brenn-wasm/components/processor-multiport:policy_srcs",
+        "//brenn-wasm/components/processor-page-blobs-test:policy_srcs",
         "//brenn-wasm/components/processor-page-bytes-test:policy_srcs",
         "//brenn-wasm/components/processor-page-test:policy_srcs",
         "//brenn-wasm/components/processor-provider-test:policy_srcs",

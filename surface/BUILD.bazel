@@ -151,9 +151,9 @@ write_file(
     content = ['{"type": "object"}', ""],
 )
 
-# The page rig's fixture kinds — one raw kind per contract and the guest-SDK
-# kind — staged like served kinds and never served: they are outside
-# `_PROCESSOR_KINDS`, so they are not in `dist`.
+# The page rig's fixture kinds — one raw kind per contract, the guest-SDK
+# kind and the guest-SDK `blobs` reader — staged like served kinds and never
+# served: they are outside `_PROCESSOR_KINDS`, so they are not in `dist`.
 surface_processor_assets(
     name = "processor-page-test_assets",
     component = "//brenn-wasm/components/processor-page-test:component",
@@ -166,6 +166,13 @@ surface_processor_assets(
     component = "//brenn-wasm/components/processor-page-bytes-test:component",
     kind = "processor-page-bytes-test",
     spec = "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
+)
+
+surface_processor_assets(
+    name = "processor-page-blobs-test_assets",
+    component = "//brenn-wasm/components/processor-page-blobs-test:component",
+    kind = "processor-page-blobs-test",
+    spec = "//brenn-wasm/components/processor-page-blobs-test:spec/processor-page-blobs-test.brenn",
 )
 
 surface_processor_assets(
@@ -182,6 +189,7 @@ surface_dist(
     testonly = True,
     dirname = "page-rig-dist",
     stages = [
+        ":processor-page-blobs-test_assets",
         ":processor-page-bytes-test_assets",
         ":processor-page-test_assets",
         ":processor-sdk-bytes-test_assets",

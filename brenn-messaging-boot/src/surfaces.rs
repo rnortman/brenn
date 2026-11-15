@@ -1087,8 +1087,9 @@ pub(crate) fn resolve_surfaces(
         // the channels predictably.
         let mut local_channel_folds: IndexMap<String, LocalChannelFold> = IndexMap::new();
         // Every transportable channel a binding names, with the directory's
-        // `non_text`, in first-binding order: subscriptions, then outputs.
-        let mut wire_channel_table: IndexMap<String, bool> = IndexMap::new();
+        // `non_text` and the largest fetch bound among its subscriptions, in
+        // first-binding order: subscriptions, then outputs.
+        let mut wire_channel_table: IndexMap<String, (bool, u64)> = IndexMap::new();
 
         // Subscriptions (input bindings): item 6 coverage is `allows_channel_access`
         // over the full address. Every *transportable* binding additionally
@@ -1134,7 +1135,7 @@ pub(crate) fn resolve_surfaces(
             {
                 wire_channel_table
                     .entry(channel.clone())
-                    .or_insert(declared);
+                    .or_insert((declared, 0));
             }
             assert!(
                 seen_sub_ports.insert((sub.instance.as_str(), sub.port.as_str())),
@@ -1188,6 +1189,25 @@ pub(crate) fn resolve_surfaces(
                 sub.instance,
                 sub.port,
             );
+            // The page's fetch bound for this binding, folded by max into the
+            // channel's: the page has one window of a channel, so it fetches
+            // for the hungriest binding on it.
+            let fetch_bytes = resolve_fetch_bytes(
+                slug,
+                &context,
+                &channel,
+                local,
+                sub.fetch_bytes,
+                component_grants
+                    .get(sub.instance.as_str())
+                    .is_some_and(|g| g.contains(&ComponentGrant::Blobs)),
+            );
+            if !local {
+                let entry = wire_channel_table
+                    .get_mut(&channel)
+                    .expect("validate_binding declares every transportable channel it admits");
+                entry.1 = entry.1.max(fetch_bytes);
+            }
             // Every binding resolves the same three page-side facts —
             // (push_depth, retain_depth, noise) — down one binding → channel
             // ladder. The one dispatch here is transportability, the one
@@ -1415,7 +1435,7 @@ pub(crate) fn resolve_surfaces(
             {
                 wire_channel_table
                     .entry(channel.clone())
-                    .or_insert(declared);
+                    .or_insert((declared, 0));
             }
             assert!(
                 seen_out_ports.insert((out.instance.as_str(), out.port.as_str())),
@@ -1605,7 +1625,11 @@ pub(crate) fn resolve_surfaces(
 
         let wire_channels = wire_channel_table
             .into_iter()
-            .map(|(address, non_text)| ResolvedWireChannel { address, non_text })
+            .map(|(address, (non_text, fetch_bytes))| ResolvedWireChannel {
+                address,
+                non_text,
+                fetch_bytes,
+            })
             .collect();
 
         let calls = resolve_surface_calls(slug, &resolved_components, &surface.calls);
@@ -1627,6 +1651,55 @@ pub(crate) fn resolve_surfaces(
         });
     }
     result
+}
+
+/// The fetch bound of one surface subscription, in bytes.
+///
+/// A stated bound is legal only on a transportable channel — a page-local
+/// message names no attachment the page could fetch — and only on an instance
+/// granted `blobs`, which alone can read what is fetched; and at most
+/// [`brenn_surface_schema::PAGE_BLOB_BYTES`], the most the page holds. Unstated,
+/// it is [`brenn_surface_schema::DEFAULT_FETCH_BYTES`] for a transportable
+/// binding of an instance granted `blobs` and `0` otherwise.
+///
+/// # Panics
+///
+/// On a stated bound that breaks any of the three rules: dead or impossible
+/// config.
+fn resolve_fetch_bytes(
+    slug: &str,
+    context: &str,
+    channel: &str,
+    local: bool,
+    stated: Option<u64>,
+    granted_blobs: bool,
+) -> u64 {
+    let Some(stated) = stated else {
+        return if granted_blobs && !local {
+            brenn_surface_schema::DEFAULT_FETCH_BYTES
+        } else {
+            0
+        };
+    };
+    assert!(
+        !local,
+        "config: [[surface]] {slug:?}: {context} on channel {channel:?} sets fetch_bytes, but a \
+         page-local channel never crosses the wire and its messages name no attachment the page \
+         could fetch; remove it",
+    );
+    assert!(
+        granted_blobs,
+        "config: [[surface]] {slug:?}: {context} on channel {channel:?} sets fetch_bytes, but the \
+         instance is not granted `blobs` and could never read what the page fetches; grant \
+         `blobs` or remove it",
+    );
+    assert!(
+        stated <= brenn_surface_schema::PAGE_BLOB_BYTES,
+        "config: [[surface]] {slug:?}: {context} on channel {channel:?} sets fetch_bytes to \
+         {stated}, over the {} bytes a page holds of attachments; lower it",
+        brenn_surface_schema::PAGE_BLOB_BYTES,
+    );
+    stated
 }
 
 /// Resolve one surface's `call` bindings, holding each against the instances it

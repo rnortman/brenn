@@ -573,6 +573,29 @@ export interface KernelModule extends WasmModule {
     brenn_processor_load_failed(instance: string, detail: string): void;
     brenn_processor_withheld(instance: string, reason: string): void;
     /**
+     * The read side of `brenn:processor/blobs`. A handle is the kernel's number
+     * for an attachment the activation opened. A refusal is thrown as the
+     * `{ payload: { tag } }` envelope the glue lifts into the WIT error
+     * variant; a handle the kernel does not hold for `instance` is thrown as an
+     * `Error`, the guest's trap.
+     */
+    brenn_blobs_limits(instance: string): BlobLimits;
+    brenn_blobs_open(
+        instance: string,
+        port: string,
+        index: number,
+        name: string,
+    ): number;
+    brenn_blobs_size(instance: string, handle: number): bigint;
+    brenn_blobs_content_type(instance: string, handle: number): string;
+    brenn_blobs_read(
+        instance: string,
+        handle: number,
+        offset: bigint,
+        len: number,
+    ): Uint8Array;
+    brenn_blobs_drop(instance: string, handle: number): void;
+    /**
      * The DOM capability seam. Node handles are the WIT `u64`, so they cross as
      * `bigint`. Every one of these throws on a refusal — an unknown handle, a tag
      * or attribute off the host's allow-list, an ungranted instance — which the
@@ -645,6 +668,12 @@ export interface KernelModule extends WasmModule {
 export interface PortRefusal {
     tag: string;
     val?: string;
+}
+
+/** `blobs.blob-limits` as the glue lowers it. */
+export interface BlobLimits {
+    maxReadBytes: number;
+    maxWriteBytes: number;
 }
 
 /**
@@ -986,7 +1015,63 @@ function processorImportsBytes(
             call: (port: string, body: Body) =>
                 kernel.brenn_processor_call_body(instance, port, body),
         },
+        "brenn:processor/blobs": blobImports(kernel, instance),
         ...sharedImports(kernel, instance),
+    };
+}
+
+/**
+ * The key the transpiled glue calls a resource's drop through:
+ * `Symbol.dispose` where the runtime has it, else `Symbol.for("dispose")` —
+ * the glue's own spelling.
+ */
+const GLUE_DISPOSE: symbol =
+    (Symbol as unknown as { dispose?: symbol }).dispose ?? Symbol.for("dispose");
+
+/**
+ * The read side of `brenn:processor/blobs`: `limits`, `open` and the `Blob`
+ * class, closed over `kernel` and `instance`.
+ *
+ * Made per instantiation, so each guest instance is handed its own class. The
+ * glue requires `open` to return an instance of the class it was given, and
+ * reaches the host's drop only through that instance's `Symbol.dispose`. Every
+ * answer is the kernel's; this holds the handle number and nothing else.
+ *
+ * No `Writer`, `create` or `publish`: a kind importing them is refused before
+ * it is served.
+ */
+function blobImports(
+    kernel: KernelModule,
+    instance: string,
+): Record<string, unknown> {
+    class PageBlob {
+        private readonly handle: number;
+
+        constructor(handle: number) {
+            this.handle = handle;
+        }
+
+        size(): bigint {
+            return kernel.brenn_blobs_size(instance, this.handle);
+        }
+
+        contentType(): string {
+            return kernel.brenn_blobs_content_type(instance, this.handle);
+        }
+
+        read(offset: bigint, len: number): Uint8Array {
+            return kernel.brenn_blobs_read(instance, this.handle, offset, len);
+        }
+
+        [GLUE_DISPOSE](): void {
+            kernel.brenn_blobs_drop(instance, this.handle);
+        }
+    }
+    return {
+        limits: () => kernel.brenn_blobs_limits(instance),
+        open: (port: string, index: number, name: string) =>
+            new PageBlob(kernel.brenn_blobs_open(instance, port, index, name)),
+        Blob: PageBlob,
     };
 }
 
@@ -1239,13 +1324,16 @@ function entryFor(
                 activationEntry,
             );
         }
-        case BYTES_CONTRACT: {
-            const imports = processorImportsBytes(kernel, component.instance);
+        case BYTES_CONTRACT:
+            // The table is built per instantiation: its `Blob` class is the
+            // one that instance's glue checks `open`'s answers against.
             return perActivationEntry(
-                () => mint(imports) as BytesProcessorInstance,
+                () =>
+                    mint(
+                        processorImportsBytes(kernel, component.instance),
+                    ) as BytesProcessorInstance,
                 activationEntryBytes,
             );
-        }
         default:
             return null;
     }

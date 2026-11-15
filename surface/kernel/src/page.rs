@@ -42,6 +42,7 @@ use uuid::Uuid;
 use crate::activation::{DropVerdicts, Schedules};
 use crate::bindings::AppliedBindings;
 use crate::connect::{ConfigApplied, SurfaceConnect};
+use crate::fetch::Fetch;
 use crate::outbound::{LostFlush, PublishAnswer, SurfaceOutbound};
 use crate::planes::SurfacePlanes;
 use crate::registry::{Registrations, StoreReconcile, SurfaceStores, new_stores, reconcile_stores};
@@ -76,6 +77,10 @@ pub struct SurfacePage {
     /// The peer's mirror of what each of the page's senders has parked on a
     /// transportable channel.
     pub views: DeferredViews,
+    /// What the page fetches of delivered attachments: the arrival holds, the
+    /// attachment cache, and the blob plane. Fetched bytes and held rows outlive
+    /// a detach; fetches in flight do not.
+    pub fetch: Fetch,
     /// The publish-body cap the most recent attachment stated, `0` before the
     /// first one.
     ///
@@ -147,20 +152,22 @@ impl SurfacePage {
             schedules: Schedules::new(),
             router: LocalRouter::new(SurfacePlanes::new()),
             views: DeferredViews::new(),
+            fetch: Fetch::new(),
             body_cap: 0,
         }
     }
 
     /// Phase 1: the attachment is live.
     ///
-    /// Four things, and deliberately nothing else. The page takes the
+    /// Five things, and deliberately nothing else. The page takes the
     /// attachment's identity, which is what every confined envelope it mints is
     /// attributed to, and its body cap, which every activation's buffer enforces.
     /// It drops every deferred-view mirror: the peer re-seeds only
     /// the *nonempty* sets, immediately behind its `Welcome`, so an unmentioned
     /// pair means an empty set — and a retained mirror would show a schedule that
-    /// released while the page was away. And it subscribes the config channel,
-    /// which is the one frame this phase sends.
+    /// released while the page was away. It hands the attachment's blob door to
+    /// the fetcher, which sends nothing until a pass runs. And it subscribes the
+    /// config channel, which is the one frame this phase sends.
     ///
     /// The wiring from the previous attachment is untouched. The page is still
     /// running on it, and it is what the document about to arrive is compared
@@ -174,6 +181,7 @@ impl SurfacePage {
         self.router.set_principal(facts.participant_id.clone());
         self.body_cap = facts.max_body_bytes;
         self.views.clear();
+        self.fetch.on_attached(&facts);
         self.connect.on_attached(facts, &mut self.subs)
     }
 
@@ -181,14 +189,16 @@ impl SurfacePage {
     ///
     /// Everything that belonged to the connection goes: the config channel's
     /// subscription, the wire state of every other one, the publishes that were
-    /// awaiting an answer, and the batches that were in flight. Everything that
-    /// belongs to the *page* stays — the wiring, the stores and their positions,
-    /// the resume cursors, the registrations, and every queued flush.
+    /// awaiting an answer, the batches and attachment fetches that were in
+    /// flight. Everything that belongs to the *page* stays — the wiring, the
+    /// stores and their positions, the resume cursors, the registrations, every
+    /// queued flush, the arrival holds and the fetched attachment bytes.
     ///
     /// Tolerates a detach with no attachment behind it: a connection lost while
     /// negotiating reports one, and the page never got a phase 1.
     pub fn on_detached(&mut self) -> Detached {
         self.connect.on_detached(&mut self.subs);
+        self.fetch.on_detached();
         Detached {
             answers: self.outbound.fail_pending(),
             steps: self.outbound.on_detached(),
@@ -252,6 +262,7 @@ impl SurfacePage {
             schedules,
             router,
             views: _,
+            fetch: _,
             body_cap: _,
         } = self;
         let bindings = connect

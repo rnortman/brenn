@@ -6,7 +6,8 @@
 use brenn_attach_client::publish::{FlushBatch, TimerChange};
 use brenn_attach_client::subs::SubscriptionDepths;
 use brenn_attach_proto::{
-    BatchEntry, Cursor, DeferredViewEntry, GapReason, Urgency as WireUrgency,
+    BatchEntry, BlobHandle, BlobOpenOutcome, BlobReadOutcome, Cursor, DeferredViewEntry, GapReason,
+    Urgency as WireUrgency,
 };
 use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
 use brenn_surface_schema::bindings::BindingsDocument;
@@ -949,6 +950,53 @@ fn a_text_only_refusal_of_a_flush_is_fatal_on_the_surface_route() {
     .expect_err("the surface route never sends the refusal");
     assert!(err.contains("TextOnlyChannel"), "{err}");
     assert!(err.contains(&correlation.to_string()), "{err}");
+}
+
+/// The page names no blob handle in a flush, so a server answering one with
+/// `AttachmentNotHeld` is not the server this page was built against.
+#[test]
+fn an_attachment_not_held_refusal_of_a_flush_is_fatal() {
+    let mut page = configured(W::default());
+    let correlation = batch_correlation(&queue_flush(&mut page, 1));
+    let err = on_server_frame(
+        &mut page,
+        ServerFrame::PublishBatchResult {
+            correlation,
+            outcome: PublishBatchOutcome::AttachmentNotHeld,
+        },
+        NOW,
+    )
+    .expect_err("the page names no blob handle");
+    assert!(err.contains("AttachmentNotHeld"), "{err}");
+    assert!(err.contains(&correlation.to_string()), "{err}");
+}
+
+/// A blob answer reaching a page that sent no blob frame for it answers nothing
+/// it asked: fatal on the connection, never a panic, since the frame decodes
+/// under the version the page speaks. A create result is one above all: the
+/// page makes no blob.
+#[test]
+fn a_blob_answer_the_page_never_asked_for_is_fatal() {
+    let frames = [
+        ServerFrame::BlobCreateResult {
+            handle: BlobHandle(1),
+            outcome: brenn_attach_proto::BlobCreateOutcome::Ok,
+        },
+        ServerFrame::BlobOpenResult {
+            handle: BlobHandle(1),
+            outcome: BlobOpenOutcome::NotRetained,
+        },
+        ServerFrame::BlobReadResult {
+            correlation: 2,
+            outcome: BlobReadOutcome::UnknownHandle,
+        },
+    ];
+    for frame in frames {
+        let mut page = configured(W::default());
+        let err = on_server_frame(&mut page, frame, NOW)
+            .expect_err("no blob frame was sent for it to answer");
+        assert!(err.contains("is not owed"), "{err}");
+    }
 }
 
 #[test]

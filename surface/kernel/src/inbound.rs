@@ -20,6 +20,11 @@
 //! - **`DeferredView`** restates what one of the page's senders has parked on one
 //!   transportable channel.
 //!
+//! The four blob answers go to the page's fetcher ([`crate::fetch`]), which also
+//! takes every application row a `Deliver` carries: it stores a row at once, or
+//! holds it in the channel's arrival hold until the attachments the page fetches
+//! of it have settled.
+//!
 //! # One frame, one pass
 //!
 //! [`on_server_frame`] takes exactly one frame and answers [`Inbound`] — frames
@@ -59,6 +64,7 @@ use brenn_attach_proto::{
 
 use crate::activation::DropVerdicts;
 use crate::bindings::channel_carries;
+use crate::fetch::{self, FetchReport, Fetched};
 use crate::outbound::{LostFlush, PublishAnswer};
 use crate::page::{Configured, SurfacePage};
 
@@ -129,6 +135,8 @@ pub struct Inbound {
     pub gap: Option<ChannelGap>,
     /// Flushes lost with the outbox that owed them.
     pub lost_flushes: Vec<LostFlush>,
+    /// What the fetcher reports for the page's error channel.
+    pub reports: Vec<FetchReport>,
 }
 
 /// Route one server frame the connection handed back.
@@ -170,10 +178,10 @@ pub fn on_server_frame(
         ServerFrame::Hello { .. } => unreachable_frame("Hello"),
         ServerFrame::Welcome { .. } => unreachable_frame("Welcome"),
         ServerFrame::Heartbeat => unreachable_frame("Heartbeat"),
-        ServerFrame::BlobCreateResult { .. } => not_a_v5_frame("BlobCreateResult"),
-        ServerFrame::BlobSealResult { .. } => not_a_v5_frame("BlobSealResult"),
-        ServerFrame::BlobOpenResult { .. } => not_a_v5_frame("BlobOpenResult"),
-        ServerFrame::BlobReadResult { .. } => not_a_v5_frame("BlobReadResult"),
+        frame @ (ServerFrame::BlobCreateResult { .. }
+        | ServerFrame::BlobSealResult { .. }
+        | ServerFrame::BlobOpenResult { .. }
+        | ServerFrame::BlobReadResult { .. }) => on_blob_frame(page, frame, now),
     }
 }
 
@@ -181,8 +189,25 @@ fn unreachable_frame(name: &str) -> ! {
     panic!("surface client: the connection consumes {name} itself and routes it to nobody")
 }
 
-fn not_a_v5_frame(name: &str) -> ! {
-    panic!("surface client: attach v5, which the page speaks, has no {name} frame to decode")
+/// Settle one blob answer through the page's fetcher. An answer to a request
+/// the page never made — a create or seal result above all, since the page
+/// makes no blob — is fatal on the connection.
+fn on_blob_frame(
+    page: &mut SurfacePage,
+    frame: ServerFrame,
+    now: Millis,
+) -> Result<Inbound, String> {
+    let Fetched {
+        frames,
+        drops,
+        reports,
+    } = fetch::on_blob_frame(page, frame, now)?;
+    Ok(Inbound {
+        frames,
+        drops,
+        reports,
+        ..Inbound::default()
+    })
 }
 
 /// Settle one channel's `SubscribeResult`.
@@ -299,15 +324,26 @@ fn on_deliver(
         // rides behind them, so its reload is the last word on the pass. A
         // refused document is peer skew, not a broken contract, so it is
         // carried rather than returned as an `Err`.
+        //
+        // Each applied document reconciles the fetcher too: a gated channel
+        // the attachment opened no blob door for is a broken peer, and a
+        // channel the document dropped takes its hold and cache with it.
         let mut configured = Vec::new();
         let mut unusable_document = None;
+        let mut reports = Vec::new();
         for row in &rows {
             let applied = match row.envelope.body.as_text() {
                 Some(text) => page.apply_config(text, now),
                 None => Err("the configuration document is not text".to_string()),
             };
             match applied {
-                Ok(applied) => configured.push(applied),
+                Ok(mut applied) => {
+                    let fetched = fetch::on_config(page, now)?;
+                    applied.frames.extend(fetched.frames);
+                    applied.drops.merge(fetched.drops);
+                    reports.extend(fetched.reports);
+                    configured.push(applied);
+                }
                 Err(detail) => {
                     unusable_document = Some(detail);
                     break;
@@ -317,6 +353,7 @@ fn on_deliver(
         return Ok(Inbound {
             configured,
             unusable_document,
+            reports,
             ..Inbound::default()
         });
     }
@@ -338,28 +375,34 @@ fn on_deliver(
             row.envelope.body.summary()
         ));
     }
-    let overflow = {
-        let store = page.stores.get_mut(&channel).unwrap_or_else(|| {
+    // The peer's figure is the channel's, so every position on it takes the
+    // full count: each of them missed those messages, and no page-side
+    // arithmetic can see a loss that happened upstream of the page.
+    page.stores
+        .get_mut(&channel)
+        .unwrap_or_else(|| {
             panic!("surface client: delivery on {channel:?}, which the page retains nothing for")
-        });
-        // The peer's figure is the channel's, so every position on it takes the
-        // full count: each of them missed those messages, and no page-side
-        // arithmetic can see a loss that happened upstream of the page.
-        store.count_server_drops(accepted);
-        // Idempotent by `message_id`: several legitimate paths re-present what
-        // the store already holds, a resubscribed channel replaying into a store
-        // the page kept most of all.
-        rows.into_iter()
-            .flat_map(|row| store.insert(row.envelope))
-            .collect()
-    };
-    let bindings = page
-        .connect
-        .bindings()
-        .expect("surface client: a subscribed channel implies a document in force");
-    let drops = page.schedules.charge_overflow(bindings, &channel, overflow);
-    Ok(Inbound {
+        })
+        .count_server_drops(accepted);
+    // Inserted by the fetcher, which stores a row in this pass unless the
+    // channel's arrival hold is holding rows or the row names an attachment the
+    // page fetches. Insertion is idempotent by `message_id`: several legitimate
+    // paths re-present what the store already holds, a resubscribed channel
+    // replaying into a store the page kept most of all.
+    let Fetched {
+        frames,
         drops,
+        reports,
+    } = fetch::on_rows(
+        page,
+        &channel,
+        rows.into_iter().map(|row| row.envelope).collect(),
+        now,
+    );
+    Ok(Inbound {
+        frames,
+        drops,
+        reports,
         ..Inbound::default()
     })
 }
@@ -390,13 +433,13 @@ fn on_batch_result(
     now: Millis,
 ) -> Result<Inbound, String> {
     // The surface route answers a non-text body offered to a text-only channel
-    // with a protocol close, never with this outcome, so a peer that sends it
-    // is not the server this page was built against.
-    assert!(
-        outcome != PublishBatchOutcome::AttachmentNotHeld,
-        "surface client: attach v5, which the page speaks, has no AttachmentNotHeld outcome"
-    );
-    if outcome == PublishBatchOutcome::TextOnlyChannel {
+    // with a protocol close, never with that outcome; and the page names no blob
+    // handle in a publish, so the server has no cause to answer that one. A peer
+    // that sends either is not the server this page was built against.
+    if matches!(
+        outcome,
+        PublishBatchOutcome::TextOnlyChannel | PublishBatchOutcome::AttachmentNotHeld
+    ) {
         return Err(format!(
             "PublishBatchResult {correlation} answered {outcome:?}, which the surface route \
              never sends"

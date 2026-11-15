@@ -27,6 +27,7 @@ mod app_parse;
 mod attachment;
 mod config_files;
 mod container;
+mod dsl_fetch_bytes;
 mod dsl_key_parity;
 mod dsl_lower;
 mod dsl_non_text;

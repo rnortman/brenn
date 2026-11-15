@@ -143,7 +143,7 @@ fn an_in_tail_accounts_for_the_consumer_and_surface_families() {
         &consumer,
         InTail::<()>::KEYS,
         &["channel", "port"],
-        &[],
+        &["fetch_bytes"],
     );
 
     // A page's throughput is the page's, not a knob the binding sets.
@@ -156,6 +156,7 @@ fn an_in_tail_accounts_for_the_consumer_and_surface_families() {
         noise,
         wake_min,
         non_text,
+        fetch_bytes,
     });
     assert_tail_parity(
         "surface subscription",

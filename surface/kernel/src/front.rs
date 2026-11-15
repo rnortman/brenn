@@ -63,6 +63,7 @@ use futures_util::Stream;
 use serde_json::Number;
 
 use crate::bindings::channel_is_transportable;
+use crate::blob_scope::BlobScope;
 use crate::outbound::{PublishCheckReject, check_publish};
 use crate::page::SurfacePage;
 use crate::publish_buffer::PublishBuffer;
@@ -198,6 +199,9 @@ pub struct InFlightPublish {
     pub instance: String,
     /// That activation's buffer — the sole quota authority for the call.
     pub buffer: PublishBuffer,
+    /// The attachments that activation may open, and the handles it holds.
+    /// Dropped with the frame, so no handle outlives the activation.
+    pub blobs: BlobScope,
     /// What the peers this entry called have already asked the page to enact.
     ///
     /// A nested call turns the page twice — the callee's assembly and its
@@ -224,11 +228,13 @@ pub struct InFlightPublish {
 pub struct InFlightStack(Vec<InFlightPublish>);
 
 impl InFlightStack {
-    /// Put `instance`'s buffer on the stack for the duration of its entry call.
-    pub fn push(&mut self, instance: &str, buffer: PublishBuffer) {
+    /// Put `instance`'s buffer and blob scope on the stack for the duration of
+    /// its entry call.
+    pub fn push(&mut self, instance: &str, buffer: PublishBuffer, blobs: BlobScope) {
         self.0.push(InFlightPublish {
             instance: instance.to_string(),
             buffer,
+            blobs,
             effects: Vec::new(),
         });
     }
@@ -254,23 +260,24 @@ impl InFlightStack {
         (frame.buffer, frame.effects)
     }
 
-    /// Run `f` against the innermost in-flight activation's buffer, but only when
-    /// that activation is `instance`'s.
+    /// Run `f` against the innermost in-flight activation's frame — its buffer
+    /// and its blob scope — but only when that activation is `instance`'s.
     ///
     /// The innermost and no other: a caller blocked in a `call` is not the entry
-    /// on the stack, and a publish it could still reach from there would join a
-    /// buffer while somebody else's activation runs. Its own frame becomes the top
-    /// again when the callee returns, which is when it can publish again.
+    /// on the stack, and a publish, open or read it could still reach from there
+    /// would act on its frame while somebody else's activation runs. Its own
+    /// frame becomes the top again when the callee returns, which is when it can
+    /// act again.
     pub fn with_innermost<R>(
         &mut self,
         instance: &str,
-        f: impl FnOnce(&mut PublishBuffer) -> R,
+        f: impl FnOnce(&mut InFlightPublish) -> R,
     ) -> Option<R> {
         let frame = self.0.last_mut()?;
         if frame.instance != instance {
             return None;
         }
-        Some(f(&mut frame.buffer))
+        Some(f(frame))
     }
 
     /// The chain a call raised from inside the innermost activation carries:
@@ -314,13 +321,14 @@ pub fn invoke_over_stack(
     slot: &std::cell::RefCell<InFlightStack>,
     instance: &str,
     buffer: PublishBuffer,
+    blobs: BlobScope,
     entry: impl FnOnce() -> crate::activation::ActivationOutcome<GuestBody>,
 ) -> (
     crate::activation::ActivationOutcome<GuestBody>,
     PublishBuffer,
     Vec<Effect>,
 ) {
-    slot.borrow_mut().push(instance, buffer);
+    slot.borrow_mut().push(instance, buffer, blobs);
     let outcome = entry();
     let (buffer, effects) = slot.borrow_mut().pop_of(instance);
     (outcome, buffer, effects)
@@ -746,7 +754,8 @@ impl SurfaceHandle {
         body: brenn_envelope::GuestBody,
         urgency: Option<Urgency>,
     ) -> Option<Result<crate::publish_buffer::Admission, crate::publish_buffer::PublishFault>> {
-        self.with_in_flight(instance, |buffer| {
+        self.with_in_flight(instance, |frame| {
+            let buffer = &mut frame.buffer;
             let before = buffer.dropped();
             let answered = match urgency {
                 Some(urgency) => buffer.publish_with_urgency(port, body, urgency),
@@ -771,7 +780,8 @@ impl SurfaceHandle {
         body: brenn_envelope::GuestBody,
         deliver_after: u64,
     ) -> Option<Result<crate::publish_buffer::Admission, crate::publish_buffer::PublishFault>> {
-        self.with_in_flight(instance, |buffer| {
+        self.with_in_flight(instance, |frame| {
+            let buffer = &mut frame.buffer;
             let before = buffer.dropped();
             let answered = buffer.publish_deferred(port, body, deliver_after);
             answered.map(|()| crate::publish_buffer::Admission::of(before, buffer.dropped()))
@@ -788,7 +798,7 @@ impl SurfaceHandle {
         port: &str,
         index: u32,
     ) -> Option<Result<(), crate::publish_buffer::DeferFault>> {
-        self.with_in_flight(instance, |buffer| buffer.defer_cancel(port, index))
+        self.with_in_flight(instance, |frame| frame.buffer.defer_cancel(port, index))
     }
 
     /// Route an edit of one of this instance's parked messages into the in-flight
@@ -803,8 +813,8 @@ impl SurfaceHandle {
         body: Option<brenn_envelope::GuestBody>,
         deliver_after: Option<u64>,
     ) -> Option<Result<(), crate::publish_buffer::DeferFault>> {
-        self.with_in_flight(instance, |buffer| {
-            buffer.defer_edit(port, index, body, deliver_after)
+        self.with_in_flight(instance, |frame| {
+            frame.buffer.defer_edit(port, index, body, deliver_after)
         })
     }
 
@@ -825,19 +835,21 @@ impl SurfaceHandle {
         instance: &str,
         body: GuestBody,
     ) -> Option<Result<brenn_envelope::MessageBody, brenn_surface_contract::CallError>> {
-        self.with_in_flight(instance, |buffer| buffer.admit_call(body))
+        self.with_in_flight(instance, |frame| frame.buffer.admit_call(body))
     }
 
-    /// [`InFlightStack::with_innermost`] over the shared stack.
+    /// [`InFlightStack::with_innermost`] over the shared stack: `instance`'s
+    /// frame when its activation is the innermost; `None` otherwise — no
+    /// activation in flight, or another instance's.
     ///
-    /// A short synchronous borrow that calls out to nothing: every buffer method
-    /// touches only the buffer. No driver can be holding this cell — each pushed
-    /// its buffer and is blocked in the entry call this dispatch came from.
+    /// A short synchronous borrow. No driver can be holding this cell — each
+    /// pushed its frame and is blocked in the entry call this dispatch came
+    /// from — and `f` must not reach the stack again.
     #[cfg(target_arch = "wasm32")]
-    fn with_in_flight<R>(
+    pub fn with_in_flight<R>(
         &self,
         instance: &str,
-        f: impl FnOnce(&mut PublishBuffer) -> R,
+        f: impl FnOnce(&mut InFlightPublish) -> R,
     ) -> Option<R> {
         self.in_flight.borrow_mut().with_innermost(instance, f)
     }

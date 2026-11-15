@@ -104,6 +104,7 @@ pub fn dispatch(page: &mut SurfacePage, now_ms: u64) -> Option<ReadyActivation> 
         schedules,
         router,
         views,
+        fetch: _,
         body_cap,
     } = page;
     let instance = schedules.ready(registrations, stores)?.to_string();
@@ -198,6 +199,7 @@ pub fn dispatch_sync(
         schedules,
         router,
         views,
+        fetch: _,
         body_cap,
     } = page;
     assert!(
@@ -709,6 +711,7 @@ fn flush_ctx(page: &mut SurfacePage, now: Millis, now_ms: u64) -> FlushCtx<'_, S
         schedules,
         router,
         views: _,
+        fetch: _,
         body_cap: _,
     } = page;
     let bindings = connect

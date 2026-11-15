@@ -444,9 +444,14 @@ impl SurfaceOutbound {
     ) -> Result<Option<PublishAnswer>, String> {
         let tag = self.pending.on_result(correlation)?;
         // The surface route answers a non-text body offered to a text-only
-        // channel with a protocol close, never with this outcome, so a peer that
-        // sends it is not the server this page was built against.
-        if outcome == PublishOutcome::TextOnlyChannel {
+        // channel with a protocol close, never with that outcome; and the page
+        // names no blob handle in a publish, so the server has no cause to answer
+        // that one. A peer that sends either is not the server this page was
+        // built against.
+        if matches!(
+            outcome,
+            PublishOutcome::TextOnlyChannel | PublishOutcome::AttachmentNotHeld
+        ) {
             return Err(format!(
                 "PublishResult {correlation:?} answered {outcome:?}, which the surface route \
                  never sends"
@@ -479,10 +484,9 @@ impl SurfaceOutbound {
                 PublishOutcome::Failed => Err(format!(
                     "PublishResult refused a {kind:?} document the wiring names: {outcome:?}"
                 )),
-                PublishOutcome::TextOnlyChannel => {
+                PublishOutcome::TextOnlyChannel | PublishOutcome::AttachmentNotHeld => {
                     unreachable!("refused above: the surface route never sends {outcome:?}")
                 }
-                PublishOutcome::AttachmentNotHeld => not_a_v5_outcome(),
             },
         }
     }
@@ -780,13 +784,8 @@ fn publish_status(outcome: PublishOutcome) -> PublishStatus {
         PublishOutcome::RateLimited => PublishStatus::RateLimited,
         PublishOutcome::BodyTooLarge { len, max } => PublishStatus::BodyTooLarge { len, max },
         PublishOutcome::Failed => PublishStatus::Failed,
-        PublishOutcome::TextOnlyChannel => {
+        PublishOutcome::TextOnlyChannel | PublishOutcome::AttachmentNotHeld => {
             unreachable!("refused where the result is settled: the surface route never sends it")
         }
-        PublishOutcome::AttachmentNotHeld => not_a_v5_outcome(),
     }
-}
-
-fn not_a_v5_outcome() -> ! {
-    panic!("surface client: attach v5, which the page speaks, has no AttachmentNotHeld outcome")
 }

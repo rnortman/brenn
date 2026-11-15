@@ -397,6 +397,7 @@ impl Blobs for SdkBlobs<'_> {
                 blobs::ReadError::TooLarge => ReadError::TooLarge,
                 blobs::ReadError::StorageFailed(detail) => ReadError::Storage(detail),
                 blobs::ReadError::QuotaExceeded => ReadError::Quota,
+                blobs::ReadError::Unavailable => ReadError::Unavailable,
             })
     }
 

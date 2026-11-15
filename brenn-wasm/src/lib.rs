@@ -53,7 +53,7 @@ pub use brenn_messaging_store::blob::HeldAttachments;
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
 /// links and what an operator writes are one set of words, and a caller
 /// building a `ProcessorLoadSpec` names them without reaching past this crate.
-pub use brenn_envelope::grants::{ComponentGrant, ComponentHost, ProcessorContract};
+pub use brenn_envelope::grants::{ComponentGrant, ComponentHost, ProcessorContract, ServedMembers};
 
 /// Grace period added on top of SKEW_WINDOW_MS when computing the `last` namespace prune cutoff.
 ///
@@ -3635,15 +3635,26 @@ pub fn processor_component_imports(component_path: &Path) -> Vec<String> {
 }
 
 /// The stage at which [`check_surface_component`] refused an artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceComponentStage {
     /// The artifact is not a component, is not on `brenn:processor@0.2.0`, or
     /// imports an interface name the surface host does not serve under it.
     Name,
-    /// A function the artifact imports from `ports@0.2.0` or `calls@0.2.0`,
-    /// under any name the name stage accepts, does not have the host's type or
-    /// is not one the host has; or an import under a served name is not an
-    /// interface.
+    /// The artifact imports a function or resource of an interface the surface
+    /// host serves only in part ([`ServedMembers::Only`]), and that member is
+    /// not one it serves.
+    Member {
+        /// The interface as the artifact imports it, alias included.
+        interface: String,
+        /// The member's name as the component model reports it.
+        member: String,
+        /// The members the host serves of that interface.
+        served: &'static [&'static str],
+    },
+    /// A function the artifact imports from `ports@0.2.0`, `calls@0.2.0` or
+    /// `blobs@0.3.0`, under any name the name stage accepts, does not have the
+    /// host's type or is not one the host has; or an import under a served
+    /// name is not an interface.
     ImportType,
     /// The artifact's `receive` export does not have the host's type.
     ExportType,
@@ -3653,6 +3664,7 @@ impl std::fmt::Display for SurfaceComponentStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Name => "by import name",
+            Self::Member { .. } => "by imported member",
             Self::ImportType => "by import type",
             Self::ExportType => "by export type",
         })
@@ -3692,10 +3704,26 @@ fn surface_v0_2_import_names() -> Vec<&'static str> {
         .collect()
 }
 
+/// The interfaces a surface host serves only in part, by the name each is
+/// linked under, with the members it serves.
+fn surface_partly_served() -> Vec<(&'static str, &'static [&'static str])> {
+    ComponentGrant::ALL
+        .into_iter()
+        .filter(|grant| grant.illegal_on(ComponentHost::Surface).is_none())
+        .filter_map(|grant| match grant.served_members(ComponentHost::Surface) {
+            ServedMembers::All => None,
+            ServedMembers::Only(members) => grant
+                .wit_import(ProcessorContract::V0_2)
+                .map(|import| (import, members)),
+        })
+        .collect()
+}
+
 /// Whether a surface kind's component is built against the shapes this host
-/// serves as `brenn:processor@0.2.0`: its import names, the types of the
-/// `ports` and `calls` functions it imports, and the type of its `receive`
-/// export. Compiles the component from `bytes`, the artifact's contents, and
+/// serves as `brenn:processor@0.2.0`: its import names, the members it imports
+/// of an interface the host serves in part, the types of the `ports`, `calls`
+/// and `blobs` functions it imports, and the type of its `receive` export.
+/// Compiles the component from `bytes`, the artifact's contents, and
 /// instantiates nothing. The caller reads the file, so an I/O failure is its to
 /// name and never a refusal.
 ///
@@ -3747,29 +3775,78 @@ pub fn check_surface_component(bytes: &[u8]) -> Result<(), SurfaceComponentRefus
         ));
     }
 
-    // `ports@0.2.0` and `calls@0.2.0` are linked with the backend's statically
-    // typed definitions, so `instantiate_pre` type-checks each function the
-    // artifact imports from them, and with them every `bus@0.2.0` type. The
-    // names they are linked under are listed here, beside the definitions,
-    // because the stub pass must define nothing under any name that aliases
-    // one: wasmtime looks an import up by its exact name first, so a stub
-    // instance under the artifact's own `…/ports@0.2.1` would be found
+    // An interface served in part: every function or resource the artifact
+    // imports of it, under the served name or any semver-compatible alias the
+    // typed definition below answers to, must be one the host serves. Types
+    // cross no boundary unless a function uses them, so they pass.
+    {
+        use wasmtime::component::types::ComponentItem;
+        let partly = surface_partly_served();
+        for (name, import) in component_type.imports(&engine) {
+            let Some((_, served)) = partly
+                .iter()
+                .find(|(linked, _)| semver_compat_match(name, linked))
+            else {
+                continue;
+            };
+            // A served name imported as something other than an instance is
+            // refused at the type stage, as every served name is.
+            let ComponentItem::ComponentInstance(instance) = import.ty else {
+                continue;
+            };
+            for (member, export) in instance.exports(&engine) {
+                if matches!(export.ty, ComponentItem::Type(_)) || served.contains(&member) {
+                    continue;
+                }
+                return Err(refuse(
+                    SurfaceComponentStage::Member {
+                        interface: name.to_string(),
+                        member: member.to_string(),
+                        served,
+                    },
+                    format!(
+                        "it imports {member:?} of {name:?}, which a surface host does not serve; \
+                         served: {}",
+                        served.join(", "),
+                    ),
+                ));
+            }
+        }
+    }
+
+    // `ports@0.2.0`, `calls@0.2.0` and `blobs@0.3.0` are linked with the
+    // backend's statically typed definitions, so `instantiate_pre` type-checks
+    // each function the artifact imports from them, and with them every
+    // `bus@0.2.0` type. Linking the whole of `blobs` is safe: the member stage
+    // has refused every function of it a surface does not serve, under every
+    // name the typed definition answers to. Nothing is instantiated, so no
+    // backend implementation runs. The names they are linked under are listed
+    // here, beside the definitions, because the stub pass must define nothing
+    // under any name that aliases one: wasmtime looks an import up by its
+    // exact name first, so a stub instance under the artifact's own `…/ports@0.2.1` would be found
     // before the typed `…/ports@0.2.0` and shadow it.
     let mut linker: Linker<ProcessorData> = Linker::new(&engine);
     ports_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(&mut linker, |d| d)
         .unwrap_or_else(|e| panic!("failed to add the 0.2.0 ports to a surface check: {e}"));
     calls_v0_2::add_to_linker::<_, HasSelf<ProcessorData>>(&mut linker, |d| d)
         .unwrap_or_else(|e| panic!("failed to add the 0.2.0 calls to a surface check: {e}"));
-    let typed: Vec<&'static str> = [ComponentGrant::Ports, ComponentGrant::Calls]
-        .into_iter()
-        .map(|grant| {
-            grant
-                .wit_import(ProcessorContract::V0_2)
-                .unwrap_or_else(|| {
-                    panic!("{} has no {} import", grant.word(), ProcessorContract::V0_2)
-                })
-        })
-        .collect();
+    processor_v0_3_bindings::brenn::processor0_3_0::blobs::add_to_linker::<
+        _,
+        HasSelf<ProcessorData>,
+    >(&mut linker, |d| d)
+    .unwrap_or_else(|e| panic!("failed to add the 0.3.0 blobs to a surface check: {e}"));
+    let typed: Vec<&'static str> = [
+        ComponentGrant::Ports,
+        ComponentGrant::Calls,
+        ComponentGrant::Blobs,
+    ]
+    .into_iter()
+    .map(|grant| {
+        grant
+            .wit_import(ProcessorContract::V0_2)
+            .unwrap_or_else(|| panic!("{} has no {} import", grant.word(), ProcessorContract::V0_2))
+    })
+    .collect();
     stub_untyped_surface_imports(&mut linker, &engine, &component, &typed)
         .map_err(|e| refuse(SurfaceComponentStage::ImportType, format!("{e:#}")))?;
     let instance_pre = linker

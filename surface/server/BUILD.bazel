@@ -52,8 +52,9 @@ rust_test(
     crate_features = ["testutils"],
     # One asset-validation test reads the shipped store-rt component to pin its
     # own premise — that the artifact really does import `brenn:processor/store`;
-    # the byte-contract tests install the bytes fixture and the stale one as
-    # kinds, so the type check runs over real artifacts.
+    # the byte-contract tests install the bytes fixture, the stale one and the
+    # blobs one as kinds, so the type and member checks run over real artifacts;
+    # the grant test installs the page's blobs fixture, which passes them.
     # Tests reach guest components at `brenn-wasm/target/components/`, relative
     # to the runfiles root. The emitter-parity test reaches the record emitter
     # and the library it sources the same way, and hands what it writes to the
@@ -61,6 +62,8 @@ rust_test(
     # hand-held against the source, like the other fifteen.
     data = [
         "//bazel/wasm:wit_lib.sh",
+        "//brenn-wasm:fixture_processor_blobs_test",
+        "//brenn-wasm:fixture_processor_page_blobs_test",
         "//brenn-wasm:fixture_processor_bytes_test",
         "//brenn-wasm:fixture_processor_stale_contract_test",
         "//brenn-wasm:fixture_processor_store_rt",

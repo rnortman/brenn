@@ -702,6 +702,14 @@ mod tests {
         ));
     }
 
+    /// `unavailable` is a surface page's answer. A held read maps `Io` to
+    /// `storage-failed` and panics on every other `BlobError` (the two
+    /// `read_panics_*` tests below), so no backend path answers it.
+    #[test]
+    fn the_backend_never_answers_unavailable() {
+        assert!(matches!(read_error(io()), wit::ReadError::StorageFailed(_)));
+    }
+
     #[test]
     #[should_panic(expected = "blobs.read on a held blob drew NotFound")]
     fn read_panics_on_not_found() {

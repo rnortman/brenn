@@ -464,6 +464,38 @@ fn carries_non_text_answers_the_wire_tables_declaration() {
     );
 }
 
+/// The fetch bound is indexed per channel off the wire table: a channel whose
+/// entry states one answers it, every other channel answers 0, and the bound
+/// is part of the wiring.
+#[test]
+fn fetch_bound_answers_the_wire_tables_bound_per_channel() {
+    let bound_at = |fetch_bytes: u64| {
+        let mut document = doc();
+        document
+            .wire_channels
+            .iter_mut()
+            .find(|w| w.channel == WIRE)
+            .expect("the fixture's input channel has a wire entry")
+            .fetch_bytes = fetch_bytes;
+        applied(&document)
+    };
+    let gated = bound_at(4096);
+    assert_eq!(gated.fetch_bound(WIRE), 4096);
+    assert_eq!(gated.fetch_bound(OTHER_WIRE), 0, "its entry states 0");
+    assert_eq!(gated.fetch_bound(LOCAL_THEME_CHANNEL), 0, "page-local");
+    assert_eq!(
+        gated.fetch_bound("ephemeral:site.bar.undeclared"),
+        0,
+        "a channel the document does not name"
+    );
+    let ungated = bound_at(0);
+    assert_eq!(ungated.fetch_bound(WIRE), 0);
+    assert!(
+        !gated.same_wiring_as(&ungated),
+        "the bound is part of the wiring"
+    );
+}
+
 /// The standard document plus `local:page/blob`, declared or not.
 fn applied_with_blob(non_text: bool) -> AppliedBindings {
     let mut document = doc();

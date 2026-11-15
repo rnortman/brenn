@@ -64,6 +64,14 @@ pub mod page;
 /// routed into the page's tables.
 pub mod inbound;
 
+/// What the page fetches of delivered attachments: the arrival hold, the
+/// attachment cache, and the blob plane that fills it.
+pub mod fetch;
+
+/// What one activation may open of the attachments in its windows, and the
+/// blob handles it holds.
+pub mod blob_scope;
+
 /// The outward half of a turn: activation dispatch and completion, the confined
 /// release pass, the outbox retry, and what the page says about a loss.
 pub mod outward;

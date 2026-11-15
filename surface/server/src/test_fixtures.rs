@@ -188,6 +188,7 @@ pub fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
             vec![brenn_lib::messaging::config::ResolvedWireChannel {
                 address: channel_address.to_string(),
                 non_text: false,
+                fetch_bytes: 0,
             }]
         },
         outputs: vec![SurfaceOutput {

@@ -76,6 +76,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use std::task::Poll;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_channel::mpsc;
@@ -242,6 +243,10 @@ pub struct SurfaceRunner<C: TransportConnector> {
     /// resolve nothing against a clock, and reading a broken one would panic
     /// instead of reporting.
     clock_usable: bool,
+    /// The attachment-fetch deadline the page last stated, on the driver's
+    /// monotonic clock. Raced in the live loop beside the driver's own wait; the
+    /// driver knows nothing of it.
+    fetch_wakeup: Option<Millis>,
 }
 
 /// One entry call, as it came back: how it finished, the buffer it left, and what
@@ -313,6 +318,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             gate,
             owed_mounts: Vec::new(),
             clock_usable: true,
+            fetch_wakeup: None,
         }
     }
 
@@ -506,6 +512,9 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         // borrow of the page cell, and the arm below holds its future across an
         // await that the sync door can run inside of.
         let has_ready = self.has_ready();
+        let fetch_in = self
+            .fetch_wakeup
+            .map(|deadline| Duration::from_millis(deadline.0.saturating_sub(self.driver.now().0)));
         let woke = {
             let Self {
                 driver,
@@ -550,9 +559,29 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 }
             }
             .fuse();
-            pin_mut!(io, effects, control, publish, alert, telemetry, activations);
+            // Pending forever while no held row has a deadline. Inside a connect
+            // attempt this loop does not run, so a deadline that falls there
+            // fires once the attempt settles.
+            let fetch_due = async {
+                match fetch_in {
+                    Some(wait) => brenn_attach_client::transport::timer::sleep(wait).await,
+                    None => future::pending::<()>().await,
+                }
+            }
+            .fuse();
+            pin_mut!(
+                io,
+                fetch_due,
+                effects,
+                control,
+                publish,
+                alert,
+                telemetry,
+                activations
+            );
             select_biased! {
                 event = io => Woke::Io(event),
+                () = fetch_due => Woke::FetchDue,
                 effects = effects => Woke::Front(FrontWoke::Effects(effects)),
                 command = control => Woke::Front(FrontWoke::Control(command)),
                 command = publish => Woke::Front(FrontWoke::Publish(command)),
@@ -566,7 +595,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         // turn *newer* than anything the door already took. So its queue is
         // emptied first, or an older turn's effects would be enacted after a
         // younger turn's.
-        if matches!(woke, Woke::Io(_)) {
+        if matches!(woke, Woke::Io(_) | Woke::FetchDue) {
             self.drain_effects().await;
         }
         match woke {
@@ -581,6 +610,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             Woke::Io(IoEvent::ReleaseDue { now_ms }) => {
                 self.turn_at(Input::ReleaseDue, now_ms).await;
             }
+            Woke::FetchDue => self.turn(Input::FetchDue).await,
             Woke::Front(front) => self.serve(front).await,
             // Nothing to serve: the readiness and the positions behind it are the
             // page's already, and the pass at the end of the loop is what takes
@@ -886,7 +916,14 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            invoke_shared(&self.entries, &self.in_flight, instance, activation, buffer)
+            invoke_shared(
+                &self.page,
+                &self.entries,
+                &self.in_flight,
+                instance,
+                activation,
+                buffer,
+            )
         }
     }
 
@@ -1187,6 +1224,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 }
                 Effect::SetRetryWakeup(change) => self.driver.set_retry_wakeup(Some(change)),
                 Effect::SetReleaseWakeup(change) => self.driver.set_release_wakeup(Some(change)),
+                Effect::SetFetchWakeup(deadline) => self.fetch_wakeup = deadline,
                 Effect::GoFatal { detail } => {
                     let step = self.driver.host_fatal(detail).await;
                     wire_lost = true;
@@ -1264,8 +1302,12 @@ fn missing_entry_trap() -> ActivationOutcome<GuestBody> {
 
 /// The browser's invocation against the shared entry table, so the run and the
 /// sync door reach a component's entry exactly the same way.
+///
+/// The activation's blob scope is built here, from the bindings the activation
+/// was assembled under, in a page borrow released before the entry is called.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn invoke_shared(
+    page: &SharedPage,
     entries: &SharedEntries,
     slot: &crate::front::InFlightSlot,
     instance: &str,
@@ -1273,10 +1315,18 @@ pub(crate) fn invoke_shared(
     buffer: PublishBuffer,
 ) -> (ActivationOutcome<GuestBody>, PublishBuffer, Vec<Effect>) {
     let entries = entries.borrow();
-    match entries.get(instance) {
-        Some(entry) => invoke_wasm(entry, activation, slot, instance, buffer),
-        None => (missing_entry_trap(), buffer, Vec::new()),
-    }
+    let Some(entry) = entries.get(instance) else {
+        return (missing_entry_trap(), buffer, Vec::new());
+    };
+    let blobs = {
+        let page = page.borrow();
+        let bindings = page
+            .connect
+            .bindings()
+            .expect("surface runner: an activation was assembled with no bindings in force");
+        crate::blob_scope::BlobScope::of(bindings, instance, activation)
+    };
+    invoke_wasm(entry, activation, slot, instance, buffer, blobs)
 }
 
 /// The native build's invocation.
@@ -1349,7 +1399,8 @@ fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// a `dom` entry publishes by dispatching an event, which surfaces on the kernel's
 /// root listener — a code path that cannot reach the buffer on this stack.
 /// Installed for exactly the duration of the call and taken back on return, so no
-/// publish can find a buffer outside an activation.
+/// publish can find a buffer outside an activation. The blob scope rides on the
+/// same frame for the same reason.
 #[cfg(target_arch = "wasm32")]
 fn invoke_wasm(
     entry: &ActivationEntry,
@@ -1357,8 +1408,9 @@ fn invoke_wasm(
     slot: &crate::front::InFlightSlot,
     instance: &str,
     buffer: PublishBuffer,
+    blobs: crate::blob_scope::BlobScope,
 ) -> (ActivationOutcome<GuestBody>, PublishBuffer, Vec<Effect>) {
-    crate::front::invoke_over_stack(slot, instance, buffer, || entry(activation))
+    crate::front::invoke_over_stack(slot, instance, buffer, blobs, || entry(activation))
 }
 
 /// Hand the executor control once, then resolve.
@@ -1458,6 +1510,8 @@ fn telemetry_command(document: TelemetryCommand) -> Command {
 /// Which arm of the live select fired.
 enum Woke {
     Io(IoEvent),
+    /// The attachment-fetch deadline the page stated has passed.
+    FetchDue,
     Front(FrontWoke),
     /// An instance is dispatchable; the pass at the end of the loop takes it.
     Activations,

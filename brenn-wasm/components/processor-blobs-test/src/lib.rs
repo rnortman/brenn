@@ -1,9 +1,9 @@
 // The `blobs` interface's test fixture, built on the guest SDK.
 //
-// Every new text message on `in` is a script: one command per line, run in
-// order. Each command appends one result word to the activation's report, a
-// JSON object `{"results": [...]}` published untyped on `report` after every
-// other publish of the activation. A script that runs `fail` or `trap` ends
+// Every new text message on `in` is a script: commands separated by newlines
+// or `;`, run in order. Each command appends one result word to the
+// activation's report, a JSON object `{"results": [...]}` published untyped on
+// `report` after every other publish of the activation. A script that runs `fail` or `trap` ends
 // the activation there and publishes no report.
 //
 // Handles live in two numbered lists for the activation: blobs (from `open`,
@@ -25,7 +25,7 @@
 //   create <content-type>          -> writer:<n> | <create-error>
 //   write <w> <offset> <hex>       -> ok | <write-error>
 //   fill <w> <offset> <len>        -> ok | <write-error>; byte i of the
-//                                     pattern is (offset + i) * 31 + 7 mod 256
+//                                     pattern is (offset + i) * 31 + 7 mod 251
 //   seal <w>                       -> blob:<n> | gap:<offset>:<len> | quota-exceeded
 //   drop-writer <w>                -> ok
 //   spent <write|seal|drop>        -> through the raw binding, which the SDK's
@@ -82,6 +82,7 @@ fn read_word(e: &ReadError) -> String {
         ReadError::TooLarge => "too-large".to_string(),
         ReadError::StorageFailed(_) => "storage-failed".to_string(),
         ReadError::QuotaExceeded => "quota-exceeded".to_string(),
+        ReadError::Unavailable => "unavailable".to_string(),
     }
 }
 
@@ -208,7 +209,7 @@ impl Script {
         let fresh = !matches!(&self.pattern, Some((o, l, _)) if *o == offset && *l == len);
         if fresh {
             let bytes = (0..len as u64)
-                .map(|i| ((offset + i).wrapping_mul(31).wrapping_add(7) % 256) as u8)
+                .map(|i| ((offset + i).wrapping_mul(31).wrapping_add(7) % 251) as u8)
                 .collect();
             self.pattern = Some((offset, len, bytes));
         }
@@ -471,11 +472,15 @@ impl Processor for ProcessorBlobsTest {
             let Ok(text) = this.body().as_text() else {
                 continue;
             };
+            let lines: Vec<&str> = text
+                .split(['\n', ';'])
+                .filter(|l| !l.trim().is_empty())
+                .collect();
             log::info(format_args!(
-                "blobs-test: script of {} lines",
-                text.lines().count()
+                "blobs-test: script of {} commands",
+                lines.len()
             ));
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            for line in lines {
                 match script.run(&activation, this, line) {
                     Ok(result) => script.results.push(result),
                     Err(Stop::Fail) => {

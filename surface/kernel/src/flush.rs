@@ -235,7 +235,7 @@ pub fn kill<P>(ctx: &mut FlushCtx<'_, P>, instance: &str) -> Killed {
     } = ctx.outbound.discard_parked(instance, ctx.now);
     assert!(
         released.is_empty(),
-        "surface kernel: a v5 session's flush named a blob handle"
+        "surface kernel: a flush named a blob handle, and this kernel names none"
     );
     Killed {
         first: true,

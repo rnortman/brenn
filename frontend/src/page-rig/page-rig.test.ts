@@ -19,6 +19,7 @@ import {
     only,
     openPage,
     stringReport,
+    windowsOf,
 } from "./page.js";
 import { expectConsoleError } from "../test-setup.js";
 import {
@@ -127,7 +128,7 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         for (const instance of instances) {
             const [mount] = page.reports(instance);
             expect(mount?.results).toEqual([]);
-            for (const window of mount?.windows ?? []) {
+            for (const window of mount === undefined ? [] : windowsOf(mount)) {
                 expect(window.envelopes).toEqual([]);
             }
         }
@@ -243,7 +244,7 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
         const generated = generatedState(1024);
         expect(results).toEqual([0, 1, 2].map((steps) => expectedState(generated, steps)));
         for (const report of rig().reports("stater")) {
-            expect(report.windows).toEqual([]);
+            expect(windowsOf(report)).toEqual([]);
         }
     });
 
@@ -261,9 +262,12 @@ describe("page rig: kernel bundle, surface.ts and a transpiled kind in node", ()
     it("reads every client frame sample the kit emits", () => {
         // Every value, not only the type: an optional field read under a name
         // Rust no longer writes would come back null or empty, not throw.
-        const frames = rig().kit.client_samples.map((sample) =>
-            readClientFrame("text" in sample ? sample.text : bytesOfHex(sample.hex)),
-        );
+        // Blob frames are covered by page-rig-blobs.test.ts, whose door sends them.
+        const frames = rig()
+            .kit.client_samples.map((sample) =>
+                readClientFrame("text" in sample ? sample.text : bytesOfHex(sample.hex)),
+            )
+            .filter((frame) => !frame.type.startsWith("Blob"));
         const body = (hex: string, contentType: string | null) => ({
             bytes: bytesOfHex(hex),
             contentType,

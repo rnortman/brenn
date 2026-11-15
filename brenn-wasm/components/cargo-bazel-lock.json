@@ -1,5 +1,5 @@
 {
-  "checksum": "1b2f916123f9dcb36e5e709c1a644e7dd545b6395b62ab091a0baed23aea0ee7",
+  "checksum": "f0b4761f2efffa61550b0cdff4dd51c784f5806e8d577744c3f3722e5876c5b8",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -924,6 +924,24 @@
           ],
           "selects": {}
         },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-page-blobs-test 0.1.0": {
+      "name": "brenn-processor-page-blobs-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
         "edition": "2024",
         "version": "0.1.0"
       },
@@ -4573,6 +4591,7 @@
     "brenn-processor-mem-exhaust 0.1.0": "brenn-wasm/components/processor-mem-exhaust",
     "brenn-processor-mqtt-test 0.1.0": "brenn-wasm/components/processor-mqtt-test",
     "brenn-processor-multiport 0.1.0": "brenn-wasm/components/processor-multiport",
+    "brenn-processor-page-blobs-test 0.1.0": "brenn-wasm/components/processor-page-blobs-test",
     "brenn-processor-page-bytes-test 0.1.0": "brenn-wasm/components/processor-page-bytes-test",
     "brenn-processor-page-test 0.1.0": "brenn-wasm/components/processor-page-test",
     "brenn-processor-provider-test 0.1.0": "brenn-wasm/components/processor-provider-test",

@@ -192,6 +192,7 @@ mod tests {
             ("processor-log", Family::Guest),
             ("processor-mqtt-test", Family::Guest),
             ("processor-multiport", Family::Guest),
+            ("processor-page-blobs-test", Family::Guest),
             ("processor-provider-test", Family::Guest),
             ("processor-sdk-bytes-test", Family::Guest),
             ("processor-store-rt", Family::Guest),

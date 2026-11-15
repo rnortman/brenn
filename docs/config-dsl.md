@@ -1148,7 +1148,7 @@ bound by a component built against the string contract
 `brenn:processor@0.1.0` — the component's load is refused at boot and at
 reload, naming the port and the channel; a surface instance's kind is judged
 the same way once its artifact is scanned, whether the channel is page-local
-or declared. A surface port may be bound to it: the page's wire is attach v5,
+or declared. A surface port may be bound to it: the page's wire is attach v6,
 which carries every body. It is served to a remote whose attach session
 negotiated protocol v5; one on v4 asking for it is answered `Unavailable`. A durable
 channel holding a non-text message cannot later be declared text-only; give it
@@ -1565,6 +1565,38 @@ names an instance, and the form takes no tail. Five rules, all compile errors:
   caller waits for its callee, so a cycle is a deadlock; the refusal spells the
   cycle out. A diamond is not a cycle and is admitted.
 - Leaving a `call` port unbound is legal. The import answers `unwired`.
+
+On a surface component's `in` binding, `fetch_bytes = <bytes>` is the largest
+attachment the page fetches on that channel, so a component granted `blobs`
+can `read` it in the activation its message wakes:
+
+```
+surface kiosk {
+  new viewer: FrameViewer {
+    grants = [ports, log, blobs];
+    in frames <- cam_frames { push_depth = 1; retain_depth = 1; fetch_bytes = 4194304; }
+  }
+}
+```
+
+Unstated, it is 1 MiB (1,048,576) on an instance granted `blobs` and 0 on any
+other; `0` fetches nothing for that binding. It is refused at boot over 64 MiB,
+on a page-local channel, and on an instance without the `blobs` grant, naming
+the instance and port; it is refused on a backend consumer's binding. An `io`
+port takes the default and has no key. A channel's bound on a surface is the
+largest among its bindings there. An attachment over the bound is never
+fetched, and `read` answers `unavailable` for it.
+
+**What it does to every other reader of the channel on that surface.** Any
+value above zero **gates** the channel: each delivered row waits on the page
+until the attachments it names that the page fetches have arrived, or its
+deadline passes, before any binding of the channel on that page sees it — a
+binding of an instance without the grant and a row with no attachment
+included. The worst case is set by the channel's depth, not by the value:
+`⌈(depth + 4) / 4⌉ · 30 s` while attached, 60 s at depth 1, and longer across
+reconnects (`docs/message-bus.md` §2.1.2a, "A surface page is a reader by
+place", for the bound and its table). A reader that must not wait on another
+instance's attachments is bound to a channel no binding on that surface gates.
 
 `io port { … }` with no arrow is a **free io** form: it claims the port and tunes
 it without connecting it, which is how a timer port gets an anonymous
@@ -2127,10 +2159,13 @@ out of the vocabulary.
 
 `blobs` grants the `brenn:processor/blobs@0.3.0` interface: reading the
 attachments of the messages an activation is handed, creating blobs, and
-publishing messages that name them. It is top-level only — refused by name on
-a placed instance, since no page host serves blob bytes — and pairs with no
-wiring, like `log`: a component that only reads blobs binds no output. A
-component that publishes with attachments also needs `ports`.
+publishing messages that name them. On a top-level instance the whole
+interface is served. On a placed instance only the read side is — `limits`,
+`open` and a blob's `size`, `content-type` and `read` — and a kind that imports
+any other function of the interface is refused when its artifact is checked at
+boot. It pairs with no wiring, like `log`: a component that only reads blobs
+binds no output. A component that publishes with attachments also needs
+`ports`.
 
 A `surface` or a `remote` — the two attach-route entities, a browser page and
 a native daemon — writes **plane** words instead: `subscribe`, `publish`, and

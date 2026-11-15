@@ -11,7 +11,7 @@
 //! # What an input is
 //!
 //! [`Input`] is what happens *to* the page: the connection's own events, the
-//! server frames it hands back, the two auxiliary deadlines, the activation
+//! server frames it hands back, the three auxiliary deadlines, the activation
 //! entries' lifecycle, and what the platform half asks for. It is `Eq` — no
 //! variant carries a float, the viewport's device-pixel ratio included.
 //!
@@ -52,6 +52,7 @@ use brenn_envelope::grants::ProcessorContract;
 
 use crate::activation::{ActivationOutcome, ReadyActivation};
 use crate::command::{self, Command};
+use crate::fetch;
 use crate::inbound;
 use crate::outward::{self, Completed, SyncCall, SyncRefusal};
 use crate::page::SurfacePage;
@@ -95,6 +96,9 @@ pub enum Input {
     /// fire that finds nothing due (a timer that fired early, a clock that stepped
     /// back) releases nothing and is not an error.
     ReleaseDue,
+    /// The attachment-fetch deadline fired: every held row past its own deadline
+    /// enters its store now, with or without its bytes.
+    FetchDue,
     /// A precondition the page cannot check for itself failed on the host side —
     /// today, a device clock reading before the Unix epoch. Terminal, through the
     /// ordinary fatal path.
@@ -335,6 +339,10 @@ fn route(
         Input::ReleaseDue => {
             let released = outward::on_release_due(page, now_ms);
             reactions.released(page, released, now, now_ms);
+        }
+        Input::FetchDue => {
+            let fetched = fetch::on_due(page, now);
+            reactions.fetched(page, fetched, now, now_ms);
         }
         Input::HostFatal { detail } => reactions.go_fatal(detail),
     }

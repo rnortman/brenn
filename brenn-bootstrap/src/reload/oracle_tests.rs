@@ -1553,7 +1553,8 @@ async fn a_bound_ephemeral_channel_flip_matches_a_fresh_boot() {
                         .iter()
                         .any(|line| line.contains("surface.deskbar.bindings")
                             && line.contains(&format!(
-                                "{{\"channel\":\"ephemeral:deskbar.feed\",\"non_text\":{to}}}"
+                                "{{\"channel\":\"ephemeral:deskbar.feed\",\"non_text\":{to},\
+                                 \"fetch_bytes\":0}}"
                             ))),
                     "{:?}",
                     reloaded.retained

@@ -470,6 +470,8 @@ pub async fn handle_blob_write(
     let size = match table.slots.get(&handle) {
         None => {
             // A write pipelined behind a refused create.
+            // TODO(attach-blob-upload-frames-without-upload): on a door
+            // without upload no create precedes it.
             counters.blobs.writes_dropped += 1;
             return FrameOutcome::Continue;
         }
@@ -527,6 +529,8 @@ pub async fn handle_blob_seal(
         return violation;
     }
     let outcome = match table.slots.remove(&handle) {
+        // TODO(attach-blob-upload-frames-without-upload): on a door without
+        // upload no create precedes it.
         None => BlobSealOutcome::UnknownHandle,
         Some(held @ BlobSlot::Held { .. }) => {
             table.slots.insert(handle, held);

@@ -320,15 +320,28 @@ fn undeclared_port_trap(host: &ProcessorHost, instance: &str, port: &str) -> JsV
     glue_trap(&reason)
 }
 
-/// A refusal as the glue lowers a WIT variant: `{ tag, val }`, `val` present
-/// exactly for a variant that carries a payload.
-fn refusal_to_js(refusal: &crate::logic::PortRefusal) -> JsValue {
+/// A WIT variant as the glue lowers it: `{ tag, val }`, `val` present exactly
+/// for a variant that carries a payload.
+fn variant_to_js(tag: &str, val: Option<&str>) -> JsValue {
     let object: JsValue = js_sys::Object::new().into();
-    dom::set(&object, "tag", &JsValue::from_str(refusal.tag));
-    if let Some(val) = &refusal.val {
+    dom::set(&object, "tag", &JsValue::from_str(tag));
+    if let Some(val) = val {
         dom::set(&object, "val", &JsValue::from_str(val));
     }
     object
+}
+
+/// The thrown value a `result`'s error variant lifts from: the shape jco's
+/// import glue reads it out of, `{ payload: variant }`.
+fn error_thrown(variant: JsValue) -> JsValue {
+    let thrown: JsValue = js_sys::Object::new().into();
+    dom::set(&thrown, "payload", &variant);
+    thrown
+}
+
+/// A port refusal as the glue lowers its WIT variant.
+fn refusal_to_js(refusal: &crate::logic::PortRefusal) -> JsValue {
+    variant_to_js(refusal.tag, refusal.val.as_deref())
 }
 
 /// The answer a port export gives for one buffer verdict: the variant the
@@ -656,16 +669,9 @@ fn calls_granted(core: &Rc<RefCell<KernelCore>>, handle: &SurfaceHandle, instanc
     }
 }
 
-/// The thrown value one `call-error` lifts from: the shape jco's import glue
-/// reads a `result`'s error out of, `{ payload: { tag, val? } }`.
+/// The thrown value one `call-error` lifts from.
 fn call_error_thrown(error: &crate::contract::CallError, contract: ProcessorContract) -> JsValue {
-    let thrown: JsValue = js_sys::Object::new().into();
-    dom::set(
-        &thrown,
-        "payload",
-        &refusal_to_js(&crate::logic::call_refusal(error, contract)),
-    );
-    thrown
+    error_thrown(refusal_to_js(&crate::logic::call_refusal(error, contract)))
 }
 
 /// The call both contracts' exports run once they hold a [`GuestBody`]: one
@@ -822,6 +828,153 @@ pub fn brenn_processor_config_get(instance: &str, key: &str) -> Option<String> {
                 dom::apply_actions(std::slice::from_ref(&refusal), &host.handle);
                 None
             }
+        }
+    })
+}
+
+// ── the blobs seam ──────────────────────────────────────────────────────────
+//
+// The read side of `brenn:processor/blobs@0.3.0`. Every export takes the
+// instance from the loader's own closure, and every decision is the innermost
+// in-flight frame's [`crate::blob_scope::BlobScope`]'s, answered from the page's
+// attachment cache. A refusal is thrown as `{ payload: { tag } }`, which the
+// glue lifts as the WIT error variant; a handle the scope does not hold is a
+// glue fault and thrown as an `Error`, the guest's trap.
+//
+// TODO(surface-wasm-test-in-ci): these exports are wasm32-only; the scope's
+// rules are tested natively and the page rig drives the exports end to end.
+
+/// The thrown value a `blobs` error variant, none of which carries a payload,
+/// lifts from.
+fn variant_thrown(tag: &str) -> JsValue {
+    error_thrown(variant_to_js(tag, None))
+}
+
+/// Run `f` against `instance`'s scope and the page's cache, or `None` when
+/// `instance` is not the innermost activation on the stack.
+fn with_blobs<R>(
+    host: &ProcessorHost,
+    instance: &str,
+    f: impl FnOnce(&mut crate::blob_scope::BlobScope, &crate::fetch::Fetch) -> R,
+) -> Option<R> {
+    host.handle.with_in_flight(instance, |frame| {
+        host.door.with_fetch(|fetch| f(&mut frame.blobs, fetch))
+    })
+}
+
+/// A handle-taking export's answer for a handle that is not `instance`'s to
+/// use: no activation of it is innermost, or its scope never minted the
+/// handle.
+fn unheld_handle(instance: &str, handle: u32) -> JsValue {
+    glue_trap(&format!(
+        "surface kernel: '{instance}' used blob handle {handle} outside the activation that \
+         opened it: the page glue and the kernel disagree on the handle table"
+    ))
+}
+
+/// `blobs.limits`: `{ maxReadBytes, maxWriteBytes }`. A page accepts no write.
+#[wasm_bindgen]
+pub fn brenn_blobs_limits(_instance: &str) -> JsValue {
+    let limits: JsValue = js_sys::Object::new().into();
+    dom::set(
+        &limits,
+        "maxReadBytes",
+        &JsValue::from(crate::blob_scope::SURFACE_MAX_READ_BYTES),
+    );
+    dom::set(
+        &limits,
+        "maxWriteBytes",
+        &JsValue::from(crate::blob_scope::SURFACE_MAX_WRITE_BYTES),
+    );
+    limits
+}
+
+/// `blobs.open`: a handle number, or a thrown `open-error`.
+///
+/// `not-permitted` without the `blobs` grant (with its breadcrumb), outside the
+/// instance's own innermost activation, or for `(port, index, name)` naming no
+/// attachment in its windows.
+#[wasm_bindgen]
+pub fn brenn_blobs_open(
+    instance: &str,
+    port: &str,
+    index: u32,
+    name: &str,
+) -> Result<u32, JsValue> {
+    use crate::blob_scope::OpenRefusal;
+    with_processor_host("blobs open", |host| {
+        let verdict = host
+            .core
+            .borrow()
+            .component_blobs_gate(instance, "blobs.open");
+        if let Err(refusal) = verdict {
+            dom::apply_actions(std::slice::from_ref(&refusal), &host.handle);
+            return Err(variant_thrown(OpenRefusal::NotPermitted.tag()));
+        }
+        match with_blobs(host, instance, |scope, fetch| {
+            scope.open(fetch, port, index, name)
+        }) {
+            Some(Ok(handle)) => Ok(handle),
+            Some(Err(refusal)) => Err(variant_thrown(refusal.tag())),
+            None => Err(variant_thrown(OpenRefusal::NotPermitted.tag())),
+        }
+    })
+}
+
+/// `blob.size`: the attachment's size, from its reference.
+#[wasm_bindgen]
+pub fn brenn_blobs_size(instance: &str, handle: u32) -> Result<u64, JsValue> {
+    with_processor_host("blob size", |host| {
+        match with_blobs(host, instance, |scope, _| scope.size(handle)) {
+            Some(Ok(size)) => Ok(size),
+            Some(Err(_)) | None => Err(unheld_handle(instance, handle)),
+        }
+    })
+}
+
+/// `blob.content-type`: the attachment's content type, from its reference.
+#[wasm_bindgen]
+pub fn brenn_blobs_content_type(instance: &str, handle: u32) -> Result<String, JsValue> {
+    with_processor_host("blob content-type", |host| {
+        match with_blobs(host, instance, |scope, _| {
+            scope.content_type(handle).map(str::to_owned)
+        }) {
+            Some(Ok(content_type)) => Ok(content_type),
+            Some(Err(_)) | None => Err(unheld_handle(instance, handle)),
+        }
+    })
+}
+
+/// `blob.read`: exactly the bytes `[offset, offset + len)` as a `Uint8Array`,
+/// or a thrown `read-error` — `unavailable` for bytes not on this page.
+#[wasm_bindgen]
+pub fn brenn_blobs_read(
+    instance: &str,
+    handle: u32,
+    offset: u64,
+    len: u32,
+) -> Result<Vec<u8>, JsValue> {
+    with_processor_host("blob read", |host| {
+        match with_blobs(host, instance, |scope, fetch| {
+            scope.read(fetch, handle, offset, len)
+        }) {
+            Some(Ok(Ok(bytes))) => Ok(bytes),
+            Some(Ok(Err(refusal))) => Err(variant_thrown(refusal.tag())),
+            Some(Err(_)) | None => Err(unheld_handle(instance, handle)),
+        }
+    })
+}
+
+/// A guest's drop of a `blob`: frees the slot.
+#[wasm_bindgen]
+pub fn brenn_blobs_drop(instance: &str, handle: u32) -> Result<(), JsValue> {
+    with_processor_host("blob drop", |host| {
+        match host
+            .handle
+            .with_in_flight(instance, |frame| frame.blobs.drop_handle(handle))
+        {
+            Some(Ok(())) => Ok(()),
+            Some(Err(_)) | None => Err(unheld_handle(instance, handle)),
         }
     })
 }

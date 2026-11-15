@@ -301,6 +301,7 @@ pub(crate) fn blob_read(blob: &RawBlob, offset: u64, len: u32) -> Result<Vec<u8>
         raw_blobs::ReadError::TooLarge => ReadError::TooLarge,
         raw_blobs::ReadError::StorageFailed(m) => ReadError::StorageFailed(m),
         raw_blobs::ReadError::QuotaExceeded => ReadError::QuotaExceeded,
+        raw_blobs::ReadError::Unavailable => ReadError::Unavailable,
     })
 }
 
