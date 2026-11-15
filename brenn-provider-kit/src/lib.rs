@@ -7,6 +7,9 @@
 //!   most [`CALL_BUDGET`] nested calls per activation and keeping the rest in
 //!   a backlog that later activations drain.
 //! - [`backlog`]: the backlog row a queued request keeps.
+//! - [`blob`]: a request's and an answer's attachments, the [`Blobs`]
+//!   interface a host serves, and the [`Step`] through which `plan` and
+//!   `advance` open, read, build and attach blobs.
 //! - [`row`]: the in-flight row a request keeps in the component's store
 //!   between the activation that issues a nested call and the one that
 //!   receives its answer, generic over the component's [`Tool`] enum.
@@ -14,9 +17,9 @@
 //!   what a step decides next.
 //! - [`args`]: reading a tool's JSON arguments.
 //! - [`answer`]: reading `api-request`'s answer envelope — as JSON with
-//!   `read_api_result`, or as a payload with its headers with
-//!   `read_api_payload` — bounding what is copied out of it, and the result
-//!   ceiling.
+//!   `read_api_result`, as a payload with its headers with
+//!   `read_api_payload`, or as an attachment with `read_api_blob` — bounding
+//!   what is copied out of it, and the result ceiling.
 //! - [`google`]: Google's display name and the detail of its standard error
 //!   shape, shared by the components that call Google APIs.
 //! - [`settings`]: reading an instance's `config` values.
@@ -27,8 +30,8 @@
 //!   design: it serves host tests, never a component step.
 //! - `testutil` (behind the `testutils` feature): fixtures for a step's tests
 //!   — `api-request` answers, nested-call errors, Google error bodies and
-//!   error answers — and `MemoryHost`, an in-memory [`Host`] for a loop's
-//!   tests.
+//!   error answers — and `MemoryHost`, an in-memory [`Host`] and [`Blobs`]
+//!   for a loop's tests.
 //!
 //! The crate is `std` plus `serde`/`serde_json` and `base64ct`, and names no
 //! guest SDK, so all of it runs on the host under test;
@@ -45,6 +48,7 @@ pub mod activation;
 pub mod answer;
 pub mod args;
 pub mod backlog;
+pub mod blob;
 pub mod call;
 pub mod google;
 pub mod row;
@@ -59,13 +63,18 @@ pub use activation::{
     Level, Logic, NESTED_WORST_CASE_MS, Request, Rows, serve,
 };
 pub use answer::{
-    Answer, COMPACT_RESULT_CEILING, NestedError, Payload, PayloadAnswer, Unreadable, bounded, copy,
-    cut, read_api_payload, read_api_result, serialized_len,
+    Answer, BlobAnswer, COMPACT_RESULT_CEILING, NestedError, Payload, PayloadAnswer, Unreadable,
+    bounded, copy, cut, read_api_blob, read_api_payload, read_api_result, serialized_len,
 };
 pub use args::{Args, capped, choice, flag, integer, object};
 pub use backlog::Queued;
+pub use blob::{
+    Append, Attached, Blob, BlobLimits, Blobs, CreateError, OpenError, ReadError, SealError, Step,
+    Unavailable, WriteError, Writer,
+};
 pub use call::{
-    ApiCall, Body, Call, ErrorKind, Failure, Next, Query, QueryValue, Target, internal, query,
+    ANSWER_ATTACHMENT, ApiCall, Body, Call, ErrorKind, Failure, Next, Query, QueryValue, Target,
+    internal, query,
 };
 pub use row::{InFlight, Tool, no_such_step, stored};
 #[cfg(feature = "testutils")]

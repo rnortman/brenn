@@ -75,6 +75,15 @@ pub struct SurfaceProfile {
     /// grant on a surface without the surface-level one, so a name here implies
     /// `alert_granted`.
     component_alertable: HashSet<String>,
+    /// Every declared instance granted `blobs` → its declared wire outputs:
+    /// the channels a publish under it may name attachments on. A key with an
+    /// empty set is an instance that only reads or publishes only page-locally,
+    /// and still opens the surface's blob door: the map has a key iff some
+    /// component may read an attachment, and a non-empty set is the reason the
+    /// door uploads. Never widened by [`SurfaceProfile::bind_error_channel`],
+    /// so no page attaches on the error channel unless the operator bound an
+    /// output to it.
+    attachable: HashMap<String, HashSet<String>>,
     /// The operator-tuned per-connection publish bucket every session of this
     /// surface starts full with.
     publish_rate: PublishRate,
@@ -193,6 +202,21 @@ impl SurfaceProfile {
         deferred_targets.sort();
         deferred_targets.dedup();
 
+        // Copied from the declared sets before the error channel widens them:
+        // an instance may attach only where it publishes by its own bindings.
+        let attachable: HashMap<String, HashSet<String>> = resolved
+            .components
+            .iter()
+            .filter(|c| c.grants.contains(&ComponentGrant::Blobs))
+            .map(|c| {
+                let channels = component_publishable
+                    .get(&c.instance)
+                    .expect("every declared instance has a publishable set")
+                    .clone();
+                (c.instance.clone(), channels)
+            })
+            .collect();
+
         let kernel_publishable: HashSet<String> = [
             description.geometry_channel.clone(),
             description.status_channel.clone(),
@@ -214,6 +238,7 @@ impl SurfaceProfile {
                 .filter(|c| c.grants.contains(&ComponentGrant::Alert))
                 .map(|c| c.instance.clone())
                 .collect(),
+            attachable,
             publish_rate: PublishRate {
                 burst: resolved.publish_burst,
                 per_sec: resolved.publish_per_sec,
@@ -360,8 +385,28 @@ impl AttachProfile for SurfaceProfile {
     }
 
     fn blob_grant(&self) -> Option<BlobGrant> {
-        // A surface has no blob door yet: no page drives the blob frames.
-        None
+        // Any `blobs` instance, a reader included, opens the door. Upload is
+        // derived from the grant and the bindings, never a separate word: a
+        // `blobs` instance with a declared wire output holds the interface
+        // whose `publish` attaches, so the page may upload. A surface whose
+        // `blobs` instances only read, or publish only page-locally, keeps a
+        // read-only door.
+        (!self.attachable.is_empty()).then(|| BlobGrant {
+            upload: self
+                .attachable
+                .values()
+                .any(|channels| !channels.is_empty()),
+        })
+    }
+
+    fn attribution_may_attach(&self, attribution: Option<&str>, channel: &str) -> bool {
+        // The bare identity publishes only the kernel's own documents and
+        // reports, which name no blob.
+        attribution.is_some_and(|instance| {
+            self.attachable
+                .get(instance)
+                .is_some_and(|channels| channels.contains(channel))
+        })
     }
 }
 

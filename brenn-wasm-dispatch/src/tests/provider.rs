@@ -160,6 +160,7 @@ impl Provider {
                 acting_conversation_id: None,
                 acting_user: None,
                 deadline: Some(tokio::time::Instant::now() + PROVIDED_TOOL_CEILING),
+                caller_opens_blobs: true,
             };
             tool.execute_value(&ctx, json!({})).await
         })

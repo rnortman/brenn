@@ -88,7 +88,9 @@ rust_test(
         "//brenn-wasm:wit/processor-0.2.wit",
         "//brenn-wasm:wit/processor.wit",
         "//docs:component-packages.md",
-        # `brenn.e2e.brenn`'s second and third module roots.
+        # `brenn.e2e.brenn`'s fixture module roots.
+        "//brenn-wasm/components/processor-blobs-test:spec/processor-blobs-test.brenn",
+        "//brenn-wasm/components/processor-page-blobs-test:spec/processor-page-blobs-test.brenn",
         "//brenn-wasm/components/processor-page-bytes-test:spec/processor-page-bytes-test.brenn",
         "//brenn-wasm/components/processor-sdk-bytes-test:spec/processor-sdk-bytes-test.brenn",
         # The recycler's dispatch cases drive the deployed guest through the real

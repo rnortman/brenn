@@ -58,8 +58,10 @@ pub const MAX_PUBLISHES_PER_ACTIVATION: usize = 256;
 /// Maximum total publish bytes buffered per activation (4 MiB).
 ///
 /// The host-memory backstop on one activation's buffer, counting every channel
-/// the activation publishes to. It is also the operative ceiling for a
-/// non-transportable (local) channel, which nothing else bounds by size.
+/// the activation publishes to. One message's body is bounded separately, on
+/// every channel of both hosts: the gate refuses a body over `max_body_bytes`
+/// whether or not the channel is transportable, so a non-transportable (local)
+/// channel's message is bounded by that per-message cap and this aggregate.
 ///
 /// **It is not the operative ceiling for a wire-bound channel.** A transportable
 /// channel's publishes travel as one `PublishBatch` frame, and the protocol

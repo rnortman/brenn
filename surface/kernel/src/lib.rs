@@ -64,6 +64,26 @@ pub mod page;
 /// routed into the page's tables.
 pub mod inbound;
 
+/// What the page fetches of delivered attachments: the arrival hold and the
+/// attachment cache.
+pub mod fetch;
+
+/// The page's one blob plane, shared by the fetcher and the upload stage.
+pub mod blob_plane;
+
+/// The upload stage: attachment flushes held per instance until their blobs
+/// are held on the live attachment.
+pub mod uploads;
+
+/// What one activation may open of the attachments in its windows, and the
+/// blob handles it holds.
+pub mod blob_scope;
+
+/// What each attachment of a page-local message names, and when it goes.
+pub mod page_blobs;
+/// Blob bytes the page made, and the ledger that bounds them.
+pub mod page_bytes;
+
 /// The outward half of a turn: activation dispatch and completion, the confined
 /// release pass, the outbox retry, and what the page says about a loss.
 pub mod outward;

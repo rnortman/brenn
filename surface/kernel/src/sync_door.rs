@@ -168,6 +168,33 @@ impl SyncDoor {
         answer
     }
 
+    /// Run `f` against the page's attachment cache and its blob table: what a
+    /// component's `open` and `read` answer from.
+    ///
+    /// A short shared borrow. The blob exports are called from inside an entry,
+    /// and every driver releases the page before calling one.
+    pub fn with_blob_sources<R>(
+        &self,
+        f: impl FnOnce(&crate::fetch::Fetch, &crate::page_blobs::PageBlobs) -> R,
+    ) -> R {
+        let page = self.page.borrow();
+        f(&page.fetch, &page.page_blobs)
+    }
+
+    /// The page's ledger of page-made bytes and the blob door the most recent
+    /// attachment advertised: what a component's `create`, `write` and
+    /// `publish` are judged against. Owned, so no page borrow is held while
+    /// the caller reaches the activation's scope.
+    pub fn made_blob_terms(
+        &self,
+    ) -> (
+        crate::page_bytes::MadeLedger,
+        Option<brenn_attach_proto::BlobFacts>,
+    ) {
+        let page = self.page.borrow();
+        (page.made.clone(), page.blob_door)
+    }
+
     /// Invoke one assembled sync activation and fold its completion, appending the
     /// completion turn's effects to what the assembly already asked for.
     ///
@@ -189,6 +216,7 @@ impl SyncDoor {
             drops: _,
         } = ready;
         let (outcome, buffer, called) = invoke_shared(
+            &self.page,
             &self.entries,
             &self.in_flight,
             &instance,

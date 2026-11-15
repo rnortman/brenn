@@ -14,7 +14,9 @@ use @git-forge-parser::*;
 use @git-sync-consumer::*;
 use @meeting::*;
 use @mode-clock::*;
+use @processor-blobs-test::*;
 use @processor-demo::*;
+use @processor-page-blobs-test::*;
 use @processor-page-bytes-test::*;
 use @processor-sdk-bytes-test::*;
 use @processor-transplant::*;
@@ -81,6 +83,9 @@ uuid_pins {
   "brenn:surface.surface.bytes.help" = "fa040201-db95-4b36-ac67-63505f645d25";
   "brenn:surface.surface.bytes.geometry" = "a4f66fad-35d2-4160-91f1-851c48eea1c7";
   "brenn:surface.surface.bytes.status" = "4a24a7d4-d4fe-4331-bc57-ddefc46f6862";
+  "brenn:surface.surface.blobs.help" = "665e3fb6-cbc3-409a-8644-3788dfab4df2";
+  "brenn:surface.surface.blobs.geometry" = "1f8e34a3-b460-4b51-8717-c2a875fa8706";
+  "brenn:surface.surface.blobs.status" = "bfa60cee-c1ae-439a-a7c3-8553a4f12121";
   "brenn:surface.kind.protobar.help" = "e01edb29-0c73-475f-bc57-a2ff204d99a1";
   "brenn:surface.kind.protobar.schema" = "d557bf65-99ce-404e-b834-d232548045ba";
   "brenn:surface.kind.echo-stub.help" = "f95e0ce1-363d-4c6b-89bf-63148106fe73";
@@ -91,6 +96,10 @@ uuid_pins {
   "brenn:surface.kind.processor-page-bytes-test.schema" = "e23d3209-1c2d-413c-8379-9970471f3b8c";
   "brenn:surface.kind.processor-sdk-bytes-test.help" = "e9c65bdb-b48d-4844-a85c-0cd363e1b771";
   "brenn:surface.kind.processor-sdk-bytes-test.schema" = "87b60871-150b-45a3-901f-122ad59c2ab1";
+  "brenn:surface.kind.processor-page-blobs-test.help" = "b27f878a-3057-45ee-ae00-77cfac0f8c0c";
+  "brenn:surface.kind.processor-page-blobs-test.schema" = "7c096fd4-3c10-418e-bc77-7d5f1b61d50a";
+  "brenn:surface.kind.processor-blobs-test.help" = "dd311511-ffa0-4ab5-ac00-4e42b63aa87a";
+  "brenn:surface.kind.processor-blobs-test.schema" = "72e18259-7610-4f9a-8299-99b157f7c8a1";
   "brenn:bar-layout" = "3c1142e7-5a7f-4781-939a-dfaa0cc8c7a0";
   "brenn:bar-a" = "3b2ef031-f286-42e8-a9ac-c66aade0ce0a";
   "brenn:bar-b" = "2ccd9df1-08b1-4554-9745-fc3ade11ed98";
@@ -105,12 +114,15 @@ new bar_pixel_desc: SurfaceDescription(slug = "bar-pixel");
 new bar_feeder_desc: SurfaceDescription(slug = "bar-feeder");
 new loopback_desc: SurfaceDescription(slug = "loopback");
 new bytes_desc: SurfaceDescription(slug = "bytes");
+new blobs_desc: SurfaceDescription(slug = "blobs");
 
 new protobar_desc: KindDescription(kind = "protobar");
 new echo_stub_desc: KindDescription(kind = "echo-stub");
 new chrome_desc: KindDescription(kind = "chrome");
 new page_bytes_test_desc: KindDescription(kind = "processor-page-bytes-test");
 new sdk_bytes_test_desc: KindDescription(kind = "processor-sdk-bytes-test");
+new page_blobs_test_desc: KindDescription(kind = "processor-page-blobs-test");
+new blobs_test_desc: KindDescription(kind = "processor-blobs-test");
 
 /// At least one app is mandatory. This one exists only to satisfy config
 /// validation: no conversation is ever started against it, and it holds no
@@ -385,4 +397,121 @@ surface bytes {
 new bytes_chrome: StandardChrome(slug = "bytes", layout = bytes_layout) {
   grants = [dom, log, page-dom, ports, takeover];
   surfaces = ["bytes"];
+}
+
+/// Where the backend producer's `b` publishes; nothing reads it. Every port of
+/// a consumer is bound, and `b` is the one the `blobs` page's scripts never
+/// name.
+channel blobs_discard at "ephemeral:blobs.discard" {
+  push_depth = 1;
+  retain_depth = 1;
+}
+/// Placeholder layout channel for the blobs page: nothing publishes, so the
+/// chrome renders its default layout. `ephemeral:` rather than `local:` for the
+/// reason `bar_feeder_layout` gives.
+channel blobs_layout at "ephemeral:blobs.in.chrome.layout" {
+  description = "Layout documents for the blobs page (latest-wins)";
+  push_depth = 1;
+  retain_depth = 1;
+}
+// The producer's command and report links span the wire: the driver is on the
+// `blobs` page, the producer at top level. `blobs_frames` carries the
+// producer's messages and their attachments to the page; the reader's own
+// links are page-local.
+link blobs_producer_cmd;
+link blobs_producer_report;
+link blobs_frames;
+link blobs_reader_cmd;
+link blobs_reader_report;
+// `blobs_made` spans the wire: the page's `maker` publishes on it and the
+// backend producer's `feed` reads it. `blobs_kept` is page-local: the maker
+// publishes on it and the page's `kept-reader` reads it.
+link blobs_maker_cmd;
+link blobs_maker_report;
+link blobs_made;
+link blobs_kept;
+link blobs_kept_reader_cmd;
+link blobs_kept_reader_report;
+
+/// The backend half of `e2e/tests/blobs.spec.ts`: a `processor-blobs-test`
+/// consumer, served from the harness's fourth mount, that makes blobs and
+/// publishes them as attachments on `a`, driven by the `blobs` page's
+/// `drive-producer`. Its `feed` holds the latest message the page's `maker`
+/// published on `blobs_made`, so a script opens and reads that message's
+/// attachments from the backend store; it never wakes the producer.
+new blobs_producer: ProcessorBlobsTest {
+  grants = [ports, log, blobs];
+  in in <- blobs_producer_cmd { push_depth = 1; retain_depth = 1; }
+  in feed <- blobs_made { push_depth = 0; retain_depth = 1; }
+  out report -> blobs_producer_report;
+  out a -> blobs_frames;
+  out b -> blobs_discard;
+}
+
+/// A surface page reading message attachments in Chromium, driven by
+/// `e2e/tests/blobs.spec.ts`. `reader`, a `processor-page-blobs-test` granted
+/// `blobs`, reads every attachment of each message the producer publishes on
+/// `blobs_frames` whole in the activation the message wakes; its `feed`
+/// binding states no `fetch_bytes`, so the page fetches up to the 1 MiB
+/// default. `maker`, a `processor-blobs-test` granted `blobs`, makes blobs and
+/// publishes them on the wire channel `blobs_made` (`a`) and the page-local
+/// `blobs_kept` (`b`), and forwards an attachment it opens in `feed`; its wire
+/// output gives the surface a door that uploads. `kept-reader` reads every
+/// attachment the maker keeps on the page. Each fixture is driven by an
+/// `EchoStub` whose sent text is its script and whose scrollback shows its
+/// reports. The page kinds are served from the harness's fourth and fifth
+/// mounts, so only `make e2e` can boot this surface.
+surface blobs {
+  grants = [subscribe];
+  new reader: ProcessorPageBlobsTest {
+    grants = [ports, log, blobs];
+    in in <- blobs_reader_cmd { push_depth = 1; retain_depth = 1; }
+    in feed <- blobs_frames { push_depth = 1; retain_depth = 1; }
+    out report -> blobs_reader_report;
+  }
+  new maker: ProcessorBlobsTest {
+    grants = [ports, log, blobs];
+    in in <- blobs_maker_cmd { push_depth = 1; retain_depth = 1; }
+    in feed <- blobs_frames { push_depth = 0; retain_depth = 1; }
+    out report -> blobs_maker_report;
+    out a -> blobs_made;
+    out b -> blobs_kept;
+  }
+  new kept-reader: ProcessorPageBlobsTest {
+    grants = [ports, log, blobs];
+    in in <- blobs_kept_reader_cmd { push_depth = 1; retain_depth = 1; }
+    in feed <- blobs_kept { push_depth = 1; retain_depth = 1; }
+    out report -> blobs_kept_reader_report;
+  }
+  new drive-maker: EchoStub {
+    grants = [ports, log, dom];
+    out out -> blobs_maker_cmd;
+    in messages <- blobs_maker_report { push_depth = 8; retain_depth = 8; }
+    io state { push_depth = 0; retain_depth = 1; }
+  }
+  new drive-kept-reader: EchoStub {
+    grants = [ports, log, dom];
+    out out -> blobs_kept_reader_cmd;
+    in messages <- blobs_kept_reader_report { push_depth = 8;
+      retain_depth = 8;
+    }
+    io state { push_depth = 0; retain_depth = 1; }
+  }
+  new drive-producer: EchoStub {
+    grants = [ports, log, dom];
+    out out -> blobs_producer_cmd;
+    in messages <- blobs_producer_report { push_depth = 8; retain_depth = 8; }
+    io state { push_depth = 0; retain_depth = 1; }
+  }
+  new drive-reader: EchoStub {
+    grants = [ports, log, dom];
+    out out -> blobs_reader_cmd;
+    in messages <- blobs_reader_report { push_depth = 8; retain_depth = 8; }
+    io state { push_depth = 0; retain_depth = 1; }
+  }
+}
+
+new blobs_chrome: StandardChrome(slug = "blobs", layout = blobs_layout) {
+  grants = [dom, log, page-dom, ports, takeover];
+  surfaces = ["blobs"];
 }

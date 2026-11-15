@@ -327,6 +327,19 @@ fn a_text_only_refusal_is_unreconcilable_on_the_surface_route() {
     }
 }
 
+/// The page names no blob handle in a publish, so an `AttachmentNotHeld`
+/// answer is unreconcilable rather than a panic.
+#[test]
+fn an_attachment_not_held_refusal_is_unreconcilable_on_the_surface_route() {
+    let bindings = wiring();
+    let mut outbound = SurfaceOutbound::new();
+    publish(&mut outbound, &bindings, "p1", "out", "a", 5);
+    let err = outbound
+        .on_publish_result(Some(0), PublishOutcome::AttachmentNotHeld)
+        .expect_err("the page names no blob handle");
+    assert!(err.contains("AttachmentNotHeld"), "{err}");
+}
+
 #[test]
 fn a_result_this_attachment_never_asked_for_is_unreconcilable() {
     let mut outbound = SurfaceOutbound::new();
@@ -1275,4 +1288,57 @@ fn an_oversized_report_field_is_cut_on_a_char_boundary_and_marked() {
 #[should_panic(expected = "smaller than the truncation marker")]
 fn a_cap_under_the_marker_length_dies_loudly() {
     truncate_report_field("anything at all".to_string(), 4);
+}
+
+/// The standard wiring with `p1` granted `blobs`.
+fn wiring_granting_p1_blobs() -> AppliedBindings {
+    let mut doc = doc(standard_outputs(), Some((ERRORS, LogLevel::Warn)));
+    doc.components[0].grants.push(ComponentGrant::Blobs);
+    AppliedBindings::apply(&doc.to_body()).expect("the fixture document applies")
+}
+
+fn attaching_entry(channel: &str) -> BatchEntry {
+    entry(channel, "with a blob").attachments(vec![brenn_attach_proto::PublishAttachment::new(
+        brenn_attach_proto::AttachmentName::new("pic").expect("a valid name"),
+        BlobHandle(1),
+    )])
+}
+
+#[test]
+fn an_entry_naming_attachments_survives_only_under_the_blobs_grant() {
+    let flush = flush_of(vec![attaching_entry(OUT)]);
+    assert!(survives(&wiring_granting_p1_blobs(), "p1", &flush, None));
+    assert!(!survives(&wiring(), "p1", &flush, None));
+    // A plain entry needs no grant.
+    assert!(survives(
+        &wiring(),
+        "p1",
+        &flush_of(vec![entry(OUT, "plain")]),
+        None
+    ));
+}
+
+#[test]
+fn an_entry_naming_attachments_survives_only_on_its_instances_own_output() {
+    let bindings = wiring_granting_p1_blobs();
+    // `SLOW` is p2's output, and the error channel is no instance's.
+    for channel in [SLOW, ERRORS] {
+        assert!(!survives(
+            &bindings,
+            "p1",
+            &flush_of(vec![attaching_entry(channel)]),
+            None
+        ));
+    }
+}
+
+#[test]
+#[should_panic(expected = "names the page-local channel")]
+fn a_wire_entry_naming_attachments_on_a_page_local_channel_is_a_bug() {
+    survives(
+        &wiring_granting_p1_blobs(),
+        "p1",
+        &flush_of(vec![attaching_entry(NOTES)]),
+        None,
+    );
 }

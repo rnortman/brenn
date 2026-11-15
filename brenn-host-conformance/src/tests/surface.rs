@@ -202,6 +202,7 @@ fn document(spec: &MountSpec) -> BindingsDocument {
         .map(|lc| WireChannel {
             channel: lc.channel.clone(),
             non_text: false,
+            fetch_bytes: 0,
         })
         .collect();
     let mut declared_out_ports: Vec<String> =

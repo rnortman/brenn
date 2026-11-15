@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::blob::Attached;
 use crate::call::Call;
 use crate::row::{InFlight, Tool, tool_name};
 
@@ -29,6 +30,10 @@ pub struct Queued<T: Tool> {
     /// from: the arrival for a first step, the earlier step's answer for a
     /// later one.
     pub queued_at_ms: u64,
+    /// The attachments the request carries; left off a row when it carries
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attached>,
 }
 
 /// The arrival time and pending id a backlog key spells, or why the key is
@@ -66,6 +71,7 @@ impl<T: Tool> Queued<T> {
             self.received_at_ms,
             now_ms,
         )
+        .with_attachments(self.attachments.clone())
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -105,10 +111,12 @@ mod tests {
                     query: Query::new(),
                     headers: BTreeMap::new(),
                     body: None,
+                    response_attachment: None,
                 },
             },
             received_at_ms,
             queued_at_ms: received_at_ms + 500,
+            attachments: Vec::new(),
         }
     }
 
@@ -131,6 +139,36 @@ mod tests {
         for row in [bare, full] {
             assert_eq!(Queued::decode(&row.encode()), Ok(row));
         }
+    }
+
+    #[test]
+    fn a_queued_row_without_attachments_is_written_as_before() {
+        assert_eq!(
+            String::from_utf8(queued(1_000, "a").encode()).unwrap(),
+            "{\"id\":\"a\",\"tool\":\"fixture-search\",\"args\":{\"q\":\"x\"},\
+             \"derived\":{\"seen\":3},\"call\":{\"step\":2,\"api\":{\"provider\":\"example\",\
+             \"method\":\"GET\",\"host\":\"api.example.com\",\"path\":\"/v1/items\"}},\
+             \"received_at_ms\":1000,\"queued_at_ms\":1500}"
+        );
+    }
+
+    #[test]
+    fn a_queued_row_with_a_body_attachment_round_trips_and_issues_with_it() {
+        let file = Attached {
+            name: "file".to_string(),
+            size: 5,
+            content_type: "text/plain".to_string(),
+        };
+        let mut row = queued(1_000, "a");
+        row.call.api.method = "PUT".to_string();
+        row.call.api.body = Some(Body::Attachment("file".to_string()));
+        row.call.api.response_attachment = Some("body".to_string());
+        row.attachments = vec![file.clone()];
+        let text = String::from_utf8(row.encode()).unwrap();
+        assert!(text.contains("\"body_attachment\":\"file\""), "{text}");
+        assert!(text.contains("\"response_attachment\":\"body\""), "{text}");
+        assert_eq!(Queued::decode(&row.encode()), Ok(row.clone()));
+        assert_eq!(row.in_flight(2_000).attachments, [file]);
     }
 
     #[test]

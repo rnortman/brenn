@@ -546,11 +546,11 @@ fn a_publish_joins_the_innermost_frame_and_no_other() {
         stack.with_innermost("p1", |_| ()).is_none(),
         "no activation is on the stack at all"
     );
-    stack.push("p1", frame_buffer());
-    stack.push("p2", frame_buffer());
+    stack.push("p1", frame_buffer(), BlobScope::empty());
+    stack.push("p2", frame_buffer(), BlobScope::empty());
     assert!(
         stack
-            .with_innermost("p1", |buffer| buffer.publish(
+            .with_innermost("p1", |frame| frame.buffer.publish(
                 "notes",
                 brenn_envelope::GuestBody::Text("outer".to_string())
             ))
@@ -558,7 +558,7 @@ fn a_publish_joins_the_innermost_frame_and_no_other() {
         "a caller blocked in a call of its own is not the entry on the stack"
     );
     assert_eq!(
-        stack.with_innermost("p2", |buffer| buffer.publish(
+        stack.with_innermost("p2", |frame| frame.buffer.publish(
             "notes",
             brenn_envelope::GuestBody::Text("inner".to_string())
         )),
@@ -567,7 +567,7 @@ fn a_publish_joins_the_innermost_frame_and_no_other() {
     let (buffer, _) = stack.pop_of("p2");
     assert_eq!(buffer.len(), 1, "the callee's publish is the callee's");
     assert_eq!(
-        stack.with_innermost("p1", |buffer| buffer.publish(
+        stack.with_innermost("p1", |frame| frame.buffer.publish(
             "notes",
             brenn_envelope::GuestBody::Text("outer".to_string())
         )),
@@ -584,24 +584,27 @@ fn a_call_is_admitted_only_from_the_frame_on_top() {
     let mut stack = InFlightStack::default();
     assert!(
         stack
-            .with_innermost("p1", |buffer| buffer
+            .with_innermost("p1", |frame| frame
+                .buffer
                 .admit_call(brenn_envelope::GuestBody::Text("x".to_string()))
                 .map(|_| ()))
             .is_none(),
         "no activation is in flight"
     );
-    stack.push("p1", frame_buffer());
-    stack.push("p2", frame_buffer());
+    stack.push("p1", frame_buffer(), BlobScope::empty());
+    stack.push("p2", frame_buffer(), BlobScope::empty());
     assert!(
         stack
-            .with_innermost("p1", |buffer| buffer
+            .with_innermost("p1", |frame| frame
+                .buffer
                 .admit_call(brenn_envelope::GuestBody::Text("x".to_string()))
                 .map(|_| ()))
             .is_none(),
         "a caller already blocked in a call may not spend its budget again"
     );
     assert_eq!(
-        stack.with_innermost("p2", |buffer| buffer
+        stack.with_innermost("p2", |frame| frame
+            .buffer
             .admit_call(brenn_envelope::GuestBody::Text("x".to_string()))
             .map(|_| ())),
         Some(Ok(())),
@@ -613,9 +616,9 @@ fn a_call_is_admitted_only_from_the_frame_on_top() {
 #[test]
 fn a_pop_returns_its_own_frames_effects_in_commit_order() {
     let mut stack = InFlightStack::default();
-    stack.push("p1", frame_buffer());
+    stack.push("p1", frame_buffer(), BlobScope::empty());
     stack.stash(vec![effect("caller-first")]);
-    stack.push("p2", frame_buffer());
+    stack.push("p2", frame_buffer(), BlobScope::empty());
     stack.stash(vec![effect("callee")]);
     let (_, callee) = stack.pop_of("p2");
     assert_eq!(bodies(&callee), ["callee"]);
@@ -629,7 +632,7 @@ fn a_pop_returns_its_own_frames_effects_in_commit_order() {
 #[test]
 fn an_empty_stash_leaves_the_frame_alone() {
     let mut stack = InFlightStack::default();
-    stack.push("p1", frame_buffer());
+    stack.push("p1", frame_buffer(), BlobScope::empty());
     stack.stash(Vec::new());
     let (_, effects) = stack.pop_of("p1");
     assert!(effects.is_empty());
@@ -639,8 +642,8 @@ fn an_empty_stash_leaves_the_frame_alone() {
 #[should_panic(expected = "the in-flight stack top belongs to another activation")]
 fn popping_a_frame_that_is_not_this_activations_panics() {
     let mut stack = InFlightStack::default();
-    stack.push("p1", frame_buffer());
-    stack.push("p2", frame_buffer());
+    stack.push("p1", frame_buffer(), BlobScope::empty());
+    stack.push("p2", frame_buffer(), BlobScope::empty());
     let _ = stack.pop_of("p1");
 }
 
@@ -663,25 +666,30 @@ fn stashing_outside_any_activation_panics() {
 #[test]
 fn an_invocation_hands_back_its_callees_effects_with_its_own_buffer() {
     let slot = RefCell::new(InFlightStack::default());
-    let (outcome, buffer, effects) = invoke_over_stack(&slot, "p1", frame_buffer(), || {
-        // What `SyncDoor::call` does from inside the caller's entry: run the
-        // peer's whole activation on this stack, then park its effects on the
-        // caller's frame.
-        let (_, callee_buffer, callee_effects) =
-            invoke_over_stack(&slot, "p2", frame_buffer(), || {
-                slot.borrow_mut().with_innermost("p2", |buffer| {
-                    buffer.publish("notes", brenn_envelope::GuestBody::Text("peer".to_string()))
+    let (outcome, buffer, effects) =
+        invoke_over_stack(&slot, "p1", frame_buffer(), BlobScope::empty(), || {
+            // What `SyncDoor::call` does from inside the caller's entry: run the
+            // peer's whole activation on this stack, then park its effects on the
+            // caller's frame.
+            let (_, callee_buffer, callee_effects) =
+                invoke_over_stack(&slot, "p2", frame_buffer(), BlobScope::empty(), || {
+                    slot.borrow_mut().with_innermost("p2", |frame| {
+                        frame
+                            .buffer
+                            .publish("notes", brenn_envelope::GuestBody::Text("peer".to_string()))
+                    });
+                    ActivationOutcome::Ok(None)
                 });
-                ActivationOutcome::Ok(None)
+            assert_eq!(callee_buffer.len(), 1, "the peer's publish is the peer's");
+            assert!(callee_effects.is_empty(), "the peer called nobody");
+            slot.borrow_mut().stash(vec![effect("peer-committed")]);
+            slot.borrow_mut().with_innermost("p1", |frame| {
+                frame
+                    .buffer
+                    .publish("notes", brenn_envelope::GuestBody::Text("mine".to_string()))
             });
-        assert_eq!(callee_buffer.len(), 1, "the peer's publish is the peer's");
-        assert!(callee_effects.is_empty(), "the peer called nobody");
-        slot.borrow_mut().stash(vec![effect("peer-committed")]);
-        slot.borrow_mut().with_innermost("p1", |buffer| {
-            buffer.publish("notes", brenn_envelope::GuestBody::Text("mine".to_string()))
+            ActivationOutcome::Ok(None)
         });
-        ActivationOutcome::Ok(None)
-    });
     assert!(matches!(outcome, ActivationOutcome::Ok(None)));
     assert_eq!(
         buffer.len(),
@@ -693,4 +701,35 @@ fn an_invocation_hands_back_its_callees_effects_with_its_own_buffer() {
         slot.borrow_mut().with_innermost("p1", |_| ()).is_none(),
         "the invocation left nothing on the stack"
     );
+}
+
+/// A blob scope is reached as a buffer is: only by the instance whose frame is
+/// on top, and it goes with the frame, so nothing a component opened outlives
+/// its activation.
+#[test]
+fn a_blob_scope_is_the_innermost_frames_and_pops_with_it() {
+    let mut scoped = BlobScope::empty();
+    scoped.add_window("in", "brenn:site.bar.in".to_string(), &[]);
+    let mut stack = InFlightStack::default();
+    assert!(
+        stack.with_innermost("p1", |_| ()).is_none(),
+        "no activation is on the stack at all"
+    );
+    stack.push("p1", frame_buffer(), scoped);
+    stack.push("p2", frame_buffer(), BlobScope::empty());
+    assert!(
+        stack.with_innermost("p1", |_| ()).is_none(),
+        "a caller blocked in a call of its own opens nothing"
+    );
+    assert_eq!(
+        stack.with_innermost("p2", |frame| frame.blobs.live_handles()),
+        Some(0)
+    );
+    let _ = stack.pop_of("p2");
+    assert!(
+        stack.with_innermost("p1", |_| ()).is_some(),
+        "the caller's scope is reachable again once its callee returned"
+    );
+    let _ = stack.pop_of("p1");
+    assert!(stack.with_innermost("p1", |_| ()).is_none());
 }

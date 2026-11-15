@@ -460,6 +460,11 @@ pub async fn handle_blob_write(
         Ok(door) => door,
         Err(violation) => return violation,
     };
+    // No create precedes a write on a door without upload, so the write is
+    // pipelined behind nothing.
+    if !door.grant.upload {
+        return ctx.violation("BlobWrite on an attachment that may not upload");
+    }
     let len = bytes.len() as u64;
     if len == 0 || len > door.facts.max_chunk_bytes {
         return ctx.violation(format!(
@@ -523,10 +528,17 @@ pub async fn handle_blob_seal(
     handle: BlobHandle,
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
-    if let Err(violation) = door_or_violate(ctx, "BlobSeal") {
-        return violation;
+    let door = match door_or_violate(ctx, "BlobSeal") {
+        Ok(door) => door,
+        Err(violation) => return violation,
+    };
+    // No create precedes a seal on a door without upload, so the seal is
+    // pipelined behind nothing.
+    if !door.grant.upload {
+        return ctx.violation("BlobSeal on an attachment that may not upload");
     }
     let outcome = match table.slots.remove(&handle) {
+        // A seal pipelined behind a refused create.
         None => BlobSealOutcome::UnknownHandle,
         Some(held @ BlobSlot::Held { .. }) => {
             table.slots.insert(handle, held);
@@ -599,6 +611,8 @@ pub async fn handle_blob_open(
     }
     // The same words a `Subscribe` there earns: outside the grants, "not
     // yours" and "no such channel" stay one answer.
+    // TODO(remote-blob-open-without-delivery): admits any message in the
+    // channel's window, delivered to this session or not.
     if ctx.profile.subscribable(channel).is_none() {
         return ctx.violation(format!(
             "BlobOpen on unsubscribable channel {}",
@@ -791,10 +805,13 @@ pub async fn handle_blob_close(
 }
 
 /// The violation a publish's attachment list is, if it is one: a list on an
-/// attachment without the door, over the per-message bound, or naming one
-/// name twice. Names outside the grammar never decode.
+/// attachment without the door, under an attribution the profile does not let
+/// attach on `channel`, over the per-message bound, or naming one name twice.
+/// Names outside the grammar never decode.
 pub fn check_attachment_shape(
     ctx: &AttachSessionCtx,
+    attribution: Option<&str>,
+    channel: &str,
     attachments: &[PublishAttachment],
     frame: &str,
 ) -> Result<(), FrameOutcome> {
@@ -802,6 +819,13 @@ pub fn check_attachment_shape(
         return Ok(());
     }
     door_or_violate(ctx, frame)?;
+    if !ctx.profile.attribution_may_attach(attribution, channel) {
+        return Err(ctx.violation(format!(
+            "{frame} names attachments on channel {} under an attribution that may not attach \
+             there",
+            sanitize_client_detail(channel)
+        )));
+    }
     check_attachment_names(attachments.iter().map(|attachment| &attachment.name)).map_err(|err| {
         match err {
             AttachmentError::TooMany { count } => ctx.violation(format!(

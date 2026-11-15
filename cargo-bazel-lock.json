@@ -1,5 +1,5 @@
 {
-  "checksum": "e43f918424d355f5229c5f065a4ff899e01ccb59bb5232ce52714119bf4037c1",
+  "checksum": "9950299860c267f7553c813c47c70e5537e73fc22af78507716f525b470dda93",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -4822,12 +4822,20 @@
               "target": "base64ct"
             },
             {
+              "id": "bytes 1.11.1",
+              "target": "bytes"
+            },
+            {
               "id": "chrono 0.4.45",
               "target": "chrono"
             },
             {
               "id": "hex 0.4.3",
               "target": "hex"
+            },
+            {
+              "id": "http-body 1.0.1",
+              "target": "http_body"
             },
             {
               "id": "percent-encoding 2.3.2",
@@ -4864,6 +4872,19 @@
             {
               "id": "url 2.5.8",
               "target": "url"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "http-body-util 0.1.3",
+              "target": "http_body_util"
+            },
+            {
+              "id": "tracing-test 0.2.6",
+              "target": "tracing_test"
             }
           ],
           "selects": {}
@@ -38143,6 +38164,7 @@
     "hkdf 0.13.0",
     "hmac 0.13.0",
     "http 1.4.2",
+    "http-body 1.0.1",
     "http-body-util 0.1.3",
     "indexmap 2.14.0",
     "js-sys 0.3.102",

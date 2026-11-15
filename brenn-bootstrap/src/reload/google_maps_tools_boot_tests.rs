@@ -218,6 +218,7 @@ new {ASSISTANT}: Assistant();
             brenn_lib::config::ApiKeyTable::new(std::sync::Arc::new(
                 brenn_lib::config::resolve_api_key_providers(&document.config),
             )),
+            brenn_oauth::tools::BlobStoreSlot::default(),
         ),
         &document.config.wasm_consumers,
         &apps,

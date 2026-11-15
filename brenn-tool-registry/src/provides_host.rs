@@ -151,6 +151,7 @@ mod tests {
                 grant(vec![clause(&[("repo", "r")])]),
             )]),
             slug.to_string(),
+            false,
             alert,
         );
         WasmProvidesHost::new(runtime.clone(), Arc::new(tools))
@@ -348,6 +349,7 @@ mod tests {
             Arc::new(git_repo_pull_only()).into(),
             BTreeMap::new(),
             PROVIDER.to_string(),
+            false,
             alert,
         );
         let host = WasmProvidesHost::new(runtime.clone(), Arc::new(tools));

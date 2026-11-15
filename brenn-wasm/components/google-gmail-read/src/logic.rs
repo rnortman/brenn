@@ -1,9 +1,10 @@
 //! The wrapper's decisions, in `std` plus `serde_json`: validating
-//! `GmailLabels`', `GmailSearch`'s, `GmailRead`'s and `GmailThread`'s
-//! arguments, building their Gmail calls as `api-request` arguments, reading
-//! `api-request`'s answer, and compacting Google's JSON into the tool's
-//! result. Nothing here names the guest SDK, so the whole module runs on the
-//! host under test. Tools are the generated `Provided` enum, whose SDK-facing
+//! `GmailLabels`', `GmailSearch`'s, `GmailRead`'s, `GmailThread`'s and
+//! `GmailAttachment`'s arguments, building their Gmail calls as `api-request`
+//! arguments, reading `api-request`'s answer, compacting Google's JSON into
+//! the tool's result, and decoding a fetched attachment from one blob into
+//! another through the kit's [`Step`]. Nothing here names the guest SDK, so
+//! the whole module runs on the host under test. Tools are the generated `Provided` enum, whose SDK-facing
 //! parts are wasm32-only.
 
 // The host test's crate root is this file, so it declares the generated
@@ -13,10 +14,12 @@ mod spec;
 
 use std::collections::BTreeMap;
 
-use brenn_google_workspace::args::{QUERY_MAX_CHARS, account, max_chars};
+use brenn_google_workspace::args::{QUERY_MAX_CHARS, account, id_arg, is_token, max_chars};
 use brenn_google_workspace::call::get_call;
+use brenn_google_workspace::gmail::attachment::{DecodeError, Decoder, part_tree_fields};
 use brenn_google_workspace::gmail::{
-    HEADER_MAX_BYTES, MESSAGES_PATH, decode, gmail_id, is_gmail_id, metadata_query, raw_header,
+    ATTACHMENT_PART_DEPTH, HEADER_MAX_BYTES, MESSAGES_PATH, PART_ID_MAX_CHARS, decode, gmail_id,
+    is_gmail_id, is_part_id, metadata_query, part_tree_mask, raw_header,
 };
 use brenn_google_workspace::scope::{Scope, google_error, no_body_refused};
 use brenn_google_workspace::settings::Settings;
@@ -24,9 +27,10 @@ use brenn_google_workspace::text::{
     PAGE_MAX_CHARS, bounded_quote, fit_text, next_page, plain, put_cut_text, shape,
 };
 use brenn_provider_kit::{
-    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, Failure, Logic, NestedError, Next,
-    QueryValue, Tool, Unreadable, bounded, capped, copy, cut, flag, google, integer, internal,
-    no_such_step, object, query, read_api_result, serialized_len, stored,
+    Answer, ApiCall, Args, BlobAnswer, COMPACT_RESULT_CEILING, Call, CreateError, ErrorKind,
+    Failure, Logic, NestedError, Next, Query, QueryValue, Step, Tool, Unreadable, bounded, capped,
+    copy, cut, flag, google, integer, internal, no_such_step, object, query, read_api_blob,
+    read_api_result, serialized_len, stored,
 };
 use serde_json::{Value, json};
 
@@ -89,13 +93,21 @@ const READ_HEADERS: &[&str] = &[
 /// `GmailRead`'s second step: the message's structure, read when the full
 /// message's read was cut at the provider's read limit or refused by the host.
 const STRUCTURE_STEP: u8 = 2;
-/// messages.get's structure mask: everything but `data`, the tree listed to
-/// the payload and three levels of parts below it.
-const STRUCTURE_FIELDS: &str = "id,threadId,labelIds,snippet,internalDate,sizeEstimate,\
-                                payload(mimeType,filename,headers,body(size,attachmentId),\
-                                parts(mimeType,filename,headers,body(size,attachmentId),\
-                                parts(mimeType,filename,headers,body(size,attachmentId),\
-                                parts(mimeType,filename,headers,body(size,attachmentId)))))";
+/// What the structure mask lists of the message itself.
+const STRUCTURE_MESSAGE_FIELDS: &str = "id,threadId,labelIds,snippet,internalDate,sizeEstimate";
+/// What the structure mask lists of each part: everything but `data`.
+const STRUCTURE_PART_FIELDS: &str = "partId,mimeType,filename,headers,body(size,attachmentId)";
+/// How many levels of parts below the payload the structure mask lists.
+const STRUCTURE_PART_DEPTH: usize = 3;
+
+/// messages.get's structure mask: the message's fields, and the tree listed
+/// to the payload and [`STRUCTURE_PART_DEPTH`] levels of parts below it.
+fn structure_fields() -> String {
+    format!(
+        "{STRUCTURE_MESSAGE_FIELDS},{}",
+        part_tree_mask(STRUCTURE_PART_FIELDS, STRUCTURE_PART_DEPTH)
+    )
+}
 
 /// The path Gmail reads one thread below.
 const THREADS_PATH: &str = "/gmail/v1/users/me/threads";
@@ -127,6 +139,23 @@ const SEARCH_MAX_DEFAULT: u64 = 10;
 const SEARCH_FIRST_GET: u8 = 2;
 const SEARCH_LAST_GET: u8 = SEARCH_FIRST_GET + SEARCH_MAX_MAX as u8 - 1;
 
+/// `GmailAttachment`'s second step: the attachment's body, asked for as an
+/// attachment of `api-request`'s answer, decoded into a blob of its own.
+const FETCH_STEP: u8 = 2;
+/// The API `GmailAttachment`'s second step reads.
+const ATTACHMENTS_GET: &str = "messages.attachments.get";
+/// The largest attachment `GmailAttachment` returns, in decoded bytes:
+/// Gmail's own ceiling for received mail, and the largest round size whose
+/// base64url JSON (about 4/3 of it) fits the host's default largest blob.
+pub const MAX_ATTACHMENT_BYTES: u64 = 50_000_000;
+/// The most characters of an `attachmentId` the fetch puts in its path. Gmail
+/// documents no length; its ids are a few hundred characters.
+const ATTACHMENT_ID_MAX_CHARS: usize = 4096;
+/// The name of the completion's attachment that holds the decoded file.
+const FILE_ATTACHMENT: &str = "attachment";
+/// The content type of a file whose part names none the host accepts.
+const OCTET_STREAM: &str = "application/octet-stream";
+
 /// The scope `tool`'s step `step` needs. A step the tool does not have is
 /// never asked for: `advance` maps an error only for a step it issued.
 fn scope(tool: Provided, step: u8) -> Scope {
@@ -135,7 +164,8 @@ fn scope(tool: Provided, step: u8) -> Scope {
             Provided::GmailLabels
             | Provided::GmailSearch
             | Provided::GmailRead
-            | Provided::GmailThread,
+            | Provided::GmailThread
+            | Provided::GmailAttachment,
             _,
         ) => Scope::GmailRead,
     }
@@ -161,12 +191,22 @@ impl Logic for GmailReads {
     type Tool = Provided;
     type Settings = Settings;
 
-    fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
+    fn plan(
+        tool: Provided,
+        args: &Value,
+        _: &Step<'_>,
+        settings: &Settings,
+    ) -> Result<Call, String> {
         plan(tool, args, settings)
     }
 
-    fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-        advance(state, outcome, settings)
+    fn advance(
+        state: &InFlight,
+        outcome: Result<Value, NestedError>,
+        step: &mut Step<'_>,
+        settings: &Settings,
+    ) -> Next {
+        advance(state, outcome, step, settings)
     }
 }
 
@@ -200,6 +240,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             Ok(Call {
                 step: 1,
                 api: thread_call(&thread, THREAD_HEADERS, settings),
+            })
+        }
+        Provided::GmailAttachment => {
+            let attachment = AttachmentArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: part_tree_call(&attachment, settings),
             })
         }
     }
@@ -369,6 +416,56 @@ fn thread_call(args: &ThreadArgs, headers: &[&str], settings: &Settings) -> ApiC
     )
 }
 
+/// `GmailAttachment`'s arguments: the message and the part of it to fetch.
+struct AttachmentArgs {
+    id: String,
+    part_id: String,
+    account: Option<String>,
+}
+
+impl AttachmentArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["id", "part_id", "account"];
+
+    fn parse(args: &Value) -> Result<AttachmentArgs, String> {
+        let map = object(args, Self::KEYS)?;
+        Ok(AttachmentArgs {
+            id: gmail_id(map, "id")?.ok_or("`id` is required")?,
+            part_id: id_arg(map, "part_id", is_part_id, || {
+                format!("1 to {PART_ID_MAX_CHARS} letters, digits or `.`")
+            })?
+            .ok_or("`part_id` is required")?,
+            account: account(map)?,
+        })
+    }
+}
+
+/// messages.get of the message's part tree to [`ATTACHMENT_PART_DEPTH`]
+/// levels below the payload, without any part's data.
+fn part_tree_call(args: &AttachmentArgs, settings: &Settings) -> ApiCall {
+    get_call(
+        settings,
+        args.account.as_deref(),
+        format!("{MESSAGES_PATH}/{}", args.id),
+        query([
+            ("format", "full".to_string()),
+            ("fields", part_tree_fields()),
+        ]),
+    )
+}
+
+/// messages.attachments.get of `attachment_id`, its body answered as an
+/// attachment.
+fn attachment_call(args: &AttachmentArgs, attachment_id: &str, settings: &Settings) -> ApiCall {
+    get_call(
+        settings,
+        args.account.as_deref(),
+        format!("{MESSAGES_PATH}/{}/attachments/{attachment_id}", args.id),
+        Query::new(),
+    )
+    .answer_as_attachment()
+}
+
 /// labels.list for the names of the user labels an answer carries.
 fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
     get_call(
@@ -518,7 +615,15 @@ fn quoted(why: &Unreadable, estimate: Option<u64>) -> String {
 /// What the request does with its nested call's answer: complete, fail, or
 /// issue its next step. Every answer completed here is held to the result
 /// ceiling; a relayed credential answer is `api-request`'s own and is not.
-pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
+pub fn advance(
+    state: &InFlight,
+    outcome: Result<Value, NestedError>,
+    step: &mut Step<'_>,
+    settings: &Settings,
+) -> Next {
+    if (state.tool, state.step) == (Provided::GmailAttachment, FETCH_STEP) {
+        return attachment_fetched(state, outcome, step);
+    }
     let body = match read_api_result(outcome, &state.target, google::API_NAME) {
         Ok(Answer::Body(body)) => body,
         Ok(Answer::NoBody { status }) => return settle(state.tool, no_body(state, status)),
@@ -564,6 +669,7 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
             (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 named(state, &body)
             }
+            (Provided::GmailAttachment, 1) => part_located(state, &body, settings),
             (tool, step) => Err(no_such_step(tool, step)),
         },
     )
@@ -583,7 +689,7 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
             (Provided::GmailRead, 1) => stored(state, ReadArgs::parse).map(|args| Next::Call {
                 call: Call {
                     step: STRUCTURE_STEP,
-                    api: read_call(&args, Some(STRUCTURE_FIELDS), settings),
+                    api: read_call(&args, Some(&structure_fields()), settings),
                 },
                 derived: why.to_derived(),
             }),
@@ -596,6 +702,7 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
             }),
             (Provided::GmailLabels, 1)
             | (Provided::GmailSearch, 1)
+            | (Provided::GmailAttachment, 1)
             | (Provided::GmailRead, STRUCTURE_STEP)
             | (Provided::GmailThread, THREAD_NARROW_STEP)
             | (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
@@ -617,7 +724,8 @@ fn no_body(state: &InFlight, status: u64) -> Result<Next, Failure> {
         },
         (Provided::GmailSearch, 1) => ("messages.list", "JSON"),
         (Provided::GmailSearch, SEARCH_FIRST_GET..=SEARCH_LAST_GET)
-        | (Provided::GmailRead, 1 | STRUCTURE_STEP) => ("messages.get", "JSON"),
+        | (Provided::GmailRead, 1 | STRUCTURE_STEP)
+        | (Provided::GmailAttachment, 1) => ("messages.get", "JSON"),
         (Provided::GmailThread, 1 | THREAD_NARROW_STEP) => ("threads.get", "JSON"),
         (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
             ("labels.list", "JSON")
@@ -636,7 +744,7 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
             let value = match tool {
                 Provided::GmailRead => fit_text(value, "text", COMPACT_RESULT_CEILING),
                 Provided::GmailThread => fit_thread(value, COMPACT_RESULT_CEILING),
-                Provided::GmailLabels | Provided::GmailSearch => value,
+                Provided::GmailLabels | Provided::GmailSearch | Provided::GmailAttachment => value,
             };
             bounded(value, COMPACT_RESULT_CEILING, None)
         }
@@ -644,6 +752,233 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
         Err(failure) => Next::Fail(failure),
     }
 }
+/// An `invalid_args` failure carrying `detail`: the caller named something
+/// this tool cannot return, and a retry cannot help.
+fn invalid_args(detail: String) -> Failure {
+    Failure {
+        kind: ErrorKind::InvalidArgs,
+        detail,
+    }
+}
+
+/// `GmailAttachment`'s part-tree read: the part named `part_id`, found within
+/// [`ATTACHMENT_PART_DEPTH`] levels of the payload, fetched next by its
+/// `attachmentId`, its `filename`, `mimeType` and `body.size` riding in
+/// `derived`. A part that is not there, is carried inside the message, or is
+/// over [`MAX_ATTACHMENT_BYTES`] is the caller's `invalid_args`.
+fn part_located(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
+    let args = stored(state, AttachmentArgs::parse)?;
+    let api = "messages.get";
+    let payload = body.get("payload").ok_or_else(|| shape(api))?;
+    let Some(part) = find_part(payload, &args.part_id, 0, api)? else {
+        return Err(invalid_args(format!(
+            "message `{}` has no part `{}` within {ATTACHMENT_PART_DEPTH} levels of its payload, \
+             the depth GmailAttachment reads; use a `part_id` GmailRead lists",
+            args.id, args.part_id
+        )));
+    };
+    let part_body = match part.get("body") {
+        None => None,
+        Some(Value::Object(part_body)) => Some(part_body),
+        Some(_) => return Err(shape(api)),
+    };
+    let attachment_id = match part_body.and_then(|part_body| part_body.get("attachmentId")) {
+        None => {
+            return Err(invalid_args(format!(
+                "part `{}` is carried inside the message, not as an attachment Gmail serves; \
+                 read it with GmailRead",
+                args.part_id
+            )));
+        }
+        Some(Value::String(id)) => id,
+        Some(_) => return Err(shape(api)),
+    };
+    let size = part_body
+        .and_then(|part_body| part_body.get("size"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| shape(api))?;
+    if size > MAX_ATTACHMENT_BYTES {
+        return Err(invalid_args(format!(
+            "attachment of {size} bytes exceeds the {MAX_ATTACHMENT_BYTES} bytes GmailAttachment \
+             returns"
+        )));
+    }
+    if !is_token(attachment_id, ATTACHMENT_ID_MAX_CHARS) {
+        return Err(shape(api));
+    }
+    let text = |key: &str| match part.get(key) {
+        None => Ok(String::new()),
+        Some(Value::String(text)) => Ok(bounded_quote(text)),
+        Some(_) => Err(shape(api)),
+    };
+    let derived = Args::from_iter([
+        ("filename".to_string(), json!(text("filename")?)),
+        ("mime_type".to_string(), json!(text("mimeType")?)),
+        ("size".to_string(), json!(size)),
+    ]);
+    Ok(Next::Call {
+        call: Call {
+            step: FETCH_STEP,
+            api: attachment_call(&args, attachment_id, settings),
+        },
+        derived,
+    })
+}
+
+/// The part of `part`'s tree, `part` at `depth` below the payload, whose
+/// `partId` is `part_id`, searched to [`ATTACHMENT_PART_DEPTH`]. A part that
+/// is not an object, or a `partId` or `parts` not of Gmail's shape, is
+/// Google's fault.
+fn find_part<'a>(
+    part: &'a Value,
+    part_id: &str,
+    depth: usize,
+    api: &str,
+) -> Result<Option<&'a Value>, Failure> {
+    let Value::Object(map) = part else {
+        return Err(shape(api));
+    };
+    match map.get("partId") {
+        Some(Value::String(id)) if id == part_id => return Ok(Some(part)),
+        None | Some(Value::String(_)) => {}
+        Some(_) => return Err(shape(api)),
+    }
+    if depth == ATTACHMENT_PART_DEPTH {
+        return Ok(None);
+    }
+    match map.get("parts") {
+        None => Ok(None),
+        Some(Value::Array(parts)) => {
+            for child in parts {
+                if let Some(found) = find_part(child, part_id, depth + 1, api)? {
+                    return Ok(Some(found));
+                }
+            }
+            Ok(None)
+        }
+        Some(_) => Err(shape(api)),
+    }
+}
+
+/// `GmailAttachment`'s fetch answered: Gmail's JSON, an attachment of the
+/// answer, decoded into the completion's attachment [`FILE_ATTACHMENT`]; a
+/// typed refusal of `api-request`'s, Google's error or an unreadable answer
+/// fails the request.
+fn attachment_fetched(
+    state: &InFlight,
+    outcome: Result<Value, NestedError>,
+    step: &mut Step<'_>,
+) -> Next {
+    let answer = match read_api_blob(outcome, &state.target, google::API_NAME) {
+        Ok(BlobAnswer::Blob { attachment, .. }) => attachment,
+        Ok(BlobAnswer::Relay(value)) => return Next::Complete(value),
+        Ok(BlobAnswer::Unreadable(why)) => {
+            return Next::Fail(why.failure(google::API_NAME, None));
+        }
+        Ok(BlobAnswer::Error { status, body }) => {
+            return Next::Fail(google_error(status, &body, scope(state.tool, state.step)));
+        }
+        Ok(BlobAnswer::TooLarge { limit, .. }) => {
+            return Next::Fail(invalid_args(format!(
+                "the attachment's encoded form exceeds the host's largest blob (max_blob_bytes, \
+                 {limit} bytes)"
+            )));
+        }
+        Ok(BlobAnswer::StoreFull) => {
+            return Next::Fail(internal(
+                "the host's blob store is full (blob_budget_bytes)",
+            ));
+        }
+        Err(failure) => return Next::Fail(failure),
+    };
+    settle(state.tool, decode_attachment(state, &answer, step))
+}
+
+/// The text `derived[key]` the part-tree read wrote.
+fn derived_text(derived: &Args, key: &str) -> Result<String, Failure> {
+    derived
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| internal(format!("in-flight row carries no `{key}`")))
+}
+
+/// Gmail's answer, the step's answer attachment `answer`, read piece by piece
+/// through the [`Decoder`] into a new blob of the part's `mimeType` (or
+/// [`OCTET_STREAM`] when the host refuses it), attached to the completion.
+/// Data that is not base64url, a stated `size` that is not the decoded
+/// length, or a decoded length that is not the part's listed size fails the
+/// request before the blob is sealed: a blob of the wrong bytes is never
+/// handed over.
+fn decode_attachment(state: &InFlight, answer: &str, step: &mut Step<'_>) -> Result<Next, Failure> {
+    let args = stored(state, AttachmentArgs::parse)?;
+    let filename = derived_text(&state.derived, "filename")?;
+    let mime_type = derived_text(&state.derived, "mime_type")?;
+    let listed = state
+        .derived
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| internal("in-flight row carries no `size`"))?;
+    let undecodable = |error| match error {
+        DecodeError::Shape => shape(ATTACHMENTS_GET),
+        DecodeError::Base64 => internal(format!(
+            "Gmail {ATTACHMENTS_GET} carries `data` that is not base64url"
+        )),
+    };
+    let mismatch = |decoded: u64| {
+        internal(format!(
+            "Gmail listed part `{}` at {listed} bytes and its data decodes to {decoded}",
+            args.part_id
+        ))
+    };
+    let blob = step.open_answer(answer)?;
+    let file = {
+        let content_type = if mime_type.is_empty() {
+            OCTET_STREAM
+        } else {
+            mime_type.as_str()
+        };
+        let mut file = match step.append(content_type) {
+            Err(CreateError::InvalidContentType(_)) => step.append(OCTET_STREAM)?,
+            created => created?,
+        };
+        let mut decoder = Decoder::new();
+        let mut decoded = Vec::new();
+        let mut total = 0u64;
+        for piece in step.pieces(&blob) {
+            decoded.clear();
+            decoder.push(&piece?, &mut decoded).map_err(undecodable)?;
+            total += decoded.len() as u64;
+            if total > listed {
+                return Err(mismatch(total));
+            }
+            file.write(&decoded)?;
+        }
+        let finished = decoder.finish().map_err(undecodable)?;
+        if let Some(stated) = finished.size
+            && stated != finished.decoded
+        {
+            return Err(internal(format!(
+                "Gmail {ATTACHMENTS_GET} states size {stated} and its data decodes to {} bytes",
+                finished.decoded
+            )));
+        }
+        if finished.decoded != listed {
+            return Err(mismatch(finished.decoded));
+        }
+        file.finish()?
+    };
+    step.attach(FILE_ATTACHMENT, file);
+    Ok(Next::Complete(json!({
+        "id": args.id,
+        "part_id": args.part_id,
+        "filename": filename,
+        "mime_type": mime_type,
+        "size": listed,
+        "attachment": FILE_ATTACHMENT,
+    })))
+}
+
 /// messages.list read: an empty page completes at once; otherwise the first
 /// listed message is read next, the ids and the page's token and estimate
 /// riding in `derived`.
@@ -858,7 +1193,8 @@ fn notes(extracted: &decode::Extracted, structure: bool) -> Vec<String> {
 }
 
 /// The attachments as answered: `filename` and `mime_type` through `plain`
-/// and cut to `HEADER_MAX_BYTES`, `size` when Google gave it, `inline`.
+/// and cut to `HEADER_MAX_BYTES`, `size` when Google gave it, `inline`, and
+/// `part_id` when the part has one the attachment fetch takes.
 fn attachments(extracted: &decode::Extracted) -> Value {
     Value::Array(
         extracted
@@ -878,6 +1214,9 @@ fn attachments(extracted: &decode::Extracted) -> Value {
                     entry.insert("size".to_string(), json!(size));
                 }
                 entry.insert("inline".to_string(), json!(attachment.inline));
+                if let Some(part_id) = &attachment.part_id {
+                    entry.insert("part_id".to_string(), json!(part_id));
+                }
                 Value::Object(entry)
             })
             .collect(),
@@ -1171,14 +1510,17 @@ mod tests {
     use brenn_google_workspace::args::{ACCOUNT_MAX_CHARS, MAX_CHARS_MAX, MAX_CHARS_MIN};
     use brenn_google_workspace::gmail::ID_MAX_CHARS;
     use brenn_google_workspace::testutil::{
-        admits_characters, assert_read_failures_are_bare, completed, cut_read, follow, lookup,
-        no_body_parts,
+        admits_characters, assert_read_failures_are_bare, base64url, completed, cut_read, follow,
+        lookup, no_body_parts,
     };
     use brenn_google_workspace::text::PAGE_MAX_BYTES;
-    use brenn_provider_kit::testutil::{binary, failure, google, http, nested, truncated};
+    use brenn_provider_kit::testutil::{
+        Answered, Completion, MemoryHost, binary, blob_answer, failure, google, http, nested,
+        store_full, too_large, truncated,
+    };
     use brenn_provider_kit::{
-        Bound, ErrorKind, Query, ToolBounds, check, hold_probes, hold_required, input_schema,
-        probes,
+        Bound, Delivered, Input, Probes, Request, ToolBounds, WriteError, check, hold_probes,
+        hold_required, input_schema, probes,
     };
     use serde_json::{Map, json};
 
@@ -1190,9 +1532,12 @@ mod tests {
         Settings::from_lookup(lookup(BASE), "gmail_host").unwrap()
     }
 
-    /// `advance` under the test settings.
+    /// `advance` under the test settings, on a step whose answer carries no
+    /// attachment.
     fn answered(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
-        advance(state, outcome, &settings())
+        let host = MemoryHost::new();
+        let mut step = Step::answering(&host, "r000", "c000", Vec::new(), Vec::new());
+        advance(state, outcome, &mut step, &settings())
     }
     fn labels(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailLabels, &args, &settings()).map(|call| {
@@ -1223,6 +1568,7 @@ mod tests {
                 query: fields("labels(id,name,type)"),
                 headers: BTreeMap::new(),
                 body: None,
+                response_attachment: None,
             }
         );
         // `api-request` refuses an argument it does not know, so an absent
@@ -1689,6 +2035,7 @@ mod tests {
                 query: fields("labels(id,name)"),
                 headers: BTreeMap::new(),
                 body: None,
+                response_attachment: None,
             }
         );
         let names = r#"{ "labels": [
@@ -2457,9 +2804,9 @@ mod tests {
                     "text_chars": 16,
                     "attachments": [
                         { "filename": "Q3 report.pdf", "mime_type": "application/pdf",
-                          "size": 48213, "inline": false },
+                          "size": 48213, "inline": false, "part_id": "1" },
                         { "filename": "logo.png", "mime_type": "image/png",
-                          "size": 1024, "inline": true },
+                          "size": 1024, "inline": true, "part_id": "2" },
                     ],
                 })
             )
@@ -2702,7 +3049,7 @@ mod tests {
     #[test]
     fn text_is_cut_at_max_chars_on_a_char_boundary() {
         let text = "é".repeat(150) + &"😀".repeat(100);
-        let data = base64_of(text.as_bytes());
+        let data = base64url(text.as_bytes());
         let body = one_part(
             json!({ "mimeType": "text/plain", "body": { "data": data } }),
             json!([]),
@@ -2712,22 +3059,6 @@ mod tests {
         assert_eq!(answer["text"], json!("é".repeat(150) + &"😀".repeat(50)));
         assert_eq!(answer["text_chars"], json!(250));
         assert_eq!(answer["text_truncated"], json!(true));
-    }
-
-    /// `bytes` in base64url without padding, for building bodies in tests.
-    fn base64_of(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let n = chunk
-                .iter()
-                .enumerate()
-                .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
-            for i in 0..=chunk.len() {
-                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
-            }
-        }
-        out
     }
 
     #[test]
@@ -2740,7 +3071,7 @@ mod tests {
         let body = |labels: Value| {
             json!({ "id": "m1", "labelIds": labels, "payload": {
                 "mimeType": "text/plain", "headers": headers,
-                "body": { "data": base64_of(text.as_bytes()) },
+                "body": { "data": base64url(text.as_bytes()) },
             } })
             .to_string()
         };
@@ -2784,10 +3115,11 @@ mod tests {
         assert_eq!(
             call.api.query["fields"],
             QueryValue::One(
-                "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(mimeType,\
-                 filename,headers,body(size,attachmentId),parts(mimeType,filename,headers,\
-                 body(size,attachmentId),parts(mimeType,filename,headers,body(size,\
-                 attachmentId),parts(mimeType,filename,headers,body(size,attachmentId)))))"
+                "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(partId,\
+                 mimeType,filename,headers,body(size,attachmentId),parts(partId,mimeType,\
+                 filename,headers,body(size,attachmentId),parts(partId,mimeType,filename,\
+                 headers,body(size,attachmentId),parts(partId,mimeType,filename,headers,\
+                 body(size,attachmentId)))))"
                     .to_string()
             )
         );
@@ -2804,7 +3136,7 @@ mod tests {
                                      the body is not",
                     "attachments": [{ "filename": "Q3 report.pdf",
                                       "mime_type": "application/pdf", "size": 48213,
-                                      "inline": false }],
+                                      "inline": false, "part_id": "1" }],
                 })
             )
         );
@@ -2831,7 +3163,7 @@ mod tests {
         assert_eq!(call.step, STRUCTURE_STEP);
         assert_eq!(
             call.api.query["fields"],
-            QueryValue::One(STRUCTURE_FIELDS.to_string())
+            QueryValue::One(structure_fields())
         );
         let answer = completed(answered(&row, http(200, STRUCTURE)));
         assert_eq!(answer["text"], Value::Null);
@@ -3270,6 +3602,506 @@ mod tests {
         assert_eq!(answer["messages_omitted"], json!(1));
     }
 
+    /// A `GmailAttachment` row at its first step, as `plan` issues it.
+    fn attachment_state(args: Value) -> InFlight {
+        let call = plan(Provided::GmailAttachment, &args, &settings()).unwrap();
+        InFlight::new(
+            &"a".repeat(32),
+            Provided::GmailAttachment,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+            1_000,
+        )
+    }
+
+    /// The attachment `messages.attachments.get` answers for `bytes`.
+    fn attachments_get(bytes: &[u8]) -> Vec<u8> {
+        json!({ "attachmentId": "ANGjdJ8", "size": bytes.len(), "data": base64url(bytes) })
+            .to_string()
+            .into_bytes()
+    }
+
+    /// A part of the tree the part-tree mask lists.
+    fn part(id: &str, mime_type: &str, filename: &str, body: Value) -> Value {
+        json!({ "partId": id, "mimeType": mime_type, "filename": filename, "body": body })
+    }
+
+    /// The PDF attachment at part `1`, of `size` bytes.
+    fn pdf(size: u64) -> Value {
+        part(
+            "1",
+            "application/pdf",
+            "report.pdf",
+            json!({ "size": size, "attachmentId": "ANGjdJ8" }),
+        )
+    }
+
+    /// A message whose payload holds a text part `0` and `attachment`.
+    fn part_tree(attachment: Value) -> String {
+        let mut payload = part("", "multipart/mixed", "", json!({ "size": 0 }));
+        payload["parts"] = json!([
+            part("0", "text/plain", "", json!({ "size": 5 })),
+            attachment
+        ]);
+        json!({ "payload": payload }).to_string()
+    }
+
+    /// A message whose attachment, part `id`, sits `depth` levels of
+    /// `multipart/mixed` below the payload.
+    fn nested_part_tree(depth: usize, id: &str) -> String {
+        let mut node = part(
+            id,
+            "application/pdf",
+            "deep.pdf",
+            json!({ "size": 3, "attachmentId": "ANGjdJ8" }),
+        );
+        for level in (0..depth).rev() {
+            let mut parent = part(
+                &format!("x{level}"),
+                "multipart/mixed",
+                "",
+                json!({ "size": 0 }),
+            );
+            parent["parts"] = json!([node]);
+            node = parent;
+        }
+        json!({ "payload": node }).to_string()
+    }
+
+    /// The part-tree read of `GmailAttachment { id: "m1", part_id }`
+    /// answered with `body`.
+    fn located(part_id: &str, body: &str) -> Next {
+        answered(
+            &attachment_state(json!({ "id": "m1", "part_id": part_id })),
+            http(200, body),
+        )
+    }
+
+    /// The row of the fetch step `located` issues.
+    fn fetch_state(part_id: &str, body: &str) -> InFlight {
+        let state = attachment_state(json!({ "id": "m1", "part_id": part_id }));
+        follow(&state, answered(&state, http(200, body))).0
+    }
+
+    #[test]
+    fn attachment_reads_the_part_tree_first() {
+        let call = plan(
+            Provided::GmailAttachment,
+            &json!({ "id": "m1", "part_id": "1.2", "account": "alice@example.com" }),
+            &settings(),
+        )
+        .unwrap();
+        assert_eq!(call.step, 1);
+        assert_eq!(call.api.method, "GET");
+        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m1");
+        assert_eq!(
+            call.api.query,
+            query([
+                ("format", "full".to_string()),
+                ("fields", part_tree_fields()),
+                ("prettyPrint", "false".to_string()),
+            ])
+        );
+        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(call.api.response_attachment, None);
+    }
+
+    #[test]
+    fn a_located_part_is_fetched_as_an_attachment() {
+        let Next::Call { call, derived } = located("1", &part_tree(pdf(3))) else {
+            panic!("the part was not fetched");
+        };
+        assert_eq!(call.step, FETCH_STEP);
+        assert_eq!(call.api.method, "GET");
+        assert_eq!(
+            call.api.path,
+            "/gmail/v1/users/me/messages/m1/attachments/ANGjdJ8"
+        );
+        assert_eq!(call.api.query, fields_free_query());
+        assert_eq!(call.api.body, None);
+        assert_eq!(call.api.response_attachment.as_deref(), Some("body"));
+        assert_eq!(
+            Value::Object(derived),
+            json!({ "filename": "report.pdf", "mime_type": "application/pdf", "size": 3 })
+        );
+    }
+
+    /// The query of a call that names no `fields` mask.
+    fn fields_free_query() -> Query {
+        query([("prettyPrint", "false".to_string())])
+    }
+
+    #[test]
+    fn a_part_is_found_within_eight_levels_and_not_below() {
+        let Next::Call { call, .. } =
+            located("deep", &nested_part_tree(ATTACHMENT_PART_DEPTH, "deep"))
+        else {
+            panic!("a part at depth 8 was not fetched");
+        };
+        assert_eq!(call.step, FETCH_STEP);
+        assert_eq!(
+            located("deep", &nested_part_tree(ATTACHMENT_PART_DEPTH + 1, "deep")),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "message `m1` has no part `deep` within 8 levels of its payload, the depth \
+                 GmailAttachment reads; use a `part_id` GmailRead lists"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_part_gmail_does_not_serve_is_the_callers() {
+        assert_eq!(
+            located("7", &part_tree(pdf(3))),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "message `m1` has no part `7` within 8 levels of its payload, the depth \
+                 GmailAttachment reads; use a `part_id` GmailRead lists"
+            ))
+        );
+        assert_eq!(
+            located("0", &part_tree(pdf(3))),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "part `0` is carried inside the message, not as an attachment Gmail serves; \
+                 read it with GmailRead"
+            ))
+        );
+        assert_eq!(
+            located("1", &part_tree(pdf(MAX_ATTACHMENT_BYTES + 1))),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "attachment of 50000001 bytes exceeds the 50000000 bytes GmailAttachment returns"
+            ))
+        );
+        let Next::Call { derived, .. } = located("1", &part_tree(pdf(MAX_ATTACHMENT_BYTES))) else {
+            panic!("the largest attachment was not fetched");
+        };
+        assert_eq!(derived["size"], json!(MAX_ATTACHMENT_BYTES));
+    }
+
+    #[test]
+    fn a_part_tree_not_of_gmails_shape_is_internal() {
+        let shape = Next::Fail(failure(
+            ErrorKind::Internal,
+            "unexpected Google messages.get response shape",
+        ));
+        let with = |edit: &dyn Fn(&mut Value)| {
+            let mut attachment = pdf(3);
+            edit(&mut attachment);
+            located("1", &part_tree(attachment))
+        };
+        for (what, next) in [
+            ("no payload", located("1", "{}")),
+            ("a part not an object", located("1", &part_tree(json!("1")))),
+            (
+                "parts not a list",
+                located("1", &json!({ "payload": { "parts": {} } }).to_string()),
+            ),
+            ("a partId not a string", with(&|p| p["partId"] = json!(1))),
+            ("a body not an object", with(&|p| p["body"] = json!([]))),
+            (
+                "no size",
+                with(&|p| p["body"] = json!({ "attachmentId": "A" })),
+            ),
+            ("a negative size", with(&|p| p["body"]["size"] = json!(-1))),
+            (
+                "an id not a string",
+                with(&|p| p["body"]["attachmentId"] = json!(1)),
+            ),
+            (
+                "an id with `/`",
+                with(&|p| p["body"]["attachmentId"] = json!("a/b")),
+            ),
+            (
+                "an id over 4096",
+                with(&|p| p["body"]["attachmentId"] = json!("a".repeat(4097))),
+            ),
+            (
+                "a filename not a string",
+                with(&|p| p["filename"] = json!(1)),
+            ),
+            (
+                "a mimeType not a string",
+                with(&|p| p["mimeType"] = json!(1)),
+            ),
+        ] {
+            assert_eq!(next, shape, "{what}");
+        }
+        let Next::Call { .. } = with(&|p| p["body"]["attachmentId"] = json!("a".repeat(4096)))
+        else {
+            panic!("a 4096-character id was refused");
+        };
+    }
+
+    #[test]
+    fn a_part_carries_its_filename_and_type_bounded() {
+        let long = "é".repeat(600);
+        let mut attachment = pdf(3);
+        attachment["filename"] = json!(long);
+        attachment.as_object_mut().unwrap().remove("mimeType");
+        let Next::Call { derived, .. } = located("1", &part_tree(attachment)) else {
+            panic!("the part was not fetched");
+        };
+        assert_eq!(derived["filename"], json!(bounded_quote(&long)));
+        assert!(derived["filename"].as_str().unwrap().ends_with('…'));
+        assert_eq!(derived["mime_type"], json!(""));
+    }
+
+    /// One `GmailAttachment` request run through the kit's loop on `host`:
+    /// the part-tree read answered with `tree`, the fetch answered with
+    /// `encoded` as its attachment. The request's completion.
+    fn fetch_through_the_loop(host: &MemoryHost, tree: &str, encoded: Vec<u8>) -> Completion {
+        let id = "r000".to_string();
+        let request = Request {
+            id: id.clone(),
+            tool: Provided::GmailAttachment.name().to_string(),
+            args: json!({ "id": "m1", "part_id": "1" }),
+            attachments: Vec::new(),
+        };
+        let deliver = |now_ms, results| Input {
+            now_ms,
+            requests: Vec::new(),
+            results,
+        };
+        host.activate::<GmailReads>(
+            &settings(),
+            Input {
+                now_ms: 0,
+                requests: vec![request],
+                results: Vec::new(),
+            },
+        )
+        .unwrap();
+        let read = host.take_calls().remove(0);
+        host.activate::<GmailReads>(
+            &settings(),
+            deliver(
+                1,
+                vec![Delivered {
+                    call_id: read.call_id,
+                    serving: Some(id.clone()),
+                    outcome: http(200, tree),
+                    attachments: Vec::new(),
+                }],
+            ),
+        )
+        .unwrap();
+        let fetch = host.take_calls().remove(0);
+        assert_eq!(fetch.call.response_attachment.as_deref(), Some("body"));
+        let size = encoded.len() as u64;
+        let answer = host.seed_result(&fetch.call_id, "body", "application/json", encoded);
+        host.activate::<GmailReads>(
+            &settings(),
+            deliver(
+                2,
+                vec![Delivered {
+                    call_id: fetch.call_id,
+                    serving: Some(id),
+                    outcome: blob_answer("body", size),
+                    attachments: vec![answer],
+                }],
+            ),
+        )
+        .unwrap();
+        let mut completions = host.take_completions();
+        assert_eq!(completions.len(), 1);
+        completions.remove(0)
+    }
+
+    /// A host reading and writing 1 024 bytes at a time.
+    fn small_pieces() -> MemoryHost {
+        let host = MemoryHost::new();
+        host.set_blob_limits(Some(brenn_provider_kit::BlobLimits {
+            max_read_bytes: 1024,
+            max_write_bytes: 1024,
+        }));
+        host
+    }
+
+    /// `n` bytes of every value, in order.
+    fn file(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 7 % 256) as u8).collect()
+    }
+
+    #[test]
+    fn a_fetched_attachment_is_decoded_into_the_completion() {
+        let bytes = file(5_000);
+        let host = small_pieces();
+        let completion = fetch_through_the_loop(
+            &host,
+            &part_tree(pdf(bytes.len() as u64)),
+            attachments_get(&bytes),
+        );
+        assert_eq!(
+            completion.answer,
+            Answered::Value(json!({
+                "id": "m1",
+                "part_id": "1",
+                "filename": "report.pdf",
+                "mime_type": "application/pdf",
+                "size": 5_000,
+                "attachment": "attachment",
+            }))
+        );
+        assert_eq!(completion.attachments.len(), 1);
+        let blob = &completion.attachments[0];
+        assert_eq!(blob.name, "attachment");
+        assert_eq!(blob.content_type, "application/pdf");
+        assert_eq!(blob.bytes, bytes);
+    }
+
+    #[test]
+    fn an_empty_attachment_is_an_empty_blob() {
+        let completion =
+            fetch_through_the_loop(&MemoryHost::new(), &part_tree(pdf(0)), attachments_get(&[]));
+        assert_eq!(completion.attachments.len(), 1);
+        assert!(completion.attachments[0].bytes.is_empty());
+    }
+
+    #[test]
+    fn a_type_the_host_refuses_is_octet_stream() {
+        let bytes = file(10);
+        let host = MemoryHost::new();
+        host.refuse_next_create(CreateError::InvalidContentType("bad".to_string()));
+        let mut attachment = pdf(10);
+        attachment["mimeType"] = json!("not a type");
+        let completion =
+            fetch_through_the_loop(&host, &part_tree(attachment), attachments_get(&bytes));
+        let Answered::Value(value) = &completion.answer else {
+            panic!("{completion:?}");
+        };
+        assert_eq!(value["mime_type"], json!("not a type"));
+        assert_eq!(completion.attachments[0].content_type, OCTET_STREAM);
+        assert_eq!(completion.attachments[0].bytes, bytes);
+        // A part with no type is octet-stream without asking.
+        let mut untyped = pdf(10);
+        untyped.as_object_mut().unwrap().remove("mimeType");
+        let completion = fetch_through_the_loop(
+            &MemoryHost::new(),
+            &part_tree(untyped),
+            attachments_get(&bytes),
+        );
+        assert_eq!(completion.attachments[0].content_type, OCTET_STREAM);
+    }
+
+    /// The error a completion answered.
+    fn error(completion: &Completion) -> (ErrorKind, &str) {
+        assert!(completion.attachments.is_empty(), "{completion:?}");
+        match &completion.answer {
+            Answered::Error(kind, detail) => (*kind, detail.as_str()),
+            Answered::Value(value) => panic!("completed with {value}"),
+        }
+    }
+
+    #[test]
+    fn a_wrong_or_undecodable_answer_completes_nothing() {
+        let bytes = file(3_000);
+        let tree = part_tree(pdf(3_000));
+        let stated = json!({ "size": 2_999, "data": base64url(&bytes) });
+        let cases = [
+            (
+                "a stated size that is not the data's",
+                stated.to_string().into_bytes(),
+                "Gmail messages.attachments.get states size 2999 and its data decodes to 3000 \
+                 bytes",
+            ),
+            (
+                "data shorter than the part",
+                attachments_get(&bytes[..2_000]),
+                "Gmail listed part `1` at 3000 bytes and its data decodes to 2000",
+            ),
+            (
+                "data longer than the part",
+                attachments_get(&file(4_000)),
+                "Gmail listed part `1` at 3000 bytes and its data decodes to 4000",
+            ),
+            (
+                "data not base64url",
+                br#"{"size": 3000, "data": "ab*d"}"#.to_vec(),
+                "Gmail messages.attachments.get carries `data` that is not base64url",
+            ),
+            (
+                "an object cut short",
+                attachments_get(&bytes)[..100].to_vec(),
+                "unexpected Google messages.attachments.get response shape",
+            ),
+        ];
+        for (what, encoded, detail) in cases {
+            let completion = fetch_through_the_loop(&MemoryHost::new(), &tree, encoded);
+            assert_eq!(error(&completion), (ErrorKind::Internal, detail), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_write_the_host_refuses_fails_naming_the_bound() {
+        let bytes = file(3_000);
+        let host = small_pieces();
+        host.set_write_budget(2_048);
+        let completion =
+            fetch_through_the_loop(&host, &part_tree(pdf(3_000)), attachments_get(&bytes));
+        assert_eq!(
+            error(&completion),
+            (
+                ErrorKind::Internal,
+                "blob write: the activation's bound on blob calls or on bytes written is reached"
+            )
+        );
+        let host = small_pieces();
+        host.refuse_next_write(WriteError::BudgetExhausted);
+        let completion =
+            fetch_through_the_loop(&host, &part_tree(pdf(3_000)), attachments_get(&bytes));
+        assert_eq!(
+            error(&completion),
+            (
+                ErrorKind::Internal,
+                "blob write: the host's blob store is full (blob_budget_bytes)"
+            )
+        );
+    }
+
+    #[test]
+    fn the_fetchs_refusals_and_errors_are_mapped() {
+        let state = fetch_state("1", &part_tree(pdf(3)));
+        assert_eq!(state.step, FETCH_STEP);
+        assert_eq!(
+            answered(&state, too_large(67_108_864, Some(70_000_000))),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "the attachment's encoded form exceeds the host's largest blob (max_blob_bytes, \
+                 67108864 bytes)"
+            ))
+        );
+        assert_eq!(
+            answered(&state, store_full()),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "the host's blob store is full (blob_budget_bytes)"
+            ))
+        );
+        let not_found = google(404, "NOT_FOUND", "Requested entity was not found.");
+        assert_eq!(
+            answered(&state, http(404, &not_found)),
+            Next::Fail(google_error(404, &not_found, Scope::GmailRead))
+        );
+        let relayed = credential_invalid(json!("alice@example.com"));
+        assert_eq!(
+            answered(&state, Ok(relayed.clone())),
+            Next::Complete(relayed)
+        );
+        assert_eq!(
+            answered(&state, cut_read(json!(300000))),
+            Next::Fail(Unreadable::Cut("300000 bytes".to_string()).failure(google::API_NAME, None))
+        );
+        let Next::Fail(Failure { kind, detail }) = answered(&state, http(200, "{}")) else {
+            panic!("an inline answer was accepted");
+        };
+        assert_eq!(kind, ErrorKind::Internal);
+        assert!(detail.contains("inline"), "{detail}");
+    }
+
     /// Every step `tool` issues a call at.
     fn steps(tool: Provided) -> Vec<u8> {
         match tool {
@@ -3280,16 +4112,20 @@ mod tests {
                 .collect(),
             Provided::GmailRead => vec![1, STRUCTURE_STEP, LABELS_STEP],
             Provided::GmailThread => vec![1, THREAD_NARROW_STEP, LABELS_STEP],
+            // The fetch step's answer is an attachment, not JSON; its tests
+            // are its own.
+            Provided::GmailAttachment => vec![1],
         }
     }
 
     /// A row of each tool at its first step, as `plan` issues it.
-    fn first_reads() -> [InFlight; 4] {
+    fn first_reads() -> [InFlight; 5] {
         let reads = [
             labels_state(json!({})),
             search_state(json!({ "q": "lunch" })),
             read_state(json!({ "id": "m1" })),
             thread_state(json!({ "id": "t1" })),
+            attachment_state(json!({ "id": "m1", "part_id": "1" })),
         ];
         for tool in Provided::ALL {
             assert!(
@@ -3313,6 +4149,10 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            scope(Provided::GmailAttachment, FETCH_STEP),
+            Scope::GmailRead
+        );
     }
 
     #[test]
@@ -3332,6 +4172,7 @@ mod tests {
             Provided::GmailSearch => (SearchArgs::KEYS, &["q"]),
             Provided::GmailRead => (ReadArgs::KEYS, &["id"]),
             Provided::GmailThread => (ThreadArgs::KEYS, &["id"]),
+            Provided::GmailAttachment => (AttachmentArgs::KEYS, &["id", "part_id"]),
         };
         let text = |max_chars| Bound::Text {
             max_chars,
@@ -3350,6 +4191,9 @@ mod tests {
                 },
                 (Provided::GmailSearch, "max") => integer(SEARCH_MAX_MIN, SEARCH_MAX_MAX),
                 (Provided::GmailThread, "max") => integer(THREAD_MAX_MIN, THREAD_MAX_MAX),
+                (Provided::GmailAttachment, "part_id") => {
+                    Bound::Pattern(format!("^[A-Za-z0-9.]{{1,{PART_ID_MAX_CHARS}}}$"))
+                }
                 _ => panic!("{tool:?} takes `{key}`, which no bound here states"),
             };
             (key, bound)
@@ -3367,6 +4211,31 @@ mod tests {
             Provided::GmailLabels => json!({}),
             Provided::GmailSearch => json!({ "q": "from:alice" }),
             Provided::GmailRead | Provided::GmailThread => json!({ "id": "m1" }),
+            Provided::GmailAttachment => json!({ "id": "m1", "part_id": "1" }),
+        }
+    }
+
+    /// The probes of an argument whose bound is a pattern of this component's
+    /// own, which the kit has none for.
+    fn pattern_probes(key: &str) -> Probes {
+        let strings = |ids: &[&str]| ids.iter().map(|id| json!(id)).collect::<Vec<_>>();
+        match key {
+            "part_id" => Probes {
+                admitted: strings(&["1", "0", "1.2.10", "Ab.9", &"1.".repeat(32)]),
+                refused: strings(&[
+                    "",
+                    &"1".repeat(PART_ID_MAX_CHARS + 1),
+                    "1-2",
+                    "1_2",
+                    "1/2",
+                    "1 2",
+                    "é",
+                ])
+                .into_iter()
+                .chain([json!(1)])
+                .collect(),
+            },
+            other => panic!("no pattern probes for `{other}`"),
         }
     }
 
@@ -3397,8 +4266,7 @@ mod tests {
                 hold_required(name, key, &base, plan_with);
             }
             for (key, bound) in &bounds.properties {
-                let probes =
-                    probes(bound).unwrap_or_else(|| panic!("`{name}`'s `{key}` has no probes"));
+                let probes = probes(bound).unwrap_or_else(|| pattern_probes(key));
                 hold_probes(name, key, &probes, &base, plan_with);
             }
         }
@@ -3541,6 +4409,7 @@ mod tests {
             listed,
             read_state(json!({ "id": "m1" })),
             thread_state(json!({ "id": "t1" })),
+            attachment_state(json!({ "id": "m1", "part_id": "1" })),
         ];
         for tool in Provided::ALL {
             assert!(

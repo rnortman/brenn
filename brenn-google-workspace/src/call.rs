@@ -70,5 +70,6 @@ pub fn new_call(
         query,
         headers: BTreeMap::new(),
         body,
+        response_attachment: None,
     }
 }

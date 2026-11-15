@@ -829,8 +829,9 @@ impl RBinding {
 /// A binding's tail, in the vocabulary its direction admits.
 #[derive(Debug, PartialEq)]
 pub enum RTail {
-    In(InTail<RVal>),
-    Out(OutTail<RVal>),
+    /// Boxed, as every tail is: the three differ by hundreds of bytes.
+    In(Box<InTail<RVal>>),
+    Out(Box<OutTail<RVal>>),
     /// Boxed: the union of the two directions, and so the largest of the three.
     Io(Box<IoTail<RVal>>),
 }

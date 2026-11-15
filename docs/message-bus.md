@@ -211,7 +211,7 @@ Who is shown the content type today:
 | 0.2.0 components (`bus.envelope`, `bus.deferred-entry`) | text and type, on the backend and on a page, whether the row arrived over the page's wire or stayed on the page | bytes and type on the backend; on a page, at rest on any channel declared `non_text`, page-local or wire-bound (shown on the node rig; `e2e/tests/bytes.spec.ts` runs the publish, the read-back and the delivery in Chromium, and an SDK-built kind's binary state on a page-local `io` port), and in a sync call or reply | in the header, on the backend; no page binds an ingress channel |
 | 0.1.0 components (`envelope-json`, `deferred-entry.payload`) | bare text, **no type** | never bound: refused at boot and at reload, on the backend and on a page | only on a channel narrowed back to text-only that still retains raw text messages (§2.7.1) |
 | Attach v4 sessions (`Deliver`, `DeferredView`), served to remotes only | bare text, **no type** | never bound: a remote's subscribe is answered `Unavailable`; left out of a deferred view | never: no session binds an ingress channel |
-| Attach v5 sessions (`Deliver`, `DeferredView`): a remote's, and every surface page's | text and type | bytes and type | never: no session binds an ingress channel |
+| Attach v5 and v6 sessions (`Deliver`, `DeferredView`): a remote's, and every surface page's (v6) | text and type | bytes and type | never: no session binds an ingress channel |
 
 The last column is the one envelope key a message a transport adaptor
 published in the raw ingress shape (§2.7.1) carries beyond the others: an
@@ -247,7 +247,7 @@ protocol v5, through `Publish` and `PublishBatch` (entries and deferred edits),
 on the same terms: a non-text body offered for a text-only channel is answered
 `TextOnlyChannel` — the whole batch, if any body in it is refused — and nothing
 is stored. A 0.2.0 component hosted on a surface page, on the same terms, on
-page-local and wire-bound channels alike: the page's wire is attach v5 and
+page-local and wire-bound channels alike: the page's wire is attach v6 and
 carries every body with its type, and the page refuses a non-text body for a
 text-only channel to the component before anything is sent. A transport
 adaptor — an MQTT client or a webhook endpoint — onto its ingress channel when
@@ -318,8 +318,9 @@ Which reader sees what:
 |---|---|
 | Host code (`Messenger::query`, the stores) | the references |
 | 0.2.0 components (`bus.envelope` header), on the backend and on a page | the references, in full |
-| Attach v5 sessions (`Deliver`), a remote's and every page's, replayed and live | the references, in full |
-| Attach v6 sessions (a remote's) | the references, in full, and the bytes by handle |
+| Attach v5 sessions (`Deliver`), a remote's, replayed and live | the references, in full |
+| Attach v6 sessions, a remote's and every page's | the references, in full, and the bytes by handle where the session has a blob door |
+| 0.2.0 components on a page granted `blobs` | the references, and the bytes of an attachment the page fetched, by place, below |
 | A conversation (pushed batches, `MessageChannelGet`, `BrennPendingList`, the intercept outcome) | each name with `size` and `content_type`; **no id**. It names an attachment by (message id, name), below |
 | The eviction archive | the references, in full. The bytes are not archived: an archived message's attachments are not recoverable |
 | 0.1.0 components (`envelope-json`), attach v4 sessions | nothing; the envelope is byte-identical to one without attachments |
@@ -337,10 +338,17 @@ or trap publishes nothing and deletes everything it made. A conversation
 does too, by name, below. Host code's
 `Messenger::publish_from_system_with_attachments` is a further publishing
 entry; the tool substrate publishes a call's request and result through it
-(below). A remote attacher on attach v6 does, by handle, below. Pages and
-v4/v5 remotes see references as metadata only, and no surface host serves
-the interface. A remote's replay store and a page's rings do not hold the
-blob, so a reference there can outlive it. `ports.publish` and its siblings
+(below). The host tool `api-request` creates one on a caller's behalf: asked
+with `response_attachment`, it streams a 2xx answer's body into a new blob
+and answers it as an attachment of the result, and only for a caller that can
+open it — a conversation, or a component granted `blobs`
+(`docs/config-dsl.md`, "The OAuth tools"). Its `body_attachment` sends an
+attachment the call carries as the request body. A remote attacher on attach v6 does, by handle, below. A component on a
+page granted `blobs` reads attachments from bytes the page fetched, and makes
+and forwards blobs, which the page uploads or opens on the backend after the
+activation returns `ok` (below, "A surface page makes blobs"). v4/v5 remotes see references as metadata only. A remote's replay
+store and a page's rings do not hold the blob, so a reference there can
+outlive it. `ports.publish` and its siblings
 carry no attachments: a component that republishes a message through them
 sends the body alone.
 
@@ -454,6 +462,244 @@ and every blob frame names one:
   the naming message is evicted, which is why opens count. Across a remote's
   sessions the bounds multiply by `max_sessions`; nothing bounds a remote over
   time.
+
+**A surface page is a reader by place.** A page speaks attach v6. Its session
+has a blob door when an instance on its surface is granted `blobs`; the door
+uploads (`Welcome.blobs.upload`) only when such an instance has a declared wire
+output (see "A surface page makes blobs" below), and is read-only otherwise. The door is the remote's,
+under the remote's admission: the server asks `Messenger::admit_retained_part`
+at every open, and the channels a page may open on are those its surface's own
+bindings name. An activation on a page is one synchronous stretch, so a
+component's `read` answers from bytes the page already holds; the page fetches
+them before the message reaches a component.
+
+- **The fetch bound.** `fetch_bytes` on a surface component's `in` binding is
+  the largest attachment, in bytes, the page fetches on that channel
+  (`docs/config-dsl.md`, "Instances and bindings"). Unstated, it is 1 MiB on an
+  instance granted `blobs` and 0 on any other; at most 64 MiB; legal only on a
+  transportable channel and on an instance granted `blobs`. A channel's bound on
+  a surface is the largest among its bindings there; an `io` port takes the
+  default. A channel whose bound is above zero is **gated**; an attachment on it
+  whose `size` is at most the bound is **eligible**. An eligible attachment
+  larger than the session's bytes held (`Welcome.blobs.max_bytes_held`, 4 ×
+  `max_blob_bytes`) is never opened — the case of an attachment stored under a
+  larger `max_blob_bytes` than the one now configured — and its row does not
+  wait for it.
+- **The arrival hold.** On a gated channel a delivered row enters the page's
+  store only once every eligible attachment it names has **settled** — fetched,
+  refused, failed — or its deadline has passed. A row that names nothing
+  eligible, arriving at an empty hold, is stored in the same pass, as on any
+  other channel. Three rules move the hold after every event that can change
+  it:
+  1. **Start.** At most 4 held rows of a channel fetch at once; the oldest
+     waiting row starts next, and its deadline runs from then.
+  2. **Release.** While the oldest held row is settled or past its deadline, it
+     enters the store as a delivered row does. Release is strictly in arrival
+     order, so the store's order is the channel's. A row released by its
+     deadline keeps its fetches running; bytes that land later are readable in a
+     later activation.
+  3. **Overflow.** The hold has room for the store's depth plus 4 rows. A row
+     arriving at a full hold evicts the oldest **waiting** row, which is never
+     stored and is counted as a drop for every reader of the channel, so each
+     binding's `noise` sees it. A fetching row is never evicted; with no row
+     waiting, the oldest row is released as it is instead.
+
+  The hold adds no frame to the wire and no wait to the server or a publisher;
+  nothing acknowledges and nothing is redelivered. It keeps its rows across a
+  reconnect, and they are not delivered again, because a subscription's resume
+  token advances when a `Deliver` is accepted.
+- **A row's deadline.** 2 s, plus 1 s for each 256 KiB chunk of each eligible
+  attachment — at least one per attachment, since each costs a read answer — at
+  most 30 s, counted from when the row started fetching. The ceiling keeps the
+  hold a property of the page and not of one binding's `fetch_bytes`. What it
+  costs: a row whose eligible attachments come to more than 28 chunks — one
+  attachment over 7 MiB, or 29 or more of any size — is handed over with its
+  bytes only on a link that moves them in 30 s (64 MiB needs about 18 Mbit/s);
+  on a slower link it is released at the ceiling, `read` answers
+  `unavailable`, and the bytes land for a later activation.
+- **The aggregate bound.** A row waits for the batches ahead of it as well as
+  its own deadline. With `H` = store depth + 4, a row that is not dropped enters
+  the store at most
+
+  `⌈H / 4⌉ · (30 s + 15 s)`
+
+  after it was delivered, the 15 s being the page's connect timeout, during
+  which a deadline cannot fire; while the page stays attached the term is
+  absent. The bound is a function of the store's depth alone. No fetch bound
+  lowers it: a message may name 32 attachments, each at most any bound above
+  zero is eligible, and 32 one-byte attachments already reach the 30 s
+  ceiling.
+
+  | Store depth | `H` | Batches | Attached | With a connect attempt at every deadline |
+  |---|---|---|---|---|
+  | 1 | 5 | 2 | 60 s | 90 s |
+  | 4 | 8 | 2 | 60 s | 90 s |
+  | 20 | 24 | 6 | 180 s | 270 s |
+  | 100 | 104 | 26 | 780 s (13 min) | 1,170 s (19.5 min) |
+
+  It grows with the depth, and the depth (`push_depth`, `retain_depth`) is the
+  term an operator moves. A deep window on a gated channel is a long worst case.
+
+  What a channel sees when every message on it carries a single attachment of
+  at most its bound is smaller, and is **not a bound**: a publisher that
+  attaches more moves the channel to the table above.
+
+  | Single attachment of at most | Store depth | A row's deadline | Attached | With a connect attempt at every deadline |
+  |---|---|---|---|---|
+  | 256 KiB (one-chunk frames) | 1 | 3 s | 6 s | 36 s |
+  | 1 MiB (the default bound) | 1 | 6 s | 12 s | 42 s |
+  | 1 MiB | 20 | 6 s | 36 s | 126 s |
+
+  Either figure is reached only when every deadline ahead of a row expires: a
+  server that delivers and answers no blob frame, a page offline with rows
+  held, or a link slower than one chunk a second throughout — an operating
+  regime for a phone on a poor link, not only a fault. A fetch that answers
+  releases its row at once.
+- **Every reader of a gated channel waits.** The page holds one store per
+  channel, so a binding of an instance without the grant, on a channel another
+  instance on the page gated, sees the channel's rows as late as the gated
+  instance does, and so does a row with no attachment behind one with. Any
+  `fetch_bytes` above zero gates the channel. The remedy for a reader that must
+  not wait on another instance's attachments is a channel no binding on that
+  surface gates. A surface with no gated channel behaves as if the hold did not
+  exist.
+- **The page's cache.** Fetched bytes are held per (channel, message id,
+  attachment name); the same blob named by two messages is fetched twice. Bytes
+  being fetched, reserved at the attachment's full size, plus bytes fetched are
+  at most 64 MiB across the page. When a fetch does not fit, the page drops the
+  bytes of messages already in a store, oldest arrival first, and never a held
+  row's; those attachments then read `unavailable` and are not fetched again.
+  An entry that still does not fit is never fetched. An entry lives while its
+  message is in the channel's hold or the page's store of the channel, and its
+  bytes go, and any fetch of it is closed, when the message leaves that window.
+  The server's handle is closed as soon as an attachment's bytes are on the
+  page, so its handle and bytes-held bounds bound fetches in flight, not what
+  the page caches.
+- **What a component is answered.** A component opens an attachment by its
+  place in its own activation's windows — port, index, name — and never by id.
+  `open` answers `not-permitted` for a place that names no attachment there,
+  and for an instance without the grant or a call outside its own innermost
+  activation; `not-found` when the server answered that the message left the
+  channel's window; `quota-exceeded` past 64 live handles; otherwise a handle,
+  whether or not the page holds the bytes, since `open` reads nothing. `read`
+  answers `too-large` over 1 MiB a call, `out-of-range` past the size, the bytes
+  when the page holds them, and **`unavailable`** otherwise: an attachment over
+  the channel's bound, one whose fetch was refused or failed, one whose bytes
+  were dropped for room, or one still on its way. A sync activation — a peer's
+  call, a mount, a gesture — reads the same way, from bytes the page holds at
+  that instant. A component reads an attachment through any binding whose window
+  holds its message, whatever that binding's own `fetch_bytes`: the cache is
+  the page's. A handle lives only for its activation.
+- **What the page reports.** A fetch the server refuses or that fails, an
+  attachment over the bytes held, and a drop of fetched bytes for room are each
+  reported on the page's error channel — the tool-channel refusal at `info`,
+  every other kind at `warn` — **once per kind of trouble, per channel, per
+  connection**: the first occurrence on a channel after the page attaches is
+  reported, its text says later ones of that kind on that channel are not
+  reported until the page reconnects, and a reconnect resets it. The component
+  is told every time, through `read` answering `unavailable`. A server answer
+  that `NotRetained` is not reported: the window moved. An answer the page did
+  not ask for, a refusal that the attachment its own `Deliver` named exists, or
+  an open whose size or content type differs from the reference ends the
+  connection.
+- **Reconnect.** Fetched bytes stay; fetches in flight end and their partial
+  bytes are discarded; held rows stay held, in order, and their deadlines keep
+  running, so a row whose deadline passes while the page is offline is released
+  without its bytes. At the next attach every unfetched entry of a held row or
+  a stored message is fetched again; one of a message already handed over wakes
+  nobody, and its bytes are there for the next activation that reads them.
+
+**A surface page makes blobs.** A component on a page granted `blobs` creates,
+writes and seals blobs, publishes messages that name them, and forwards
+attachments it opened, through the same interface as on the backend. The page
+is not the store, and one activation is one synchronous stretch, so a page
+holds two kinds of blob, which a component never tells apart:
+
+- **page bytes** — a blob the page made, its bytes in page memory and nowhere
+  else;
+- **a backend reference** — a blob in the backend store, known by the place it
+  was delivered (wire channel, message id, attachment name); the page may or
+  may not hold a fetched copy.
+
+Nothing leaves the page for a blob before its activation returns `ok`. On `err`
+or a trap the activation's publishes are dropped and every buffer it made with
+them; the server never saw any of it.
+
+| the blob | published on a wire channel | published on a page-local channel |
+|---|---|---|
+| made in this activation | uploaded | the message holds the page's bytes |
+| opened from a wire message | forwarded by reference | the message carries the reference |
+| opened from a page-local message, page bytes | uploaded from the page's bytes | shared, no copy |
+| opened from a page-local message, a reference | forwarded by reference | the reference, shared |
+
+No pairing is refused for where its blob came from, and none drops the
+attachment from its message.
+
+- **Page-local attachments.** A page-local (`local:`) message's attachments live
+  in page memory. The bytes a page made live while a retained or parked message
+  of a page-local channel names them, and are freed when none does — this
+  section's lifetime rule with the page as the host. A `defer-edit` keeps them; a
+  `defer-cancel` releases them. Nothing is uploaded and nothing is persisted; a
+  reload loses them with the channel. A page-local attachment is a way to hold
+  bytes above the body cap on a page, not a store for component state: state is
+  a retained channel's body. A backend reference named in a page-local message
+  stays a reference: a reader opens it, and `read` answers the bytes while the
+  page still holds them for the wire message that delivered them and
+  `unavailable` otherwise; published onward to a wire channel it is forwarded
+  by reference. The page copies nothing on its own: a component that needs the
+  bytes to outlive the wire message reads them and makes a blob.
+- **The upload.** A wire flush that names an attachment is held by the page,
+  per instance in completion order, and every later flush of that instance waits
+  behind it. Once the page is attached under a document that still lets the
+  instance attach on that channel (the instance is granted `blobs` and the
+  channel is one of its wire outputs) and still subscribes the channel each
+  forwarded reference was delivered on, and the instance has nothing else in
+  flight, the page creates and writes each blob it made, opens each reference it
+  forwards, waits for every handle to be answered held, and only then sends the
+  batch naming them. The server's per-session bounds (64 handles, 4 ×
+  `max_blob_bytes` held) cover uploads and the page's own fetches together;
+  while an upload waits for room no new fetch starts.
+- **The verdict rule.** What the page can judge it answers in the call: the
+  page's own bounds below, a door without `upload` (`not-permitted` on a wire
+  port), the server's largest blob, handles and bytes held as the last
+  `Welcome` advertised them. What only the server knows arrives after `ok`: a
+  refused create (`BudgetExhausted`, `StorageFailed`, a limit), a refused open
+  (the forwarded message left the server's window), a flush that no longer fits
+  the door or the document of a later attachment. Each **loses the flush
+  whole** — every entry of the activation's wire batch, never the message
+  without its attachment — frees its bytes, and is announced: a toast, a
+  console line, and a `warn` report with the instance as subject on the
+  surface's error channel when the page is attached, the first per instance and
+  kind of loss reported while attached at `warn` and later repeats at `debug`
+  (a loss while detached is at `warn` on the console and demotes nothing).
+  The page stays up and the
+  instance's next flush proceeds. The same activation's page-local publishes
+  were committed at the flush and stay. On a surface `budget-exhausted` from
+  `create` or `write` is the page's own budget; the backend store's budget is
+  never answered in a call.
+- **Detach.** A flush waiting or being uploaded at a detach stays on the page,
+  within its bounds, and is uploaded again from nothing after the next attach,
+  if the new document still lets it. A batch already sent and unanswered at a
+  detach may have been applied, so it is never sent again: it is announced lost
+  by toast and console at once, and the count of such flushes is reported on
+  the error channel after the next attach.
+- **The page's bounds**, each a typed answer:
+
+  | Bound | Value | Refusal |
+  |---|---|---|
+  | Largest write | 1 MiB | `write`: `too-large` |
+  | Largest blob | the smaller of 64 MiB and the door's `max_blob_bytes` | `write`: `blob-too-large` |
+  | Bytes one activation writes | 64 MiB | `write`: `quota-exceeded` |
+  | Page-made bytes held at once | 64 MiB | `create`, `write`: `budget-exhausted` |
+  | Handles one activation holds, writers and blobs | 64 | `create`, `open`: `quota-exceeded` |
+  | Written ranges of one writer | 1,024 | `write`: `too-fragmented` |
+  | Distinct blobs one activation's wire publishes name | 32, and no more than the door's `max_handles` | `publish`: `plain(quota-exceeded)` |
+  | Bytes of those blobs together | the door's `max_bytes_held` | `publish`: `plain(quota-exceeded)` |
+
+  Made and fetched bytes have separate bounds: fetched bytes are a cache the
+  page may drop for room, since the server still has them, while made bytes are
+  the only copy and nothing drops them for room. A page holds at most 128 MiB of
+  attachment bytes.
 
 **Bounds.** Three keys in the `messaging` section (`docs/config-dsl.md`):
 `max_blob_bytes` caps one blob's extent (default 64 MiB), `blob_budget_bytes`
@@ -572,10 +818,11 @@ blob held only in flight is gone — no row names it, and the store unlinks it
 at the next start — and one a durable
 row names is redeemable while the row stays in its window.
 
-What is not built: the `blobs` interface on a page, save and attach for a
-conversation without a shell tool, connectors that produce blobs, the
-surface's handling of them, attachments on `calls.call` and
-`tools.call-fast`, and transfer of bytes to a page.
+What is not built: save and attach for a conversation without a shell tool,
+attachments on `calls.call` and `tools.call-fast`, a page making a blob or
+forwarding an attachment (`create`, `writer` and `publish` on a surface), and
+a page reading part of an attachment larger than its channel's fetch bound
+(`surface-blob-partial-read-over-bound` in `TODO.md`).
 
 ### 2.1.3 Limits on a remote's stream of messages
 
@@ -672,11 +919,17 @@ outside this section: a surface cannot bind one (§2.1.1).
 | Session push queue / writer queue | 256 / 256 frames | Fixed |
 | A live `Deliver` | one row per frame; no rate limit and no byte budget on delivery | — |
 | A replay or catch-up `Deliver` | up to `max(push_depth, retain_depth)` rows in one frame, with no size cap | the binding's depths |
-| Server-to-page frame size | unbounded: the 204,800-byte v5 frame cap bounds what a page sends | — |
+| Server-to-page frame size | unbounded: the 274,432-byte v6 frame cap bounds what a page sends | — |
 | The page's inbound queue | unbounded; drained one frame per browser task | — |
 | The page's store | `max(push_depth, retain_depth)` rows per channel, a count | the binding's depths |
 | One activation's input | every bound port's window, with no byte limit; the 4 MiB per-activation bound is on publishes only | — |
 | Sessions per surface / per user on one surface | 64 / 16 | Fixed |
+| Fetch bound, the largest attachment a page fetches on a channel | 1 MiB on an instance granted `blobs`, 0 otherwise; at most 64 MiB | Operator: `fetch_bytes` on the `in` binding |
+| The page's attachment cache, bytes reserved and fetched | 64 MiB per page | Fixed |
+| Arrival hold, rows per gated channel | store depth + 4, of which at most 4 fetch at once | the binding's depths |
+| A held row's deadline | 2 s + 1 s per 256 KiB chunk of each eligible attachment, at most 30 s | Fixed |
+| The aggregate hold, delivery to store on a gated channel | `⌈(store depth + 4) / 4⌉ · 30 s` attached, `· 45 s` with a connect attempt at every deadline: 60 s / 90 s at depth 1 | the binding's depths; no fetch bound lowers it |
+| Blob handles / read answers in flight per page session | 64 / 4, across every channel | Fixed |
 
 What follows:
 
@@ -695,11 +948,45 @@ What follows:
   `metered`.
 - **Reconnect.** A replay pass is one frame of up to the window's depth times
   the body cap, on every reconnect.
+- **Attachments.** On a gated channel (§2.1.2a, "A surface page is a reader by
+  place") a frame with one attachment of `c` chunks (`c = ⌈size / 256 KiB⌉`)
+  costs, server to page, the `Deliver`, one open answer and `c` binary read
+  answers; page to server, one open, `c` reads and one close. None draws on a
+  token bucket. The open and the reads are two round trips in series, the
+  reads of one attachment overlapping up to 4 wide; up to 4 frames of a
+  channel fetch at once, and the page's reads share 4 in flight across every
+  channel. With `R_o` and `R_r` the round trips of an open and of a read
+  answer, a channel is handed at most
+  `min(4 / (R_o + R_r · ⌈c / 4⌉), 4 / (c · R_r))` attachments a second, each
+  `R_o + R_r · ⌈c / 4⌉` later than a body-only message would be — for
+  one-chunk frames `4 / (R_o + R_r)`: 200 a second at 10 ms a round trip, 40 at
+  50 ms. Past that rate the hold drops waiting frames oldest first and hands
+  over what it fetched; the rate handed over does not fall. A newer frame does
+  nothing to an older one being fetched. The deadline and its ceiling bound a
+  fetch that does not answer and are not terms of the rate. The terms that move
+  without an interface or wire change: the 4 rows fetching at once and the
+  hold's deadlines (kernel constants), the server's handles, reads in flight
+  and bytes held (advertised in `Welcome.blobs`; bytes held follows
+  `max_blob_bytes`), the second round trip (a later client method that reads
+  through an opening handle), and the operator's `fetch_bytes` and depths. A
+  read answer carries at most 256 KiB, which bounds `c` and not the rule.
+- **Uploads.** A page's upload of a blob it made goes the other way on the
+  same socket: one create, the blob in writes of at most 256 KiB, a seal, then
+  the batch. The page composes one write at a time, but the browser's socket
+  queues the whole upload at once, because the transport exposes no send-side
+  flow information, so everything the page sends after an upload starts — every
+  component's publishes and the upload's own batch — leaves behind it, up to
+  64 MiB later. Inbound frames are not delayed, and each answer the server sends
+  keeps the connection's liveness. A create the server refuses does not stop the
+  writes already queued; the server drops them.
 
 So a camera frame that fits 64 KiB, sent by a remote onto a `non_text`
 `ephemeral:` channel, reaches a 0.2.0 kind on a surface at 1 per second with
 no configuration and at up to 30 per second with one `remote`-block setting;
-larger frames need the body cap raised. These are limits, not measurements;
+a larger frame travels as a blob per frame, which a kind granted `blobs` on
+the page reads once the page has fetched it, at the rate above, up to the
+1 MiB default bound with no configuration beyond the grant, or the body cap is
+raised. These are limits, not measurements;
 `docs/page-rig-timings.md` has what one delivered row costs a 0.2.0 kind in
 Chromium, with a kind on the page as the publisher — no browser run has a
 remote as the publisher.
@@ -925,7 +1212,7 @@ reads its bindings document as text, so the declaration would admit only
 bodies no page can apply. A 0.1.0 kind bound to any `non_text` channel,
 page-local or wire-bound, is refused at boot and at reload.
 
-The page's wire is attach v5. On any channel declared `non_text`, page-local
+The page's wire is attach v6. On any channel declared `non_text`, page-local
 or wire-bound, a page-hosted `brenn:processor@0.2.0` kind publishes, parks and
 edits non-text bodies, is delivered them, and reads them back byte for byte
 with their content type; on any channel it keeps typed text with its type; it

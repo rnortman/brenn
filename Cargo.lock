@@ -1050,11 +1050,15 @@ dependencies = [
  "base64ct",
  "brenn-envelope",
  "brenn-lib",
+ "brenn-messaging-store",
  "brenn-obs",
  "brenn-provider-kit",
  "brenn-tool-registry",
+ "bytes",
  "chrono",
  "hex",
+ "http-body",
+ "http-body-util",
  "percent-encoding",
  "rand 0.10.1",
  "reqwest",
@@ -1063,6 +1067,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-test",
  "url",
 ]
 

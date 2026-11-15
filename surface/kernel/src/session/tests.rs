@@ -917,6 +917,7 @@ fn a_trap_completion_reports_its_instance_terminal_in_its_own_words() {
     let killed = crate::flush::Killed {
         first: true,
         discarded: 2,
+        frames: Vec::new(),
         retry_wakeup: Some(TimerChange::Disarm),
     };
     let effects = fold(&mut page, |r, page| {
@@ -961,7 +962,9 @@ fn a_trap_completion_reports_its_instance_terminal_in_its_own_words() {
 /// reason.
 #[test]
 fn a_trap_reason_is_reported_at_the_level_the_memo_dictates() {
+    // Connected, so the first report can reach the error channel and is memoed.
     let mut core = KernelCore::new();
+    core.on_event(&super::connected(&page()));
     let mut reports = Vec::new();
     for first in [true, false] {
         let mut page = page();
@@ -972,6 +975,7 @@ fn a_trap_reason_is_reported_at_the_level_the_memo_dictates() {
                     killed: Some(crate::flush::Killed {
                         first,
                         discarded: 0,
+                        frames: Vec::new(),
                         retry_wakeup: None,
                     }),
                     ..Completion::nothing(
@@ -1020,6 +1024,7 @@ fn a_trap_on_an_already_terminal_instance_still_reports_its_reason() {
     let killed = crate::flush::Killed {
         first: false,
         discarded: 0,
+        frames: Vec::new(),
         retry_wakeup: None,
     };
     let effects = fold(&mut page, |r, page| {

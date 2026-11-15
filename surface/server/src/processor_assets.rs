@@ -44,8 +44,10 @@ pub const MANIFEST_VERSION: u32 = 3;
 const PROCESSOR_PACKAGE: &str = "brenn:processor";
 
 /// The WIT interfaces a surface-hosted processor may import: the transpilable
-/// profile. `store`/`mqtt`/`tools`/`provides`/`blobs` are backend-only; `dom`/`page-dom` run
-/// the other way and are surface-only, because only a page has a DOM.
+/// profile. `store`/`mqtt`/`tools`/`provides` are backend-only; `dom`/`page-dom` run
+/// the other way and are surface-only, because only a page has a DOM. `blobs` is served
+/// in part: everything but its tool-call forms, which `check_surface_component` holds a
+/// kind's imported members to.
 ///
 /// `types` and `bus` are in the set but are not capabilities: they define the
 /// record and enum shapes the other interfaces speak, so a processor imports
@@ -54,8 +56,8 @@ const PROCESSOR_PACKAGE: &str = "brenn:processor";
 /// defines. They are listed here because the manifest reports the world's
 /// imports truthfully, and a type-carrying import must not read as an
 /// unsatisfiable one.
-const SURFACE_IMPORTS: [&str; 9] = [
-    "types", "bus", "ports", "log", "alert", "config", "calls", "dom", "page-dom",
+const SURFACE_IMPORTS: [&str; 10] = [
+    "types", "bus", "ports", "log", "alert", "config", "calls", "blobs", "dom", "page-dom",
 ];
 
 /// Every WIT interface name the processor WIT files define (`bus` is defined
@@ -98,11 +100,36 @@ pub fn record_contract(manifest: &ProcessorManifest) -> brenn_envelope::grants::
 /// the migration.
 pub fn stale_contract_reason(kind: &str, refusal: &brenn_wasm::SurfaceComponentRefusal) -> String {
     use brenn_envelope::grants::ProcessorContract;
+    if let brenn_wasm::SurfaceComponentStage::Member {
+        interface,
+        member,
+        served,
+    } = &refusal.stage
+    {
+        return unserved_member_reason(kind, interface, member, served);
+    }
     format!(
         "processor component {kind:?} declares the component contract {}, but its artifact \
          does not have that contract's shape ({refusal}). Rebuild the kind against this brenn's \
          `processor-0.2.wit`.",
         ProcessorContract::V0_2,
+    )
+}
+
+/// Why a kind importing a member of an interface the surface serves only in
+/// part is not served: the artifact has the contract's shape, and asks the page
+/// for something it does not serve, so the remedy is the kind's code or its
+/// placement, not a rebuild.
+fn unserved_member_reason(kind: &str, interface: &str, member: &str, served: &[&str]) -> String {
+    let served = served
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "processor component {kind:?} imports `{member}` of `{interface}`, which a surface host \
+         does not serve. A surface serves only {served} of that interface. Remove the call, or \
+         host the kind at top level."
     )
 }
 
@@ -755,8 +782,8 @@ mod tests {
     /// The interface names the world defines and only a surface host links.
     /// [`KNOWN_IMPORTS`] is "every interface `processor.wit` defines", so it
     /// carries them; a top-level component may not be granted them. That is the
-    /// mirror image of `store`/`mqtt`/`tools`/`provides`/`blobs`, which the world defines and only
-    /// the backend links.
+    /// mirror image of `store`/`mqtt`/`tools`/`provides`, which the world defines and only the
+    /// backend links.
     const SURFACE_ONLY: [&str; 2] = ["dom", "page-dom"];
 
     /// One host's link profile, derived from the world's interfaces rather than

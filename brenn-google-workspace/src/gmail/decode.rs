@@ -413,29 +413,82 @@ pub fn internal_date(epoch_ms: &str) -> Option<String> {
 /// or a final group of one character, which encodes no whole byte.
 pub fn base64url(data: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 4 * 3 + 2);
-    let mut bits: u32 = 0;
-    let mut held = 0u32;
-    let mut group = 0usize;
-    for b in data.bytes() {
-        let value = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            b'=' | b' ' | b'\t' | b'\r' | b'\n' => continue,
-            _ => return None,
-        };
-        bits = (bits << 6) | u32::from(value);
-        held += 6;
-        group = (group + 1) % 4;
-        if held >= 8 {
-            held -= 8;
-            out.push((bits >> held) as u8);
-            bits &= (1 << held) - 1;
-        }
+    let mut decoder = Base64Url::default();
+    let read = decoder.push(data.as_bytes(), &mut out);
+    (read == data.len() && decoder.whole()).then_some(out)
+}
+
+/// One input byte's class in base64url: its six bits, [`B64_SKIP`], or
+/// [`B64_STOP`].
+const B64_SKIP: u8 = 64;
+const B64_STOP: u8 = 255;
+
+/// Each byte's class: either alphabet, `=` padding and the four whitespace
+/// characters skipped, everything else a stop.
+const B64_CLASS: [u8; 256] = {
+    let mut table = [B64_STOP; 256];
+    let mut i = 0;
+    while i < 26 {
+        table[b'A' as usize + i] = i as u8;
+        table[b'a' as usize + i] = 26 + i as u8;
+        i += 1;
     }
-    (group != 1).then_some(out)
+    let mut d = 0;
+    while d < 10 {
+        table[b'0' as usize + d] = 52 + d as u8;
+        d += 1;
+    }
+    table[b'-' as usize] = 62;
+    table[b'+' as usize] = 62;
+    table[b'_' as usize] = 63;
+    table[b'/' as usize] = 63;
+    table[b'=' as usize] = B64_SKIP;
+    table[b' ' as usize] = B64_SKIP;
+    table[b'\t' as usize] = B64_SKIP;
+    table[b'\r' as usize] = B64_SKIP;
+    table[b'\n' as usize] = B64_SKIP;
+    table
+};
+
+/// A push decoder of base64url, by [`base64url`]'s rules, fed in pieces split
+/// anywhere; it holds at most one partial group's bits between pieces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Base64Url {
+    bits: u32,
+    held: u32,
+    /// The position in the current group of four characters.
+    group: u8,
+}
+
+impl Base64Url {
+    /// Decode `input` up to its first byte that is neither in either alphabet
+    /// nor skipped, appending the bytes to `out`: the index of that byte, or
+    /// `input.len()` when there is none.
+    pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) -> usize {
+        for (i, &b) in input.iter().enumerate() {
+            match B64_CLASS[usize::from(b)] {
+                B64_SKIP => {}
+                B64_STOP => return i,
+                value => {
+                    self.bits = (self.bits << 6) | u32::from(value);
+                    self.held += 6;
+                    self.group = (self.group + 1) % 4;
+                    if self.held >= 8 {
+                        self.held -= 8;
+                        out.push((self.bits >> self.held) as u8);
+                        self.bits &= (1 << self.held) - 1;
+                    }
+                }
+            }
+        }
+        input.len()
+    }
+
+    /// Whether the input may end here: not after a final group of one
+    /// character, which encodes no whole byte.
+    pub fn whole(&self) -> bool {
+        self.group != 1
+    }
 }
 
 /// Windows-1252's 0x80–0x9F, where it differs from ISO-8859-1; `None` for
@@ -508,6 +561,12 @@ pub struct Attachment {
     /// Shown in the body (`Content-Disposition: inline` or a `Content-ID`),
     /// not attached beside it.
     pub inline: bool,
+    /// The part's `partId`, when the part has a `body.attachmentId`, the id
+    /// is a part id ([`super::is_part_id`]) and the part is at most
+    /// [`super::ATTACHMENT_PART_DEPTH`] levels below the payload: the name
+    /// the part is fetched by. `None` for a part carried inside the message,
+    /// nested deeper, or without such an id.
+    pub part_id: Option<String>,
 }
 
 /// What a MIME tree yields: its text parts in reading order, every part
@@ -585,11 +644,22 @@ fn walk(part: &Value, depth: usize, out: &mut Extracted) -> Result<(), WalkError
             None => None,
             Some(size) => Some(size.as_u64().ok_or(WalkError::Shape)?),
         };
+        let part_id = match part.get("partId") {
+            Some(Value::String(id))
+                if attachment_id
+                    && depth <= super::ATTACHMENT_PART_DEPTH
+                    && super::is_part_id(id) =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        };
         out.attachments.push(Attachment {
             filename: filename.to_string(),
             mime_type: declared.to_string(),
             size,
             inline,
+            part_id,
         });
         return Ok(());
     }
@@ -979,7 +1049,58 @@ mod tests {
                 mime_type: "image/png".to_string(),
                 size: Some(4),
                 inline: false,
+                part_id: None,
             }]
+        );
+    }
+
+    /// `leaf` wrapped in `levels` levels of `multipart/mixed`, so it sits at
+    /// depth `levels`.
+    fn nested(leaf: Value, levels: usize) -> Value {
+        (0..levels).fold(leaf, |inner, level| {
+            json!({ "partId": format!("w{level}"), "mimeType": "multipart/mixed",
+                    "parts": [inner] })
+        })
+    }
+
+    fn served(part_id: Value) -> Value {
+        json!({ "partId": part_id, "mimeType": "application/pdf", "filename": "a.pdf",
+                "body": { "size": 3, "attachmentId": "ATT" } })
+    }
+
+    #[test]
+    fn a_part_id_is_given_to_a_served_attachment_within_the_fetch_depth() {
+        let part_ids = |payload: &Value| -> Vec<Option<String>> {
+            extract(payload)
+                .unwrap()
+                .attachments
+                .into_iter()
+                .map(|a| a.part_id)
+                .collect()
+        };
+        let depth = crate::gmail::ATTACHMENT_PART_DEPTH;
+        assert_eq!(
+            part_ids(&nested(served(json!("1.0.2")), depth)),
+            [Some("1.0.2".to_string())]
+        );
+        assert_eq!(part_ids(&served(json!("0"))), [Some("0".to_string())]);
+        // One level deeper than the fetch reads: listed, unnamed.
+        assert_eq!(part_ids(&nested(served(json!("1.0.2")), depth + 1)), [None]);
+        // Carried inside the message: no attachmentId, no name.
+        let carried = json!({ "partId": "1", "mimeType": "image/png", "filename": "a.png",
+                              "body": { "size": 3, "data": "YWJj" } });
+        assert_eq!(part_ids(&carried), [None]);
+        // No partId, an empty one, one that is not a string or not of the
+        // part-id grammar: unnamed.
+        let mut bare = served(json!("x"));
+        bare.as_object_mut().unwrap().remove("partId");
+        assert_eq!(part_ids(&bare), [None]);
+        for id in [json!(""), json!(3), json!("1/2"), json!("1".repeat(65))] {
+            assert_eq!(part_ids(&served(id.clone())), [None], "{id}");
+        }
+        assert_eq!(
+            part_ids(&served(json!("1".repeat(64)))),
+            [Some("1".repeat(64))]
         );
     }
 

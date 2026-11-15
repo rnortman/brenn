@@ -1,6 +1,7 @@
 //! What every Gmail component shares: ids, the messages path, the metadata
 //! query, header reading and the MIME decoder.
 
+pub mod attachment;
 pub mod decode;
 
 use brenn_provider_kit::{Args, Failure, Query, QueryValue, query};
@@ -14,6 +15,39 @@ use crate::text::shape;
 /// neither decodes nor refuses; being ASCII, an id's characters are its bytes,
 /// so the bound holds for ids Google answers too.
 pub const ID_MAX_CHARS: usize = 128;
+
+/// How many levels of `parts` below a message's payload (the payload is
+/// depth 0) an attachment is named by its `part_id` and fetched within: the
+/// depth `GmailRead` hands out a `part_id` to and the depth the attachment
+/// fetch's mask lists.
+pub const ATTACHMENT_PART_DEPTH: usize = 8;
+
+/// A `fields` mask over a message's part tree: `payload(…)` with
+/// `part_fields`, and `depth` levels of `parts(…)` nested below it, each with
+/// `part_fields`.
+pub fn part_tree_mask(part_fields: &str, depth: usize) -> String {
+    let mut mask = String::new();
+    mask.push_str("payload(");
+    mask.push_str(part_fields);
+    for _ in 0..depth {
+        mask.push_str(",parts(");
+        mask.push_str(part_fields);
+    }
+    for _ in 0..=depth {
+        mask.push(')');
+    }
+    mask
+}
+
+/// The most characters a part id may hold.
+pub const PART_ID_MAX_CHARS: usize = 64;
+
+/// Whether `id` is a part id as the attachment fetch takes one: 1 to
+/// [`PART_ID_MAX_CHARS`] ASCII letters, digits and `.`.
+pub fn is_part_id(id: &str) -> bool {
+    (1..=PART_ID_MAX_CHARS).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+}
 
 /// The most UTF-8 bytes of a message header's value copied into a result. A
 /// sender writes these, and nothing bounds their length.

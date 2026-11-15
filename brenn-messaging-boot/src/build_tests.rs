@@ -3533,6 +3533,7 @@ async fn boot_carries_the_planned_tool_caller_grant_table() {
     assert_eq!(callers, vec!["wasm:probe"]);
     assert_eq!(
         carried.tool_caller_grants["wasm:probe"]
+            .tools
             .keys()
             .collect::<Vec<_>>(),
         vec!["apull"],

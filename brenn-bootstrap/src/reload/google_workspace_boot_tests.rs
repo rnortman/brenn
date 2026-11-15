@@ -48,7 +48,13 @@ struct Class {
     clauses: &'static [(&'static str, &'static str)],
     /// The result inbox's depth, as the tuning block sets it.
     result_depth: u64,
+    /// The grants the class requires, as the instance's `grants` list is
+    /// written.
+    grants: &'static str,
 }
+
+/// The grants of a class that handles no attachments.
+const PROVIDER_GRANTS: &str = "log, store, config, tools, provides";
 
 const GMAIL_READ: Class = Class {
     artifact: "brenn_google_gmail_read.wasm",
@@ -62,6 +68,7 @@ const GMAIL_READ: Class = Class {
         ("gmail-search", "GmailSearch"),
         ("gmail-read", "GmailRead"),
         ("gmail-thread", "GmailThread"),
+        ("gmail-attachment", "GmailAttachment"),
     ],
     clauses: &[
         ("GET", "/gmail/v1/users/me/labels"),
@@ -69,8 +76,10 @@ const GMAIL_READ: Class = Class {
         ("GET", "/gmail/v1/users/me/messages"),
         ("GET", "/gmail/v1/users/me/messages/*"),
         ("GET", "/gmail/v1/users/me/threads/*"),
+        ("GET", "/gmail/v1/users/me/messages/*/attachments/*"),
     ],
     result_depth: 32,
+    grants: "log, store, config, tools, provides, blobs",
 };
 
 const GMAIL_COMPOSE: Class = Class {
@@ -86,6 +95,7 @@ const GMAIL_COMPOSE: Class = Class {
         ("POST", "/gmail/v1/users/me/drafts"),
     ],
     result_depth: 16,
+    grants: PROVIDER_GRANTS,
 };
 
 const GMAIL_ORGANIZE: Class = Class {
@@ -98,6 +108,7 @@ const GMAIL_ORGANIZE: Class = Class {
     tools: &[("gmail-modify-labels", "GmailModifyLabels")],
     clauses: &[("POST", "/gmail/v1/users/me/messages/batchModify")],
     result_depth: 16,
+    grants: PROVIDER_GRANTS,
 };
 
 const CALENDAR_READ: Class = Class {
@@ -120,6 +131,7 @@ const CALENDAR_READ: Class = Class {
         ("POST", "/calendar/v3/freeBusy"),
     ],
     result_depth: 32,
+    grants: PROVIDER_GRANTS,
 };
 
 const CALENDAR_WRITE: Class = Class {
@@ -141,6 +153,7 @@ const CALENDAR_WRITE: Class = Class {
         ("DELETE", "/calendar/v3/calendars/*/events/*"),
     ],
     result_depth: 16,
+    grants: PROVIDER_GRANTS,
 };
 
 /// The class's packaged specification.
@@ -161,7 +174,7 @@ fn document(
     client_file: &std::path::Path,
     store: &std::path::Path,
 ) -> String {
-    let grants: String = class
+    let tool_grants: String = class
         .tools
         .iter()
         .map(|(name, _)| format!("    tool {name} {{}}\n"))
@@ -216,7 +229,7 @@ channel at "brenn:tool-results/{slug}" {{
 }}
 
 new {slug}: {class_name} {{
-    grants = [log, store, config, tools, provides];
+    grants = [{component_grants}];
     store_path = "{store}";
     tool api-request {{
 {clauses}        rate_limit {{ burst = 60; sustained_per_minute = 120; }}
@@ -231,7 +244,7 @@ agent Assistant() {{
     working_dir = ".";
     container = "sandbox";
     container_working_dir = "/work";
-{grants}}}
+{tool_grants}}}
 
 new {ASSISTANT}: Assistant();
 "#,
@@ -239,6 +252,7 @@ new {ASSISTANT}: Assistant();
         slug = class.slug,
         depth = class.result_depth,
         class_name = class.class,
+        component_grants = class.grants,
         host_key = class.host_key,
         host = class.host,
         home = home.display(),
@@ -293,7 +307,11 @@ async fn assert_class_boots(class: &Class) {
             let resolved = brenn_lib::config::resolve_oauth(config, &apps)
                 .expect("the document declares a provider");
             let service = std::sync::Arc::new(brenn_oauth::OAuthService::new(resolved, alerts));
-            brenn_oauth::tools::registered(Some(&service), brenn_lib::config::ApiKeyTable::empty())
+            brenn_oauth::tools::registered(
+                Some(&service),
+                brenn_lib::config::ApiKeyTable::empty(),
+                brenn_oauth::tools::BlobStoreSlot::default(),
+            )
         },
     )
     .await;

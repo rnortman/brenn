@@ -75,7 +75,9 @@ pub enum ComponentGrant {
     Provides,
     /// `brenn:processor/blobs` — read the blobs the activation's messages
     /// carry by byte range, create blobs, and publish messages that carry
-    /// them. Backend-only: no surface host serves blob bytes yet.
+    /// them. The backend host serves the whole interface; a surface host
+    /// serves every member but the tool-call forms, the members
+    /// [`SURFACE_BLOBS_MEMBERS`] lists (see [`ComponentGrant::served_members`]).
     Blobs,
     /// Fullscreen takeover of the page the component is placed on. Names no WIT
     /// interface: the capability is a binding to a takeover-plane channel, and
@@ -199,6 +201,39 @@ pub enum ComponentHost {
     TopLevel,
 }
 
+/// Which members of a grant's interface a host serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedMembers {
+    /// Every function and resource of the interface.
+    All,
+    /// Only the functions and resources named, as the component model names
+    /// an instance's members: a free function by its name, a method as
+    /// `[method]<resource>.<name>`, a resource's drop as
+    /// `[resource-drop]<resource>`, a resource by its name. A kind importing
+    /// any other function or resource of the interface is refused.
+    Only(&'static [&'static str]),
+}
+
+/// The members of `brenn:processor/blobs@0.3.0` a surface host serves: the
+/// read side, `create`, the `writer` resource and `publish`. The tool-call
+/// forms `call-async`, `call-async-for` and `complete` are not served on a
+/// page.
+pub const SURFACE_BLOBS_MEMBERS: &[&str] = &[
+    "limits",
+    "open",
+    "blob",
+    "[method]blob.size",
+    "[method]blob.content-type",
+    "[method]blob.read",
+    "[resource-drop]blob",
+    "create",
+    "writer",
+    "[method]writer.write",
+    "[method]writer.seal",
+    "[resource-drop]writer",
+    "publish",
+];
+
 impl ComponentGrant {
     /// Every capability a component may be granted, in the order they are
     /// listed.
@@ -299,6 +334,10 @@ impl ComponentGrant {
     /// in the surface server's processor-asset validation), modulo two deltas
     /// that side asserts by name: `types` is in both import lists and is no
     /// capability, and `takeover` names no import at all.
+    ///
+    /// A legal grant may still be served only in part on a host: that is
+    /// [`ComponentGrant::served_members`]. `blobs` is legal on a surface and
+    /// served there without its tool-call forms.
     pub fn illegal_on(self, host: ComponentHost) -> Option<&'static str> {
         match (host, self) {
             (ComponentHost::Surface, Self::Store) => Some(
@@ -313,9 +352,6 @@ impl ComponentGrant {
             (ComponentHost::Surface, Self::Provides) => Some(
                 "`provides` is backend-only: the surface host links no tool substrate to serve requests from",
             ),
-            (ComponentHost::Surface, Self::Blobs) => {
-                Some("`blobs` is backend-only: no surface host serves blob bytes yet")
-            }
             (ComponentHost::TopLevel, Self::Takeover) => {
                 Some("`takeover` is a page capability; a top-level consumer has no page")
             }
@@ -326,6 +362,17 @@ impl ComponentGrant {
                 Some("`page-dom` is a page capability; a top-level consumer has no page to arrange")
             }
             _ => None,
+        }
+    }
+
+    /// Which members of this grant's interface `host` serves, for a grant
+    /// legal there. Every pair serves its whole interface but `blobs` on a
+    /// surface, which serves everything but the tool-call forms; a surface
+    /// refuses at boot a kind that imports any other member of it.
+    pub fn served_members(self, host: ComponentHost) -> ServedMembers {
+        match (self, host) {
+            (Self::Blobs, ComponentHost::Surface) => ServedMembers::Only(SURFACE_BLOBS_MEMBERS),
+            _ => ServedMembers::All,
         }
     }
 
@@ -1237,12 +1284,8 @@ mod tests {
     }
 
     #[test]
-    fn tools_provides_and_blobs_are_backend_only_words() {
-        for grant in [
-            ComponentGrant::Tools,
-            ComponentGrant::Provides,
-            ComponentGrant::Blobs,
-        ] {
+    fn tools_and_provides_are_backend_only_words() {
+        for grant in [ComponentGrant::Tools, ComponentGrant::Provides] {
             assert!(
                 grant.illegal_on(ComponentHost::Surface).is_some(),
                 "{grant:?} is admitted on a host with no tool substrate"
@@ -1251,6 +1294,61 @@ mod tests {
                 grant.illegal_on(ComponentHost::TopLevel).is_none(),
                 "{grant:?} is refused on the only host that can implement it"
             );
+        }
+    }
+
+    /// `blobs` is legal on both hosts; the surface serves reading, making and
+    /// publishing, and not the tool-call forms.
+    #[test]
+    fn blobs_is_legal_on_both_hosts_and_served_without_tool_calls_on_a_surface() {
+        for host in [ComponentHost::Surface, ComponentHost::TopLevel] {
+            assert_eq!(ComponentGrant::Blobs.illegal_on(host), None);
+        }
+        assert_eq!(
+            ComponentGrant::Blobs.served_members(ComponentHost::TopLevel),
+            ServedMembers::All
+        );
+        let ServedMembers::Only(members) =
+            ComponentGrant::Blobs.served_members(ComponentHost::Surface)
+        else {
+            panic!("a surface serves `blobs` in part");
+        };
+        assert_eq!(members, SURFACE_BLOBS_MEMBERS);
+        for producing in [
+            "create",
+            "writer",
+            "[method]writer.write",
+            "[method]writer.seal",
+            "[resource-drop]writer",
+            "publish",
+        ] {
+            assert!(
+                members.contains(&producing),
+                "{producing} is not served on a page"
+            );
+        }
+        for tool_call in ["call-async", "call-async-for", "complete"] {
+            assert!(
+                !members.contains(&tool_call),
+                "{tool_call} is served on a page"
+            );
+        }
+    }
+
+    /// Every pair but `(blobs, surface)` serves its whole interface.
+    #[test]
+    fn every_other_pair_serves_its_whole_interface() {
+        for grant in ComponentGrant::ALL {
+            for host in [ComponentHost::Surface, ComponentHost::TopLevel] {
+                if (grant, host) == (ComponentGrant::Blobs, ComponentHost::Surface) {
+                    continue;
+                }
+                assert_eq!(
+                    grant.served_members(host),
+                    ServedMembers::All,
+                    "{grant:?} on {host:?}"
+                );
+            }
         }
     }
 

@@ -22,6 +22,9 @@
 //! the buffered entries — plus the last step onto the contract's error
 //! vocabulary.
 
+#[cfg(test)]
+mod attachment_tests;
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -29,16 +32,24 @@ use brenn_budget::{
     ActivationGate, DeferRefusalKind, GateRefusal, PublishCheck, PublishRefusalKind,
     check_deliver_after, defer_refusal_kind, publish_refusal_kind,
 };
-use brenn_envelope::{GuestBody, MessageBody, Urgency};
+use brenn_envelope::{
+    AttachmentListError, AttachmentName, GuestBody, MessageBody, Urgency, check_attachment_list,
+};
 use brenn_surface_contract::{CallError, DeferError, PublishError};
 use uuid::Uuid;
 
 use brenn_attach_client::Codec;
 use brenn_attach_client::store::DeferOp;
+use brenn_attach_proto::{BlobFacts, BlobHandle, PublishAttachment};
 use brenn_surface_schema::SURFACE_ATTACH_VERSION;
 
 use crate::bindings::{channel_carries, channel_is_transportable};
+use crate::blob_scope::{Blob, BlobScope, UnknownHandle, blobs_bytes, distinct_blobs, door_holds};
 use crate::outbound::truncate_report_field;
+
+/// The most distinct blobs one activation's wire-bound publishes name, together.
+/// The door's `max_handles` bounds it further.
+pub const SURFACE_MAX_FLUSH_BLOBS: usize = 32;
 
 /// The byte cap on a guest-supplied port name reaching a diagnostic. The name is
 /// component-controlled and the diagnostic reaches the console and a log frame,
@@ -83,6 +94,129 @@ fn port_for_report(port: &str) -> String {
 /// the wire batch budget, by the codec of the version the surface route serves.
 fn wire_charge(channel: &str, body: Option<&MessageBody>) -> usize {
     Codec::negotiated(SURFACE_ATTACH_VERSION).op_charged_bytes(channel, body)
+}
+
+/// What a publish's attachments charge against the wire batch budget, by the
+/// same codec. The charge reads only the names, so the handle each attachment
+/// will carry on the wire is not yet needed and a placeholder stands in.
+fn attachments_charge(attachments: &[BufferedAttachment]) -> usize {
+    let placeholders: Vec<PublishAttachment> = attachments
+        .iter()
+        .map(|attachment| PublishAttachment::new(attachment.name.clone(), BlobHandle(0)))
+        .collect();
+    Codec::negotiated(SURFACE_ATTACH_VERSION).attachments_charged_bytes(&placeholders)
+}
+
+/// `blobs.publish`'s `publish-error`: a `ports.publish` refusal, or one of the
+/// attachment list's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobsPublishError {
+    Plain(PublishError),
+    InvalidAttachmentName(String),
+    DuplicateAttachmentName(String),
+    TooManyAttachments,
+}
+
+/// A refused or violating `blobs.publish`. See [`PortFault`].
+pub type BlobsPublishFault = PortFault<BlobsPublishError>;
+
+/// Whether the caller of [`PublishBuffer::publish_attached`] holds every grant
+/// the call needs, as the core judged it. The buffer does not judge grants; it
+/// answers this verdict at its place in the check order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantVerdict {
+    Held,
+    Missing,
+}
+
+impl GrantVerdict {
+    /// The verdict of a grant judgement: `Held` iff it refused nothing.
+    pub fn of<R>(grants: &Result<(), R>) -> Self {
+        match grants {
+            Ok(()) => Self::Held,
+            Err(_) => Self::Missing,
+        }
+    }
+}
+
+/// The answer to a `blobs.publish` call: `None` when no activation of the
+/// caller is in flight, else the buffer's answer.
+pub type BlobsPublishAnswer = Option<Result<Result<Admission, BlobsPublishFault>, UnknownHandle>>;
+
+/// The grant refusal a `blobs.publish` call reports, given the judgement it was
+/// made under and its answer.
+///
+/// A missing grant is reported when the call was answered `not-permitted`, by
+/// the buffer or because no activation of the caller is in flight; it is not
+/// reported when the call was answered `quota-exceeded`, because the charge came
+/// first and the grant was never judged. A call that held every grant reports
+/// nothing.
+///
+/// # Panics
+///
+/// On any other answer under a missing grant: [`PublishBuffer::publish_attached`]
+/// answers a missing verdict `not-permitted` or `quota-exceeded` and nothing else.
+pub fn ungranted_report<'a, R>(
+    instance: &str,
+    grants: &'a Result<(), R>,
+    answer: &BlobsPublishAnswer,
+) -> Option<&'a R> {
+    let Err(refusal) = grants else {
+        return None;
+    };
+    match answer {
+        Some(Ok(Err(PortFault::Refused(BlobsPublishError::Plain(PublishError::NotPermitted)))))
+        | None => Some(refusal),
+        Some(Ok(Err(PortFault::Refused(BlobsPublishError::Plain(
+            PublishError::QuotaExceeded,
+        ))))) => None,
+        other => panic!(
+            "surface kernel: the buffer answered '{instance}''s ungranted blobs.publish \
+             {other:?}; it answers a missing grant `not-permitted` or `quota-exceeded`"
+        ),
+    }
+}
+
+/// A `ports.publish` fault as `blobs.publish` answers it.
+fn plain_fault(fault: PublishFault) -> BlobsPublishFault {
+    match fault {
+        PortFault::Refused(err) => PortFault::Refused(BlobsPublishError::Plain(err)),
+        PortFault::Undeclared(port) => PortFault::Undeclared(port),
+    }
+}
+
+/// The attachment list's names, checked as every host checks them.
+fn check_attachment_names(
+    attachments: &[(String, u32)],
+) -> Result<Vec<AttachmentName>, BlobsPublishError> {
+    check_attachment_list(attachments.iter().map(|(name, _)| name.as_str())).map_err(|refusal| {
+        match refusal {
+            AttachmentListError::TooMany => BlobsPublishError::TooManyAttachments,
+            AttachmentListError::InvalidName(why) => BlobsPublishError::InvalidAttachmentName(why),
+            AttachmentListError::DuplicateName(name) => {
+                BlobsPublishError::DuplicateAttachmentName(name)
+            }
+        }
+    })
+}
+
+/// The blobs `names` name, each resolved through `scope`; a handle the scope
+/// does not hold as a blob is the caller's trap.
+fn resolve_attachments(
+    scope: &BlobScope,
+    names: Vec<AttachmentName>,
+    attachments: &[(String, u32)],
+) -> Result<Vec<BufferedAttachment>, UnknownHandle> {
+    names
+        .into_iter()
+        .zip(attachments)
+        .map(|(name, &(_, handle))| {
+            Ok(BufferedAttachment {
+                name,
+                blob: scope.blob(handle)?.clone(),
+            })
+        })
+        .collect()
 }
 
 /// A gate verdict as the component sees it on the publish path.
@@ -132,6 +266,14 @@ fn defer_error(refusal: GateRefusal) -> DeferFault {
     })
 }
 
+/// One attachment of a buffered publish: the message's name for it and the
+/// blob its handle held at the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferedAttachment {
+    pub name: AttachmentName,
+    pub blob: Blob,
+}
+
 /// One publish accepted into the buffer, in call order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BufferedPublish {
@@ -159,6 +301,9 @@ pub(crate) struct BufferedPublish {
     /// Whether a value in the past parks or publishes immediately is decided at
     /// flush, against the clock read there.
     pub deliver_after: Option<u64>,
+    /// The attachments, in call order; empty for a `ports` publish. Holding
+    /// them holds their blobs until the flush.
+    pub attachments: Vec<BufferedAttachment>,
 }
 
 /// One accepted control op against a message this instance already parked, in
@@ -272,9 +417,7 @@ pub struct PublishBuffer {
     /// distinguish them, because an op is applied at its channel's authority and
     /// the identity is what travels either way.
     deferred: HashMap<String, Vec<Uuid>>,
-    /// Accepted publishes, in call order.
-    // TODO(blob-attachment-host-sites): an attachment-carrying publish is an
-    // entry of this list, not of a list beside it, or call order is lost.
+    /// Accepted publishes, `ports` and `blobs` alike, in call order.
     entries: Vec<BufferedPublish>,
     /// Accepted control ops, in call order.
     defer_ops: Vec<BufferedDeferOp>,
@@ -327,7 +470,10 @@ impl PublishBuffer {
             .entries
             .iter()
             .filter(|entry| channel_is_transportable(&entry.channel))
-            .map(|entry| wire_charge(&entry.channel, Some(&entry.body)))
+            .map(|entry| {
+                wire_charge(&entry.channel, Some(&entry.body))
+                    + attachments_charge(&entry.attachments)
+            })
             .sum();
         let ops: usize = self
             .defer_ops
@@ -441,7 +587,9 @@ impl PublishBuffer {
         self.publish_inner(port, body, Some(urgency), None)
     }
 
-    /// The publish path both entry points share.
+    /// The publish path the `ports` entry points share: [`Self::publish_attached`]
+    /// with no attachments and the grants held — the `ports` exports answer
+    /// their grant before they reach the buffer.
     ///
     /// The gate's publish order, with the page's host-data checks at their
     /// documented positions: the call ceiling first (so a component looping on
@@ -456,45 +604,161 @@ impl PublishBuffer {
         urgency_override: Option<Urgency>,
         deliver_after: Option<u64>,
     ) -> Result<(), PublishFault> {
-        self.gate.charge_call().map_err(publish_error)?;
+        let no_handles = BlobScope::empty();
+        match self.publish_attached(
+            &no_handles,
+            GrantVerdict::Held,
+            None,
+            port,
+            body,
+            &[],
+            urgency_override,
+            deliver_after,
+        ) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(PortFault::Refused(BlobsPublishError::Plain(err)))) => {
+                Err(PortFault::Refused(err))
+            }
+            Ok(Err(PortFault::Undeclared(port))) => Err(PortFault::Undeclared(port)),
+            Ok(Err(PortFault::Refused(refusal))) => {
+                unreachable!("an empty attachment list drew {refusal:?}")
+            }
+            Err(handle) => unreachable!("an empty attachment list named handle {handle:?}"),
+        }
+    }
+
+    /// `blobs.publish`: publish `body` from `port` carrying the blobs
+    /// `attachments` names by `scope`'s handles. An empty list is
+    /// `ports.publish`, and both share one buffer, so the two interfaces keep
+    /// one call order.
+    ///
+    /// `grants` is the core's verdict on the caller's grants, and `door` the
+    /// blob door the last `Welcome` advertised. The checks run in the
+    /// interface's order, with the page's additions:
+    ///
+    /// 1. the call budget shared with `ports`;
+    /// 2. the grants — `plain(not-permitted)` on [`GrantVerdict::Missing`],
+    ///    buffering nothing and reading nothing below;
+    /// 3. the port — undeclared traps; declared and unwired runs every check
+    ///    below that needs no channel and drops the message;
+    /// 4. a non-empty list on a wire-bound port without a door that uploads is
+    ///    `plain(not-permitted)`;
+    /// 5. the body — `invalid-body`, then `text-only-channel`;
+    /// 6. the attachment names — `too-many-attachments`,
+    ///    `invalid-attachment-name`, `duplicate-attachment-name`;
+    /// 7. each handle is a blob of `scope`, or the caller traps
+    ///    (the outer `Err`);
+    /// 8. the size cap and budgets: the body cap, the wire batch budget with
+    ///    each attachment's charge, on a wire-bound port the activation's
+    ///    distinct blobs against [`SURFACE_MAX_FLUSH_BLOBS`] and the door's
+    ///    `max_handles` and `max_bytes_held`, then the gate's own budgets.
+    ///
+    /// So a caller without a grant answers `plain(not-permitted)` until the
+    /// activation's call ceiling, and `plain(quota-exceeded)` from the call
+    /// that passes it, each refusal drawing on the count every publish of the
+    /// activation draws on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_attached(
+        &mut self,
+        scope: &BlobScope,
+        grants: GrantVerdict,
+        door: Option<&BlobFacts>,
+        port: &str,
+        body: GuestBody,
+        attachments: &[(String, u32)],
+        urgency_override: Option<Urgency>,
+        deliver_after: Option<u64>,
+    ) -> Result<Result<(), BlobsPublishFault>, UnknownHandle> {
+        if let Err(refusal) = self.gate.charge_call() {
+            return Ok(Err(plain_fault(publish_error(refusal))));
+        }
+        if grants == GrantVerdict::Missing {
+            return Ok(Err(PortFault::Refused(BlobsPublishError::Plain(
+                PublishError::NotPermitted,
+            ))));
+        }
         // The binding's own key is the sink key, so nothing is allocated to ask
         // the gate: a refused publish copies neither the port name nor the
         // channel, and only an accepted one owns them.
         let Some((sink, spec)) = self.outputs.get_key_value(port) else {
-            return self.publish_unwired(port, body, deliver_after);
+            return self.publish_unwired(scope, port, body, attachments, deliver_after);
         };
-        let body = build_body(body, PublishError::InvalidBody)?;
-        self.judge_carriage(port, spec, &body, PublishError::TextOnlyChannel)?;
+        let wire_bound = channel_is_transportable(&spec.channel);
+        if wire_bound && !attachments.is_empty() && !door.is_some_and(|door| door.upload) {
+            return Ok(Err(PortFault::Refused(BlobsPublishError::Plain(
+                PublishError::NotPermitted,
+            ))));
+        }
+        let body = match build_body(body, PublishError::InvalidBody) {
+            Ok(body) => body,
+            Err(fault) => return Ok(Err(plain_fault(fault))),
+        };
+        if let Err(fault) = self.judge_carriage(port, spec, &body, PublishError::TextOnlyChannel) {
+            return Ok(Err(plain_fault(fault)));
+        }
+        let names = match check_attachment_names(attachments) {
+            Ok(names) => names,
+            Err(refusal) => return Ok(Err(PortFault::Refused(refusal))),
+        };
+        let attachments = resolve_attachments(scope, names, attachments)?;
         let urgency = urgency_override.unwrap_or(spec.default_urgency);
         // The wire batch budget, before the gate charges anything: the gate
         // charges on acceptance and `take` asserts its count against this
         // buffer's, so a refusal after it would leave the two disagreeing.
-        let charge = wire_charge(&spec.channel, Some(&body));
-        if body.len() <= self.gate.max_body_bytes()
-            && self.overruns_batch_budget(&spec.channel, charge)
-        {
-            return Err(PortFault::Refused(PublishError::QuotaExceeded));
+        // Both asked only of a body inside the cap, so the gate's
+        // `BodyTooLarge` still names an oversize argument rather than a budget.
+        let charge = wire_charge(&spec.channel, Some(&body)) + attachments_charge(&attachments);
+        let within_cap = body.len() <= self.gate.max_body_bytes();
+        let over_flush_blobs = wire_bound
+            && !attachments.is_empty()
+            && !self.flush_blobs_fit(
+                door.expect("checked above: a wire-bound attachment publish has a door"),
+                &attachments,
+            );
+        if within_cap && (self.overruns_batch_budget(&spec.channel, charge) || over_flush_blobs) {
+            return Ok(Err(PortFault::Refused(BlobsPublishError::Plain(
+                PublishError::QuotaExceeded,
+            ))));
         }
         // A bound port always has a seeded bucket — the core seeds one per entry
         // of the same `outputs` map this resolved against — so the gate's miss
         // panic is a broken kernel invariant, not a component's problem.
-        self.gate
-            .admit_publish(PublishCheck {
-                sink,
-                body_len: body.len(),
-                deliver_after,
-                entry_addend: 0,
-            })
-            .map_err(publish_error)?;
+        if let Err(refusal) = self.gate.admit_publish(PublishCheck {
+            sink,
+            body_len: body.len(),
+            deliver_after,
+            entry_addend: 0,
+        }) {
+            return Ok(Err(plain_fault(publish_error(refusal))));
+        }
+        let channel = spec.channel.clone();
         self.entries.push(BufferedPublish {
             port: port.to_string(),
-            channel: spec.channel.clone(),
+            channel,
             body,
             urgency,
             urgency_override,
             deliver_after,
+            attachments,
         });
-        Ok(())
+        Ok(Ok(()))
+    }
+
+    /// Whether this activation's wire-bound publishes, with `more` added, name
+    /// no more distinct blobs than [`SURFACE_MAX_FLUSH_BLOBS`] and `door`'s
+    /// `max_handles`, and no more of their bytes together than `door`'s
+    /// `max_bytes_held`. The flush holds one server handle per distinct blob.
+    fn flush_blobs_fit(&self, door: &BlobFacts, more: &[BufferedAttachment]) -> bool {
+        let named = self
+            .entries
+            .iter()
+            .filter(|entry| channel_is_transportable(&entry.channel))
+            .flat_map(|entry| &entry.attachments)
+            .chain(more)
+            .map(|attachment| &attachment.blob);
+        let distinct = distinct_blobs(named);
+        distinct.len() <= SURFACE_MAX_FLUSH_BLOBS
+            && door_holds(door, distinct.len(), blobs_bytes(distinct.iter().copied()))
     }
 
     /// The publish path for a port with no binding: either a declared port the
@@ -514,21 +778,37 @@ impl PublishBuffer {
     /// batch budget, the buffer and the carry. Answering `Ok` where a bound port
     /// answers `invalid-payload` would hand the component its own wiring back.
     /// The body is built, so a malformed one draws `invalid-body` here too; with
-    /// no channel there is nothing to judge its carriage against.
+    /// no channel there is nothing to judge its carriage against. The
+    /// attachment names and handles are checked as a bound port checks them;
+    /// the door and the per-flush blob bounds are a wire channel's and are
+    /// not asked. The attachments are dropped with the message.
     fn publish_unwired(
         &mut self,
+        scope: &BlobScope,
         port: &str,
         body: GuestBody,
+        attachments: &[(String, u32)],
         deliver_after: Option<u64>,
-    ) -> Result<(), PublishFault> {
+    ) -> Result<Result<(), BlobsPublishFault>, UnknownHandle> {
         if !self.declared_out_ports.contains(port) {
-            return Err(PortFault::Undeclared(port_for_report(port)));
+            return Ok(Err(PortFault::Undeclared(port_for_report(port))));
         }
-        let body = build_body(body, PublishError::InvalidBody)?;
-        self.gate
+        let body = match build_body(body, PublishError::InvalidBody) {
+            Ok(body) => body,
+            Err(fault) => return Ok(Err(plain_fault(fault))),
+        };
+        let names = match check_attachment_names(attachments) {
+            Ok(names) => names,
+            Err(refusal) => return Ok(Err(PortFault::Refused(refusal))),
+        };
+        resolve_attachments(scope, names, attachments)?;
+        if let Err(refusal) = self
+            .gate
             .admit_publish_without_sink(body.len(), deliver_after, 0)
-            .map_err(publish_error)?;
-        Ok(())
+        {
+            return Ok(Err(plain_fault(publish_error(refusal))));
+        }
+        Ok(Ok(()))
     }
 
     /// Cancel one message this instance has parked on `port`'s channel, named by

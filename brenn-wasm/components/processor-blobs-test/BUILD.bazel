@@ -1,8 +1,11 @@
 load("@wasm_crates//:defs.bzl", "all_crate_deps")
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load("//bazel/wasm:defs.bzl", "grant_parity_test", "wasm_component", "wasm_guest_cdylib")
+load("//bazel/wasm:defs.bzl", "component_install_tree", "component_package", "grant_parity_test", "wasm_component", "wasm_guest_cdylib")
 
 policy_srcs()
+
+# `brenn.e2e.brenn` compiles against this specification's directory.
+exports_files(["spec/processor-blobs-test.brenn"])
 
 # Bindings come from the brenn-guest SDK's `generate!`; this crate names no
 # WIT of its own.
@@ -22,9 +25,27 @@ wasm_component(
 )
 
 # The specification is held to the artifact's imports here rather than through
-# `COMPONENT_PACKAGES`: the fixture is test-only and never packaged.
+# `COMPONENT_PACKAGES`: the fixture is test-only and never released.
 grant_parity_test(
     name = "grant_parity",
     component = ":component",
     spec = "spec/processor-blobs-test.brenn",
+)
+
+# The e2e harness's backend producer of attachments: `make e2e` mounts this
+# one-package components root so `brenn.e2e.brenn` can place the class at top
+# level. Outside `COMPONENT_PACKAGES`, so neither the release nor the shipped
+# install tree carries it.
+component_package(
+    name = "e2e_package",
+    component = ":component",
+    package = "processor-blobs-test",
+    spec = "spec/processor-blobs-test.brenn",
+    world = "brenn:processor",
+)
+
+component_install_tree(
+    name = "e2e_install_tree",
+    packages = [":e2e_package"],
+    visibility = ["//visibility:public"],
 )

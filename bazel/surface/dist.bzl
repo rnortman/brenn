@@ -203,10 +203,12 @@ _processor_stage = rule(
 def surface_processor_assets(name, kind, component, spec, help = None, schema = None, visibility = ["//visibility:public"]):
     """Transpile one processor component and stage the result for `surface/dist`.
 
-    `--instantiation async` is load-bearing: it makes the emitted module export
+    `--instantiation sync` is load-bearing: it makes the emitted module export
     an `instantiate(getCoreModule, imports)` function instead of instantiating
     at module scope, which is what one compiled module per kind and one
-    instantiation per instance requires.
+    instantiation per instance requires; and that function returns the
+    instance rather than a promise, so the page mints one inside an activation
+    entry, a sync call's or a gesture's included, which cannot await.
 
     Args:
         name: target name; also the staging directory's name.

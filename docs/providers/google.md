@@ -73,12 +73,19 @@ The answer is `{ emailAddress, messagesTotal, threadsTotal, historyId }`.
 
 ### An attachment
 
-One attachment's bytes. The message id is a `GmailSearch` or `GmailRead` id;
-the attachment id is the `attachmentId` of the part, which
-`GmailRead` does not answer. Read it from messages.get with `format=full`
-(neither `minimal` nor `metadata` carries the parts) and a `fields` mask that
-names the part tree without `data`, so a large text part does not push the
-answer past the read limit:
+One attachment's bytes. `GmailAttachment` is the route: it takes the message
+id and the `part_id` `GmailRead` lists for the attachment, and answers the
+decoded file as an attachment of its result, which can be forwarded with
+`BrennSend`, saved with `brenn-tool save` or handed to another tool. A part
+`GmailRead` lists without a `part_id` is carried inside the message, or nested
+deeper than `GmailAttachment` reads, and is not fetched.
+
+The raw route is messages.attachments.get through `api-request`. The
+attachment id is the `attachmentId` of the part, which `GmailRead` does not
+answer. Read it from messages.get with `format=full` (neither `minimal` nor
+`metadata` carries the parts) and a `fields` mask that names the part tree
+without `data`, so a large text part does not push the answer past the read
+limit:
 `payload(filename,mimeType,body(size,attachmentId),parts(filename,mimeType,body(size,attachmentId),parts(filename,mimeType,body(size,attachmentId),parts(filename,mimeType,body(size,attachmentId)))))`.
 Reference: `https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages.attachments/get`.
 
@@ -90,16 +97,20 @@ Reference: `https://developers.google.com/workspace/gmail/api/reference/rest/v1/
   "path": "/gmail/v1/users/me/messages/<message id>/attachments/<attachment id>",
   "query": {
     "prettyPrint": "false"
-  }
+  },
+  "response_attachment": "envelope"
 }
 ```
 
-The answer is `{ size, data }`: `data` is the attachment's bytes in base64url
-(URL-safe alphabet), a third larger than the attachment. An attachment whose
-encoded form passes the read limit — about 190 KB of attachment at the
-256 KiB default — comes back cut, `truncated: true`, and cannot be read
-whole through `api-request`. The clause that admits it names the path's two
-ids as `*`: `/gmail/v1/users/me/messages/*/attachments/*`.
+The answer's body is `{ size, data }`: `data` is the attachment's bytes in
+base64url (URL-safe alphabet), a third larger than the attachment. With
+`response_attachment` the body is not in the answer: it comes back whole as
+the result's attachment `envelope`, up to the deployment's largest blob
+(`max_blob_bytes`), and the answer is `{ status, headers, bytes, attachment }`.
+That attachment is Google's JSON, not the file; decoding it is the caller's.
+Without `response_attachment` the body is inline and cut at the read limit.
+The clause that admits the call names the path's two ids as `*`:
+`/gmail/v1/users/me/messages/*/attachments/*`.
 
 ### A message in another form
 

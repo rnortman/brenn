@@ -315,6 +315,7 @@ fn surface_input(instance: &str, port: &str, channel: &str) -> SurfaceSubscripti
         noise: None,
         wake_min: None,
         non_text: false,
+        fetch_bytes: None,
     }
 }
 
@@ -5515,7 +5516,8 @@ surface alice_pod {
     assert_eq!(
         refusal.message,
         "`amplification` is not a key of the `heard` port of instance `widget` of surface \
-         `alice_pod`; expected `push_depth`, `retain_depth`, `noise`, `wake_min` or `non_text`"
+         `alice_pod`; expected `push_depth`, `retain_depth`, `noise`, `wake_min`, `non_text` or \
+         `fetch_bytes`"
     );
     assert_eq!(
         refusal.line_col(),

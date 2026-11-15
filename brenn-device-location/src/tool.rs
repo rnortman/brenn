@@ -231,6 +231,7 @@ mod tests {
             acting_conversation_id: Some(7),
             acting_user,
             deadline: None,
+            caller_opens_blobs: true,
         }
     }
 

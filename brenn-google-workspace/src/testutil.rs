@@ -103,6 +103,23 @@ pub fn four_byte(i: usize, n: usize) -> String {
         .collect()
 }
 
+/// `bytes` in base64url without padding, as Gmail sends a body or an
+/// attachment's data.
+pub fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
 /// A `no_body_refused` detail at `status`, read back as the API it names
 /// and the rest after ` answers `: what that API answers, and a write step's
 /// hint where one was appended. `None` for any other detail.

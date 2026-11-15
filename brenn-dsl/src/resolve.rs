@@ -5946,14 +5946,14 @@ fn resolve_binding(
             check_port(class, &bound.port, PortDir::In, errors)?;
             let chan = bound_chan(Some(&bound.chan), scope, errors)?;
             let (tail, refused) = typed_tail(bound.tail, InTail::empty, scope, errors);
-            bound_binding(bound.port, chan, RTail::In(tail), &refused)
+            bound_binding(bound.port, chan, RTail::In(Box::new(tail)), &refused)
                 .map(|binding| Bound::Chan(Box::new(binding)))
         }
         BindStmt::Outof(bound) => {
             check_port(class, &bound.port, PortDir::Out, errors)?;
             let chan = bound_chan(Some(&bound.chan), scope, errors)?;
             let (tail, refused) = typed_tail(bound.tail, OutTail::empty, scope, errors);
-            bound_binding(bound.port, chan, RTail::Out(tail), &refused)
+            bound_binding(bound.port, chan, RTail::Out(Box::new(tail)), &refused)
                 .map(|binding| Bound::Chan(Box::new(binding)))
         }
         BindStmt::Both(bound) => {

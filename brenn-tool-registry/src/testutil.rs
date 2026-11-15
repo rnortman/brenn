@@ -38,7 +38,8 @@ pub fn git_repo_pull_only() -> ToolRegistry {
 
 /// An async tool with a configurable user binding and the ACL keys
 /// `provider` and `path`, which refuses any clause whose `path` is `"bad"`
-/// and answers the acting user it was handed.
+/// and answers the acting user it was handed and whether its caller opens
+/// blobs.
 struct BoundTool(ToolDescriptor);
 
 #[async_trait]
@@ -62,7 +63,12 @@ impl AsyncTool for BoundTool {
         _attachments: HeldAttachments,
     ) -> Result<ToolOutput, ToolError> {
         let user = ctx.require_acting_user(self.0.name)?;
-        Ok(serde_json::json!({ "id": user.id, "username": user.username }).into())
+        Ok(serde_json::json!({
+            "id": user.id,
+            "username": user.username,
+            "opens_blobs": ctx.caller_opens_blobs,
+        })
+        .into())
     }
 }
 

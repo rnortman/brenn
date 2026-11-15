@@ -79,21 +79,30 @@ pub async fn surface_harness_with_siblings(
     siblings: Vec<ResolvedSurface>,
     entries: Vec<ChannelEntry>,
 ) -> SurfaceTestHarness {
-    surface_harness_extending_messenger(db, surface, siblings, entries, |messenger| messenger).await
+    surface_harness_extending_messenger(db, surface, siblings, entries, None, |messenger| messenger)
+        .await
 }
 
 /// [`surface_harness_with_siblings`] with `extend` applied to the messenger
 /// before anything shares it, for the builder steps (`with_blob_store`, a
 /// further `with_subscriber_registrations`) that only an unshared messenger
 /// takes.
+///
+/// `error_channel`, a bare `brenn:` name, is configured as the surface error
+/// channel as boot configures one: declared, every surface granted to publish
+/// it, and bound into every runtime's profile.
 pub async fn surface_harness_extending_messenger(
     db: &brenn_db::Db,
     surface: ResolvedSurface,
     siblings: Vec<ResolvedSurface>,
     mut entries: Vec<ChannelEntry>,
+    error_channel: Option<&str>,
     extend: impl FnOnce(Arc<brenn_messaging::Messenger>) -> Arc<brenn_messaging::Messenger>,
 ) -> SurfaceTestHarness {
     let params = fixtures_config::description_params();
+    if let Some(bare) = error_channel {
+        entries.push(brenn_channel_entry(bare, uuid::Uuid::new_v4()));
+    }
     let status_uuid = uuid::Uuid::new_v4();
     entries.push(brenn_channel_entry(
         &brenn_surface_server::description::surface_status_bare(&params.prefix, &surface.slug),
@@ -102,6 +111,21 @@ pub async fn surface_harness_extending_messenger(
 
     let mut surfaces = vec![surface];
     surfaces.extend(siblings);
+    if let Some(bare) = error_channel {
+        for surface in &mut surfaces {
+            surface
+                .policy
+                .grants
+                .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
+            surface
+                .policy
+                .acls
+                .brenn_publish
+                .push(brenn_lib::access::acl::ChannelMatcher::Exact(
+                    bare.to_string(),
+                ));
+        }
+    }
     brenn_surface_server::boot_policy::inject_surface_geometry_status_grants(
         &mut surfaces,
         &params.prefix,
@@ -137,7 +161,7 @@ pub async fn surface_harness_extending_messenger(
         surfaces,
         Some(Arc::clone(&messenger)),
         TEST_MAX_BODY_BYTES,
-        None,
+        error_channel.map(|bare| format!("brenn:{bare}")),
         params,
     ));
     router.set_state(state.clone());

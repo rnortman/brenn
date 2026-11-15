@@ -3,22 +3,58 @@
 
 pub mod accounts;
 pub mod api_request;
+#[cfg(test)]
+mod api_request_blob_tests;
 pub mod connect;
 pub mod disconnect;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use brenn_lib::config::ApiKeyTable;
 use brenn_lib::tools::{AclClause, acl_admits};
+use brenn_messaging_store::blob::BlobStore;
 use brenn_tool_registry::{AclDenied, RegisteredTool};
 
 use crate::OAuthService;
 
+/// The blob store `api-request` streams bodies from and into, attached once
+/// messaging is built: the registry that holds the tool is built before the
+/// store exists. Clones share one slot.
+// TODO(quality-blobstoreslot-copies-the-late-attach-newtype): one generic
+// late-attach type for this, `DeviceLocationBus` and `ProviderRuntime`'s
+// messenger.
+#[derive(Clone, Default)]
+pub struct BlobStoreSlot(Arc<OnceLock<Arc<BlobStore>>>);
+
+impl BlobStoreSlot {
+    /// Attach `store` for every clone of this slot.
+    ///
+    /// # Panics
+    ///
+    /// A store is already attached.
+    pub fn attach(&self, store: Arc<BlobStore>) {
+        assert!(
+            self.0.set(store).is_ok(),
+            "BUG: a blob store attached twice to api-request's slot"
+        );
+    }
+
+    /// The attached store, or `None` in a process with no messaging.
+    pub fn get(&self) -> Option<&Arc<BlobStore>> {
+        self.0.get()
+    }
+}
+
 /// The registry tools for the declared providers: the three OAuth tools when
 /// `oauth` is present, and `api-request` when either kind is declared — when
-/// `keys` holds a provider as it stands now, for the key kind.
-pub fn registered(oauth: Option<&Arc<OAuthService>>, keys: ApiKeyTable) -> Vec<RegisteredTool> {
+/// `keys` holds a provider as it stands now, for the key kind. `blobs` is the
+/// slot `api-request` finds its blob store in.
+pub fn registered(
+    oauth: Option<&Arc<OAuthService>>,
+    keys: ApiKeyTable,
+    blobs: BlobStoreSlot,
+) -> Vec<RegisteredTool> {
     let mut tools: Vec<RegisteredTool> = Vec::new();
     if let Some(service) = oauth {
         tools.push(RegisteredTool::Async(Arc::new(
@@ -32,7 +68,7 @@ pub fn registered(oauth: Option<&Arc<OAuthService>>, keys: ApiKeyTable) -> Vec<R
         )));
     }
     if api_request_registered(oauth.is_some(), !keys.load().is_empty()) {
-        tools.push(api_request(oauth.cloned(), keys));
+        tools.push(api_request(oauth.cloned(), keys, blobs));
     }
     tools
 }
@@ -44,9 +80,15 @@ pub fn api_request_registered(has_oauth: bool, has_key_providers: bool) -> bool 
 }
 
 /// The `api-request` tool over `oauth` and the key table `keys`, which it reads
-/// per call.
-pub fn api_request(oauth: Option<Arc<OAuthService>>, keys: ApiKeyTable) -> RegisteredTool {
-    RegisteredTool::Async(Arc::new(api_request::ApiRequestTool::new(oauth, keys)))
+/// per call, writing answers into the store `blobs` holds.
+pub fn api_request(
+    oauth: Option<Arc<OAuthService>>,
+    keys: ApiKeyTable,
+    blobs: BlobStoreSlot,
+) -> RegisteredTool {
+    RegisteredTool::Async(Arc::new(api_request::ApiRequestTool::new(
+        oauth, keys, blobs,
+    )))
 }
 
 /// Whether `acl` admits `provider`, for a tool whose only ACL key is
@@ -87,10 +129,27 @@ mod tests {
             "oauth-disconnect",
             "api-request",
         ];
-        assert_eq!(names(&registered(None, maps(base))), ["api-request"]);
-        assert_eq!(names(&registered(Some(&svc), ApiKeyTable::empty())), all);
-        assert_eq!(names(&registered(Some(&svc), maps(base))), all);
-        assert!(registered(None, ApiKeyTable::empty()).is_empty());
+        assert_eq!(
+            names(&registered(None, maps(base), BlobStoreSlot::default())),
+            ["api-request"]
+        );
+        assert_eq!(
+            names(&registered(
+                Some(&svc),
+                ApiKeyTable::empty(),
+                BlobStoreSlot::default()
+            )),
+            all
+        );
+        assert_eq!(
+            names(&registered(
+                Some(&svc),
+                maps(base),
+                BlobStoreSlot::default()
+            )),
+            all
+        );
+        assert!(registered(None, ApiKeyTable::empty(), BlobStoreSlot::default()).is_empty());
     }
 
     /// Every descriptor's schema has the shape a call is validated against.
@@ -98,7 +157,7 @@ mod tests {
     async fn every_descriptor_schema_has_the_checked_shape() {
         let base = "http://127.0.0.1:9";
         let (svc, _dir) = service(vec![provider_config("google", base)]);
-        let tools = registered(Some(&svc), maps(base));
+        let tools = registered(Some(&svc), maps(base), BlobStoreSlot::default());
         assert_eq!(tools.len(), 4);
         for tool in &tools {
             let d = tool.descriptor();

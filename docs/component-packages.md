@@ -124,20 +124,48 @@ contract: a component that imports it is a 0.2.0 component, told apart by
 `bus@0.2.0`, and names the world `brenn:processor/processor@0.3.0`, which is
 the 0.2.0 world with `blobs` imported. A kind that does not name `blobs` in
 `requires` does not import it, and its artifact, its record and its spec are
-what they were. A kind that does is backend-only — a surface refuses a
-component that imports it, and the word is refused on a placed instance —
-and needs a brenn new enough to link it, by the same ordering rule as `calls`.
+what they were. A kind that does needs a brenn new enough to link it, by the
+same ordering rule as `calls`. The backend serves the whole interface. A
+surface serves everything but the tool-call forms — `limits`, `open`, a blob's
+`size`, `content-type` and `read`, `create`, the `writer` resource and
+`publish` — and a kind that imports `call-async`, `call-async-for` or
+`complete` is refused when its artifact is checked at boot, naming the
+function. A kind placed on a surface with the `blobs` grant reads, makes and
+forwards blobs there. On a page `open` succeeds for any attachment of a message
+in the activation's windows, and `read` answers `unavailable` when the page
+does not hold that attachment's bytes (`docs/message-bus.md` §2.1.2a, "A
+surface page is a reader by place"); the backend never answers `unavailable`.
+A page holds the blobs it makes in page memory and uploads them only after the
+activation returns `ok`, so the backend store's verdict on one arrives after
+the call: a refused upload, or a forwarded attachment whose message left the
+server's window, loses the activation's wire batch whole and the page announces
+it; the message is never published without its attachments. On a surface
+`budget-exhausted` is the page's own budget (`docs/message-bus.md` §2.1.2a, "A
+surface page makes blobs").
 Publishing with attachments goes through `blobs.publish`, and a class that
 calls it requires `ports` as well as `blobs`, whether or not it also calls
 `ports.publish`: the function's error type wraps `ports@0.2.0`'s
 `publish-error`, so the artifact imports `brenn:processor/ports@0.2.0` for the
 type, which is what the build check and the load check read. `ports.publish`
-still carries none. The interface is **not yet declared
-stable**: a shape changes in place only while no tagged brenn release has
-served it; a shape a tagged release has served changes only as a new version
-of the interface, served beside the old one for at least one release and
-announced in `CHANGELOG.md`; the old version may be removed one release after
-its replacement, and nothing longer is promised.
+still carries none. The interface is **declared stable**, with the promise
+`brenn:processor@0.2.0` carries, in the terms its WIT header states: no type or
+function of `blobs@0.3.0` is changed or removed, no case is added to a variant
+or an enum and no field to a record, and each keeps doing what the file says.
+While brenn serves the interface, an artifact built against the shapes in the
+file loads and means what it meant. brenn does not stop serving it without a
+removal period announced in `CHANGELOG.md` and in the file no later than the
+first release the period counts; no length is promised. A breaking change is a
+new version served beside this one through that period. An addition is a
+function no existing component imports, added beside the functions the
+interface has, which keep their shapes and behaviour; a host coming to serve a
+function it refuses today is an addition of the same kind. Bounds stay host
+policy and outside the promise. The promise is to an artifact built against the
+shapes in the file, not at any commit that carried it, because one shape
+changed in place before the declaration: `read-error` gained `unavailable`,
+last. A component built against the earlier shape that calls `blob.read` no
+longer links and is rebuilt against the current `brenn-guest`; one that matches
+`brenn_guest::blobs::ReadError` exhaustively gains an arm for
+`ReadError::Unavailable`.
 
 **Blobs and tool calls.** An asynchronous tool call carries named
 attachments by reference in both directions. Three functions of `blobs` are
@@ -181,7 +209,22 @@ names the caller or the tool gave; their bodies are unchanged. `blobs.open`
 reaches them by `(port, index, name)`, as on any input port. A result carries
 attachments only when its outcome is `ok`. `brenn-guest`'s
 `tools::ToolResult` and `provides::ToolRequest` list them in `attachments` and
-open one with `open(name)`.
+open one with `open(name)`. `ToolRequest::open` reaches a request only in the
+activation that delivers it new; `provides::open_request_attachment(activation,
+id, name)` opens an attachment of the request `id` wherever its message sits in
+the activation's `tool-requests` window, new or context, and answers
+`NotInWindow` once newer requests have displaced it. The window holds the last
+Σ `max_concurrency` requests of the provider's tools, so a request that waits
+behind that many newer ones can no longer reach its attachments.
+
+*A host tool that takes and answers attachments.* `api-request` is one: its
+`body_attachment` argument names the call's attachment to send as the request
+body, and its `response_attachment` argument asks for a 2xx answer's body as
+an attachment of the result under that name (`docs/config-dsl.md`, "The OAuth
+tools"). A component sends a file by `blobs.call-async` with the attachment
+named in `body_attachment`, and reads an answer by opening the result's
+attachment. A component whose instance is not granted `blobs` cannot open such
+an answer, and `api-request` refuses its `response_attachment` `denied`.
 
 *Who holds a blob.* A call is buffered and flushed as the plain form is: the
 request reaches the bus iff the activation returns `ok`, and the buffered
@@ -484,6 +527,23 @@ JSON read as "a body that is not JSON"; `read_api_payload` reads a payload's
 bytes whichever field carried them. A component that matches `Answer` exhaustively adds an arm for `Bytes`
 — failing `internal`, if the API it calls never answers in bytes. The `testutil` fixtures gained `binary`, an answer carrying bytes, and
 `text_body`, a call's text body.
+
+Another cut of this kind in force now, in the provider kit: **a step carries
+attachments.** `Logic::plan` takes a `&Step` and `advance` a `&mut Step`
+(*A tool provider on the kit*, below). A hand-written `Host` implements
+`Blobs` as a supertrait, and its `call` takes the nested call's body blob
+(`Option<(&str, &Blob)>`) and `complete` the completion's attachments
+(`&[(String, Blob)]`). `Request`, `Delivered`, `ApiCall`
+(`response_attachment`), `InFlight` and `Queued` (`attachments`) gain a field,
+so a struct literal of any of them breaks; an `ApiCall` literal adds
+`response_attachment: None`. `Body` gains `Attachment(String)`, so an
+exhaustive match adds an arm. `MemoryHost`'s `NestedCall` gains `body` and
+`Completion` gains `attachments`. Rows are unchanged on the wire for a request
+without attachments, and a call that uses neither new form serializes as
+before, so a row written before the cut parses after it. A component that uses
+no attachment changes signatures and literals and nothing else, keeps calling
+`serve`, and keeps its grants. `brenn-guest` gained
+`provides::open_request_attachment` (an addition; no WIT changed).
 
 Another cut of this kind in force now: **`MessageEnvelope.body` is a
 `MessageBody`**, bytes with an optional content type, re-exported from
@@ -909,7 +969,8 @@ arrives as `Unreadable` when it exceeds either. The `testutil` fixture
 `payload` fakes one, carried in `body` or `body_base64` by the rule the host
 uses. A DAV component sets its own `Content-Type` (`api-request` defaults a
 body's to `application/json`), and sends a collection's path with its
-trailing `/`, as the server's href gives it.
+trailing `/`, as the server's href gives it. A body sent from an attachment
+takes the blob's content type instead, unless the call sets its own.
 
 A component issues `MKCOL`, `COPY` and `MOVE` as any other method. On `COPY`
 and `MOVE` it sets `headers["Destination"]` to the destination's absolute
@@ -919,6 +980,91 @@ admitted by a clause for that method as the request path is. `read_api_payload`
 reads a `201` or `204` as a `Payload`, a `207` answering a partly failed
 `COPY` or `MOVE` as a `Payload` carrying the multi-status body, and a `409`,
 `412` or `423` as `PayloadAnswer::Error`.
+
+**Attachments.** A step reaches blobs through its `Step`, and only for its own
+duration: a `Blob` is a handle the host adapter keeps for one step, released
+when the step's outcome is carried out, so an activation serving many requests
+stays inside the host's 64 live handles as long as one step does.
+
+- **Receiving.** `request_attachments()` lists the attachments the caller gave
+  (`Attached { name, size, content_type }`), and `open_request(name)` opens one.
+  A tool takes them only if its `provide` statement says
+  `accepts_attachments = true`.
+- **Forwarding one as a nested call's body.** `Body::Attachment(name)` sends
+  the request's attachment of that name as the body, no byte copied; on the
+  wire it is `api-request`'s `body_attachment`. A name the request does not
+  carry is the component's fault and fails the activation.
+- **Asking for a blob answer.** `ApiCall::answer_as_attachment()` sets
+  `response_attachment` to `ANSWER_ATTACHMENT` (`"body"`). `read_api_blob`
+  reads the answer as a `BlobAnswer`: `Blob { status, headers, bytes,
+  attachment }` for a 2xx, `TooLarge { limit, bytes }` when the body passed
+  the host's largest blob, `StoreFull` when the blob pool is full, and
+  `Relay`, `Unreadable` and `Error` as the other readers read them. A 2xx
+  answered inline though an attachment was asked is `internal`.
+  `answer_attachments()` and `open_answer(name)` reach the answer's blob.
+- **Reading by range.** `read(blob, offset, len)`, or `pieces(blob)`, the blob
+  in order in pieces of the host's `max_read_bytes` (1 MiB).
+- **Building a blob.** `append(content_type)` answers an `Append` that
+  buffers to `max_write_bytes` per host call; `finish` seals it. At most one
+  read piece and one write buffer are in memory, so a blob larger than guest
+  memory is handled whole.
+- **Completing with attachments.** `attach(name, blob)` names a blob as an
+  attachment of the request's completion; `Next::Complete` carries what the
+  step attached, `Next::Fail` drops it (an error answer carries none), and
+  `Next::Call` after an attach is the component's fault.
+
+Every blob error converts to an `internal` `Failure` naming the bound, so a
+step with nothing better to say writes `?`.
+
+The entry point is the grant. `serve` serves no blobs: every `Step` blob
+method answers `Unavailable`, an `internal` failure naming `serve_with_blobs`,
+and the artifact references no function of the SDK's `blobs` module, so the
+class keeps `requires` without `blobs` and grant parity proves it.
+`serve_with_blobs` serves them through the SDK, and the class requires
+`blobs`. A component served by `serve` that asks for an attachment answer has
+its nested call answered `denied` by `api-request`, which `read_api_blob`
+reads as every reader reads a denied call. `processor-kit-file-test` is the
+worked example of both directions; `google-gmail-read`'s `GmailAttachment` is
+one that reads an answer by range and builds the blob it completes with.
+
+Three limits are the component's to design for:
+
+- **A request's attachments reach as far as its window.** A request's
+  attachment opens in the activation that delivers it, and afterwards only
+  while its message is among the last Σ `max_concurrency` messages of the
+  provider's request inbox. A queued first step or a later step whose request
+  has been displaced answers the request `internal` ("the request's
+  attachment `<name>` is no longer in this provider's request window; newer
+  requests displaced it while this one waited"), without spending the call
+  budget.
+- **An activation's blob bounds are shared** by every step it runs: the 64 MiB
+  it may write, its 4,096 blob calls and the fuel attachments add. A refused
+  write is `WriteError::Quota`. `max_concurrency` bounds the requests the
+  host holds pending, not the answers an activation delivers: a nested call
+  admitted late can answer after the host has given up its request and a
+  newer one has taken the slot. The host's 240 s deadline counts from when
+  the host takes the call, before the call waits for the tool's permit, and
+  a nested provided call may inherit an earlier deadline from the call it
+  serves. The kit cannot see that deadline, so it cuts off 240 s after the
+  activation that delivered the request: it does not advance an answer
+  arriving later than that, and answers that request `internal`, which the
+  host drops once it no longer holds it. An answer that arrives between the
+  host's deadline and the kit's cutoff is still advanced, so
+  `max_concurrency` with the cutoff does not guarantee one blob-building
+  step per activation; a late answer can still share an activation's bounds
+  with a live one. `GmailAttachment` declares 1.
+- **An answer rests after it is read.** An answer asked for as an attachment
+  rests on the component's `brenn:tool-results/<slug>` for that inbox's
+  window after the component has read it, and so does a completion's
+  attachment on its caller's inbox. Size `blob_budget_bytes` at or above the
+  sum, over the inboxes that receive attachment answers, of the inbox's depth
+  × `max_blob_bytes` (`docs/config-dsl.md`, "The OAuth tools").
+
+`MemoryHost` serves `Blobs` in memory for a host test: `seed_request` and
+`seed_result` give a request or a result an attachment's bytes; the limits,
+an activation's write and call budgets, a window-displacement switch and
+scripted `create` and `write` refusals stand in for the host's; and each nested
+call's body and each completion's attachments are recorded with their bytes.
 
 ### The gate set
 

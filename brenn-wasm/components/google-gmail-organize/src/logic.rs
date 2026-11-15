@@ -76,11 +76,21 @@ impl Logic for GmailOrganize {
     type Tool = Provided;
     type Settings = Settings;
 
-    fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
+    fn plan(
+        tool: Provided,
+        args: &Value,
+        _: &brenn_provider_kit::Step<'_>,
+        settings: &Settings,
+    ) -> Result<Call, String> {
         plan(tool, args, settings)
     }
 
-    fn advance(state: &InFlight, outcome: Result<Value, NestedError>, _: &Settings) -> Next {
+    fn advance(
+        state: &InFlight,
+        outcome: Result<Value, NestedError>,
+        _: &mut brenn_provider_kit::Step<'_>,
+        _: &Settings,
+    ) -> Next {
         advance(state, outcome)
     }
 }
@@ -648,6 +658,7 @@ mod tests {
                 query: query([("prettyPrint", "false".to_string())]),
                 headers: BTreeMap::new(),
                 body: call.body.clone(),
+                response_attachment: None,
             }
         );
         let body: Value = serde_json::from_str(text_body(&call)).unwrap();

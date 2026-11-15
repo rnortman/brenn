@@ -1,0 +1,43 @@
+load("@wasm_crates//:defs.bzl", "all_crate_deps")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "grant_parity_test", "guest_spec_scaffold", "wasm_component", "wasm_guest_cdylib")
+
+policy_srcs()
+
+# Bindings come from the brenn-guest SDK's `generate!`; this crate names no
+# WIT of its own. The port surface is generated from the fixture's own
+# specification.
+guest_spec_scaffold(
+    name = "spec",
+    spec = "spec/processor-kit-file-test.brenn",
+)
+
+wasm_guest_cdylib(
+    name = "brenn-processor-kit-file-test",
+    generated_srcs = {"src/spec.rs": ":spec"},
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-provider-kit:brenn-provider-kit_guest",
+        "//brenn-wasm/components/guest:brenn-guest",
+        "//brenn-wasm/components/provider-kit-guest:brenn-provider-kit-guest",
+    ],
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-processor-kit-file-test",
+    visibility = ["//visibility:public"],
+)
+
+# The specification is held to the artifact's imports here rather than through
+# `COMPONENT_PACKAGES`: the fixture is test-only and never packaged.
+grant_parity_test(
+    name = "grant_parity",
+    component = ":component",
+    spec = "spec/processor-kit-file-test.brenn",
+)
+
+# The rig of `brenn-server`'s `kit_file_e2e.rs` lowers its instance from the
+# specification.
+exports_files(["spec/processor-kit-file-test.brenn"])

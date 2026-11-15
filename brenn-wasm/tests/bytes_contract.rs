@@ -647,22 +647,36 @@ fn the_surface_check_refuses_a_string_contract_component_by_name() {
     );
 }
 
-/// A 0.2.0 component importing `blobs` is refused at the name stage: no
-/// surface host serves the interface.
+/// The backend blobs fixture reads, makes and publishes blobs, which a surface
+/// serves: it passes every stage of the surface check.
 #[test]
-fn the_surface_check_refuses_a_blobs_importer_by_name() {
+fn the_surface_check_passes_the_backend_blobs_fixture() {
     let bytes = artifact_bytes("brenn_processor_blobs_test");
-    let refusal = brenn_wasm::check_surface_component(&bytes)
-        .expect_err("a blobs importer is refused on a surface");
-    assert_eq!(
-        refusal.stage,
-        brenn_wasm::SurfaceComponentStage::Name,
-        "{refusal}"
-    );
-    assert!(
-        refusal.detail.contains("brenn:processor/blobs@0.3.0"),
-        "{refusal}"
-    );
+    brenn_wasm::check_surface_component(&bytes)
+        .unwrap_or_else(|refusal| panic!("a blobs producer is a surface kind: {refusal}"));
+}
+
+/// The blob-carrying tool fixtures import `tools`, which a surface does not
+/// link, so they are refused by name before their `call-async`,
+/// `call-async-for` and `complete` reach the member stage.
+#[test]
+fn the_surface_check_refuses_the_blob_tool_call_fixtures_by_name() {
+    for stem in [
+        "brenn_processor_blob_caller_test",
+        "brenn_processor_blob_provider_test",
+    ] {
+        let refusal = brenn_wasm::check_surface_component(&artifact_bytes(stem))
+            .expect_err("a tool-call fixture is refused on a surface");
+        assert_eq!(
+            refusal.stage,
+            brenn_wasm::SurfaceComponentStage::Name,
+            "{stem}: {refusal}"
+        );
+        assert!(
+            refusal.detail.contains("brenn:processor/tools"),
+            "{stem}: {refusal}"
+        );
+    }
 }
 
 #[test]
@@ -768,6 +782,181 @@ fn the_surface_check_passes_an_aliased_ports_import_that_imports_nothing_wrong()
         brenn_wasm::SurfaceComponentStage::ExportType,
         "{refusal}"
     );
+}
+
+/// The read side of `blobs` as an artifact imports it under `name`, with
+/// `read_error_cases` the cases of its `read-error`, and `extra` further
+/// instance declarations.
+fn blobs_import(name: &str, read_error_cases: &str, extra: &str) -> String {
+    format!(
+        r#"(import "{name}" (instance
+             (export "blob" (type $blob (sub resource)))
+             (type $limits-rec (record (field "max-read-bytes" u32) (field "max-write-bytes" u32)))
+             (export "blob-limits" (type $limits (eq $limits-rec)))
+             (type $open-var (variant (case "not-permitted") (case "not-found") (case "quota-exceeded")))
+             (export "open-error" (type $open-error (eq $open-var)))
+             (type $read-var (variant {read_error_cases}))
+             (export "read-error" (type $read-error (eq $read-var)))
+             (type $own (own $blob))
+             (type $borrow (borrow $blob))
+             (type $opened (result $own (error $open-error)))
+             (type $bytes (list u8))
+             (type $read (result $bytes (error $read-error)))
+             (export "limits" (func (result $limits)))
+             (export "open"
+               (func (param "port" string) (param "index" u32) (param "name" string)
+                 (result $opened)))
+             (export "[method]blob.size" (func (param "self" $borrow) (result u64)))
+             (export "[method]blob.content-type" (func (param "self" $borrow) (result string)))
+             (export "[method]blob.read"
+               (func (param "self" $borrow) (param "offset" u64) (param "len" u32) (result $read)))
+             {extra}))"#
+    )
+}
+
+/// `read-error` as this host has it.
+const READ_ERROR: &str = r#"(case "out-of-range") (case "too-large") (case "storage-failed" string)
+    (case "quota-exceeded") (case "unavailable")"#;
+
+/// `read-error` before it gained `unavailable`.
+const READ_ERROR_WITHOUT_UNAVAILABLE: &str = r#"(case "out-of-range") (case "too-large")
+    (case "storage-failed" string) (case "quota-exceeded")"#;
+
+/// The surface check's verdict on a fixture whose only other fault is that it
+/// exports no `receive`: an artifact that passes every import stage is refused
+/// at `ExportType`.
+fn passes_every_import_stage(bytes: &[u8]) {
+    let refusal = brenn_wasm::check_surface_component(bytes)
+        .expect_err("a fixture with no receive export must be refused");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::ExportType,
+        "{refusal}"
+    );
+}
+
+/// The member stage's refusal of `bytes`, which must name `member` of
+/// `interface`.
+fn refused_on_member(bytes: &[u8], interface: &str, member: &str) {
+    let refusal =
+        brenn_wasm::check_surface_component(bytes).expect_err("the fixture must be refused");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::Member {
+            interface: interface.to_string(),
+            member: member.to_string(),
+            served: brenn_envelope::grants::SURFACE_BLOBS_MEMBERS,
+        },
+        "{refusal}"
+    );
+}
+
+#[test]
+fn the_surface_check_passes_a_read_only_blobs_importer() {
+    passes_every_import_stage(&surface_fixture(&blobs_import(
+        "brenn:processor/blobs@0.3.0",
+        READ_ERROR,
+        "",
+    )));
+}
+
+#[test]
+fn the_surface_check_passes_a_read_only_blobs_importer_under_an_alias() {
+    passes_every_import_stage(&surface_fixture(&blobs_import(
+        "brenn:processor/blobs@0.3.1",
+        READ_ERROR,
+        "",
+    )));
+}
+
+/// The members a surface does not serve, each refused at the member stage by
+/// name, under the served name and under an alias an exact-name check would let
+/// through to a type stage that links them.
+#[test]
+fn the_surface_check_refuses_each_blobs_tool_call_form_by_member() {
+    for name in ["brenn:processor/blobs@0.3.0", "brenn:processor/blobs@0.3.1"] {
+        for member in ["call-async", "call-async-for", "complete"] {
+            let bytes = surface_fixture(&blobs_import(
+                name,
+                READ_ERROR,
+                &format!(r#"(export "{member}" (func))"#),
+            ));
+            refused_on_member(&bytes, name, member);
+        }
+    }
+}
+
+/// `create` imported with a type the host does not have is refused at the type
+/// stage, under the served name and an alias.
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_blobs_create_by_type() {
+    for name in ["brenn:processor/blobs@0.3.0", "brenn:processor/blobs@0.3.1"] {
+        let bytes = surface_fixture(&blobs_import(
+            name,
+            READ_ERROR,
+            r#"(export "create" (func))"#,
+        ));
+        let refusal = refused_on_import_type(&bytes);
+        assert!(refusal.detail.contains("create"), "{refusal}");
+    }
+}
+
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_writer_write_by_type() {
+    let bytes = surface_fixture(&blobs_import(
+        "brenn:processor/blobs@0.3.0",
+        READ_ERROR,
+        r#"(export "writer" (type $writer (sub resource)))
+           (type $writer-borrow (borrow $writer))
+           (export "[method]writer.write" (func (param "self" $writer-borrow)))"#,
+    ));
+    let refusal = refused_on_import_type(&bytes);
+    assert!(refusal.detail.contains("writer.write"), "{refusal}");
+}
+
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_blobs_publish_by_type() {
+    let bytes = surface_fixture(&blobs_import(
+        "brenn:processor/blobs@0.3.0",
+        READ_ERROR,
+        r#"(export "publish" (func (param "port" string)))"#,
+    ));
+    let refusal = refused_on_import_type(&bytes);
+    assert!(refusal.detail.contains("publish"), "{refusal}");
+}
+
+/// The `writer` resource is served: importing it alone passes every import
+/// stage.
+#[test]
+fn the_surface_check_passes_a_blobs_writer_resource_importer() {
+    passes_every_import_stage(&surface_fixture(&blobs_import(
+        "brenn:processor/blobs@0.3.0",
+        READ_ERROR,
+        r#"(export "writer" (type (sub resource)))"#,
+    )));
+}
+
+/// An artifact built against `read-error` before `unavailable` has a
+/// wrong-typed `read`.
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_blob_read_by_type() {
+    let bytes = surface_fixture(&blobs_import(
+        "brenn:processor/blobs@0.3.0",
+        READ_ERROR_WITHOUT_UNAVAILABLE,
+        "",
+    ));
+    let refusal = refused_on_import_type(&bytes);
+    assert!(refusal.detail.contains("blob.read"), "{refusal}");
+}
+
+#[test]
+fn the_surface_check_refuses_a_wrong_typed_blob_read_under_an_alias_by_type() {
+    let bytes = surface_fixture(&blobs_import(
+        "brenn:processor/blobs@0.3.1",
+        READ_ERROR_WITHOUT_UNAVAILABLE,
+        "",
+    ));
+    refused_on_import_type(&bytes);
 }
 
 fn artifact_bytes(name: &str) -> Vec<u8> {

@@ -21,6 +21,7 @@ use brenn_lib::messaging::config::{ProvidedToolDecl, SystemChannelTuning};
 use brenn_lib::tools::ResolvedToolGrant;
 use brenn_messaging::testutils::{TEST_BLOB_LIMITS, TempBlobDir, install_blob_store_with};
 use brenn_messaging::{Messenger, MountDebt};
+use brenn_messaging_store::blob::BlobLimits;
 use brenn_tool_registry::bus_wiring::{
     app_result_inbox_entries, inbox_input_port, request_channel_entry, request_inbox_depth,
     request_inbox_entry, request_inbox_subscription, request_input_port, tool_executor_spec,
@@ -29,8 +30,9 @@ use brenn_tool_registry::bus_wiring::{
 use brenn_tool_registry::executor::TOOL_EXECUTOR_COMPONENT;
 use brenn_tool_registry::testutil::grant;
 use brenn_tool_registry::{
-    ActingUser, GrantOwner, HeldAttachments, ProvidedTool, ProviderRuntime, RegisteredTool,
-    ToolCallerGrants, ToolError, ToolExecutor, ToolRegistry, WasmProvidesHost, WasmToolHost,
+    ActingUser, CallerGrants, GrantOwner, HeldAttachments, ProvidedTool, ProviderRuntime,
+    RegisteredTool, ToolCallerGrants, ToolError, ToolExecutor, ToolOutput, ToolRegistry,
+    WasmProvidesHost, WasmToolHost,
 };
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -52,6 +54,9 @@ pub(super) struct ProviderSetup<'a> {
     pub caller: Option<CallerSetup<'a>>,
     /// Apps whose conversations call the registry, if the suite has any.
     pub conversations: Option<ConversationSetup>,
+    /// The blob store's limits, on a rig that installs one;
+    /// [`TEST_BLOB_LIMITS`] when `None`.
+    pub blob_limits: Option<BlobLimits>,
 }
 
 /// The apps of a rig whose conversations call the registry. The rig gives the
@@ -119,6 +124,7 @@ impl ProviderRig {
             component,
             caller,
             conversations,
+            blob_limits,
         } = setup;
         let (alert, _alerts) = noop_alert_dispatcher();
         let runtime = ProviderRuntime::new(alert.clone());
@@ -208,7 +214,8 @@ impl ProviderRig {
         )))
         .with_subscriber_registrations(registrations);
         let (messenger, blobs) = if with_blobs {
-            let (messenger, dir) = install_blob_store_with(messenger, TEST_BLOB_LIMITS).await;
+            let limits = blob_limits.unwrap_or(TEST_BLOB_LIMITS);
+            let (messenger, dir) = install_blob_store_with(messenger, limits).await;
             (messenger, Some(dir))
         } else {
             (messenger, None)
@@ -237,13 +244,15 @@ impl ProviderRig {
         super::attach_tool_executor(&messenger).await;
 
         registry.validate_grants(GrantOwner::WasmConsumer { slug }, &provider_grants);
+        let provider_blobs = component.grants.contains(&ComponentGrant::Blobs);
         let provider_tools = Arc::new(WasmToolHost::new(
             registry.clone().into(),
             provider_grants.clone(),
             slug.to_string(),
+            provider_blobs,
             alert.clone(),
         ));
-        let blob_host = if component.grants.contains(&ComponentGrant::Blobs) {
+        let blob_host = if provider_blobs {
             brenn_wasm_dispatch::blob_host_over(&messenger)
         } else {
             None
@@ -278,15 +287,26 @@ impl ProviderRig {
             provider: Some(runtime.clone()),
         };
 
-        let mut caller_grants =
-            HashMap::from([(provider_sub.as_str().to_string(), provider_grants.clone())]);
+        let mut caller_grants = HashMap::from([(
+            provider_sub.as_str().to_string(),
+            CallerGrants {
+                tools: provider_grants.clone(),
+                blobs: provider_blobs,
+            },
+        )]);
         let caller = caller
             .zip(caller_inboxes)
             .map(|(setup, (trigger, _, results_ch))| {
                 let grants = BTreeMap::from([(setup.tool.to_string(), grant(vec![]))]);
                 registry.validate_grants(GrantOwner::WasmConsumer { slug: setup.slug }, &grants);
                 let sub = ParticipantId::for_wasm(setup.slug);
-                caller_grants.insert(sub.as_str().to_string(), grants.clone());
+                caller_grants.insert(
+                    sub.as_str().to_string(),
+                    CallerGrants {
+                        tools: grants.clone(),
+                        blobs: false,
+                    },
+                );
                 let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
                     input_amplification_mt: HashMap::from([
                         ("in".to_string(), 1000),
@@ -308,6 +328,7 @@ impl ProviderRig {
                         registry.clone().into(),
                         grants,
                         setup.slug.to_string(),
+                        false,
                         alert.clone(),
                     ))),
                     ..ProcessorLoadSpec::minimal(Path::new(super::tool_e2e::TOOL_WASM), setup.slug)
@@ -379,11 +400,34 @@ impl ProviderRig {
 
     /// An app conversation acting for alice calls the tool `mcp_name`, on a
     /// task of its own: it waits for the provider as an agent's call does.
+    /// The answer carries no attachments.
     pub fn call_for_alice(
         &self,
         mcp_name: &str,
         args: Value,
     ) -> JoinHandle<Result<Value, ToolError>> {
+        let call = self.call_for_alice_with(mcp_name, args, HeldAttachments::none());
+        let mcp_name = mcp_name.to_string();
+        tokio::spawn(async move {
+            call.await.expect("the call's task").map(|output| {
+                assert!(
+                    output.attachments.is_empty(),
+                    "{mcp_name} answered attachments: {:?}",
+                    output.attachments.refs()
+                );
+                output.value
+            })
+        })
+    }
+
+    /// [`call_for_alice`](Self::call_for_alice) handing the tool
+    /// `attachments`, answering the whole output.
+    pub fn call_for_alice_with(
+        &self,
+        mcp_name: &str,
+        args: Value,
+        attachments: HeldAttachments,
+    ) -> JoinHandle<Result<ToolOutput, ToolError>> {
         let registry = self.registry.clone();
         let alert = self.alert.clone();
         let tool = format!("mcp__brenn__{mcp_name}");
@@ -396,11 +440,10 @@ impl ProviderRig {
                     Some(7),
                     Some(alice()),
                     args,
-                    HeldAttachments::none(),
+                    attachments,
                     &alert,
                 )
                 .await
-                .map(|output| output.value)
         })
     }
 

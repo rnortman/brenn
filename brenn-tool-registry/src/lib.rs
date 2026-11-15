@@ -40,7 +40,9 @@ pub use descriptor::{
     MAX_ASYNC_RESULT_BYTES, MAX_FAST_BUDGET, MAX_FAST_CALLS_PER_ACTIVATION, MAX_FAST_RESULT_BYTES,
     PROVIDED_TOOL_CEILING, ToolClass, ToolDescriptor, ToolError, UserBinding,
 };
-pub use executor::{CallerGrantTable, TOOL_EXECUTOR_COMPONENT, ToolCallerGrants, ToolExecutor};
+pub use executor::{
+    CallerGrantTable, CallerGrants, TOOL_EXECUTOR_COMPONENT, ToolCallerGrants, ToolExecutor,
+};
 pub use git_repo_pull::GitRepoPullTool;
 pub use provided::{
     CompleteError, PendingGuard, PendingId, ProvidedRequest, ProvidedTool, ProviderRuntime,

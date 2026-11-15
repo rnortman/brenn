@@ -15,7 +15,7 @@ use super::*;
 use std::collections::{BTreeMap, HashMap};
 
 use brenn_lib::config::{ApiKeyProviderConfig, PACKAGED, config_from_dsl};
-use brenn_lib::messaging::config::ProvidedToolDecl;
+use brenn_lib::messaging::config::WasmConsumerConfigRaw;
 use brenn_messaging::MountDebt;
 use brenn_oauth::testutil;
 use brenn_tool_registry::ToolError;
@@ -62,9 +62,9 @@ const CLAUSES: &[(&str, &str)] = &[
     ("POST", COMPUTE_ROUTES),
 ];
 
-/// The component's `provide` statements, lowered from its packaged
-/// specification under one instance of its class.
-fn provided() -> Vec<ProvidedToolDecl> {
+/// One instance of the component's class, lowered from its packaged
+/// specification: its `provide` statements and its grants.
+fn lowered() -> WasmConsumerConfigRaw {
     let spec =
         std::fs::read_to_string(MAPS_SPEC).unwrap_or_else(|e| panic!("read {MAPS_SPEC}: {e}"));
     let config = config_from_dsl(&format!(
@@ -81,7 +81,6 @@ new {PROVIDER}: GoogleMapsTools {{
         .into_iter()
         .find(|consumer| consumer.slug == PROVIDER)
         .expect("the instance lowers")
-        .provides
 }
 
 /// One Geocoding v4 result for Mountain View.
@@ -135,18 +134,24 @@ async fn rig_with(
     let (service, vault) = testutil::service(vec![]);
     let (key_name, mut key_config) = testutil::key_provider_config(KEY_PROVIDER, &started.base);
     key(&mut key_config);
+    let instance = lowered();
+    let api_blobs = brenn_oauth::tools::BlobStoreSlot::default();
     StubRig::build(
         started,
         StubProvider {
             slug: PROVIDER,
             wasm: MAPS_WASM,
-            decls: provided(),
+            decls: instance.provides,
+            grants: instance.grants.into_iter().collect(),
+            blob_limits: None,
             native: brenn_oauth::tools::registered(
                 Some(&service),
                 brenn_lib::config::ApiKeyTable::new(std::sync::Arc::new(BTreeMap::from([(
                     key_name, key_config,
                 )]))),
+                api_blobs.clone(),
             ),
+            api_blobs,
             clauses: clauses
                 .iter()
                 .map(|&(method, path)| {
@@ -165,6 +170,7 @@ async fn rig_with(
                 ("routes_host".to_string(), host),
             ]),
             caller,
+            conversations: None,
             vault,
         },
     )

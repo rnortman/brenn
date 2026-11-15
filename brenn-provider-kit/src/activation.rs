@@ -12,7 +12,8 @@
 //!    deleted and answered `internal`.
 //! 2. **Results.** Each result claims its request's in-flight row and
 //!    advances it: the request completes, fails, or issues or queues its next
-//!    step.
+//!    step. A request more than [`HOST_DEADLINE_MS`] older than the activation
+//!    that delivered it is answered `internal` instead and not advanced.
 //! 3. **Backlog.** Entries are issued oldest first until the budget is spent.
 //! 4. **New requests.** Each is planned, then issued or queued.
 //! 5. **Guard.** A backlog with no call issued this activation and no live
@@ -22,15 +23,26 @@
 //! At the end of every activation that returns `Ok`, a non-empty backlog
 //! implies an in-flight row issued within [`NESTED_WORST_CASE_MS`], whose
 //! result activates the instance again.
+//!
+//! Each step — planning a request, advancing it on an answer, issuing a
+//! backlog entry — runs with a [`Step`] over the host's [`Blobs`], and the
+//! loop calls [`Blobs::release`] once the step's outcome is carried out. A
+//! completion carries what the step attached; a failure carries nothing; a
+//! step that attaches and then issues a call is the component's fault.
 
 use serde_json::{Map, Value};
 
 use crate::answer::{NestedError, not_issued, result_summary};
 use crate::backlog::{Queued, parse_key};
-use crate::call::{ApiCall, Call, ErrorKind, Next};
+use crate::blob::{Attached, Blob, Blobs, OpenError, Step};
+use crate::call::{ApiCall, Body, Call, ErrorKind, Failure, Next};
 use crate::row::{InFlight, Tool, claim, issued_at_ms, row_expired};
 
-/// The host answers a provided-tool call at this age (`PROVIDED_TOOL_CEILING`).
+/// The host's ceiling on a provided-tool call (`PROVIDED_TOOL_CEILING`). The
+/// host counts it from when it takes the call, before the call waits for the
+/// tool's permit, and a nested provided call may inherit an earlier deadline
+/// from the call it serves; so the host may answer a request well before this
+/// long after the provider receives it.
 pub const HOST_DEADLINE_MS: u64 = 240_000;
 
 /// `api-request`'s execution worst case once a call is admitted: a token
@@ -78,8 +90,9 @@ pub const NESTED_TOOL: &str = "api-request";
 pub type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// What the loop needs of the host: one store transaction, the `provides`
-/// calls and the log. Every method acts inside the activation it serves.
-pub trait Host {
+/// calls, the log, and the `blobs` interface its steps use. Every method acts
+/// inside the activation it serves.
+pub trait Host: Blobs {
     type Error;
 
     /// A structural fault of the loop's own (a request for an unprovided tool,
@@ -96,13 +109,25 @@ pub trait Host {
     fn scan(&self, ns: &str) -> Result<Rows, Self::Error>;
 
     /// Queue the nested `api-request` call `call` serving request `id`,
-    /// correlated by `call_id`; `Err` is the host's refusal text (the call was
-    /// not queued).
-    fn call(&self, id: &str, call: &ApiCall, call_id: &str) -> Result<(), String>;
+    /// correlated by `call_id`, carrying `body` — the attachment named in the
+    /// call's `body_attachment` and its blob — when it has one; `Err` is the
+    /// host's refusal text (the call was not queued).
+    fn call(
+        &self,
+        id: &str,
+        call: &ApiCall,
+        call_id: &str,
+        body: Option<(&str, &Blob)>,
+    ) -> Result<(), String>;
 
-    /// Complete `id`; a request the host no longer holds is dropped, not an
-    /// error.
-    fn complete(&self, id: &str, value: &Value) -> Result<(), Self::Error>;
+    /// Complete `id` with `value` and `attachments`; a request the host no
+    /// longer holds is dropped, not an error.
+    fn complete(
+        &self,
+        id: &str,
+        value: &Value,
+        attachments: &[(String, Blob)],
+    ) -> Result<(), Self::Error>;
 
     /// Answer `id` with an error; a request the host no longer holds is
     /// dropped, not an error.
@@ -126,12 +151,21 @@ pub trait Logic {
     type Settings;
 
     /// A new request's first call, or the reason its arguments are refused.
-    fn plan(tool: Self::Tool, args: &Value, settings: &Self::Settings) -> Result<Call, String>;
+    /// `step` reaches the request's attachments; it cannot attach.
+    fn plan(
+        tool: Self::Tool,
+        args: &Value,
+        step: &Step<'_>,
+        settings: &Self::Settings,
+    ) -> Result<Call, String>;
 
     /// What a request does once its outstanding call answered `outcome`.
+    /// `step` reaches the request's and the answer's attachments; what it
+    /// attaches goes with [`Next::Complete`].
     fn advance(
         state: &InFlight<Self::Tool>,
         outcome: Result<Value, NestedError>,
+        step: &mut Step<'_>,
         settings: &Self::Settings,
     ) -> Next;
 }
@@ -142,6 +176,7 @@ pub struct Request {
     pub id: String,
     pub tool: String,
     pub args: Value,
+    pub attachments: Vec<Attached>,
 }
 
 /// A nested call's result on the instance's result inbox.
@@ -151,6 +186,8 @@ pub struct Delivered {
     /// The pending id the call served, if any.
     pub serving: Option<String>,
     pub outcome: Result<Value, NestedError>,
+    /// The result's attachments; empty on an error outcome.
+    pub attachments: Vec<Attached>,
 }
 
 /// One activation's input: the host's clock, and the new messages.
@@ -269,6 +306,11 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
     }
 
     /// Answer one result: claim its request's row and advance the request.
+    /// A request more than [`HOST_DEADLINE_MS`] older than the activation that
+    /// delivered it is answered `internal` and not advanced. The host's own
+    /// deadline is not visible here and may fall earlier (see
+    /// [`HOST_DEADLINE_MS`]), so an answer arriving between that deadline and
+    /// this cutoff is still advanced.
     fn answer(&mut self, result: Delivered) -> Result<(), H::Error> {
         let Some(id) = result.serving else {
             self.host.log(
@@ -291,6 +333,32 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
             return Ok(());
         };
         self.host.delete(INFLIGHT_NS, result.call_id.as_bytes())?;
+        // TODO(correctness-max-concurrency-one-does-not-bound-attachment-decodes-per-activation):
+        // cut on the host's actual deadline for this request, which the
+        // provides contract does not carry.
+        let age = self.now_ms.saturating_sub(state.received_at_ms);
+        if age > HOST_DEADLINE_MS {
+            self.host.log(
+                Level::Info,
+                format!(
+                    "{} step {} result for {id} arrived {age} ms after the request: \
+                     past the host's deadline, not advanced",
+                    state.tool.name(),
+                    state.step,
+                ),
+            );
+            return self.host.complete_err(
+                &id,
+                ErrorKind::Internal,
+                &format!(
+                    "step {} of this request was answered {} s after the request arrived, \
+                     past the {} s a provided tool is given; the request was not advanced",
+                    state.step,
+                    age / 1000,
+                    HOST_DEADLINE_MS / 1000
+                ),
+            );
+        }
         self.host.log(
             Level::Info,
             format!(
@@ -300,9 +368,24 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
                 result_summary(&result.outcome)
             ),
         );
-        match L::advance(&state, result.outcome, self.settings) {
-            Next::Complete(value) => self.host.complete(&id, &value),
+        let mut step = Step::answering(
+            self.host,
+            &id,
+            &result.call_id,
+            state.attachments.clone(),
+            result.attachments,
+        );
+        let next = L::advance(&state, result.outcome, &mut step, self.settings);
+        let attached = step.take_attached();
+        drop(step);
+        let carried = match next {
+            Next::Complete(value) => self.host.complete(&id, &value, &attached),
             Next::Fail(failure) => self.host.complete_err(&id, failure.kind, &failure.detail),
+            Next::Call { .. } if !attached.is_empty() => Err(H::fault(format!(
+                "{} step {} attached a blob to its completion and then issued a call",
+                state.tool.name(),
+                state.step
+            ))),
             Next::Call { call, derived } => self.issue_or_queue(Queued {
                 id: state.id,
                 tool: state.tool,
@@ -311,8 +394,11 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
                 call,
                 received_at_ms: state.received_at_ms,
                 queued_at_ms: self.now_ms,
+                attachments: state.attachments,
             }),
-        }
+        };
+        self.host.release();
+        carried
     }
 
     /// Issue backlog entries oldest first until the budget is spent. Whether
@@ -324,7 +410,9 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
             }
             let entry = self.queued_row(&key, &bytes)?;
             self.host.delete(BACKLOG_NS, &key)?;
-            self.issue(entry)?;
+            let issued = self.issue(entry);
+            self.host.release();
+            issued?;
         }
         Ok(false)
     }
@@ -337,7 +425,10 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
                 request.tool
             )));
         };
-        match L::plan(tool, &request.args, self.settings) {
+        let step = Step::planning(self.host, &request.id, request.attachments.clone());
+        let planned = L::plan(tool, &request.args, &step, self.settings);
+        drop(step);
+        let carried = match planned {
             Err(reason) => self
                 .host
                 .complete_err(&request.id, ErrorKind::InvalidArgs, &reason),
@@ -349,8 +440,11 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
                 call,
                 received_at_ms: self.now_ms,
                 queued_at_ms: self.now_ms,
+                attachments: request.attachments,
             }),
-        }
+        };
+        self.host.release();
+        carried
     }
 
     /// Issue `entry`'s call if the budget allows, or keep it in the backlog.
@@ -375,13 +469,26 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
 
     /// Issue `entry`'s call and record its in-flight row, or answer the
     /// request with the host's refusal when the call cannot be queued. A
-    /// refused attempt counts against the budget.
+    /// refused attempt counts against the budget; a body attachment that
+    /// cannot be opened answers the request without an attempt.
     fn issue(&mut self, entry: Queued<L::Tool>) -> Result<(), H::Error> {
+        let body = match &entry.call.api.body {
+            Some(Body::Attachment(name)) => match self.open_body(&entry, name)? {
+                Ok(blob) => Some((name.as_str(), blob)),
+                Err(failure) => {
+                    return self
+                        .host
+                        .complete_err(&entry.id, failure.kind, &failure.detail);
+                }
+            },
+            _ => None,
+        };
         self.attempted += 1;
         let state = entry.in_flight(self.now_ms);
         let call_id = state.call_id();
         let api = &entry.call.api;
-        match self.host.call(&entry.id, api, &call_id) {
+        let body = body.as_ref().map(|(name, blob)| (*name, blob));
+        match self.host.call(&entry.id, api, &call_id, body) {
             Ok(()) => {
                 self.issued += 1;
                 self.host.log(
@@ -405,6 +512,54 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
                     .complete_err(&entry.id, ErrorKind::Internal, &detail)
             }
         }
+    }
+
+    /// The request's attachment `name`, which `entry`'s call forwards as its
+    /// body, or the request's failure when it cannot be opened. A name the
+    /// request does not carry is the component's fault.
+    fn open_body(
+        &self,
+        entry: &Queued<L::Tool>,
+        name: &str,
+    ) -> Result<Result<Blob, Failure>, H::Error> {
+        if !entry
+            .attachments
+            .iter()
+            .any(|attached| attached.name == name)
+        {
+            return Err(H::fault(format!(
+                "{} step {} for {} sends attachment `{name}` as its body, which the request \
+                 does not carry",
+                entry.tool.name(),
+                entry.call.step,
+                entry.id
+            )));
+        }
+        Ok(match self.host.open_request(&entry.id, name) {
+            Ok(blob) => Ok(blob),
+            Err(OpenError::LeftWindow | OpenError::NotFound) => {
+                self.host.log(
+                    Level::Warn,
+                    format!(
+                        "{} step {} for {}: attachment `{name}` has left the request window",
+                        entry.tool.name(),
+                        entry.call.step,
+                        entry.id
+                    ),
+                );
+                Err(crate::call::internal(format!(
+                    "the request's attachment `{name}` is no longer in this provider's request \
+                     window; newer requests displaced it while this one waited"
+                )))
+            }
+            Err(OpenError::NotAttached) => {
+                return Err(H::fault(format!(
+                    "the host finds no attachment `{name}` on request {}, whose message lists it",
+                    entry.id
+                )));
+            }
+            Err(other) => Err(other.into()),
+        })
     }
 
     /// Whether some in-flight row was issued within the execution worst case
@@ -497,6 +652,7 @@ mod tests {
                 query: Query::new(),
                 headers: BTreeMap::new(),
                 body: None,
+                response_attachment: None,
             },
         }
     }
@@ -505,7 +661,7 @@ mod tests {
         type Tool = Fixture;
         type Settings = ();
 
-        fn plan(tool: Fixture, args: &Value, _: &()) -> Result<Call, String> {
+        fn plan(tool: Fixture, args: &Value, _: &Step<'_>, _: &()) -> Result<Call, String> {
             let q = args
                 .get("q")
                 .and_then(Value::as_str)
@@ -513,7 +669,12 @@ mod tests {
             Ok(call(1, tool, q))
         }
 
-        fn advance(state: &InFlight<Fixture>, outcome: Result<Value, NestedError>, _: &()) -> Next {
+        fn advance(
+            state: &InFlight<Fixture>,
+            outcome: Result<Value, NestedError>,
+            _: &mut Step<'_>,
+            _: &(),
+        ) -> Next {
             match outcome {
                 Ok(value) if value.get("more") == Some(&json!(true)) => Next::Call {
                     call: call(state.step + 1, state.tool, "more"),
@@ -535,6 +696,7 @@ mod tests {
                 id: id(n),
                 tool: "fixture-lookup".to_string(),
                 args: json!({ "q": format!("q{n}") }),
+                attachments: Vec::new(),
             })
             .collect()
     }
@@ -544,6 +706,7 @@ mod tests {
             call_id: call.call_id.clone(),
             serving: Some(call.id.clone()),
             outcome: Ok(json!({ "status": 200, "more": more })),
+            attachments: Vec::new(),
         }
     }
 
@@ -736,6 +899,7 @@ mod tests {
             call: call(step, Fixture::Lookup, "more"),
             received_at_ms,
             queued_at_ms,
+            attachments: Vec::new(),
         }
     }
 
@@ -965,6 +1129,7 @@ mod tests {
             id: id(0),
             tool: "fixture-search".to_string(),
             args: json!({}),
+            attachments: Vec::new(),
         };
         run(&host, input(0, vec![request], vec![])).unwrap();
         assert!(host.take_calls().is_empty());
@@ -981,6 +1146,7 @@ mod tests {
             id: id(0),
             tool: "no-such-tool".to_string(),
             args: json!({ "q": "x" }),
+            attachments: Vec::new(),
         };
         assert_eq!(
             run(&host, input(0, vec![request], vec![])),
@@ -1009,6 +1175,7 @@ mod tests {
             call_id: "r000/1".to_string(),
             serving: Some(id(0)),
             outcome: Ok(json!({})),
+            attachments: Vec::new(),
         };
         let error = run(&host, input(1, vec![], vec![delivered])).unwrap_err();
         assert!(
@@ -1040,11 +1207,13 @@ mod tests {
                 call_id: "x/1".to_string(),
                 serving: None,
                 outcome: Ok(json!({})),
+                attachments: Vec::new(),
             },
             Delivered {
                 call_id: "r000/1".to_string(),
                 serving: Some(id(0)),
                 outcome: Ok(json!({})),
+                attachments: Vec::new(),
             },
         ];
         run(&host, input(0, vec![], results)).unwrap();
@@ -1076,6 +1245,7 @@ mod tests {
                 kind: "internal".to_string(),
                 detail: "timed out".to_string(),
             }),
+            attachments: Vec::new(),
         };
         run(&host, input(1, vec![], vec![failed])).unwrap();
         assert_eq!(
@@ -1085,11 +1255,36 @@ mod tests {
         assert!(host.rows(INFLIGHT_NS).is_empty());
     }
 
+    #[test]
+    fn an_answer_past_the_host_deadline_is_not_advanced() {
+        let host = MemoryHost::new();
+        run(&host, input(0, requests(0..1), vec![])).unwrap();
+        run(&host, input(1, requests(1..2), vec![])).unwrap();
+        let calls = host.take_calls();
+        let answers = calls.iter().map(|call| result(call, true)).collect();
+        run(&host, input(HOST_DEADLINE_MS + 1, vec![], answers)).unwrap();
+        assert_eq!(
+            errors(&host.take_completions()),
+            [(
+                id(0).as_str(),
+                ErrorKind::Internal,
+                "step 1 of this request was answered 240 s after the request arrived, past \
+                 the 240 s a provided tool is given; the request was not advanced"
+            )]
+        );
+        let next = host.take_calls();
+        assert_eq!(ids(&next), [id(1).as_str()]);
+        assert_eq!(next[0].call_id, format!("{}/2", id(1)));
+        let rows = host.rows(INFLIGHT_NS);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, next[0].call_id.as_bytes());
+    }
+
     /// One scripted activation: when, how many new requests, how many of the
     /// oldest outstanding calls answer, every how-many-th of those advances
     /// (0: none), how many calls the host refuses, and whether completions
     /// fail the activation.
-    struct Step {
+    struct Script {
         now_ms: u64,
         new: usize,
         answer: usize,
@@ -1102,18 +1297,18 @@ mod tests {
     fn the_backlog_always_has_a_live_call_behind_it() {
         #[rustfmt::skip]
         let script = [
-            Step { now_ms: 0, new: 40, answer: 0, advance_every: 0, refuse: 0, fail: false },
-            Step { now_ms: 1_000, new: 10, answer: 5, advance_every: 2, refuse: 0, fail: false },
-            Step { now_ms: 2_000, new: 0, answer: 10, advance_every: 3, refuse: 4, fail: false },
-            Step { now_ms: 3_000, new: 50, answer: 3, advance_every: 0, refuse: 0, fail: false },
-            Step { now_ms: 4_000, new: 0, answer: 6, advance_every: 2, refuse: 0, fail: true },
-            Step { now_ms: 5_000, new: 5, answer: 20, advance_every: 2, refuse: 0, fail: false },
-            Step { now_ms: 6_000, new: 0, answer: 0, advance_every: 0, refuse: 0, fail: false },
-            Step { now_ms: 7_000, new: 30, answer: 30, advance_every: 4, refuse: 10, fail: false },
-            Step { now_ms: 30_000, new: 45, answer: 0, advance_every: 0, refuse: 32, fail: false },
-            Step { now_ms: 211_000, new: 40, answer: 0, advance_every: 0, refuse: 64, fail: false },
-            Step { now_ms: 212_000, new: 10, answer: 10, advance_every: 2, refuse: 0, fail: false },
-            Step { now_ms: 213_000, new: 0, answer: 200, advance_every: 0, refuse: 0, fail: false },
+            Script { now_ms: 0, new: 40, answer: 0, advance_every: 0, refuse: 0, fail: false },
+            Script { now_ms: 1_000, new: 10, answer: 5, advance_every: 2, refuse: 0, fail: false },
+            Script { now_ms: 2_000, new: 0, answer: 10, advance_every: 3, refuse: 4, fail: false },
+            Script { now_ms: 3_000, new: 50, answer: 3, advance_every: 0, refuse: 0, fail: false },
+            Script { now_ms: 4_000, new: 0, answer: 6, advance_every: 2, refuse: 0, fail: true },
+            Script { now_ms: 5_000, new: 5, answer: 20, advance_every: 2, refuse: 0, fail: false },
+            Script { now_ms: 6_000, new: 0, answer: 0, advance_every: 0, refuse: 0, fail: false },
+            Script { now_ms: 7_000, new: 30, answer: 30, advance_every: 4, refuse: 10, fail: false },
+            Script { now_ms: 30_000, new: 45, answer: 0, advance_every: 0, refuse: 32, fail: false },
+            Script { now_ms: 211_000, new: 40, answer: 0, advance_every: 0, refuse: 64, fail: false },
+            Script { now_ms: 212_000, new: 10, answer: 10, advance_every: 2, refuse: 0, fail: false },
+            Script { now_ms: 213_000, new: 0, answer: 200, advance_every: 0, refuse: 0, fail: false },
         ];
         let host = MemoryHost::new();
         let mut outstanding: Vec<NestedCall> = Vec::new();
@@ -1164,5 +1359,399 @@ mod tests {
                 id(n)
             );
         }
+    }
+
+    /// A provider that forwards its request's `file` as a `PUT` body, or
+    /// copies a `GET`'s attachment answer piece by piece into its completion.
+    struct Files;
+
+    impl Logic for Files {
+        type Tool = Fixture;
+        type Settings = ();
+
+        fn plan(tool: Fixture, args: &Value, _: &Step<'_>, _: &()) -> Result<Call, String> {
+            let mut call = call(1, tool, "f");
+            if args.get("put").is_some() {
+                call.api.method = "PUT".to_string();
+                call.api.body = Some(Body::Attachment("file".to_string()));
+            } else {
+                call.api = call.api.answer_as_attachment();
+            }
+            Ok(call)
+        }
+
+        fn advance(
+            state: &InFlight<Fixture>,
+            outcome: Result<Value, NestedError>,
+            step: &mut Step<'_>,
+            _: &(),
+        ) -> Next {
+            let copied = (|| {
+                let answer = crate::answer::read_api_blob(outcome, &state.target, "Example")?;
+                let crate::answer::BlobAnswer::Blob { attachment, .. } = answer else {
+                    return Ok(None);
+                };
+                let blob = step.open_answer(&attachment)?;
+                let mut copy = step.append("text/plain")?;
+                for piece in step.pieces(&blob) {
+                    copy.write(&piece?)?;
+                }
+                Ok::<_, Failure>(Some(copy.finish()?))
+            })();
+            match copied {
+                Ok(Some(blob)) => {
+                    step.attach("copy", blob);
+                    Next::Complete(json!({ "copied": true }))
+                }
+                Ok(None) => Next::Complete(json!({ "copied": false })),
+                Err(failure) => Next::Fail(failure),
+            }
+        }
+    }
+
+    #[test]
+    fn attachments_go_out_as_a_body_and_come_back_into_a_completion() {
+        let host = MemoryHost::new();
+        let bytes: Vec<u8> = (0..5_000u32).map(|n| n as u8).collect();
+        let file = host.seed_request(&id(0), "file", "application/pdf", bytes.clone());
+        let put = Request {
+            id: id(0),
+            tool: "fixture-lookup".to_string(),
+            args: json!({ "put": true }),
+            attachments: vec![file.clone()],
+        };
+        host.activate::<Files>(&(), input(0, vec![put.clone()], vec![]))
+            .unwrap();
+        let calls = host.take_calls();
+        assert_eq!(calls[0].body, Some(("file".to_string(), bytes.clone())));
+        let row = InFlight::<Fixture>::decode(&host.rows(INFLIGHT_NS)[0].1).unwrap();
+        assert_eq!(row.attachments, [file]);
+
+        host.request_attachments_left_window(true);
+        let late = Request { id: id(1), ..put };
+        host.activate::<Files>(&(), input(1, vec![late], vec![]))
+            .unwrap();
+        assert!(host.take_calls().is_empty());
+        assert_eq!(
+            errors(&host.take_completions()),
+            [(
+                id(1).as_str(),
+                ErrorKind::Internal,
+                "the request's attachment `file` is no longer in this provider's request window; \
+                 newer requests displaced it while this one waited"
+            )]
+        );
+
+        host.set_blob_limits(Some(crate::blob::BlobLimits {
+            max_read_bytes: 1024,
+            max_write_bytes: 1024,
+        }));
+        host.activate::<Files>(&(), input(2, requests(2..3), vec![]))
+            .unwrap();
+        let get = host.take_calls().remove(0);
+        assert_eq!(get.call.response_attachment.as_deref(), Some("body"));
+        let answer = host.seed_result(&get.call_id, "body", "text/plain", bytes.clone());
+        let delivered = Delivered {
+            call_id: get.call_id.clone(),
+            serving: Some(get.id.clone()),
+            outcome: crate::testutil::blob_answer("body", 5_000),
+            attachments: vec![answer],
+        };
+        host.activate::<Files>(&(), input(3, vec![], vec![delivered]))
+            .unwrap();
+        let completion = host.take_completions().remove(0);
+        assert_eq!(
+            completion.answer,
+            Answered::Value(json!({ "copied": true }))
+        );
+        assert_eq!(completion.attachments.len(), 1);
+        assert_eq!(completion.attachments[0].name, "copy");
+        assert_eq!(completion.attachments[0].bytes, bytes);
+        assert_eq!(host.peak_handles(), 2);
+    }
+
+    fn put(n: usize, file: &crate::blob::Attached) -> Request {
+        Request {
+            id: id(n),
+            tool: "fixture-lookup".to_string(),
+            args: json!({ "put": true }),
+            attachments: vec![file.clone()],
+        }
+    }
+
+    #[test]
+    fn a_body_attachment_queued_past_the_budget_is_issued_next_activation_with_its_blob() {
+        let host = MemoryHost::new();
+        let mut puts = Vec::new();
+        let mut files = Vec::new();
+        for n in 0..=CALL_BUDGET {
+            let bytes = format!("file {n}").into_bytes();
+            let file = host.seed_request(&id(n), "file", "text/plain", bytes.clone());
+            puts.push(put(n, &file));
+            files.push((file, bytes));
+        }
+        host.activate::<Files>(&(), input(0, puts, vec![])).unwrap();
+        let first = host.take_calls();
+        assert_eq!(first.len(), CALL_BUDGET);
+        for (n, call) in first.iter().enumerate() {
+            assert_eq!(call.body, Some(("file".to_string(), files[n].1.clone())));
+        }
+        let backlog = host.rows(BACKLOG_NS);
+        assert_eq!(backlog.len(), 1);
+        let queued = Queued::<Fixture>::decode(&backlog[0].1).unwrap();
+        assert_eq!(queued.attachments, [files[CALL_BUDGET].0.clone()]);
+
+        host.activate::<Files>(&(), input(1, vec![], vec![]))
+            .unwrap();
+        let second = host.take_calls();
+        assert_eq!(ids(&second), [id(CALL_BUDGET)]);
+        assert_eq!(
+            second[0].body,
+            Some(("file".to_string(), files[CALL_BUDGET].1.clone()))
+        );
+        assert_eq!(second[0].call.body, Some(Body::Attachment("file".into())));
+        let row = host
+            .rows(INFLIGHT_NS)
+            .iter()
+            .map(|(_, bytes)| InFlight::<Fixture>::decode(bytes).unwrap())
+            .find(|row| row.id == id(CALL_BUDGET))
+            .unwrap();
+        assert_eq!(row.attachments, [files[CALL_BUDGET].0.clone()]);
+        assert!(host.rows(BACKLOG_NS).is_empty());
+    }
+
+    #[test]
+    fn a_body_attachment_that_left_the_window_spends_no_budget() {
+        let host = MemoryHost::new();
+        let file = host.seed_request(&id(0), "file", "text/plain", b"x".to_vec());
+        host.request_attachments_left_window(true);
+        let mut new = vec![put(0, &file)];
+        new.extend(requests(1..CALL_BUDGET + 1));
+        host.activate::<Files>(&(), input(0, new, vec![])).unwrap();
+        assert_eq!(
+            ids(&host.take_calls()),
+            (1..=CALL_BUDGET).map(id).collect::<Vec<_>>()
+        );
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        let completions = host.take_completions();
+        assert_eq!(errors(&completions).len(), 1);
+        assert_eq!(completions[0].id, id(0));
+        assert!(
+            host.take_log()
+                .iter()
+                .any(|(level, line)| *level == Level::Warn
+                    && line.contains("attachment `file` has left the request window"))
+        );
+    }
+
+    #[test]
+    fn a_body_naming_an_attachment_the_request_does_not_carry_is_a_fault() {
+        let host = MemoryHost::new();
+        let bare = Request {
+            id: id(0),
+            tool: "fixture-lookup".to_string(),
+            args: json!({ "put": true }),
+            attachments: Vec::new(),
+        };
+        let fault = host
+            .activate::<Files>(&(), input(0, vec![bare], vec![]))
+            .unwrap_err();
+        assert_eq!(
+            fault,
+            format!(
+                "fixture-lookup step 1 for {} sends attachment `file` as its body, which the \
+                 request does not carry",
+                id(0)
+            )
+        );
+        assert!(host.take_calls().is_empty());
+        assert!(host.rows(INFLIGHT_NS).is_empty());
+    }
+
+    #[test]
+    fn a_blob_larger_than_a_read_or_a_write_is_copied_by_range() {
+        let host = MemoryHost::new();
+        host.set_blob_limits(Some(crate::blob::BlobLimits {
+            max_read_bytes: 1024,
+            max_write_bytes: 1024,
+        }));
+        host.activate::<Files>(&(), input(0, requests(0..1), vec![]))
+            .unwrap();
+        let get = host.take_calls().remove(0);
+        let bytes: Vec<u8> = (0..1u32 << 20).map(|n| (n % 251) as u8).collect();
+        let answer = host.seed_result(&get.call_id, "body", "text/plain", bytes.clone());
+        let delivered = Delivered {
+            call_id: get.call_id.clone(),
+            serving: Some(get.id.clone()),
+            outcome: crate::testutil::blob_answer("body", bytes.len() as u64),
+            attachments: vec![answer],
+        };
+        host.activate::<Files>(&(), input(1, vec![], vec![delivered]))
+            .unwrap();
+        let completion = host.take_completions().remove(0);
+        assert_eq!(
+            completion.answer,
+            Answered::Value(json!({ "copied": true }))
+        );
+        assert_eq!(completion.attachments[0].bytes, bytes);
+        assert_eq!(completion.attachments[0].content_type, "text/plain");
+        assert_eq!(host.peak_handles(), 2);
+    }
+
+    /// A provider whose first call's path counts the request's attachments,
+    /// and whose answer builds a blob of `size` bytes (default 1), attaches it,
+    /// and then completes, fails (`"then": "fail"`) or calls again
+    /// (`"then": "call"`).
+    struct Attacher;
+
+    impl Logic for Attacher {
+        type Tool = Fixture;
+        type Settings = ();
+
+        fn plan(tool: Fixture, _: &Value, step: &Step<'_>, _: &()) -> Result<Call, String> {
+            Ok(call(
+                1,
+                tool,
+                &format!("n{}", step.request_attachments().len()),
+            ))
+        }
+
+        fn advance(
+            state: &InFlight<Fixture>,
+            _: Result<Value, NestedError>,
+            step: &mut Step<'_>,
+            _: &(),
+        ) -> Next {
+            let size = state.args.get("size").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let built = (|| -> Result<Blob, Failure> {
+                let mut blob = step.append("text/plain")?;
+                blob.write(&vec![7; size])?;
+                blob.finish()
+            })();
+            let blob = match built {
+                Ok(blob) => blob,
+                Err(failure) => return Next::Fail(failure),
+            };
+            step.attach("built", blob);
+            match state.args.get("then").and_then(Value::as_str) {
+                Some("fail") => Next::Fail(internal("refused after attaching")),
+                Some("call") => Next::Call {
+                    call: call(state.step + 1, state.tool, "more"),
+                    derived: Map::new(),
+                },
+                _ => Next::Complete(json!({ "built": size })),
+            }
+        }
+    }
+
+    fn attacher(n: usize, args: Value) -> Request {
+        Request {
+            id: id(n),
+            tool: "fixture-lookup".to_string(),
+            args,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Plan `request` and deliver its call's answer, in two activations;
+    /// the second activation's outcome.
+    fn answer_attacher(host: &MemoryHost, request: Request) -> Result<(), String> {
+        host.activate::<Attacher>(&(), input(0, vec![request], vec![]))
+            .unwrap();
+        let call = host.take_calls().remove(0);
+        host.activate::<Attacher>(&(), input(1, vec![], vec![result(&call, false)]))
+    }
+
+    #[test]
+    fn a_requests_attachments_reach_its_plan() {
+        let host = MemoryHost::new();
+        let file = host.seed_request(&id(0), "file", "text/plain", b"x".to_vec());
+        let more = host.seed_request(&id(0), "more", "text/plain", b"y".to_vec());
+        let mut request = attacher(0, json!({}));
+        request.attachments = vec![file.clone(), more.clone()];
+        host.activate::<Attacher>(&(), input(0, vec![request], vec![]))
+            .unwrap();
+        assert_eq!(
+            host.take_calls()[0].call.path,
+            "/v1/fixture-lookup/n2".to_string()
+        );
+        let row = InFlight::<Fixture>::decode(&host.rows(INFLIGHT_NS)[0].1).unwrap();
+        assert_eq!(row.attachments, [file, more]);
+    }
+
+    #[test]
+    fn what_a_step_attaches_goes_with_its_completion_only() {
+        let host = MemoryHost::new();
+        answer_attacher(&host, attacher(0, json!({}))).unwrap();
+        let completion = host.take_completions().remove(0);
+        assert_eq!(completion.answer, Answered::Value(json!({ "built": 1 })));
+        assert_eq!(completion.attachments.len(), 1);
+        assert_eq!(completion.attachments[0].name, "built");
+        assert_eq!(completion.attachments[0].bytes, [7]);
+
+        answer_attacher(&host, attacher(1, json!({ "then": "fail" }))).unwrap();
+        let completion = host.take_completions().remove(0);
+        assert_eq!(
+            completion.answer,
+            Answered::Error(ErrorKind::Internal, "refused after attaching".to_string())
+        );
+        assert!(completion.attachments.is_empty());
+
+        let fault = answer_attacher(&host, attacher(2, json!({ "then": "call" }))).unwrap_err();
+        assert_eq!(
+            fault,
+            "fixture-lookup step 1 attached a blob to its completion and then issued a call"
+        );
+        assert!(host.take_calls().is_empty());
+        assert!(host.take_completions().is_empty());
+    }
+
+    #[test]
+    fn each_steps_handles_are_released_before_the_next_step() {
+        let host = MemoryHost::new();
+        let new = (0..3).map(|n| attacher(n, json!({}))).collect();
+        host.activate::<Attacher>(&(), input(0, new, vec![]))
+            .unwrap();
+        let results = host
+            .take_calls()
+            .iter()
+            .map(|call| result(call, false))
+            .collect();
+        host.activate::<Attacher>(&(), input(1, vec![], results))
+            .unwrap();
+        assert_eq!(host.take_completions().len(), 3);
+        assert_eq!(host.peak_handles(), 1);
+    }
+
+    #[test]
+    fn a_write_past_the_activations_budget_is_refused_quota() {
+        let host = MemoryHost::new();
+        host.set_write_budget(1_000);
+        answer_attacher(&host, attacher(0, json!({ "size": 1_001 }))).unwrap();
+        let completion = host.take_completions().remove(0);
+        assert_eq!(
+            completion.answer,
+            Answered::Error(
+                ErrorKind::Internal,
+                crate::Failure::from(crate::blob::WriteError::Quota).detail
+            )
+        );
+        assert!(completion.attachments.is_empty());
+
+        answer_attacher(&host, attacher(1, json!({ "size": 1_000 }))).unwrap();
+        let completion = host.take_completions().remove(0);
+        assert_eq!(completion.attachments[0].bytes.len(), 1_000);
+    }
+
+    #[test]
+    fn a_step_served_no_blobs_fails_naming_the_entry_point() {
+        let host = MemoryHost::new();
+        host.set_blob_limits(None);
+        answer_attacher(&host, attacher(0, json!({}))).unwrap();
+        let completion = host.take_completions().remove(0);
+        let Answered::Error(ErrorKind::Internal, detail) = completion.answer else {
+            panic!("completed with {:?}", completion.answer);
+        };
+        assert!(detail.contains("`serve_with_blobs`"), "{detail}");
     }
 }

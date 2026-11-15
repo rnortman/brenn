@@ -1,10 +1,12 @@
 //! Gmail read (brenn:processor world): `GmailLabels`, `GmailSearch`,
-//! `GmailRead` and `GmailThread`.
+//! `GmailRead`, `GmailThread` and `GmailAttachment`.
 //!
 //! Each activation reads the instance's `config` and hands the activation to
 //! `brenn-provider-kit`'s loop, which runs it in one store transaction: it
 //! sweeps rows no result can still arrive for, answers every new result,
-//! issues queued requests, serves every new request, and commits. At most
+//! issues queued requests, serves every new request, and commits. The loop
+//! is served with the SDK's `blobs`: `GmailAttachment` reads Gmail's answer
+//! from a blob and completes with the decoded file as one. At most
 //! `CALL_BUDGET` nested calls go out per activation; requests past it wait in
 //! the store's backlog for a later activation.
 //!
@@ -32,7 +34,7 @@ struct GoogleGmailRead;
 impl Processor for GoogleGmailRead {
     fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         let settings = Settings::from_lookup(config::get, "gmail_host").map_err(Error::failed)?;
-        brenn_provider_kit_guest::serve::<logic::GmailReads>(&activation, &settings)?;
+        brenn_provider_kit_guest::serve_with_blobs::<logic::GmailReads>(&activation, &settings)?;
         Ok(None)
     }
 }

@@ -564,6 +564,84 @@ rate never meters it.
   in `TODO.md`; once it is a per-device read, this exposure is that of any other
   database-reading frame.
 
+### 6.6 The surface blob door
+
+A surface page speaks attach v6 and reads, makes and attaches blobs through
+the remote's blob door (§9a). What the door gives a page:
+
+- **Who gets a door.** A surface session has one only when an instance on that
+  surface is granted `blobs`. The door uploads only when some instance granted
+  `blobs` has a declared wire output — a binding of one of its output ports to
+  a channel that is not `local:`. A surface whose `blobs` instances only read,
+  or publish only page-locally, has a door without upload, on which a
+  `BlobCreate`, a `BlobWrite` and a `BlobSeal` are each a protocol violation.
+  The upload door is derived from the grant and the bindings, never a separate
+  operator word (`SurfaceProfile::blob_grant`).
+- **Who may attach, and where.** A publish naming attachments is admitted only
+  under an attribution granted `blobs`, and only on one of that instance's
+  declared wire outputs (`SurfaceProfile::attribution_may_attach`); under the
+  bare identity, under another instance, or on any other channel it is a
+  protocol violation. The publish ACL still decides the publish; this is one
+  more condition on a non-empty attachment list. The operator's error channel,
+  which every attribution may publish plain reports on, is not a declared
+  output, so no page attaches there unless the operator bound an output to it.
+- **What it reaches.** The bytes of every attachment of every message inside
+  the window of a wire channel the surface's own bindings name — the channel's
+  window, not the binding's depth, and whether or not the row was delivered to
+  this session. The admission is the remote door's,
+  `Messenger::admit_retained_part`, asked afresh at every open; the surface's
+  reach is its bound wire channels and its config channel, with no ACL lookup
+  (`SurfaceProfile::subscribable`). An authenticated browser is untrusted: the
+  page kernel's scope rules — a component opens only an attachment of a message
+  in its own activation's windows, by port, index and name, never by id — bind
+  components, not a page that speaks the wire itself. The profile is what
+  protects the bytes.
+- **What it could already do and still can.** Read the references. What is new
+  besides bytes: with a door, a publish naming a handle the session opened is
+  admitted onto a declared wire output of a `blobs`-granted instance, so a
+  hostile page can forward an attachment it can read to such a channel. It
+  gains no bytes it could not read and no channel it could not write.
+- **What an upload door adds.** A hostile page can make blobs in the backend
+  store: one session holds at most 64 handles and 4 × `max_blob_bytes` (256 MiB
+  at the default) of blobs it made or opened; a surface takes 64 sessions, 16 a
+  user. All of it draws on the one pool every blob user shares (1 GiB at the
+  default), which is the only bound across sessions: one user's sessions can
+  exhaust it, and every other maker of blobs is then refused `budget-exhausted`
+  until those sessions end or close their handles. A blob no published message
+  names dies with the session's handle. A blob a published message names lives
+  as long as that message is in its channel's window, so occupancy by published
+  messages is bounded by the windows of the declared wire outputs of the
+  surface's `blobs`-granted instances, times 32 attachments, times
+  `max_blob_bytes`. The per-session cap is not tightened for surfaces: at one
+  blob per session sixteen sessions of one user still reach the default pool,
+  and a tighter cap would take room from the page's own fetches, which count
+  against the same bound. The bound that closes it is a share of the pool per
+  publisher (`blob-budget-per-component` in `TODO.md`).
+- **No token bucket.** Blob frames draw on none, upload frames included; a
+  publish naming a blob draws what a plain publish draws. The static bounds per
+  session: 64 handles, 4 read answers in flight, 256 KiB an answer or a write,
+  4 × `max_blob_bytes` held; per surface, 64 sessions and 16 a user. Nothing
+  bounds a session's transfer frames over time — the exposure §9a accepts for a
+  remote's.
+- **fail2ban.** A blob frame on a session without a door; a `BlobCreate`, a
+  `BlobWrite` or a `BlobSeal` on a door without upload; a `BlobCreate` naming a
+  live handle, a `BlobWrite` or `BlobSeal` naming a held blob; a `BlobOpen` on a
+  channel the surface does not bind; a `BlobRead` over the chunk bound; a
+  publish naming attachments under the bare identity, under an instance not
+  granted `blobs`, or on a channel that is not one of its instance's declared
+  wire outputs — the error channel among them; and a publish naming an
+  attachment twice or more than 32 of them each end the session as
+  `attach_protocol_violation` with the peer's address. An unknown handle, a
+  read out of range and a fifth read in flight are answers, not violations —
+  and so, on a door with upload, as §9a's table gives them, are a `BlobWrite`
+  to an unknown handle (dropped, counted) and a `BlobSeal` of one
+  (`UnknownHandle`), which is what a frame pipelined behind a refused create
+  meets.
+- **On the page.** Fetched bytes are held in the page's memory, at most 64 MiB,
+  and only while their message is in the page's window of the channel; a
+  component's handle dies with its activation (`docs/message-bus.md` §2.1.2a,
+  "A surface page is a reader by place").
+
 ## 7. Boundaries B2 / B3 — The Claude Code Subprocess
 
 CC is the most security-load-bearing boundary. The framing: **we control how CC
@@ -804,8 +882,9 @@ by reference (`docs/message-bus.md` §2.1.2a).
   (below). Publishing with attachments needs `ports` as well. A conversation
   forwards, saves and attaches blobs by name (below). A remote on attach v6
   does both — reads an attachment's bytes and, with publish authority, creates
-  a blob — through the session's blob door reviewed in §9a; pages still
-  cannot. Host code's
+  a blob — through the session's blob door reviewed in §9a; a surface page
+  reads attachments through the same door and, when the door uploads, creates
+  and forwards blobs through it too (§6.6). Host code's
   `Messenger::publish_from_system_with_attachments` carries the tool
   substrate's requests and results, and `Messenger::publish_with_attachments`
   a conversation's sends. Every later door that admits an outside producer or
@@ -895,6 +974,40 @@ by reference (`docs/message-bus.md` §2.1.2a).
   unsealed at once. A send refused at publish, or a connection that drops,
   leaves no blob. Nothing bounds a conversation over time: over many sends it
   can fill the pool as a component can (`blob-budget-per-component`).
+- **`api-request` is a producer, on a caller's behalf.** A call with
+  `response_attachment` has a 2xx answer's body written into a new blob,
+  streamed, never held whole. Per call the bound is `max_blob_bytes`: a
+  declared length over it, or over what the pool has left, is refused before a
+  body byte is read, and a body without one is refused at the write that would
+  cross; either is an answer (`response_too_large`, `blob_store_full`), never a
+  cut blob, and a refused or failed answer's unsealed writer is dropped, which
+  deletes its file and returns its charge. In flight the bound is the tool's
+  concurrency, 8 × `max_blob_bytes` charged and unsealed at once. Nothing bounds
+  it over time. A sealed answer's one hold is the tool's output: the executor
+  publishes it on the component caller's `brenn:tool-results/<slug>`, or the
+  LLM path on the app's `brenn:app-tool-results/<app-slug>`, and a result the
+  executor or the bridge cannot publish drops it, so no answer is left without
+  a holder. `api-request` writes an answer into a blob only for a caller that
+  can open it: a conversation, or a component whose instance is granted
+  `blobs`. A component without the grant asking for `response_attachment` is
+  refused `denied` in the tool's preparation, before anything is sent, and the
+  refusal is logged at `warn` with caller and request line. A provided tool's
+  completion has no such check: its attachments reach the caller's inbox
+  whatever the caller is granted, so a provider answering a component without
+  `blobs` with attachments leaves blobs on that inbox nobody can open
+  (`tool-result-attachments-to-caller-without-blobs` in `TODO.md`).
+- **An attachment answer rests for its inbox's window.** Whoever wrote it —
+  `api-request`, or a provider completing with attachments — an answer stays
+  on the caller's inbox, charged to the pool, after the caller has read it,
+  until that many newer results arrive there; on a quiet inbox, indefinitely.
+  Each inbox that receives attachment answers holds up to its depth ×
+  `max_blob_bytes`, and for a provider's result inbox of depth 32 that is 2 GiB
+  against the 1 GiB default pool. When the pool is full every producer in the
+  deployment is refused until a window turns over; nothing is cut or evicted.
+  The operator sizes `blob_budget_bytes` at or above the sum, over the inboxes
+  that receive attachment answers, of depth × `max_blob_bytes`, or lowers
+  `max_blob_bytes` (`docs/config-dsl.md`, "The OAuth tools";
+  `docs/google-workspace.md` gives `GmailAttachment`'s figure).
 - **A remote is a producer, and a holder.** A remote session on attach v6 with
   publish authority creates blobs, each reserved at its declared size before
   any byte crosses. Every v6 session with the door — subscribe-only included —
@@ -924,6 +1037,14 @@ by reference (`docs/message-bus.md` §2.1.2a).
   way into one `warn` per activation, and the activation's first storage
   failure is logged at `error` with its I/O error, so a guest retrying in a
   loop writes one line, not one per call.
+  CPU grows with the attachments handed in: an instance granted `blobs` gets,
+  beside the envelope-count fuel, 128 fuel per byte of attachment on the
+  messages delivered *new* to the activation, capped at 8,589,934,592
+  (`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`, `PROCESSOR_MAX_ATTACHMENT_FUEL`).
+  Attachments on window context, and every attachment for an instance without
+  the grant, add nothing. The 30 s epoch deadline is unchanged and is still the
+  wall-clock bound, so the most any activation gains is bounded whatever
+  arrives.
 - **What does not bound a component.** Over many activations a component can
   fill the store: each activation may write 64 MiB, and what it publishes
   lives as long as the channels' windows hold it. The store's budget is one
@@ -1023,7 +1144,11 @@ internally-originated.
   untrusted guest with no effective CPU/wall-clock bound — particularly one fed by
   external input — is a finding. (If a given guest world cannot yet be bounded, it
   must be restricted to operator-trusted, in-tree guests only; accepting an
-  out-of-tree guest into an unbounded world is a finding.)
+  out-of-tree guest into an unbounded world is a finding.) A backend
+  processor's CPU bound is fuel, scaled by the envelopes an activation is
+  handed and, for an instance granted `blobs`, by the bytes of attachment on
+  its new messages up to a fixed cap (§7.6, "What bounds one activation"); the
+  epoch deadline bounds its wall clock whatever its fuel.
 - **Output volume is bounded.** Per-activation call budgets and payload-size
   limits must bound what a guest can emit, and guest-produced strings that reach
   host logs/alerts/diagnostics must be sanitized (length-bounded and made
@@ -1288,6 +1413,13 @@ Limits, stated beside the guarantees:
   reads, as the component's own calls do (§9f).
 - A request delivered after its record is gone (restart, expiry) is served to a
   provider that then cannot act on it or complete it.
+- A provider's reach to its requests' attachments is its request window. It
+  opens one by the request message's place in the `tool-requests` window, which
+  holds the last Σ `max_concurrency` requests; the pending record holds no
+  attachments. A request still pending whose message newer requests displaced
+  can no longer reach its attachments, and the provider kit answers it
+  `internal` (`kit-request-attachment-outlives-window` in `TODO.md`). Nothing
+  wider is reachable: a request's attachments are what its caller handed it.
 - A live request can be pushed out of a provider's request inbox unseen, when a
   later request expires or its caller abandons it before the provider runs. It
   is answered `internal` at its deadline and nothing runs for it. A drop on the
@@ -1474,7 +1606,10 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   by the admission the conversation door shares (§7.6), logged at `warn` on a
   session's first. `BlobCreate` needs the door's `upload`, granted only to a
   remote with publish authority on some channel; a publish naming handles is
-  judged by the existing publish authority for its channel.
+  judged by the existing publish authority for its channel. A surface session
+  uses the same door, reaching the channels its surface's bindings name, with
+  upload only where a `blobs`-granted instance has a declared wire output and
+  attachments only under that instance on those outputs (§6.6).
 - **What a stolen token now reaches.** On v6, the bytes of every attachment of
   every message in the window of every channel the remote may subscribe to,
   the tool channels excepted — where a v5 token reached their references
@@ -1511,8 +1646,8 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   | Frame | absent | writer | held |
   |---|---|---|---|
   | `BlobCreate`, `BlobOpen` | proceeds | violation | violation |
-  | `BlobWrite` | dropped, counted | written | violation |
-  | `BlobSeal` | answer `UnknownHandle` | answer `Ok` or `Incomplete` | violation |
+  | `BlobWrite` | dropped, counted; a violation on a door without upload | written | violation |
+  | `BlobSeal` | answer `UnknownHandle`; a violation on a door without upload | answer `Ok` or `Incomplete` | violation |
   | `BlobRead` | answer `UnknownHandle` | answer `NotSealed` | read |
   | a publish naming it | answer `AttachmentNotHeld` | answer `AttachmentNotHeld` | published |
   | `BlobClose` | no-op, counted | bytes deleted | hold dropped |
@@ -2076,7 +2211,12 @@ for each account's file, and a caller with no user is admitted only to read.
   `Cookie`, `Host` and the framing headers are refused from the caller.
   `Destination` is the caller's to name, as a path, and Brenn's to write: the
   header sent is the one Brenn builds, and a `Destination` Brenn did not build
-  is never sent, on any method.
+  is never sent, on any method. A body from an attachment (`body_attachment`)
+  changes none of this: the caller's `headers` are checked exactly as without
+  one, the blob's content type reaches only `Content-Type` and only when the
+  caller set none, built as a header value and refused if it is not one, and
+  `Content-Length` is the blob's size, set by the transport. A blob cannot set
+  `Authorization`, a transport header or a key's header.
 - **Reserved injection name.** The key's header is Brenn's. A caller header of
   that name, in any case, is refused on a key-provider call before anything is
   sent. Boot and reload refuse `Destination` as a key's header, so the key
@@ -2105,7 +2245,12 @@ for each account's file, and a caller with no user is admitted only to read.
       of the resource at that path is bounded by the credential and by the
       provider, not by the grant. This holds for every method and is not new:
       a `POST` to a JSON API endpoint names in its body whichever of the
-      account's data the credential reaches.
+      account's data the credential reaches. A body from a blob is as
+      unbounded by the clause as any body, and larger: a caller can name as a
+      body only a blob it could already read (a component by handle, a
+      conversation by a name `admit_conversation_name` admits), and sending
+      those bytes to an admitted request line is what `body_base64` already
+      allowed, without its 48 KiB ceiling.
     - The DAV instances, named because a DAV `path` looks like a boundary
       between single resources and is not one. A `path` template is matched
       segment for segment against the request URI, and it confines a request
@@ -2160,8 +2305,19 @@ for each account's file, and a caller with no user is admitted only to read.
       RFC 4918 allows a copy or move across servers. No other header is
       matched: the `If` header (RFC 4918 section 10.4) may name resources,
       as conditions and not as targets.
-- **Bounded results.** A response is cut to a configured size, and then to what
-  the tool result can carry, on every caller path.
+- **Bounded results, inline and by attachment.** An inline response is cut to
+  the provider's `max_response_bytes`, and then to what the tool result can
+  carry, on every caller path. A response asked for with `response_attachment`
+  is not bounded by `max_response_bytes`: a 2xx body is written whole into a
+  blob up to `max_blob_bytes`, refused typed above it, and never cut (§7.6). A
+  non-2xx answer is inline and cut as before. That an answer may be written
+  into a blob is a second question beside the clause, answered by the caller's
+  kind: a conversation always, a component only when its instance is granted
+  `blobs`. The clause — provider, user, account, method, host, path — remains
+  the whole question of which request a caller may make. What the attachment
+  form adds is quantity, and one quality: a conversation can move a file
+  between a provider's API and the bus without its bytes entering the model's
+  context.
 - **The redirect back is provider-authored data carried by a B1 browser.** The
   provider composes the query string of the callback, and its vocabulary is not
   Brenn's to allowlist. Unknown parameters are ignored and raise no event: a

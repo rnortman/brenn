@@ -57,6 +57,7 @@ use crate::outbound::{
 use crate::page::{Detached, SurfacePage};
 use crate::registry::BindingKey;
 use crate::telemetry::{self, StatusReport};
+use crate::uploads::Lost;
 
 /// The urgency the kernel states on its own control planes.
 ///
@@ -180,6 +181,9 @@ pub struct CommandOutcome {
     pub close: bool,
     /// A composition that contradicts the page's own state — the caller's fatal.
     pub fatal: Option<String>,
+    /// Attachment flushes on the wire, unanswered, when a close ended the
+    /// attachment.
+    pub lost: Vec<Lost>,
 }
 
 /// Run one command against the page.
@@ -580,10 +584,15 @@ fn on_status(
 /// outlive the attachment — because the caller owns what happens next, and nothing
 /// here can reload or drop a page.
 fn on_close(page: &mut SurfacePage) -> CommandOutcome {
-    let Detached { answers, steps } = page.on_detached();
+    let Detached {
+        answers,
+        steps,
+        lost,
+    } = page.on_detached();
     CommandOutcome {
         answers,
         steps,
+        lost,
         close: true,
         ..CommandOutcome::default()
     }

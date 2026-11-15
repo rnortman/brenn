@@ -496,6 +496,9 @@ pub(crate) fn load_consumer(
         ctx.tool_registry.clone(),
         consumer.policy.tool_grants.clone(),
         consumer.slug.clone(),
+        consumer
+            .grants
+            .contains(&brenn_lib::messaging::ComponentGrant::Blobs),
         ctx.alert_dispatcher.clone(),
     ));
     let tool_host: Option<brenn_wasm::ToolHostFn> =

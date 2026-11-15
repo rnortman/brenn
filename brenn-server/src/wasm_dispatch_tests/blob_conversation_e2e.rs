@@ -174,6 +174,7 @@ async fn rig_with(rate_limit: Option<ResolvedRateLimit>) -> Rig {
                 .collect(),
             producer: PRODUCER,
         }),
+        blob_limits: None,
     })
     .await;
     Rig {

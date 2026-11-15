@@ -37,7 +37,7 @@ pub fn welcome(facts: AttachmentFacts) -> WireMessage {
         max_body_bytes: facts.max_body_bytes,
         max_frame_bytes: facts.max_frame_bytes,
         alert_granted: facts.alert_granted,
-        blobs: None,
+        blobs: facts.blobs,
     })
 }
 

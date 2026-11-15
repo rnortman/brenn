@@ -268,6 +268,16 @@
 //!   [`BatchEntry`](brenn_attach_proto::BatchEntry) with `BatchEntry::new`,
 //!   `.deliver_after(..)` and `.attachments(..)`. A struct literal compiles
 //!   today and breaks when a field is added.
+//! - **[`RouteRequest`](router::RouteRequest) does not grow.** It has no
+//!   constructor and every consumer builds it as a literal, so what a
+//!   confined publish gains arrives as a method beside
+//!   [`route`](router::LocalRouter::route):
+//!   [`route_attached`](router::LocalRouter::route_attached) mints the
+//!   envelope with attachments.
+//! - **New read-only questions arrive as methods.**
+//!   [`Outboxes::is_idle`](publish::Outboxes::is_idle) answers whether a
+//!   registrant has nothing parked and nothing unanswered, for an embedder
+//!   that holds a handle-naming flush back until its outbox is free.
 //! - **A new outcome or event variant is a compile break, deliberately.** The
 //!   enums stay exhaustive: a refusal a daemon does not handle is a bug.
 //! - **A later protocol version does not change these types' meaning.** The

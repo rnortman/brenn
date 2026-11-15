@@ -38,6 +38,8 @@ pub struct WasmToolHost {
     /// The caller principal (`wasm:<slug>`), keyed into the body's `caller` field
     /// and the rate-limit bucket.
     caller: ParticipantId,
+    /// Whether this consumer's instance is granted `blobs`.
+    blobs: bool,
     alert: AlertDispatcher,
 }
 
@@ -48,6 +50,7 @@ impl WasmToolHost {
         registry: ToolRegistryCell,
         tool_grants: BTreeMap<String, ResolvedToolGrant>,
         slug: String,
+        blobs: bool,
         alert: AlertDispatcher,
     ) -> Self {
         let caller = ParticipantId::for_wasm(&slug);
@@ -56,6 +59,7 @@ impl WasmToolHost {
             tool_grants,
             slug,
             caller,
+            blobs,
             alert,
         }
     }
@@ -98,6 +102,7 @@ impl ToolHost for WasmToolHost {
             acting_conversation_id: None,
             acting_user: None,
             deadline: None,
+            caller_opens_blobs: self.blobs,
         };
         // `invoke_fast` emits the unified invocation log (tool, caller, class,
         // duration, outcome) on every path, so nothing is logged here.
@@ -271,7 +276,7 @@ mod tests {
 
     fn host(grants: BTreeMap<String, ResolvedToolGrant>) -> WasmToolHost {
         let (alert, _h) = noop_alert_dispatcher();
-        WasmToolHost::new(registry().into(), grants, "sync".to_string(), alert)
+        WasmToolHost::new(registry().into(), grants, "sync".to_string(), false, alert)
     }
 
     #[tokio::test]

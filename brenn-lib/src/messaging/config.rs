@@ -1459,6 +1459,14 @@ pub struct SurfaceSubscriptionRaw {
     /// semantics as [`WasmConsumerSubscriptionRaw::non_text`]; legal only where
     /// the port's channel is page-local.
     pub non_text: bool,
+    /// The largest attachment, in bytes, the page fetches on this binding's
+    /// channel before a delivered message enters the page's window. `None` ⇒
+    /// [`brenn_surface_schema::DEFAULT_FETCH_BYTES`] for an instance granted
+    /// `blobs`, `0` for any other. Legal only on a transportable channel and
+    /// only on an instance granted `blobs`; at most
+    /// [`brenn_surface_schema::PAGE_BLOB_BYTES`]. The channel's bound on the
+    /// surface is the largest among its bindings there.
+    pub fetch_bytes: Option<u64>,
 }
 
 /// A static output binding on a surface (`[[surface.output]]`).
@@ -1885,6 +1893,10 @@ pub struct ResolvedWireChannel {
     /// The directory entry's `non_text`: whether the channel may carry bodies
     /// that are not UTF-8 text.
     pub non_text: bool,
+    /// The largest attachment, in bytes, the page fetches on this channel: the
+    /// largest resolved `fetch_bytes` among the surface's subscriptions of it,
+    /// `0` when none fetches. An output binding contributes nothing.
+    pub fetch_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

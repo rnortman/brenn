@@ -438,9 +438,12 @@ pub struct InstBody {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum Binding {
     /// `in messages <- messages_p1;`
-    Into(DirBinding<InTail>),
+    ///
+    /// Boxed, as every variant holding a tail is: tails are hundreds of bytes
+    /// and differ by direction, and a call binding holds three names.
+    Into(Box<DirBinding<InTail>>),
     /// `out takeover -> "local:brenn/takeover";`
-    Outof(DirBinding<OutTail>),
+    Outof(Box<DirBinding<OutTail>>),
     /// `io acks <-> acks;` or the free form `io tick { push_depth = 1; }`
     ///
     /// Boxed: an `io` tail is the union of the two directions, so this variant
@@ -1376,9 +1379,9 @@ vocabulary! {
 
 vocabulary! {
     /// An `in` binding's tail: the union across the consumer and surface
-    /// subscription families, which differ by exactly one key.
-    /// `amplification` is a consumer's alone; stating it on a surface port is
-    /// refused at lowering.
+    /// subscription families, which differ by one key each way.
+    /// `amplification` is a consumer's alone and `fetch_bytes` a surface's;
+    /// each is refused at lowering in the other family.
     ///
     /// `WasmConsumerSubscriptionRaw`'s and `SurfaceSubscriptionRaw`'s fields
     /// other than the port and the channel the statement carries, held equal to
@@ -1396,6 +1399,10 @@ vocabulary! {
         /// declared one. On a surface port, legal only where the port's channel
         /// is page-local.
         opt non_text: V,
+        /// The largest attachment, in bytes, the page fetches on this port's
+        /// channel before a delivered message enters the page's window. A
+        /// surface port's alone.
+        opt fetch_bytes: V,
     }
 
     /// An `out` binding's tail: the union across the consumer and surface

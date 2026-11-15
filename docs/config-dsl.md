@@ -625,6 +625,48 @@ tool api-request {
 }
 ```
 
+**Bodies, and answers as attachments.** A request body comes from one of
+three arguments, and at most one may be given: `body`, text sent as written;
+`body_base64`, bytes in standard base64; or `body_attachment`, the name of an
+attachment the call carries, whose bytes are sent as they are. Text and base64
+ride in the call's arguments and are bounded by them (64 KiB, about 48 KiB of
+bytes in base64). An attachment is bounded only by the deployment's largest
+blob (`max_blob_bytes`) and is streamed, never held whole. A component hands
+the attachment through `blobs.call-async`; a conversation through the
+reserved `attachments` argument (`{"<name>": {"message_id", "name"}}`). A
+call whose attachment `body_attachment` does not name, or that carries more
+than one, is refused `invalid_args` naming the unused one: nothing handed to
+the tool is ignored. Without a caller `Content-Type`, the blob's content type
+is sent as `Content-Type`; `Content-Length` is the blob's size and is Brenn's
+to set.
+
+`response_attachment` names an attachment of the result: a 2xx answer's body
+comes back as that attachment instead of inside the value, and the value is
+`{"status", "headers", "bytes", "attachment"}`. An empty 2xx, a `HEAD`
+included, is an empty attachment. A non-2xx answer is answered inline exactly
+as without the argument, so an API's error is read the same way either way.
+`max_response_bytes` bounds an inline answer, and cuts it with `truncated`;
+it does not bound an attachment answer, which `max_blob_bytes` bounds and
+which is never cut. Two refusals are answers, not errors, and leave no blob:
+`{"error": "response_too_large", "status", "headers", "bytes", "limit"}` when
+the body passes `max_blob_bytes` (`bytes` is the declared length, or `null`),
+and `{"error": "blob_store_full", "status", "headers"}` when the blob pool
+(`blob_budget_bytes`) cannot hold it. A component whose instance is not
+granted `blobs` cannot open an attachment, so its `response_attachment` is
+refused `denied` naming the grant, before anything is sent; a conversation
+is always admitted. The whole transfer, bodies included, must finish inside
+`api-request`'s 60 s timeout.
+
+An attachment answer rests on the result's row in the caller's inbox — a
+component's `brenn:tool-results/<slug>`, an app's
+`brenn:app-tool-results/<app-slug>` — until that inbox's window turns over,
+and holds its bytes in the blob pool for that long, after the caller has
+read it. Size `blob_budget_bytes` at or above the sum, over the inboxes that
+receive attachment answers, of the inbox's depth × `max_blob_bytes`, or lower
+`max_blob_bytes`. An `api-request` attachment answer and a provided tool's
+attachment (`GmailAttachment`'s file, for one) both count. When the pool is
+full every producer in the deployment is refused until a window turns over.
+
 #### The device-location tool
 
 `device-location` (MCP `mcp__brenn__DeviceLocation`) is always registered;
@@ -840,8 +882,9 @@ No other attribute or block is accepted inside an `account`.
 #### `api-request` on a key provider
 
 A key provider is called through `api-request`, named by its block's name as
-`provider`. The `method`, `host` and `path` keys, the path template, and the
-request rules are those of *The OAuth tools*. What differs:
+`provider`. The `method`, `host` and `path` keys, the path template, the
+request rules, and the body and attachment forms (`body_attachment`,
+`response_attachment`) are those of *The OAuth tools*. What differs:
 
 - **Whose key.** On the deployment form every caller sends the same key: it
   is the deployment's, not a user's, there is no account to connect and no
@@ -1105,7 +1148,7 @@ bound by a component built against the string contract
 `brenn:processor@0.1.0` — the component's load is refused at boot and at
 reload, naming the port and the channel; a surface instance's kind is judged
 the same way once its artifact is scanned, whether the channel is page-local
-or declared. A surface port may be bound to it: the page's wire is attach v5,
+or declared. A surface port may be bound to it: the page's wire is attach v6,
 which carries every body. It is served to a remote whose attach session
 negotiated protocol v5; one on v4 asking for it is answered `Unavailable`. A durable
 channel holding a non-text message cannot later be declared text-only; give it
@@ -1522,6 +1565,38 @@ names an instance, and the form takes no tail. Five rules, all compile errors:
   caller waits for its callee, so a cycle is a deadlock; the refusal spells the
   cycle out. A diamond is not a cycle and is admitted.
 - Leaving a `call` port unbound is legal. The import answers `unwired`.
+
+On a surface component's `in` binding, `fetch_bytes = <bytes>` is the largest
+attachment the page fetches on that channel, so a component granted `blobs`
+can `read` it in the activation its message wakes:
+
+```
+surface kiosk {
+  new viewer: FrameViewer {
+    grants = [ports, log, blobs];
+    in frames <- cam_frames { push_depth = 1; retain_depth = 1; fetch_bytes = 4194304; }
+  }
+}
+```
+
+Unstated, it is 1 MiB (1,048,576) on an instance granted `blobs` and 0 on any
+other; `0` fetches nothing for that binding. It is refused at boot over 64 MiB,
+on a page-local channel, and on an instance without the `blobs` grant, naming
+the instance and port; it is refused on a backend consumer's binding. An `io`
+port takes the default and has no key. A channel's bound on a surface is the
+largest among its bindings there. An attachment over the bound is never
+fetched, and `read` answers `unavailable` for it.
+
+**What it does to every other reader of the channel on that surface.** Any
+value above zero **gates** the channel: each delivered row waits on the page
+until the attachments it names that the page fetches have arrived, or its
+deadline passes, before any binding of the channel on that page sees it — a
+binding of an instance without the grant and a row with no attachment
+included. The worst case is set by the channel's depth, not by the value:
+`⌈(depth + 4) / 4⌉ · 30 s` while attached, 60 s at depth 1, and longer across
+reconnects (`docs/message-bus.md` §2.1.2a, "A surface page is a reader by
+place", for the bound and its table). A reader that must not wait on another
+instance's attachments is bound to a channel no binding on that surface gates.
 
 `io port { … }` with no arrow is a **free io** form: it claims the port and tunes
 it without connecting it, which is how a timer port gets an anonymous
@@ -2084,10 +2159,22 @@ out of the vocabulary.
 
 `blobs` grants the `brenn:processor/blobs@0.3.0` interface: reading the
 attachments of the messages an activation is handed, creating blobs, and
-publishing messages that name them. It is top-level only — refused by name on
-a placed instance, since no page host serves blob bytes — and pairs with no
+publishing messages that name them. On a top-level instance the whole
+interface is served. On a placed instance everything but the tool-call forms
+is — reading, creating and publishing, on the page's wire and page-local
+channels alike — and a kind that imports `call-async`, `call-async-for` or
+`complete` is refused when its artifact is checked at boot. It pairs with no
 wiring, like `log`: a component that only reads blobs binds no output. A
 component that publishes with attachments also needs `ports`.
+
+A surface's blob door follows from these grants and needs no configuration of
+its own. The surface has a door when some placed instance is granted `blobs`;
+the door uploads when some instance granted `blobs` has a declared output on a
+wire channel (not `local:`). Such an instance may attach blobs only on its own
+declared wire outputs; the surface error channel, which every instance may
+report on, takes no attachment unless an instance's output is bound to it. A
+surface whose `blobs` instances only read, or publish only on page-local
+channels, keeps a door that does not upload.
 
 A `surface` or a `remote` — the two attach-route entities, a browser page and
 a native daemon — writes **plane** words instead: `subscribe`, `publish`, and

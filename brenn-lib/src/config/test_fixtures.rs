@@ -182,17 +182,21 @@ pub fn stage_fixture(dir: &Path, name: &str, document: &str) -> DocumentInputs {
 }
 
 /// The module roots the shipped root config `filename` at `repo_root` compiles
-/// against: `config/specs` for every root. `brenn.e2e.brenn` has two more, the
-/// page fixtures' authored spec directories: `make e2e` serves each fixture
-/// kind from a mount of its own (the `e2e-mounts` recipe in the `Makefile`),
-/// and their modules are not shipped in `config/specs`. That recipe names the
-/// same directories as its own literals; nothing checks that they agree, so
-/// move them together.
+/// against: `config/specs` for every root. `brenn.e2e.brenn` has four more, the
+/// fixtures' authored spec directories: `make e2e` serves each fixture from a
+/// mount of its own (the `e2e-mounts` recipe in the `Makefile`), and their
+/// modules are not shipped in `config/specs`. That recipe names the same
+/// directories as its own literals; nothing checks that they agree, so move
+/// them together.
+// TODO(quality-e2e-fixture-roots-hand-synced-in-five-places): one source for
+// the e2e fixture roots, or a check that the copies agree.
 pub fn shipped_module_roots(repo_root: &Path, filename: &str) -> Vec<PathBuf> {
     let mut roots = vec![repo_root.join("config/specs")];
     if filename == "brenn.e2e.brenn" {
         roots.push(repo_root.join("brenn-wasm/components/processor-page-bytes-test/spec"));
         roots.push(repo_root.join("brenn-wasm/components/processor-sdk-bytes-test/spec"));
+        roots.push(repo_root.join("brenn-wasm/components/processor-blobs-test/spec"));
+        roots.push(repo_root.join("brenn-wasm/components/processor-page-blobs-test/spec"));
     }
     roots
 }

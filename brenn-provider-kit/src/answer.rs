@@ -376,6 +376,94 @@ pub fn read_api_payload(
     })
 }
 
+/// What a nested `api-request` call that asked for its answer as an
+/// attachment (`response_attachment`) answered, read.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BlobAnswer {
+    /// A 2xx whose body is the result's attachment `attachment`, of `bytes`
+    /// bytes.
+    Blob {
+        status: u64,
+        headers: BTreeMap<String, String>,
+        bytes: u64,
+        attachment: String,
+    },
+    /// `api-request`'s `credential_invalid` value, as [`Answer::Relay`].
+    Relay(Value),
+    /// A non-2xx answer cut at the read limit, or an answer not delivered.
+    Unreadable(Unreadable),
+    /// The API's whole 4xx/5xx answer, inline: its HTTP status and body text.
+    Error { status: u64, body: String },
+    /// `api-request` refused the body: over the host's largest blob
+    /// (`limit`), of `bytes` when the API declared a length.
+    TooLarge { limit: u64, bytes: Option<u64> },
+    /// The host's blob pool is full.
+    StoreFull,
+}
+
+/// `api-request`'s answer to a call made with `response_attachment`, read:
+/// a 2xx is the result's attachment, its two typed refusals are
+/// [`BlobAnswer::TooLarge`] and [`BlobAnswer::StoreFull`], and every other
+/// answer reads as [`read_api_result`] reads it. A 2xx that arrives inline is
+/// internal. `api` is the API's display name, which the refusals the model
+/// sees name.
+pub fn read_api_blob(
+    outcome: Result<Value, NestedError>,
+    target: &Target,
+    api: &str,
+) -> Result<BlobAnswer, Failure> {
+    if let Ok(value) = &outcome {
+        match value.get("error").and_then(Value::as_str) {
+            Some("response_too_large") => {
+                let limit = value.get("limit").and_then(Value::as_u64).ok_or_else(|| {
+                    internal("api-request's response_too_large answer carries no limit")
+                })?;
+                return Ok(BlobAnswer::TooLarge {
+                    limit,
+                    bytes: value.get("bytes").and_then(Value::as_u64),
+                });
+            }
+            Some("blob_store_full") => return Ok(BlobAnswer::StoreFull),
+            _ => {}
+        }
+        if let Some(attachment) = value.get("attachment") {
+            let attachment = attachment
+                .as_str()
+                .ok_or_else(|| internal("api-request's answer names no attachment"))?;
+            let status = value
+                .get("status")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| internal("api-request's answer carries no status"))?;
+            if !(200..300).contains(&status) {
+                return Err(internal(format!(
+                    "api-request answered {api}'s HTTP {status} as an attachment"
+                )));
+            }
+            let bytes = value
+                .get("bytes")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| internal("api-request's attachment answer carries no size"))?;
+            return Ok(BlobAnswer::Blob {
+                status,
+                headers: read_headers(value)?,
+                bytes,
+                attachment: attachment.to_string(),
+            });
+        }
+    }
+    Ok(match read_envelope(outcome, target, api)? {
+        Envelope::Relay(value) => BlobAnswer::Relay(value),
+        Envelope::Unreadable(why) => BlobAnswer::Unreadable(why),
+        Envelope::Error { status, body } => BlobAnswer::Error { status, body },
+        Envelope::Success { status, .. } => {
+            return Err(internal(format!(
+                "{api} answered HTTP {status} inline, though its body was asked for as an \
+                 attachment"
+            )));
+        }
+    })
+}
+
 /// The envelope's `headers` object. `api-request` always writes one of
 /// string values, so anything else is a host bug.
 fn read_headers(value: &Value) -> Result<BTreeMap<String, String>, Failure> {
@@ -440,6 +528,111 @@ mod tests {
 
     fn read(outcome: Result<Value, NestedError>) -> Result<Answer, Failure> {
         read_api_result(outcome, &target(), API_NAME)
+    }
+
+    fn read_blob(outcome: Result<Value, NestedError>) -> Result<BlobAnswer, Failure> {
+        read_api_blob(outcome, &target(), API_NAME)
+    }
+
+    #[test]
+    fn a_blob_answer_reads_its_attachment_and_its_headers() {
+        assert_eq!(
+            read_blob(crate::testutil::blob_answer("body", 3_000)),
+            Ok(BlobAnswer::Blob {
+                status: 200,
+                headers: BTreeMap::from([(
+                    "content-type".to_string(),
+                    "application/octet-stream".to_string()
+                )]),
+                bytes: 3_000,
+                attachment: "body".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_two_blob_refusals_are_typed() {
+        assert_eq!(
+            read_blob(crate::testutil::too_large(64 << 20, Some(70 << 20))),
+            Ok(BlobAnswer::TooLarge {
+                limit: 64 << 20,
+                bytes: Some(70 << 20)
+            })
+        );
+        assert_eq!(
+            read_blob(crate::testutil::too_large(64 << 20, None)),
+            Ok(BlobAnswer::TooLarge {
+                limit: 64 << 20,
+                bytes: None
+            })
+        );
+        assert_eq!(
+            read_blob(crate::testutil::store_full()),
+            Ok(BlobAnswer::StoreFull)
+        );
+        assert_eq!(
+            read_blob(Ok(json!({ "error": "response_too_large", "status": 200 }))),
+            Err(internal(
+                "api-request's response_too_large answer carries no limit"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_blob_readers_other_answers_read_as_the_envelope_reads_them() {
+        let relay = json!({
+            "error": "credential_invalid",
+            "provider": "google",
+            "account": null,
+            "detail": "no account is connected for this provider",
+        });
+        assert_eq!(read_blob(Ok(relay.clone())), Ok(BlobAnswer::Relay(relay)));
+        assert_eq!(
+            read_blob(http(404, "{\"error\":\"gone\"}")),
+            Ok(BlobAnswer::Error {
+                status: 404,
+                body: "{\"error\":\"gone\"}".to_string()
+            })
+        );
+        assert!(matches!(
+            read_blob(nested("internal", "timed out")),
+            Ok(BlobAnswer::Unreadable(_))
+        ));
+        assert_eq!(
+            read_blob(nested("denied", "no clause admits it")).unwrap_err(),
+            read(nested("denied", "no clause admits it")).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn a_blob_answer_that_is_inline_or_not_2xx_is_internal() {
+        assert_eq!(
+            read_blob(http(200, "{}")),
+            Err(internal(format!(
+                "{API_NAME} answered HTTP 200 inline, though its body was asked for as an \
+                 attachment"
+            )))
+        );
+        assert_eq!(
+            read_blob(Ok(json!({
+                "status": 404, "headers": {}, "bytes": 3, "attachment": "body",
+            }))),
+            Err(internal(format!(
+                "api-request answered {API_NAME}'s HTTP 404 as an attachment"
+            )))
+        );
+        assert_eq!(
+            read_blob(Ok(
+                json!({ "status": 200, "headers": {}, "attachment": "body" })
+            )),
+            Err(internal("api-request's attachment answer carries no size"))
+        );
+        assert_eq!(
+            read_blob(Ok(
+                json!({ "status": 200, "headers": {}, "bytes": 3, "attachment": 1 })
+            )),
+            Err(internal("api-request's answer names no attachment"))
+        );
     }
 
     #[test]

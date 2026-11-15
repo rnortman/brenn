@@ -480,6 +480,7 @@ pub(super) fn surface_sub_raw(
         noise: None,
         wake_min: None,
         non_text: false,
+        fetch_bytes: None,
     }
 }
 

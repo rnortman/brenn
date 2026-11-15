@@ -38,15 +38,18 @@ pub mod shape;
 pub mod testutils;
 pub mod tool_schema;
 pub mod versioned;
+pub mod written_ranges;
 
 pub use attachment::{
-    AttachmentName, AttachmentNameError, Attachments, BlobId, BlobRef, MAX_ATTACHMENTS_PER_MESSAGE,
+    AttachmentListError, AttachmentName, AttachmentNameError, Attachments, BlobId, BlobRef,
+    MAX_ATTACHMENTS_PER_MESSAGE, check_attachment_list,
 };
 pub use body::{BodyError, GuestBody, MessageBody, check_content_type, is_text_content_type};
 pub use shape::{
     EnvelopeHeader, EnvelopeShape, HeaderShape, ShapedEnvelope, TextShape, serialize_text_shape,
     write_attachment_metadata, write_attachment_refs,
 };
+pub use written_ranges::WrittenRanges;
 
 // ---------------------------------------------------------------------------
 // Address scheme

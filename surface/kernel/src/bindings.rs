@@ -103,6 +103,9 @@ pub struct AppliedBindings {
     store_depths: BTreeMap<String, u64>,
     /// The channels the document declares `non_text`, both classes.
     non_text_channels: BTreeSet<String>,
+    /// Transportable channel → its fetch bound, for the channels whose bound
+    /// is above zero: the gated channels.
+    fetch_bounds: BTreeMap<String, u64>,
     /// Instance id → the port names its component kind declares it may publish
     /// to. Shared rather than copied because every activation of the instance
     /// seeds its buffer with the same set.
@@ -212,9 +215,13 @@ impl AppliedBindings {
         // A transportable channel's declaration is the directory's, carried in
         // the wire table; the document's validation has proved the table names
         // exactly the transportable channels the bindings do.
+        let mut fetch_bounds = BTreeMap::new();
         for wc in &doc.wire_channels {
             if wc.non_text {
                 non_text_channels.insert(wc.channel.clone());
+            }
+            if wc.fetch_bytes > 0 {
+                fetch_bounds.insert(wc.channel.clone(), wc.fetch_bytes);
             }
         }
 
@@ -269,6 +276,7 @@ impl AppliedBindings {
             wire_depths,
             store_depths,
             non_text_channels,
+            fetch_bounds,
             declared_out_ports,
             calls,
             grants,
@@ -352,6 +360,19 @@ impl AppliedBindings {
     /// channel, declared or not.
     pub fn carries_non_text(&self, channel: &str) -> bool {
         self.non_text_channels.contains(channel)
+    }
+
+    /// The largest attachment, in bytes, the page fetches on `channel` before
+    /// a delivered message enters its store. `0` — the channel is not gated —
+    /// for a page-local channel, a transportable one no binding fetches on, and
+    /// a channel the document does not declare.
+    pub fn fetch_bound(&self, channel: &str) -> u64 {
+        self.fetch_bounds.get(channel).copied().unwrap_or(0)
+    }
+
+    /// Every channel whose fetch bound is above zero, in address order.
+    pub fn gated_channels(&self) -> impl Iterator<Item = &str> {
+        self.fetch_bounds.keys().map(String::as_str)
     }
 
     /// The output binding `instance` publishes on through `port`, or `None` for

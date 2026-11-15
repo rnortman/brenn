@@ -1,0 +1,15 @@
+/// The page host's `blobs` fixture, built on the guest SDK. Every new text
+/// message on `in` is a script of read commands, separated by newlines or
+/// `;`, run against the attachments of the messages in the activation's
+/// windows. For each new message on `feed` it reads every attachment whole.
+/// A sync call on `ask` runs the request's text as a script and answers the
+/// result words, one per line, as `text/plain`. Every activation publishes one
+/// untyped JSON report on `report`.
+component ProcessorPageBlobsTest {
+  abi = processor;
+  requires = [ports, log, blobs];
+  in in;
+  in feed;
+  sync ask;
+  out report;
+}

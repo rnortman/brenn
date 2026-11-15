@@ -1576,6 +1576,7 @@ mod tests {
                     |address| brenn_lib::messaging::config::ResolvedWireChannel {
                         address: address.to_string(),
                         non_text: false,
+                        fetch_bytes: 0,
                     },
                 )
                 .collect(),
@@ -2150,6 +2151,8 @@ mod tests {
 
     const BYTES_ARTIFACT: &str = "brenn_processor_bytes_test";
     const STALE_ARTIFACT: &str = "brenn_processor_stale_contract_test";
+    const BLOBS_ARTIFACT: &str = "brenn_processor_blobs_test";
+    const PAGE_BLOBS_ARTIFACT: &str = "brenn_processor_page_blobs_test";
 
     #[test]
     fn a_byte_contract_kind_is_served_with_its_contract() {
@@ -2251,6 +2254,32 @@ mod tests {
         processor_assets::read_processor_record_in(AssetContext::BOOT, dir.path(), "frames");
     }
 
+    /// The backend blobs fixture imports `create`, `writer` and `publish`,
+    /// which a surface serves: under a bundle's mount, placed with the grants
+    /// it imports, it is served like any other kind.
+    #[test]
+    fn a_kind_importing_the_producing_blobs_members_is_served() {
+        let brenn = tempfile::tempdir().expect("tempdir");
+        let bundle = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(brenn.path());
+        write_real_kind(bundle.path(), "maker", BLOBS_ARTIFACT);
+        let mut surface = resolved_with_processor("deskbar", "maker");
+        surface.components[0].grants = [
+            brenn_lib::messaging::ComponentGrant::Ports,
+            brenn_lib::messaging::ComponentGrant::Log,
+            brenn_lib::messaging::ComponentGrant::Blobs,
+        ]
+        .into();
+
+        let roots = validate_surface_assets(
+            &mount_roots(&[("brenn", brenn.path()), ("maker-bundle", bundle.path())]),
+            &[surface],
+        );
+
+        assert_eq!(roots.withheld_kind("maker"), None);
+        assert_eq!(roots.kind_root("maker"), Some(bundle.path()));
+    }
+
     /// The page-local channel the contract cases bind.
     const STATE: &str = "local:deskbar/state";
 
@@ -2323,6 +2352,7 @@ mod tests {
             surface.wire_channels = vec![brenn_lib::messaging::config::ResolvedWireChannel {
                 address: channel.to_string(),
                 non_text,
+                fetch_bytes: 0,
             }];
         }
         surface
@@ -2888,15 +2918,15 @@ mod tests {
     /// a 0.1.0 one.
     #[test]
     #[should_panic(
-        expected = "imports \"brenn:processor/blobs\", which no surface can satisfy — it is backend-only"
+        expected = "imports \"brenn:processor/tools\", which no surface can satisfy — it is backend-only"
     )]
-    fn validate_surface_assets_panics_on_backend_only_blobs_import() {
+    fn validate_surface_assets_panics_on_backend_only_import_of_a_0_2_kind() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_kernel_pair(dir.path());
-        write_processor_tree(dir.path(), "blobs-rt", &["bus", "ports", "blobs"], |_| {});
+        write_processor_tree(dir.path(), "tools-rt", &["bus", "ports", "tools"], |_| {});
         validate_one_root(
             dir.path(),
-            &[resolved_with_processor("deskbar", "blobs-rt")],
+            &[resolved_with_processor("deskbar", "tools-rt")],
         );
     }
 
@@ -3023,6 +3053,25 @@ mod tests {
         sibling.instance = "noisy-2".to_string();
         sibling.grants = [brenn_lib::messaging::ComponentGrant::Ports].into();
         surface.components.push(sibling);
+        validate_one_root(dir.path(), &[surface]);
+    }
+
+    /// The page's read-side fixture imports `ports`, `log` and the members of
+    /// `blobs` a surface serves, so it passes the record read and every stage
+    /// of the surface check; an instance granted all of it but `blobs` is
+    /// then refused at boot for that grant.
+    #[test]
+    #[should_panic(expected = "\"blobs\" is not in the component's grants")]
+    fn validate_surface_assets_panics_on_an_ungranted_blobs_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_kernel_pair(dir.path());
+        write_real_kind(dir.path(), "reader", PAGE_BLOBS_ARTIFACT);
+        let mut surface = resolved_with_processor("deskbar", "reader");
+        surface.components[0].grants = [
+            brenn_lib::messaging::ComponentGrant::Ports,
+            brenn_lib::messaging::ComponentGrant::Log,
+        ]
+        .into();
         validate_one_root(dir.path(), &[surface]);
     }
 

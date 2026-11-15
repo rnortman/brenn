@@ -552,6 +552,146 @@ async fn frames_no_conforming_client_sends_are_violations() {
     assert!(detail.contains("may not upload"), "{detail}");
 }
 
+/// **On a door without upload, `BlobWrite` and `BlobSeal` are violations**,
+/// where on a door with upload the same frames naming no handle are a dropped
+/// write and an `UnknownHandle` answer: no create precedes them, so they are
+/// pipelined behind nothing.
+#[tokio::test]
+async fn upload_frames_on_a_door_without_upload_are_violations() {
+    let mut readonly = rig_with(profile(false), 6, Some(TEST_BLOB_LIMITS)).await;
+    let detail = violated(readonly.write(1, 0, b"x").await);
+    assert!(
+        detail.contains("BlobWrite on an attachment that may not upload"),
+        "{detail}"
+    );
+    let mut readonly = rig_with(profile(false), 6, Some(TEST_BLOB_LIMITS)).await;
+    let detail = violated(readonly.seal(1).await);
+    assert!(
+        detail.contains("BlobSeal on an attachment that may not upload"),
+        "{detail}"
+    );
+
+    let mut uploading = rig().await;
+    continued(uploading.write(1, 0, b"x").await);
+    assert_eq!(uploading.counters.blobs.writes_dropped, 1);
+    assert_eq!(
+        uploading.seal_answer(1).await,
+        BlobSealOutcome::UnknownHandle
+    );
+}
+
+/// [`profile`] with the attach rule stated: the bare identity may attach on
+/// nothing.
+fn profile_attaching_nowhere() -> TestProfile {
+    TestProfile {
+        attachable: Some(HashMap::from([(None, HashSet::new())])),
+        ..profile(true)
+    }
+}
+
+/// **An attachment where the profile does not let the attribution attach is a
+/// violation; a plain publish there is not.** The publish ACL still admits
+/// the channel, so the plain message is applied, while the same message
+/// naming a held blob ends the session, as a `Publish` and as a batch entry.
+#[tokio::test]
+async fn an_attachment_the_profile_does_not_let_attach_is_a_violation() {
+    let mut rig = rig_with(profile_attaching_nowhere(), 6, Some(TEST_BLOB_LIMITS)).await;
+    rig.upload(1, b"one").await;
+    assert_eq!(
+        rig.publish(&[]).await,
+        PublishOutcome::Ok,
+        "a plain publish"
+    );
+
+    let body = MessageBody::from("frame");
+    let mut bucket = TokenBucket::new(64, std::time::Duration::from_secs(1), 64);
+    let request = PublishRequest {
+        channel: CAM,
+        attribution: None,
+        body: &body,
+        urgency: Urgency::Normal,
+        correlation: Some(1),
+        attachments: &[attach("f", 1)],
+        blobs: &rig.table,
+    };
+    let detail = violated(handle_publish(&rig.ctx, &mut bucket, request, &mut rig.counters).await);
+    assert!(
+        detail.contains("Publish names attachments on channel ephemeral:cam under an attribution"),
+        "{detail}"
+    );
+
+    let entries =
+        [BatchEntry::new(CAM, body.clone(), Urgency::Normal).attachments(vec![attach("f", 1)])];
+    let request = PublishBatchRequest {
+        attribution: None,
+        correlation: 2,
+        publishes: &entries,
+        deferred_ops: &[],
+        blobs: &rig.table,
+    };
+    let detail = violated(handle_publish_batch(&rig.ctx, request, &mut rig.counters).await);
+    assert!(
+        detail.contains("PublishBatch entry names attachments on channel ephemeral:cam"),
+        "{detail}"
+    );
+
+    // A plain batch entry is not asked the rule.
+    let entries = [BatchEntry::new(CAM, body, Urgency::Normal)];
+    let request = PublishBatchRequest {
+        attribution: None,
+        correlation: 3,
+        publishes: &entries,
+        deferred_ops: &[],
+        blobs: &rig.table,
+    };
+    continued(handle_publish_batch(&rig.ctx, request, &mut rig.counters).await);
+    match rig.answer() {
+        ServerFrame::PublishBatchResult { outcome, .. } => {
+            assert_eq!(outcome, PublishBatchOutcome::Ok)
+        }
+        other => panic!("expected PublishBatchResult, got {other:?}"),
+    }
+}
+
+/// **One handle under two names in one entry is applied**: the message names
+/// one blob twice, and the session's table holds it once.
+#[tokio::test]
+async fn a_batch_entry_naming_one_handle_under_two_names_is_applied() {
+    let mut rig = rig().await;
+    rig.upload(1, b"one").await;
+    let entries = [
+        BatchEntry::new(CAM, MessageBody::from("twice"), Urgency::Normal)
+            .attachments(vec![attach("a", 1), attach("b", 1)]),
+    ];
+    let request = PublishBatchRequest {
+        attribution: None,
+        correlation: 1,
+        publishes: &entries,
+        deferred_ops: &[],
+        blobs: &rig.table,
+    };
+    continued(handle_publish_batch(&rig.ctx, request, &mut rig.counters).await);
+    match rig.answer() {
+        ServerFrame::PublishBatchResult { outcome, .. } => {
+            assert_eq!(outcome, PublishBatchOutcome::Ok)
+        }
+        other => panic!("expected PublishBatchResult, got {other:?}"),
+    }
+    let rows = rig
+        .messenger
+        .store_for_address(CAM)
+        .replay_from(None, Depth::Bounded(4))
+        .await
+        .messages;
+    let [row] = rows.as_slice() else {
+        panic!("one message, got {rows:?}");
+    };
+    let a = row.message.attachments.get(&name("a")).expect("a");
+    let b = row.message.attachments.get(&name("b")).expect("b");
+    assert_eq!(a.id, b.id, "one blob under two names");
+    assert_eq!(rig.store().usage().sealed, 1);
+}
+
 #[tokio::test]
 async fn an_open_reads_an_attachment_and_refuses_by_type() {
     let mut rig = rig().await;

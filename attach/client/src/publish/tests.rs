@@ -203,6 +203,41 @@ fn a_flush_on_a_free_wire_goes_straight_out() {
 }
 
 #[test]
+fn an_outbox_is_idle_only_with_nothing_parked_and_nothing_unanswered() {
+    let mut outboxes = Outboxes::new();
+    assert!(
+        !outboxes.is_idle(&alpha()),
+        "an unregistered key is not idle"
+    );
+    outboxes.register(alpha(), Some(alpha()), 4);
+    assert!(outboxes.is_idle(&alpha()));
+    // Detached, a flush parks.
+    outboxes.flush(&alpha(), batch(&["one"]), now());
+    assert!(!outboxes.is_idle(&alpha()), "parked");
+    let steps = outboxes.on_attached(v4(), BODY_CAP, now(), |_, _| true);
+    assert!(!outboxes.is_idle(&alpha()), "in flight, unanswered");
+    let first = correlation_of(&steps.frames[0]);
+    let answer = outboxes
+        .on_batch_result(first, PublishBatchOutcome::RateLimited, now())
+        .unwrap();
+    assert!(answer.steps.frames.is_empty());
+    assert!(!outboxes.is_idle(&alpha()), "re-parked after a refusal");
+    let steps = outboxes.on_retry_tick(now());
+    let second = correlation_of(&steps.frames[0]);
+    outboxes
+        .on_batch_result(second, PublishBatchOutcome::Ok, now())
+        .unwrap();
+    assert!(outboxes.is_idle(&alpha()), "answered");
+    outboxes.flush(&alpha(), batch(&["two"]), now());
+    assert!(!outboxes.is_idle(&alpha()), "in flight again");
+    outboxes.on_detached();
+    assert!(
+        outboxes.is_idle(&alpha()),
+        "the detach forgets the flush in flight"
+    );
+}
+
+#[test]
 fn a_frame_carries_the_registrations_attribution_and_both_lists() {
     let mut outboxes = attached(4);
     let flush = FlushBatch {

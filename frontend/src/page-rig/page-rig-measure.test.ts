@@ -23,7 +23,7 @@
 // another.
 
 import { afterAll, describe, expect, it } from "vitest";
-import { type Page, type Report, bytesReport, only, openPage } from "./page.js";
+import { type Page, type Report, bytesReport, only, openPage, windowsOf } from "./page.js";
 import { expectedState, fnv1a64, generatedState } from "./state.js";
 
 /** Raw state sizes, with the iterations timed and the untimed warm-up at each. */
@@ -167,7 +167,7 @@ describe("page rig: the state workload on a page-local io port, on each contract
                 for (let i = 0; i < warm + n; i++) {
                     const [elapsed, report] = await timed(rig(), stater, "noop");
                     expect(report.results).toEqual(["ok"]);
-                    expect(report.windows).toEqual([]);
+                    expect(windowsOf(report)).toEqual([]);
                     if (i >= warm) {
                         noopSamples.push(elapsed);
                     }

@@ -280,6 +280,66 @@ async fn the_first_provider_registers_api_request() {
     );
 }
 
+/// The `api-request` a reload registers finds boot's blob store: a call asking
+/// for an attachment answer passes the store check and meets the next one, the
+/// read-only rule for a caller with no acting user, without sending anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reloaded_api_request_writes_into_boots_blob_store() {
+    let tree = Tree::new();
+    let maps = key_file(tree.secret_path("maps"), "k3y-maps");
+    tree.write(&document(""));
+    let mut booted = boot_with(
+        &tree,
+        BootFixture {
+            native_tools: vec![async_pull_tool()],
+            ..BootFixture::default()
+        },
+    )
+    .await;
+    tree.write(&document(&deployment("maps", &maps)));
+    assert_applied(&reload(&mut booted).await);
+    let env = booted.driver.env();
+    let attached = env
+        .api_request_blobs
+        .get()
+        .expect("boot attaches the store to the slot");
+    let messaging = booted
+        .messenger
+        .blob_store()
+        .expect("the rig installs a store");
+    assert!(std::sync::Arc::ptr_eq(attached, messaging));
+    let host = env.api_keys.load()["maps"].api_origins[0].0.clone();
+    let Some(brenn_tool_registry::RegisteredTool::Async(tool)) =
+        env.tool_registry.load().get("api-request").cloned()
+    else {
+        panic!("the reload registers the native api-request");
+    };
+    let ctx = brenn_tool_registry::ToolCtx {
+        caller: brenn_lib::messaging::ParticipantId::for_app("pa", "test-origin"),
+        grant: brenn_lib::tools::ResolvedToolGrant {
+            acl: Vec::new(),
+            rate_limit: None,
+        },
+        acting_conversation_id: None,
+        acting_user: None,
+        deadline: None,
+        caller_opens_blobs: true,
+    };
+    let args = serde_json::json!({
+        "provider": "maps", "method": "POST", "host": host, "path": "/v1/x",
+        "response_attachment": "body",
+    });
+    let out = tool
+        .execute(&ctx, args, brenn_tool_registry::HeldAttachments::none())
+        .await;
+    match out {
+        Err(brenn_tool_registry::ToolError::Denied(detail)) => {
+            assert!(detail.contains("may only read"), "{detail}")
+        }
+        other => panic!("expected the read-only refusal, got {other:?}"),
+    }
+}
+
 /// A process that started with no asynchronous tool runs no tool executor, so
 /// a first provider, which would register its first, is refused naming a
 /// restart and the table stays empty.

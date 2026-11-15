@@ -90,7 +90,8 @@ fn document_carries_every_resolved_section() {
 }
 
 /// The wire table is copied from the resolved surface, entry for entry and in
-/// its order, declaration included; a page-local channel is not in it.
+/// its order, declaration and fetch bound included; a page-local channel is not
+/// in it.
 #[test]
 fn document_carries_the_wire_channel_table() {
     let mut surface = bar();
@@ -106,6 +107,7 @@ fn document_carries_the_wire_channel_table() {
         .push(brenn_lib::messaging::config::ResolvedWireChannel {
             address: "ephemeral:bar-frames".to_string(),
             non_text: true,
+            fetch_bytes: 4096,
         });
     let doc = build_bindings_document(&surface, &params());
     assert_eq!(
@@ -114,17 +116,19 @@ fn document_carries_the_wire_channel_table() {
             WireChannel {
                 channel: "brenn:bar-a".to_string(),
                 non_text: false,
+                fetch_bytes: 0,
             },
             WireChannel {
                 channel: "ephemeral:bar-frames".to_string(),
                 non_text: true,
+                fetch_bytes: 4096,
             },
         ]
     );
     assert!(doc.validate().is_ok(), "the builder writes valid documents");
     let body = doc.to_body();
     assert!(
-        body.contains(r#"{"channel":"ephemeral:bar-frames","non_text":true}"#),
+        body.contains(r#"{"channel":"ephemeral:bar-frames","non_text":true,"fetch_bytes":4096}"#),
         "{body}"
     );
 }

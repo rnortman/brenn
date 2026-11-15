@@ -139,6 +139,7 @@ pub fn build_bindings_document(
             .map(|c| WireChannel {
                 channel: c.address.clone(),
                 non_text: c.non_text,
+                fetch_bytes: c.fetch_bytes,
             })
             .collect(),
         chrome_instance: resolved

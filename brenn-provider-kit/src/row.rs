@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::activation::INFLIGHT_TTL_MS;
+use crate::blob::Attached;
 use crate::call::{Call, Failure, Target, internal};
 
 /// A provided-tool enum as the spec scaffold generates it: each tool has a
@@ -41,6 +42,10 @@ pub struct InFlight<T: Tool> {
     /// The nested call outstanding.
     pub target: Target,
     pub issued_at_ms: u64,
+    /// The attachments the request carries; left off a row when it carries
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attached>,
 }
 
 impl<T: Tool> InFlight<T> {
@@ -62,6 +67,15 @@ impl<T: Tool> InFlight<T> {
             derived,
             target: call.api.target(),
             issued_at_ms: now_ms,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// This row with the request's `attachments`.
+    pub fn with_attachments(self, attachments: Vec<Attached>) -> InFlight<T> {
+        InFlight {
+            attachments,
+            ..self
         }
     }
 
@@ -77,6 +91,7 @@ impl<T: Tool> InFlight<T> {
             self.received_at_ms,
             now_ms,
         )
+        .with_attachments(self.attachments.clone())
     }
 
     pub fn call_id(&self) -> String {
@@ -199,6 +214,7 @@ mod tests {
                 query: Query::new(),
                 headers: BTreeMap::new(),
                 body: None,
+                response_attachment: None,
             },
         }
     }
@@ -247,6 +263,35 @@ mod tests {
                  \"path\":\"/v1/items/one\"}},\"issued_at_ms\":1000}}",
                 "a".repeat(32)
             )
+        );
+    }
+
+    #[test]
+    fn a_rows_attachments_ride_last_and_only_when_it_has_some() {
+        let file = Attached {
+            name: "file".to_string(),
+            size: 5,
+            content_type: "text/plain".to_string(),
+        };
+        let state = state(json!({ "q": "x" })).with_attachments(vec![file.clone()]);
+        let text = String::from_utf8(state.encode()).unwrap();
+        assert!(
+            text.ends_with(
+                ",\"issued_at_ms\":1000,\"attachments\":[{\"name\":\"file\",\"size\":5,\
+                 \"content_type\":\"text/plain\"}]}"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            InFlight::<Fixture>::decode(&state.encode()),
+            Ok(state.clone())
+        );
+        let next = state.next(&call(2, "/v1/items/two"), Map::new(), 2_000);
+        assert_eq!(next.attachments, [file]);
+        assert!(
+            !String::from_utf8(state.with_attachments(Vec::new()).encode())
+                .unwrap()
+                .contains("attachments")
         );
     }
 

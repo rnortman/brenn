@@ -260,11 +260,21 @@ impl Logic for Maps {
     type Tool = Provided;
     type Settings = Settings;
 
-    fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
+    fn plan(
+        tool: Provided,
+        args: &Value,
+        _: &brenn_provider_kit::Step<'_>,
+        settings: &Settings,
+    ) -> Result<Call, String> {
         plan(tool, args, settings)
     }
 
-    fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
+    fn advance(
+        state: &InFlight,
+        outcome: Result<Value, NestedError>,
+        _: &mut brenn_provider_kit::Step<'_>,
+        settings: &Settings,
+    ) -> Next {
         advance(state, outcome, settings)
     }
 }
@@ -554,6 +564,7 @@ fn weather_call(args: &WeatherArgs, lat: f64, lng: f64, settings: &Settings) -> 
         query: params,
         headers: BTreeMap::new(),
         body: None,
+        response_attachment: None,
     }
 }
 
@@ -613,6 +624,7 @@ fn geocode_call(place: &Where, settings: &Settings) -> ApiCall {
             GEOCODE_FIELD_MASK.to_string(),
         )]),
         body: None,
+        response_attachment: None,
     }
 }
 
@@ -857,6 +869,7 @@ fn compute_routes_call(
         query: Query::new(),
         headers: BTreeMap::from([("X-Goog-FieldMask".to_string(), mask.to_string())]),
         body: Some(Body::Text(Value::Object(body).to_string())),
+        response_attachment: None,
     }
 }
 
@@ -917,6 +930,7 @@ fn place_details_call(args: &PlaceDetailsArgs, settings: &Settings) -> ApiCall {
         query: params,
         headers: BTreeMap::from([("X-Goog-FieldMask".to_string(), mask)]),
         body: None,
+        response_attachment: None,
     }
 }
 
@@ -1000,6 +1014,7 @@ fn search_text_call(
             PLACES_SEARCH_FIELD_MASK.to_string(),
         )]),
         body: Some(Body::Text(Value::Object(body).to_string())),
+        response_attachment: None,
     }
 }
 

@@ -13,6 +13,7 @@ use brenn_envelope::grants::{ComponentGrant, ProcessorContract};
 
 use crate::PublishStatus;
 use crate::outbound::truncate_report_field;
+use crate::outward::lost_flush_sentence;
 use crate::schema::bindings::BindingsDocument;
 use crate::schema::telemetry::{InstanceReport, MAX_INSTANCE_REASON_BYTES};
 use crate::schema::{
@@ -21,6 +22,7 @@ use crate::schema::{
     SurfaceStateInstance,
 };
 use crate::session::Event;
+use crate::uploads::LossKind;
 use crate::{contract, schema};
 
 /// Derive the surface's whole connect URL from the page's `location` and its
@@ -727,7 +729,9 @@ pub struct KernelCore {
     /// Instance → the last activation-failure text reported at
     /// [`LogLevel::Error`] for it. A repeat of the same text is reported at
     /// [`LogLevel::Debug`] instead, so a component failing every delivery does
-    /// not fill the error channel with copies of one fact.
+    /// not fill the error channel with copies of one fact. Recorded only while
+    /// [`Self::reports_deliverable`], so a failure reported while detached
+    /// does not demote the first one the error channel could receive.
     ///
     /// Entries are never removed: the key set is bounded by the surface's own
     /// configuration, and a terminal instance receives no further activations,
@@ -736,6 +740,12 @@ pub struct KernelCore {
     /// `Debug` whenever the text matches
     /// (`TODO(kernel-registration-gate-lifecycle)`).
     activation_error_memo: BTreeMap<String, String>,
+    /// Every `(instance, kind of reason)` a lost attachment flush has been
+    /// reported for at [`LogLevel::Warn`] while [`Self::reports_deliverable`].
+    /// A repeat of the kind, whatever numbers its refusal carries, is reported
+    /// at [`LogLevel::Debug`].
+    /// Bounded by the surface's instances times the finite set of kinds.
+    flush_loss_memo: Vec<(String, LossKind)>,
 }
 
 impl KernelCore {
@@ -754,6 +764,7 @@ impl KernelCore {
             connect_indicator_active: true,
             processors_started: false,
             activation_error_memo: BTreeMap::new(),
+            flush_loss_memo: Vec::new(),
         }
     }
 
@@ -1065,6 +1076,24 @@ impl KernelCore {
         }
     }
 
+    /// Whether `instance` may open an attachment, and the refusal to report if
+    /// it may not.
+    ///
+    /// The runtime half of the boot gate that refuses a kind importing `blobs`
+    /// without the word in its grants, as [`component_calls_gate`] is for
+    /// `calls`. An ungranted instance's blob scope is empty as well, so the
+    /// refusal is `not-permitted` either way; this is what writes the
+    /// breadcrumb.
+    ///
+    /// [`component_calls_gate`]: Self::component_calls_gate
+    pub fn component_blobs_gate(&self, instance: &str, what: &str) -> Result<(), KernelAction> {
+        if self.instance_granted(instance, ComponentGrant::Blobs) {
+            Ok(())
+        } else {
+            Err(ungranted_capability(instance, ComponentGrant::Blobs, what))
+        }
+    }
+
     /// Whether `instance` has registered an activation entry. The gate's state,
     /// readable so a caller can assert on it.
     #[cfg(test)]
@@ -1279,7 +1308,7 @@ impl KernelCore {
                     MAX_LOG_MESSAGE_BYTES,
                 );
                 let repeat = self.activation_error_memo.get(instance) == Some(&message);
-                if !repeat {
+                if !repeat && self.reports_deliverable() {
                     self.activation_error_memo
                         .insert(instance.clone(), message.clone());
                 }
@@ -1387,6 +1416,33 @@ impl KernelCore {
                 message: format!("refused {instance}/{port} publish to {channel}: {reason}"),
                 subject: Some(instance.clone()),
             }],
+            // The first loss of each kind per instance reported while the
+            // error channel can take it goes out at warn and says that repeats
+            // are demoted; the rest are debug. A loss while the page is not
+            // connected is at warn on the console and spends nothing. The
+            // toast already went out with the event.
+            Event::FlushLost(lost) => {
+                let key = (lost.instance.clone(), lost.reason.kind());
+                let repeat = self.flush_loss_memo.contains(&key);
+                let first = !repeat && self.reports_deliverable();
+                if first {
+                    self.flush_loss_memo.push(key);
+                }
+                let sentence = lost_flush_sentence(lost);
+                vec![KernelAction::Report {
+                    level: if repeat {
+                        LogLevel::Debug
+                    } else {
+                        LogLevel::Warn
+                    },
+                    message: if first {
+                        format!("{sentence} (later losses of this kind are logged at debug)")
+                    } else {
+                        sentence
+                    },
+                    subject: Some(lost.instance.clone()),
+                }]
+            }
             Event::StragglerDiscarded {
                 channel,
                 seq,
@@ -1667,6 +1723,13 @@ impl KernelCore {
             reason: reason.to_string(),
         });
         actions
+    }
+
+    /// Whether a report composed now can reach the error channel: the page is
+    /// connected, with a document in force. A report composed otherwise is
+    /// console-only, so it does not spend a memo that demotes the next one.
+    fn reports_deliverable(&self) -> bool {
+        self.link_state == LinkState::Connected
     }
 
     /// Publish a link-state transition on `local:brenn/link-state`, suppressing a
@@ -3041,6 +3104,28 @@ mod tests {
         );
     }
 
+    /// A failure reported while the page is not connected is console-only, so
+    /// it does not demote the same failure once the error channel can take it.
+    #[test]
+    fn an_activation_failure_while_detached_does_not_demote_the_next_one_attached() {
+        let entry = || vec![granted_entry("panel-a", "panel", &[ComponentGrant::Dom])];
+        let mut core = KernelCore::new();
+        core.on_event(&connected_event(entry()));
+        core.on_event(&Event::Disconnected {
+            reason: DetachReason::LivenessTimeout,
+        });
+        let failure = Event::ActivationFailed {
+            instance: "panel-a".to_string(),
+            message: "TypeError: expected a string".to_string(),
+        };
+        assert_eq!(levels(&core.on_event(&failure)), vec![LogLevel::Error]);
+        assert_eq!(levels(&core.on_event(&failure)), vec![LogLevel::Error]);
+
+        core.on_event(&connected_event(entry()));
+        assert_eq!(levels(&core.on_event(&failure)), vec![LogLevel::Error]);
+        assert_eq!(levels(&core.on_event(&failure)), vec![LogLevel::Debug]);
+    }
+
     /// The levels of every `Report` in an action vector, in order.
     fn levels(actions: &[KernelAction]) -> Vec<LogLevel> {
         actions
@@ -3570,6 +3655,36 @@ mod tests {
             assert_eq!(subject.as_deref(), Some(instance));
             assert!(message.contains("calls.call"), "{message}");
             assert!(message.contains("calls capability"), "{message}");
+        }
+    }
+
+    /// `blobs` is its own grant: the ports grant every in-tree instance holds
+    /// opens no attachment.
+    #[test]
+    fn the_blobs_gate_admits_only_the_blobs_grant() {
+        let granted = connect(
+            vec![granted_entry("p1", "protobar", &[ComponentGrant::Blobs])],
+            true,
+        );
+        assert_eq!(granted.component_blobs_gate("p1", "blobs.open"), Ok(()));
+
+        let ports_only = connect(
+            vec![granted_entry("p1", "protobar", &[ComponentGrant::Ports])],
+            true,
+        );
+        for instance in ["p1", "ghost"] {
+            let Err(KernelAction::Report {
+                level,
+                message,
+                subject,
+            }) = ports_only.component_blobs_gate(instance, "blobs.open")
+            else {
+                panic!("a blobs-less instance ({instance}) was admitted");
+            };
+            assert_eq!(level, LogLevel::Warn);
+            assert_eq!(subject.as_deref(), Some(instance));
+            assert!(message.contains("blobs.open"), "{message}");
+            assert!(message.contains("blobs capability"), "{message}");
         }
     }
 

@@ -562,6 +562,7 @@ fn waiter_ctx(deadline: Duration) -> ToolCtx {
         acting_conversation_id: None,
         acting_user: None,
         deadline: Some(tokio::time::Instant::now() + deadline),
+        caller_opens_blobs: true,
     }
 }
 

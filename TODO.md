@@ -131,6 +131,28 @@ an operator action removes a named key profile's `exhausted` flag from
 and `docs/claude-accounts.md` describes the action. The
 `TODO(claude-key-flag-operator-clear)` comment sits in
 `AccountLedger::turn`, where a successful turn removes the flag.
+
+## `correctness-page-blob-table-last-origin-wins`
+
+The surface page's blob table (`surface/kernel/src/page_blobs.rs`)
+records a backend reference committed to a page-local message under the
+backend blob id, and a later commit of the same id from another place of
+delivery replaces the origin. That happens even when the route then
+refuses the second message, because the commit precedes the route. When
+one backend blob reaches the page on two wire channels and both are
+republished page-locally, every page-local message naming that id
+resolves to the newest origin. A `read` then answers `unavailable` while
+the page still caches the bytes under the older origin, and a forward to
+the wire is lost `NotRetained` when opening the older origin would have
+worked. Needs a design, because the replacement is the stated rule today
+and each fix changes what `open` on a page-local port looks up: keep every
+origin per id and try them in turn in `read` and in the stage's open, or
+key the table by the page-local message's own channel, message id and
+name so each message keeps the origin it was committed with. Done = a
+page-local attachment resolves through an origin that delivered it while
+any such origin still holds the bytes, with a test of two origins with
+different windows, and the `TODO(correctness-page-blob-table-last-origin-wins)`
+comment in `PageBlobs::commit` is gone.
 ## `surface-small-row-delivery-latency`
 
 In the Chromium timing run (`make e2e-measure`, `docs/page-rig-timings.md`,
@@ -210,12 +232,27 @@ when that test refuses it by type at load. Code site
 (`TODO(stale-contract-import-side-fixture)`): `brenn-wasm/src/lib.rs`, the
 `instantiate_pre` step of `ProcessorComponent::load`.
 
+## `surface-blob-partial-read-over-bound`
+
+A surface page fetches an attachment whole or not at all, within the page's
+bound; a component on a surface cannot read a range of an attachment larger
+than that bound, where a backend component can. The owner's requirement is
+read by byte range "so you only access the parts you care about". Serving it
+needs a way for a message a reader has already seen to wake it when bytes
+arrive — a new activation cause — since an activation on a page cannot wait for
+the network. Done = a surface component reads a stated range of an attachment
+larger than the page's bound, with the answer for bytes not yet on the page
+typed and documented, and a test in the page rig. Code site
+(`TODO(surface-blob-partial-read-over-bound)`): `Fetch::on_rows` in
+`surface/kernel/src/fetch.rs`, where an attachment over the channel's fetch
+bound is left out of a row's eligible attachments.
+
 ## `surface-check-untyped-imports`
 
 `brenn_wasm::check_surface_component` type-checks a 0.2.0 surface kind's
-`ports@0.2.0` and `calls@0.2.0` imports (and through them every `bus@0.2.0`
-type they use) and its `receive` export, under any import name the check
-accepts. The functions of every other interface a surface host serves —
+`ports@0.2.0`, `calls@0.2.0` and `blobs@0.3.0` imports (and through them
+every `bus@0.2.0` type they use) and its `receive` export, under any import
+name the check accepts. The functions of every other interface a surface host serves —
 `log`, `alert`, `config`, `dom` and `page-dom`, all at `@0.1.0` — are
 stubbed untyped by the check's stub pass, which accepts any type. The jco
 glue on the page checks nothing against the host, so a kind bound by hand
@@ -252,7 +289,7 @@ that carries types only, `bus@0.2.0` or `types@0.1.0`, is held where a
 function or `receive` uses its types; a type nothing uses crosses no
 boundary and no host compares it); tests pin that refusal with two fixtures
 whose only fault is the type of a function imported from an interface
-outside `ports@0.2.0` and `calls@0.2.0`, one under the served name and one
+outside `ports@0.2.0`, `calls@0.2.0` and `blobs@0.3.0`, one under the served name and one
 under a semver-compatible alias of it; the `CHANGELOG.md` entry for
 component authors in the release that carries the change says which
 artifacts are now refused; and `docs/component-packages.md`, *Contract
@@ -264,22 +301,34 @@ check then type-checks. Code site (`TODO(surface-check-untyped-imports)`):
 
 ## `byte-body-ceiling-per-activation`
 
-Owner ruling wanted: one activation's publishes are capped at 4 MiB in total
-by the constant `MAX_PUBLISH_BYTES_PER_ACTIVATION`
-(`brenn-budget/src/lib.rs`), and nothing else bounds a non-transportable
-channel's body by size, so under the byte-carrying contract
-`brenn:processor@0.2.0` the binary state a component can hold in one message
-on an `io` port tops out at 4 MiB raw (about 3,000,000 B today as base64), on
-the backend and on the surface. The binary-bus project's spec asks for
-"storing large state in binary" on a surface `io` port and routes large
-objects to blobs; nobody has ruled where one ends and the other begins.
-Options: (a) leave the constant — state above 4 MiB is a blob's job and waits
-for the blob slices; costs nothing now; (b) raise the constant — a larger
-host-memory backstop for every component on both hosts; (c) make it a
-per-channel or operator setting — new configuration surface, and the
-constant's own doc treats it as a fixed backstop. Under (b) or (c) the change
-belongs with the surface host's byte path. Code site
-(`TODO(byte-body-ceiling-per-activation)`): the constant.
+Owner ruling wanted: how large one message of binary state on a component's
+`io` port may be. The binary-bus project's main use case, in the owner's words,
+is 'a surface component can have an `io` port for storing large state in
+binary without having to base64 it and stuff it in json', and that state is a
+byte body, not a blob: 'Obviously the state cannot be zero-copy or a blob; WASM
+is going to force a copy in and out there.' Two ceilings bound it. One
+message's body is capped at `[messaging] max_body_bytes`, 65,536 bytes by
+default: one operator setting for the whole bus, applied to every channel on
+both hosts, a surface's page-local channels included, with no upper bound
+checked, and the attach frame caps and every ring's worst-case weight follow
+it. One activation's publishes are capped at 4 MiB in total by the constant
+`MAX_PUBLISH_BYTES_PER_ACTIVATION` (`brenn-budget/src/lib.rs`). So at default
+configuration binary state in one message tops out at 64 KiB, and under any
+setting at 4 MiB. A surface component granted `blobs` can also publish and read
+an attachment on a page-local channel, by range, held in page memory; that is a
+second way to hold bytes above the body cap, not the route the owner described.
+Nobody has ruled whether the ceilings stand. Options: (a) leave both — an
+operator whose components hold larger state raises `max_body_bytes` for the
+whole bus, and above 4 MiB it is an attachment; costs nothing, and widens every
+wire frame and ring with the setting; (b) raise the default, the constant, or
+both — a larger host-memory backstop for every component on both hosts; (c) a
+body cap per channel, or one for non-transportable channels, so state that
+never leaves a host grows without widening wire frames — new configuration
+surface, and the constant's doc treats it as a fixed backstop. Done = the
+ruling is recorded here or in `docs/message-bus.md` §2.1.4 with the size of
+state it was made for, and under (b) or (c) a surface component publishes and
+reads back one binary message of that size on an `io` port, in the page rig.
+Code site (`TODO(byte-body-ceiling-per-activation)`): the constant.
 
 ## `attach-v4-beside-v5`
 
@@ -417,6 +466,38 @@ a file as a blob in one call each, on the native transport, with a test of each
 against the real server. Code site (`TODO(attach-client-blob-conveniences)`):
 the module docs of `attach/client/src/blobs.rs`.
 
+## `remote-blob-open-without-delivery`
+
+On attach v6 a remote's `BlobOpen` is admitted when the remote's profile
+grants subscribe authority over the channel, the message is inside the
+channel's retained window and the channel is outside the tool-substrate family
+(`Messenger::admit_retained_part` in `brenn-messaging/src/retained_part.rs`,
+called from `attach/server/src/blobs.rs`). The handle rule this project was
+given asks two things of a handle — it is in the retained buffer of a channel
+the holder has access to, and the holder has read a message containing it
+since its start or last compaction — and only the first is applied to a
+remote: the attach server keeps no record of delivered messages, so a remote,
+or a stolen remote token, reaches the bytes of every attachment in the window
+of every channel it may subscribe to, including messages it was never
+delivered and messages deeper than its own subscribe depth ceiling
+(`docs/security-posture.md` §9a, "What a stolen token now reaches";
+`CHANGELOG.md`, BREAKING for operators). The same door admits a surface
+session, read-only, bounded to the wire channels its surface's bindings name
+(`SurfaceProfile::subscribable`, `docs/security-posture.md` §6.6), and the same
+reach applies: a hostile page reaches every attachment in the window of those
+channels. Both doors share the code site below. The second half was read as written
+for an LLM conversation's context and not built for remotes. Build, if a
+remote's reach should be what it was handed: admit a `BlobOpen` only for a
+message the session was delivered, or only within the depth the remote's
+subscribe matcher allows, as a new refusal reason of the existing open answer
+— server-side, no wire version, the client plane already reports a refused
+open. Done = a remote's open of an attachment on a message beyond what it was
+delivered (or beyond its depth ceiling) is refused, with a test, and §9a
+states the narrower reach; or `docs/security-posture.md` §9a records that a
+remote's reach is the channel's window by decision and why. Code site
+(`TODO(remote-blob-open-without-delivery)`): the `BlobOpen` handler in
+`attach/server/src/blobs.rs`, where subscribe authority is re-derived.
+
 ## `attach-blob-write-io-failure-test`
 
 The attach server's `BlobWrite` handler has an arm for a filesystem error from
@@ -466,19 +547,6 @@ the contract and the release that dropped it. Done = no host serves 0.1.0 and
 the texts say which release dropped it. Code sites
 (`TODO(string-contract-removal)`): the two notices in
 `brenn-bootstrap/src/consumers.rs`.
-
-## `blob-attachment-host-sites`
-
-When a surface host serves the `blobs` interface, its attachment-carrying
-publishes must be pushed into the page's one per-activation publish buffer,
-`PublishBuffer::entries`, and not a buffer of their own merged at flush. The
-contract promises the flush in call order, and a second buffer loses the order
-between `ports` and `blobs`. The backend host already pushes `blobs.publish`
-into `ProcessorData::publish_buffer`. Done = the slice serving the interface on
-a surface pushes its attachment-carrying publishes into
-`PublishBuffer::entries`, with a test of the order across the two interfaces.
-Code site (`TODO(blob-attachment-host-sites)`): `PublishBuffer::entries` in
-`surface/kernel/src/publish_buffer.rs`.
 
 ## `blob-handle-integrity`
 
@@ -594,29 +662,6 @@ are named there: `blob` has `read` and no `write`, `size` and `content-type`
 are fixed on a handle, and forwarding shares the blob rather than copying it.
 The build-or-never ruling remains.
 
-## `blobs-interface-stable-declaration`
-
-The `blobs` component interface (`brenn:processor/blobs@0.3.0`) is served by
-the backend host and is not yet declared stable: its file says its shapes are
-expected to change, because no surface host serves it and the surface is where
-a synchronous host must answer a range read without the network. (Its other
-reason, that tool calls did not carry blobs, is discharged: `call-async`,
-`call-async-for` and `complete` of the interface carry them.) Until the
-declaration the rule is: a shape changes in place only while no tagged brenn
-release has served it; a shape a tagged release has served changes only as a
-new version of the interface, served beside the old one for at least one
-release and announced in `CHANGELOG.md`, because brenn releases first and
-out-of-tree components follow — there is no lockstep upgrade. The old version
-may be removed one release after its replacement; nothing longer is promised.
-Declare it stable — the same promise `brenn:processor@0.2.0` carries, in its
-WIT header, `docs/component-packages.md` and a `CHANGELOG.md` entry for
-component authors — once a surface host serves the same interface, or once it
-is decided that surfaces get a different one. Done = the declaration is in
-those three texts, or this entry records why surfaces take another interface
-and the declaration is made for the backend alone. Code site
-(`TODO(blobs-interface-stable-declaration)`): the status paragraph of
-`brenn-wasm/wit/processor-0.3.wit`.
-
 ## `blobs-on-sync-calls`
 
 `tools.call-fast` and `calls.call` carry no attachments. Both return to the
@@ -671,16 +716,50 @@ publishes; and after a restart an app's inbox holds blobs no conversation can
 name until its window turns over. A remote attacher on attach v6 is a
 producer against the same pool — bounded per session at 64 handles and
 4 × `max_blob_bytes` held, uploads and opened attachments together, across its
-sessions by `max_sessions`, and not over time. Decide whether a component or a
-conversation gets a share of the budget, who is charged for a blob that is
+sessions by `max_sessions`, and not over time. A browser session on a surface
+with an upload door — an authenticated but untrusted page — is a producer
+against the same pool too: it can make blobs up to the per-session cap (64
+handles, 4 × `max_blob_bytes` held), a surface takes 64 sessions and 16 for one
+user, so one user's sessions together can exhaust the pool and every other
+producer is then refused `budget-exhausted`; a share per publisher is the bound
+that closes it. `api-request` is a producer
+against the same pool — an answer it writes into a blob on a caller's behalf
+(`response_attachment`), bounded per call by `max_blob_bytes` and in flight by
+the tool's concurrency (8), and not over time. At rest it is the largest
+contributor named here: an answer stays on the caller's inbox for that inbox's
+window, so a provider instance whose tools ask for attachment answers holds up
+to its result inbox's depth × `max_blob_bytes` — 2 GiB at depth 32, against the
+1 GiB default pool — of blobs it has already read. Decide whether a component, a
+conversation or an attached session's publisher gets a share of the budget, who is charged for a blob that is
 forwarded and so held by messages of several producers — a blob handed to a
 tool or returned by one included — and whether the share is operator
 configuration. Done = one
 producer, component or conversation, at its share cannot cause another
 producer's write to be refused, with a test, and `docs/security-posture.md`
-§7.6 no longer states the exposure for either. Code site
+§7.6, §6.6 and §9a no longer state the exposure for either. Code site
 (`TODO(blob-budget-per-component)`):
 `PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION` in `brenn-wasm/src/lib.rs`.
+
+## `tool-result-attachments-to-caller-without-blobs`
+
+The tool executor publishes a result's attachments to the caller's inbox
+whatever the caller is granted (`Reply::send` in
+`brenn-tool-registry/src/executor.rs`). A component that is not granted `blobs`
+can open none of them, so a provided tool that answers such a caller with
+attachments leaves blobs on `brenn:tool-results/<slug>` that nobody can read,
+charged to the shared pool for that inbox's window. `api-request` refuses to
+write an answer into a blob for such a caller; a provider's completion has no
+such check. `GmailAttachment` (`GoogleGmailRead`) is the first tool in this
+repository that reaches it: every success is an attachment, and nothing refuses
+its grant to a component without `blobs`, because a tool does not declare that
+it answers attachments (`ToolDescriptor` has `accepts_attachments` only) and
+grant validation checks names and ACL keys. Decide what a result with
+attachments does for a component caller without `blobs`: it is delivered
+without them, it is replaced by an error, or the grant of a tool that answers
+attachments is refused to such a caller at validation — each is a contract
+components outside this repository build on. Done = a result's attachments
+never rest on the inbox of a component that cannot open them, with a test; or
+`docs/security-posture.md` §7.6 records that they may and why.
 
 ## `blob-durable-sync-on-async-task`
 
@@ -692,27 +771,6 @@ drains, liveness — stops for the sync. Done = no blob fsync runs on an async
 worker thread on any door, with the sync still complete before the row that
 names the blob commits. Code site (`TODO(blob-durable-sync-on-async-task)`):
 `HeldAttachments::make_durable` in `brenn-messaging-store/src/blob/durable.rs`.
-
-## `blobs-surface-store-budget-refusal`
-
-On the backend host `budget-exhausted` from `blobs.create` and `blobs.write` is
-the blob store's own answer, given while the guest runs. A surface host that
-buffers a fresh blob in page memory and uploads it at the flush learns the
-backend store's verdict only after the guest has returned `ok`, where no
-variant of the interface reaches the component, so a refusal there loses the
-flush. The per-blob cap is static and can be mirrored into the kernel as the
-body cap is; the store's budget is a moving total the page cannot know. The
-slice that serves `blobs` on a surface decides between accepting a lost,
-announced flush for a blob the backend refuses and a change of shape that
-brings the verdict back to the component — which the interface's undeclared
-status (`blobs-interface-stable-declaration`) keeps open — and likewise whether
-a page fetches a binding's attachments before it activates a kind, answering
-`not-found` for one it could not fetch, or fetches lazily, which wants one more
-`open-error` variant. Done = the surface slice's documents state which, with a
-test of a page-made blob the backend store refuses, and
-`blobs-interface-stable-declaration` is not discharged before this is. Code
-site (`TODO(blobs-surface-store-budget-refusal)`): the `budget-exhausted` case
-of `create-error` in `brenn-wasm/wit/processor-0.3.wit`.
 
 ## `correctness-brenn-scheme-send-text-shown-to-ephemeral-only-app`
 
@@ -737,6 +795,36 @@ the head of `messaging_virtual_tools` in `brenn-lib/src/integration.rs`.
 Done = no messaging tool text directs an app without `MessagingPublish` to
 send to `brenn:`, with a test for an `EphemeralPublish`-only app over every
 messaging tool's description and schema.
+
+## `correctness-max-concurrency-one-does-not-bound-attachment-decodes-per-activation`
+
+The provider kit's `Run::answer` (`brenn-provider-kit/src/activation.rs`)
+stops advancing a request 240 s (`HOST_DEADLINE_MS`) after the activation
+that delivered it, but the host's deadline for the call counts from when
+the host takes it, before the call waits for the tool's permit
+(`ToolRegistry::invoke_for_llm`, the executor's `dequeued +
+PROVIDED_TOOL_CEILING`), and a nested provided call inherits the served
+call's deadline when that is earlier. An answer arriving between the
+host's deadline and the kit's cutoff is still advanced: a late
+`GmailAttachment` step 2 decodes up to 50 MB for nobody and can share an
+activation's 64 MiB write bound and fuel cap with a live request, failing
+it `internal`; a late `GmailDraft` step 1 issues `drafts.create` after
+its caller has been answered. Under `max_concurrency = 1` the window is
+the request's own permit wait. Closing it needs the host's deadline for a
+provided-tool request carried to the provider on the `provides` contract
+(or a way for a step to ask whether a request is still pending), and the
+kit's `answer` and backlog cutting on that instead of on `received_at_ms +
+HOST_DEADLINE_MS`. That is a WIT addition visible to out-of-tree
+providers; its shape (absolute deadline or remaining budget, and its
+relation to the activation's wall-clock `now`) needs a design.
+
+Code site
+(`TODO(correctness-max-concurrency-one-does-not-bound-attachment-decodes-per-activation)`):
+the age check in `Run::answer`.
+
+Done = no answer is advanced after the host has answered its caller, with
+a test that delivers a request whose host deadline started before its
+admission wait.
 
 ## `correctness-no-single-instance-guard-before-startup-side-effects`
 
@@ -796,35 +884,38 @@ a test; for (b), this entry and its comment removed, the limit staying in the
 reader's documentation. The `TODO(kit-payload-reader-cannot-read-304)` comment
 sits at `read_api_payload` in `brenn-provider-kit/src/answer.rs`.
 
-## `api-request-body-caps-bound-file-transfer`
+## `kit-request-attachment-outlives-window`
 
-A provider component cannot move an ordinary file through `api-request`. The
-request body rides inside the tool call's arguments, capped at 64 KiB
-(`MAX_ARGS_BYTES`, equal to `brenn_wasm::PROCESSOR_MAX_TOOL_ARGS_BYTES`) and
-base64-encoded when binary: an upload of under about 48 KiB. The answer is
-capped at the provider's `max_response_bytes`, whose ceiling is the
-compile-time `MAX_RESPONSE_BYTES_CEILING` (512 KiB, tied to
-`MAX_ASYNC_RESULT_BYTES`), again base64 when binary: a download of about
-380 KiB, and less under the bus default (see
-`api-request-read-limit-vs-bus-cap`). What the component then answers its own
-caller is bounded again, by the provider kit's `COMPACT_RESULT_CEILING`
-(256 KiB) and the bus cap. A WebDAV file component or a mail-attachment tool
-built on the provider kit is therefore limited to small files. The route is
-decided: a body that does not ride in the call, named by attachment on the
-tool call — the host holds the bytes and the component names them by handle,
-for upload and for download. The tool-call path it needs is built: a tool
-call and its result carry attachments by reference
-(`blobs.call-async`, `blobs.call-async-for` and `blobs.complete` in
-`brenn-wasm/wit/processor-0.3.wit`; `accepts_attachments` on a `provide`
-statement). What remains is `api-request` itself taking a request body and
-answering a response body as attachments, the provider kit's forms for
-handing and receiving them (its contract changes, which components built
-outside this repository pay for at their next pin move), and the component
-test. Done = a component test that uploads and downloads a body larger than
-today's caps through the kit. The
-`TODO(api-request-body-caps-bound-file-transfer)` comments sit at
-`MAX_ARGS_BYTES` and `MAX_ASYNC_RESULT_BYTES` in
-`brenn-tool-registry/src/descriptor.rs`.
+A provider's request carries the attachments its caller gave, and a component
+reaches one only by its message's place in the `tool-requests` window. The
+window holds the last Σ `max_concurrency` requests, the pending table holds no
+attachments (`PendingCall` in `brenn-tool-registry/src/provided.rs`), and a
+request still pending is displaced when that many newer requests arrive. The
+kit therefore answers `internal` when a queued first step or a later step
+needs a request's attachment that has left the window
+(`OpenError::LeftWindow`). Build: the host holds a pending request's
+attachments for as long as the request is pending, and a function of the
+`blobs` interface opens one by pending id — a WIT addition under the
+interface's version rule. Done = a kit request's attachment opens in any
+activation while the request is pending, with a test that displaces its
+message from the window first; or `docs/component-packages.md` records the
+window as the contract and why.
+
+## `kit-nested-call-body-built-in-activation`
+
+A kit component's nested call can carry a body blob only by forwarding one of
+its request's attachments (`Body::Attachment`). The kit has no form for a body
+the component builds — a MIME message wrapping an attachment, a transcoded
+file. The host allows it in the activation that built the blob: a sealed blob
+can be handed to `call_async_for_with_attachments` there, and the call's
+message then holds it. What it does not allow is a call the kit's loop queues
+past `CALL_BUDGET`, which is issued by a later activation that no longer holds
+the blob. Decide between issuing such a call only in the activation that built
+it, failing the request when the budget is spent — a contract components
+outside this repository then build on — and a way to keep a built blob across
+activations. Done = a kit component uploads a body it built from a request's
+attachment, with a test at the call budget; or the kit's documentation records
+forwarding as the only form and why.
 
 ## `agent-file-delivery-beyond-markdown`
 
@@ -840,10 +931,11 @@ legacy TypeScript UI (the upload route) and not on the bus
 in the Fastmail tooling, whose mail-filter export and import route and mail
 attachments would be its first callers. The bus has a carrier for such a file
 now: an attachment on a message, which a conversation can make from a file
-with `brenn-tool send` and a component through `blobs`. What is missing is a
-surface page that reads a blob. The delivery path is a message attachment read
-on the user's surface, built with or after the work that serves `blobs` on a
-surface page; its shape is not decided. Done is a delivery path for a
+with `brenn-tool send` and a component through `blobs`, and a component on a
+surface page granted `blobs` reads it. What is missing is a component that
+renders or saves such a file on the user's surface.
+The delivery path is a message attachment read on the user's surface; its
+shape is not decided. Done is a delivery path for a
 non-markdown file from a tool result or a component to the user's surface.
 The `TODO(agent-file-delivery-beyond-markdown)` comment sits at the
 `DisplayFile` handler's read in
@@ -927,6 +1019,10 @@ refusal protects nothing and only blocks scripts from those tools: decide
 what, if anything, gates them for a script, and drop the `requires_approval`
 reason. Deferred until it blocks someone.
 
+## `gmail-attachment-real-bridge-run`
+
+`GmailAttachment`'s answer to a conversation is tested at the bridge level: the hook path answers `{"result","message_id","attachments"}` with no blob id. No test runs it through a real bridge, in the manner of `blob_conversation_e2e.rs`, to the bytes on disk. Done = a real-bridge run in which a conversation calls `GmailAttachment` and `brenn-tool save` of the attachment it was handed writes the stub's decoded bytes.
+
 ## `gmail-filters-tier-3`
 
 Gmail filter tools (`GmailFilters`, `GmailFilterCreate`, `GmailFilterDelete`,
@@ -972,6 +1068,10 @@ thread is read again narrower, and any other read fails naming why. What
 stays open here is the configuration question above; a sender who fills
 `From` or `Subject` is unreadable through the tools under any pair, which the
 operator guide states.
+
+## `api-request-transfer-time-bound`
+
+`api-request` bounds a whole request, bodies included, at `API_TIMEOUT` (60 s), whatever the size of an attachment it sends or receives: a 64 MiB blob needs about 9 Mbit/s. `PROVIDED_TOOL_CEILING` (240 s) and the provider kit's `NESTED_WORST_CASE_MS` are sized on that timeout, inside the 300 s hook and CLI windows. Decide whether a transfer by attachment gets a bound that grows with its size, and what then happens to the ceiling and the kit's constants. Done = a transfer of `max_blob_bytes` at a stated minimum rate completes, with the ceilings re-derived and a test; or `docs/config-dsl.md` records the 60 s bound as the contract.
 
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
@@ -1098,6 +1198,20 @@ and message generalised beyond `server.vault_dir`.
 
 Done = every file kind the posture covers is refused at boot and on reload when
 it lies inside an agent-visible root, with a test per kind.
+
+## `quality-e2e-fixture-roots-hand-synced-in-five-places`
+
+Every e2e fixture's spec directory is listed by hand in five places: the
+`Makefile`'s `E2E_TARGETS` and `e2e-mounts` recipe, `shipped_module_roots` in
+`brenn-lib/src/config/test_fixtures.rs` (the roots `make check` compiles
+`brenn.e2e.brenn` against), and the test `data` of `brenn-lib/BUILD.bazel` and
+`brenn-bootstrap/BUILD.bazel`. Nothing checks that they agree. A mismatch
+shows only under `make e2e`, as a server that does not boot, or under
+`make check`, as a module that does not resolve. Choose one source: a
+checked-in mount-spec file that the `Makefile` reads and `shipped_module_roots`
+parses, or a `brenn-lib` test that compares the `Makefile`'s `modules:` paths
+with `shipped_module_roots("brenn.e2e.brenn")`. The second means maintaining a
+`Makefile` parser in a Rust test. Then delete the "move them together" comments.
 
 ## `quality-virtual-tools-final-symlink-left-open-though-local-fix-exists`
 
@@ -1572,6 +1686,32 @@ Code site (`TODO(surface-single-publish-tightening)`):
 
 ---
 
+## `surface-kernel-tracing-has-no-sink`
+
+The browser kernel installs no `tracing` subscriber, so every `tracing` event
+in `surface/kernel` and `attach/client` is discarded on a page. Several are the
+only record of a loss: a refused flush that outlived its outbox, a queued flush
+that died with an outbox a document closed, the flushes discarded from a
+terminal instance, the peer's failure to replay to the resume point. Decide
+which of them a page should surface and where — a console sink with a level
+floor, or kernel events for the ones an operator acts on — and build it. Done =
+each `tracing` event at `warn` or above in the kernel either reaches the
+console or the error channel on a page or is removed, with a test of one. Code
+site (`TODO(surface-kernel-tracing-has-no-sink)`): `start` in
+`surface/kernel/src/entry.rs`.
+
+## `surface-upload-pacing`
+
+A surface page hands a whole blob's upload to the browser's socket in one
+stretch: the attach transport exposes no send-side flow information, so
+everything the page sends after an upload starts waits behind it, up to the
+page's largest blob, and a create the server refuses does not stop the bytes
+already queued. Pace the upload against the socket's buffered amount so the
+page's other traffic interleaves and a refused upload stops. Done = with an
+upload of the largest blob in progress, a plain publish from another instance
+reaches the peer before the upload's last chunk, in the page rig;
+`docs/message-bus.md` §2.1.4 states the new cost.
+
 ## `surface-wasm-test-in-ci`
 
 The browser-side wasm test suites — wasm-bindgen-test, real browser — now have
@@ -1619,7 +1759,11 @@ the five migrated kinds render through and is compiled by nothing in CI. The
 `brenn_processor_call` and `surface/kernel/src/sync_door.rs`'s `SyncDoor::call`
 are wasm32-only compositions — each decision they make is pinned natively, and
 the node rig runs their order for one admitted call between headless kinds; the
-refusal arms and a `dom` peer are run by nothing.
+refusal arms and a `dom` peer are run by nothing. `brenn_blobs_publish` is a
+third: the order of its checks is pinned natively in the buffer, and that it
+hands the buffer the grant verdict the core gave, answers no grant refusal ahead
+of the buffer's charge, and reports only a `not-permitted` answer is run by
+nothing.
 
 ---
 
@@ -2575,9 +2719,8 @@ about how a bus peer acquires and proves ownership of an upload; the schema
 field is already in place so the change is purely additive when that decision
 lands. A candidate answer exists now and is not decided: the command message's
 own bus attachments, which the peer can only name if it made or was handed the
-blobs. The command's attachments come from a page, so this is built with or
-after the work that lets a surface page make a blob and publish a message
-naming it, and not before. Done when a bus `send` with attachments resolves
+blobs. The command's attachments come from a page, and a surface page can now
+make a blob and publish a message naming it, so that answer is buildable. Done when a bus `send` with attachments resolves
 them and reaches the harness with the files attached.
 
 Code sites (`TODO(chat-bus-attachments)`): `brenn-envelope/src/chat.rs`, the
@@ -4717,6 +4860,23 @@ a read that stops at the newest message per device — a newest-first paged
 `MessageStore` read, or a per-channel newest-per-key query — and decide whether
 it is a store-trait method every family may use. Done = the admission read and
 the tool's read cost O(devices) regardless of window size.
+
+## `quality-blobstoreslot-copies-the-late-attach-newtype`
+
+Three slots attach a messaging handle after the registry is built, each its
+own type: `BlobStoreSlot` (`brenn-oauth/src/tools/mod.rs`),
+`DeviceLocationBus` (`brenn-device-location/src/lib.rs`) and
+`ProviderRuntime.messenger` with its `attach`
+(`brenn-tool-registry/src/provided.rs`). Each is threaded as its own
+constructor parameter and attached by its own line in `run_server` and in the
+reload rig (`brenn-bootstrap/src/reload/driver.rs`), and a tool that next needs
+the bus or the store late adds a fourth. One generic late-attach type (an
+`Arc<OnceLock<Arc<T>>>` that panics on a second attach) in `brenn-lib` would
+serve all three, but they disagree on a missed attach — device-location
+panics, `api-request` answers `Internal` "no blob store is attached" — so the
+generic type needs a decision on that policy, and on whether a consumer is
+handed the whole messenger or only the piece it uses. Done = one late-attach
+type used by every such slot, with one missed-attach policy.
 
 ## `quality-system-family-classification-triplicated`
 

@@ -342,6 +342,137 @@ fn only_the_instances_granted_alert_are_alertable() {
     );
 }
 
+/// **The blob door follows the instances' grants.** A surface with no instance
+/// granted `blobs` admits no blob frame; one instance granted it opens the door
+/// for the surface's sessions.
+#[test]
+fn the_blob_door_opens_when_an_instance_is_granted_blobs() {
+    assert_eq!(profile().blob_grant(), None, "no instance holds `blobs`");
+
+    let resolved = SurfaceFixture::new("deskbar", "chrome")
+        .processor("viewer", "frame-viewer", Default::default())
+        .grant("viewer", ComponentGrant::Alert)
+        .build();
+    assert_eq!(
+        build_profile(&resolved).blob_grant(),
+        None,
+        "a grant other than `blobs` opens no door"
+    );
+}
+
+/// A surface with one `blobs` reader (no outputs), one page-local-only
+/// producer, and an ungranted instance with a wire output — every way to hold
+/// `blobs` without a wire output, beside a wire output without `blobs`.
+fn surface_without_a_blob_producer() -> ResolvedSurface {
+    SurfaceFixture::new("deskbar", "chrome")
+        .processor("viewer", "frame-viewer", Default::default())
+        .grant("viewer", ComponentGrant::Blobs)
+        .processor("local-maker", "frame-maker", Default::default())
+        .grant("local-maker", ComponentGrant::Blobs)
+        .output("local:frames", "local-maker", "out")
+        .processor("plain", "mode-clock", Default::default())
+        .output("brenn:plain-out", "plain", "out")
+        .build()
+}
+
+/// [`surface_without_a_blob_producer`] plus a `blobs` instance with a declared
+/// wire output.
+fn surface_with_a_blob_producer() -> ResolvedSurface {
+    SurfaceFixture::new("deskbar", "chrome")
+        .processor("viewer", "frame-viewer", Default::default())
+        .grant("viewer", ComponentGrant::Blobs)
+        .processor("local-maker", "frame-maker", Default::default())
+        .grant("local-maker", ComponentGrant::Blobs)
+        .output("local:frames", "local-maker", "out")
+        .processor("plain", "mode-clock", Default::default())
+        .output("brenn:plain-out", "plain", "out")
+        .processor("maker", "frame-maker", Default::default())
+        .grant("maker", ComponentGrant::Blobs)
+        .output("brenn:frames", "maker", "out")
+        .build()
+}
+
+/// **The door uploads only for a surface with a `blobs` producer on the
+/// wire.** Readers, page-local-only producers, and wire outputs of instances
+/// without `blobs` leave the door read-only; one `blobs` instance with a
+/// declared wire output makes it upload. Binding the error channel — which
+/// every instance may publish on — changes neither answer.
+#[test]
+fn the_door_uploads_only_for_a_blobs_instance_with_a_declared_wire_output() {
+    for bind_error in [false, true] {
+        let mut reader = build_profile(&surface_without_a_blob_producer());
+        let mut producer = build_profile(&surface_with_a_blob_producer());
+        if bind_error {
+            reader.bind_error_channel(ERROR_CHANNEL);
+            producer.bind_error_channel(ERROR_CHANNEL);
+        }
+        assert_eq!(
+            reader.blob_grant(),
+            Some(BlobGrant { upload: false }),
+            "no producer on the wire, error channel bound: {bind_error}"
+        );
+        assert_eq!(
+            producer.blob_grant(),
+            Some(BlobGrant { upload: true }),
+            "a producer on the wire, error channel bound: {bind_error}"
+        );
+    }
+}
+
+/// **An instance attaches only on its own declared wire outputs, and only
+/// with `blobs`.** Not on the error channel it may publish on, not on another
+/// instance's output, not on a page-local channel, and never under the bare
+/// identity or an undeclared name.
+#[test]
+fn only_a_granted_instance_attaches_and_only_on_its_declared_wire_outputs() {
+    let mut profile = build_profile(&surface_with_a_blob_producer());
+    profile.bind_error_channel(ERROR_CHANNEL);
+
+    assert!(profile.attribution_may_attach(Some("maker"), "brenn:frames"));
+
+    assert!(
+        profile.publishable(Some("maker"), ERROR_CHANNEL),
+        "the error channel is publishable"
+    );
+    assert!(
+        !profile.attribution_may_attach(Some("maker"), ERROR_CHANNEL),
+        "but takes no attachment"
+    );
+    assert!(
+        !profile.attribution_may_attach(Some("maker"), "brenn:plain-out"),
+        "another instance's output"
+    );
+    assert!(
+        !profile.attribution_may_attach(Some("plain"), "brenn:plain-out"),
+        "an ungranted instance on its own output"
+    );
+    assert!(
+        !profile.attribution_may_attach(Some("local-maker"), "local:frames"),
+        "a page-local output never crosses the wire"
+    );
+    assert!(!profile.attribution_may_attach(None, "brenn:frames"));
+    assert!(!profile.attribution_may_attach(None, ERROR_CHANNEL));
+    assert!(!profile.attribution_may_attach(Some("ghost"), "brenn:frames"));
+}
+
+/// **An output the operator bound to the error channel is a declared wire
+/// output.** The channel takes that instance's attachments, and only its.
+#[test]
+fn an_output_bound_to_the_error_channel_is_attachable_by_its_instance() {
+    let resolved = SurfaceFixture::new("deskbar", "chrome")
+        .processor("maker", "frame-maker", Default::default())
+        .grant("maker", ComponentGrant::Blobs)
+        .output(ERROR_CHANNEL, "maker", "out")
+        .processor("other", "frame-maker", Default::default())
+        .grant("other", ComponentGrant::Blobs)
+        .build();
+    let mut profile = build_profile(&resolved);
+    profile.bind_error_channel(ERROR_CHANNEL);
+    assert_eq!(profile.blob_grant(), Some(BlobGrant { upload: true }));
+    assert!(profile.attribution_may_attach(Some("maker"), ERROR_CHANNEL));
+    assert!(!profile.attribution_may_attach(Some("other"), ERROR_CHANNEL));
+}
+
 /// The burst must cover a boot-valid maximum-size surface's first-connect
 /// reconcile — one `Subscribe` per bound channel in one burst — or a legitimate
 /// connect becomes a violation. Asserted against the binding maximum, so the

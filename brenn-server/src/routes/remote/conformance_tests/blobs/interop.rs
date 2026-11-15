@@ -28,6 +28,14 @@ const REPORT: &str = "brenn:rb-blobs-report";
 
 const BLOBS_WASM: &str = "brenn-wasm/target/components/brenn_processor_blobs_test.wasm";
 
+/// The bytes the fixture's `fill <w> 0 <len>` writes. Its period, 251, divides
+/// no chunk size, so a chunk read from the wrong offset changes the bytes.
+fn fill_pattern(len: usize) -> Vec<u8> {
+    (0..len as u64)
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect()
+}
+
 /// Over one remote chunk, and inside one component read and one write.
 const SIZE: usize = 300_000;
 
@@ -152,7 +160,7 @@ async fn a_remote_and_a_component_each_read_the_blob_the_other_made() {
         .await;
 
     // Remote to component.
-    let data = bytes_of(SIZE, 7);
+    let data = fill_pattern(SIZE);
     let handle = b
         .rig
         .client
@@ -181,8 +189,7 @@ async fn a_remote_and_a_component_each_read_the_blob_the_other_made() {
         "the component opens the remote's attachment and reads every byte"
     );
 
-    // Component to remote. The fixture's `fill` pattern is `bytes_of`'s at
-    // seed 7.
+    // Component to remote: `fill` writes `data` again.
     assert_eq!(
         run(
             &b,

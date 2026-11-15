@@ -527,6 +527,7 @@ pub(crate) fn surface_io_bindings(
             noise: io.noise,
             wake_min: None,
             non_text: io.non_text,
+            fetch_bytes: None,
         })
         .collect();
     let outputs = io_ports

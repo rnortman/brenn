@@ -566,6 +566,7 @@ pub(crate) mod tests {
             acting_conversation_id: Some(7),
             acting_user,
             deadline,
+            caller_opens_blobs: true,
         }
     }
 
