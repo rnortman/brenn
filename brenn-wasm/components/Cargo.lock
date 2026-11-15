@@ -214,6 +214,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-processor-kit-file-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+ "brenn-provider-kit",
+ "brenn-provider-kit-guest",
+ "serde_json",
+]
+
+[[package]]
 name = "brenn-processor-log"
 version = "0.1.0"
 dependencies = [

@@ -4,9 +4,13 @@
 //! The client never follows a redirect: a credential sent to one origin must
 //! never be replayed to the origin a `Location` names.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use brenn_lib::config::OAuthProviderConfig;
+use brenn_messaging_store::blob::{BlobError, BlobHold, BlobStore, BlobWriter};
+
+use crate::blocking::blocking;
 
 /// Connect timeout for every call.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -15,7 +19,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// userinfo, revoke).
 pub const AUTH_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Total timeout for a credentialed API request, body included.
+/// Total timeout for a credentialed API request, body included, whatever the
+/// size of a body streamed from or into a blob.
+// TODO(api-request-transfer-time-bound): a blob body of `max_blob_bytes` must
+// cross the wire inside this one bound.
 pub const API_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Most bytes of an error body carried into a log line.
@@ -144,35 +151,17 @@ impl OAuthHttp {
     }
 
     /// Send a credentialed API request: `request` with `auth` placed on it,
-    /// never following a redirect, reading at most `limit` body bytes.
-    pub async fn api(
-        &self,
-        request: ApiCall,
-        auth: Auth<'_>,
-        limit: usize,
-    ) -> Result<ApiResponse, String> {
+    /// never following a redirect. Answers once the status and headers have
+    /// arrived; the body is read by [`Answered::read`] or
+    /// [`Answered::read_into`].
+    pub async fn send(&self, request: ApiCall, auth: Auth<'_>) -> Result<Answered, String> {
         let builder = self.credentialed(request, auth);
-        let mut response = builder.send().await.map_err(|e| transport_text(&e))?;
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let content_length = response.content_length();
-        let mut body = Vec::new();
-        let mut truncated = false;
-        while let Some(chunk) = response.chunk().await.map_err(|e| transport_text(&e))? {
-            let room = limit - body.len();
-            if chunk.len() > room {
-                body.extend_from_slice(&chunk[..room]);
-                truncated = true;
-                break;
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(ApiResponse {
-            status,
-            headers,
-            body,
-            truncated,
-            content_length,
+        let response = builder.send().await.map_err(|e| transport_text(&e))?;
+        Ok(Answered {
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+            content_length: response.content_length(),
+            response,
         })
     }
 
@@ -203,8 +192,12 @@ impl OAuthHttp {
         if let Some(token) = bearer {
             builder = builder.bearer_auth(token);
         }
-        if let Some(body) = body {
-            builder = builder.body(body);
+        match body {
+            None => {}
+            Some(RequestBody::Bytes(bytes)) => builder = builder.body(bytes),
+            Some(RequestBody::Blob(hold)) => {
+                builder = builder.body(reqwest::Body::wrap(BlobBody::new(hold)));
+            }
         }
         builder
     }
@@ -273,7 +266,253 @@ pub struct ApiCall {
     pub method: reqwest::Method,
     pub url: url::Url,
     pub headers: reqwest::header::HeaderMap,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<RequestBody>,
+}
+
+/// A request body: bytes in memory, or a sealed blob streamed from the store
+/// in pieces of [`BLOB_CHUNK_BYTES`].
+#[derive(Clone)]
+pub enum RequestBody {
+    Bytes(Vec<u8>),
+    Blob(Arc<BlobHold>),
+}
+
+/// The piece a blob is read or written in while it streams to or from the
+/// wire: one piece per direction is in memory at a time.
+pub const BLOB_CHUNK_BYTES: usize = 256 * 1024;
+
+/// A blob as an HTTP request body: each piece read on the blocking pool, the
+/// exact remaining size as the size hint, so the transport sends it as the
+/// `Content-Length`.
+struct BlobBody {
+    hold: Arc<BlobHold>,
+    offset: u64,
+    reading: Option<tokio::task::JoinHandle<Result<Vec<u8>, BlobError>>>,
+}
+
+impl BlobBody {
+    fn new(hold: Arc<BlobHold>) -> Self {
+        Self {
+            hold,
+            offset: 0,
+            reading: None,
+        }
+    }
+
+    fn size(&self) -> u64 {
+        self.hold.reference().size
+    }
+}
+
+impl http_body::Body for BlobBody {
+    type Data = bytes::Bytes;
+    type Error = BlobError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let size = self.size();
+        if self.reading.is_none() {
+            if self.offset == size {
+                return Poll::Ready(None);
+            }
+            let len = usize::try_from(size - self.offset)
+                .unwrap_or(usize::MAX)
+                .min(BLOB_CHUNK_BYTES);
+            let hold = Arc::clone(&self.hold);
+            let offset = self.offset;
+            self.reading = Some(tokio::task::spawn_blocking(move || hold.read(offset, len)));
+        }
+        let reading = self.reading.as_mut().expect("set above");
+        let joined = std::task::ready!(std::pin::Pin::new(reading).poll(cx));
+        self.reading = None;
+        Poll::Ready(Some(crate::blocking::joined(joined).map(|piece| {
+            self.offset += piece.len() as u64;
+            http_body::Frame::data(bytes::Bytes::from(piece))
+        })))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.reading.is_none() && self.offset == self.size()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.size() - self.offset)
+    }
+}
+
+/// An API response whose status and headers have arrived and whose body has
+/// not been read.
+pub struct Answered {
+    pub status: u16,
+    pub headers: reqwest::header::HeaderMap,
+    /// The `Content-Length` the response declared, when it did.
+    pub content_length: Option<u64>,
+    response: reqwest::Response,
+}
+
+/// What [`Answered::read_into`] made of a body.
+#[derive(Debug)]
+pub enum IntoBlob {
+    /// The whole body, sealed.
+    Sealed(BlobHold),
+    /// The body passes the store's largest blob.
+    TooLarge,
+    /// The body passes what the store's budget has left.
+    BudgetExhausted,
+}
+
+impl Answered {
+    /// The body, reading at most `limit` bytes of it.
+    pub async fn read(mut self, limit: usize) -> Result<ApiResponse, String> {
+        let mut body = Vec::new();
+        let mut truncated = false;
+        while let Some(chunk) = self
+            .response
+            .chunk()
+            .await
+            .map_err(|e| transport_text(&e))?
+        {
+            let room = limit - body.len();
+            if chunk.len() > room {
+                body.extend_from_slice(&chunk[..room]);
+                truncated = true;
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(ApiResponse {
+            status: self.status,
+            headers: self.headers,
+            body,
+            truncated,
+            content_length: self.content_length,
+        })
+    }
+
+    /// The body written into a new blob of `content_type` as it arrives,
+    /// gathered into pieces of [`BLOB_CHUNK_BYTES`], each written on the
+    /// blocking pool. A declared length is reserved before the
+    /// first byte is read, so a body over a bound is refused before any of it
+    /// lands. On every outcome but [`IntoBlob::Sealed`] the unsealed blob is
+    /// dropped, which deletes it, and the connection is closed undrained.
+    ///
+    /// # Panics
+    ///
+    /// `content_type` is not one the store accepts.
+    pub async fn read_into(
+        mut self,
+        store: &Arc<BlobStore>,
+        content_type: &str,
+    ) -> Result<IntoBlob, String> {
+        let declared = self.content_length;
+        let created = {
+            let store = Arc::clone(store);
+            let content_type = content_type.to_string();
+            blocking(move || {
+                let mut writer = store.create(&content_type)?;
+                if let Some(size) = declared {
+                    writer.reserve(size)?;
+                }
+                Ok::<_, BlobError>(writer)
+            })
+            .await
+        };
+        let mut writer = match created {
+            Ok(writer) => writer,
+            Err(BlobError::InvalidContentType(e)) => {
+                panic!("BUG: read_into was handed a content type the store refuses: {e}")
+            }
+            Err(e) => return refused(e),
+        };
+        let mut offset: u64 = 0;
+        let mut piece: Vec<u8> = Vec::with_capacity(BLOB_CHUNK_BYTES);
+        loop {
+            let chunk = match self.response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    discard(writer).await;
+                    return Err(transport_text(&e));
+                }
+            };
+            let mut rest = &chunk[..];
+            while !rest.is_empty() {
+                let take = rest.len().min(BLOB_CHUNK_BYTES - piece.len());
+                piece.extend_from_slice(&rest[..take]);
+                rest = &rest[take..];
+                if piece.len() < BLOB_CHUNK_BYTES {
+                    continue;
+                }
+                let (returned, emptied, written) = write_piece(writer, piece, offset).await;
+                (writer, piece) = (returned, emptied);
+                match written {
+                    Ok(len) => offset += len,
+                    Err(e) => {
+                        discard(writer).await;
+                        return refused(e);
+                    }
+                }
+            }
+        }
+        if !piece.is_empty() {
+            let (returned, _, written) = write_piece(writer, piece, offset).await;
+            writer = returned;
+            if let Err(e) = written {
+                discard(writer).await;
+                return refused(e);
+            }
+        }
+        match writer.seal() {
+            Ok(hold) => Ok(IntoBlob::Sealed(hold)),
+            Err(refused) => {
+                let gap = refused.gap.clone();
+                discard(refused.writer).await;
+                Err(format!(
+                    "the response body ended at byte {} of the {} it declared",
+                    gap.start,
+                    declared.unwrap_or(gap.end)
+                ))
+            }
+        }
+    }
+}
+
+/// Write `piece` at `offset` on the blocking pool. The writer comes back, with
+/// the piece emptied for reuse and the length written or the store's refusal.
+async fn write_piece(
+    mut writer: BlobWriter,
+    mut piece: Vec<u8>,
+    offset: u64,
+) -> (BlobWriter, Vec<u8>, Result<u64, BlobError>) {
+    blocking(move || {
+        let written = writer.write(offset, &piece).map(|()| piece.len() as u64);
+        piece.clear();
+        (writer, piece, written)
+    })
+    .await
+}
+
+/// Drop an unsealed writer on the blocking pool, where its file is unlinked.
+async fn discard(writer: BlobWriter) {
+    blocking(move || drop(writer)).await;
+}
+
+/// A store refusal or failure while a body was written into a blob.
+fn refused(e: BlobError) -> Result<IntoBlob, String> {
+    match e {
+        BlobError::TooLarge { .. } => Ok(IntoBlob::TooLarge),
+        BlobError::BudgetExhausted { .. } => Ok(IntoBlob::BudgetExhausted),
+        BlobError::Io(e) => Err(format!("writing the response body into a blob: {e}")),
+        e @ (BlobError::InvalidContentType(_)
+        | BlobError::TooFragmented
+        | BlobError::NotFound
+        | BlobError::OutOfRange { .. }) => {
+            panic!("BUG: a front-to-back blob write refused: {e}")
+        }
+    }
 }
 
 /// An API response, its body read up to the caller's limit.
@@ -446,6 +685,55 @@ mod tests {
             headers,
             body: None,
         }
+    }
+
+    fn store(dir: &std::path::Path, max_blob_bytes: u64, budget_bytes: u64) -> Arc<BlobStore> {
+        BlobStore::for_tests(
+            dir,
+            brenn_messaging_store::blob::BlobLimits {
+                max_blob_bytes,
+                budget_bytes,
+            },
+        )
+    }
+
+    fn sealed(store: &Arc<BlobStore>, bytes: &[u8]) -> Arc<BlobHold> {
+        let mut writer = store.create("application/octet-stream").unwrap();
+        writer.write(0, bytes).unwrap();
+        Arc::new(writer.seal().unwrap())
+    }
+
+    /// Every frame of `body`, concatenated, and the size hints seen before
+    /// each frame.
+    async fn drain(mut body: BlobBody) -> (Vec<u8>, Vec<u64>) {
+        use http_body_util::BodyExt;
+        let mut out = Vec::new();
+        let mut hints = Vec::new();
+        loop {
+            hints.push(http_body::Body::size_hint(&body).exact().unwrap());
+            match body.frame().await {
+                None => break,
+                Some(frame) => out.extend_from_slice(&frame.unwrap().into_data().unwrap()),
+            }
+        }
+        assert!(http_body::Body::is_end_stream(&body));
+        (out, hints)
+    }
+
+    #[tokio::test]
+    async fn a_blob_body_streams_in_pieces_with_an_exact_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path(), 1 << 30, 1 << 30);
+        let bytes: Vec<u8> = (0..BLOB_CHUNK_BYTES * 2 + 7).map(|i| i as u8).collect();
+        let (out, hints) = drain(BlobBody::new(sealed(&store, &bytes))).await;
+        assert_eq!(out, bytes);
+        let total = bytes.len() as u64;
+        let chunk = BLOB_CHUNK_BYTES as u64;
+        assert_eq!(hints, [total, total - chunk, 7, 0]);
+
+        let (out, hints) = drain(BlobBody::new(sealed(&store, b""))).await;
+        assert!(out.is_empty());
+        assert_eq!(hints, [0]);
     }
 
     #[test]

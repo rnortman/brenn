@@ -348,6 +348,34 @@ a file as a blob in one call each, on the native transport, with a test of each
 against the real server. Code site (`TODO(attach-client-blob-conveniences)`):
 the module docs of `attach/client/src/blobs.rs`.
 
+## `remote-blob-open-without-delivery`
+
+On attach v6 a remote's `BlobOpen` is admitted when the remote's profile
+grants subscribe authority over the channel, the message is inside the
+channel's retained window and the channel is outside the tool-substrate family
+(`Messenger::admit_retained_part` in `brenn-messaging/src/retained_part.rs`,
+called from `attach/server/src/blobs.rs`). The handle rule this project was
+given asks two things of a handle — it is in the retained buffer of a channel
+the holder has access to, and the holder has read a message containing it
+since its start or last compaction — and only the first is applied to a
+remote: the attach server keeps no record of delivered messages, so a remote,
+or a stolen remote token, reaches the bytes of every attachment in the window
+of every channel it may subscribe to, including messages it was never
+delivered and messages deeper than its own subscribe depth ceiling
+(`docs/security-posture.md` §9a, "What a stolen token now reaches";
+`CHANGELOG.md`, BREAKING for operators). The second half was read as written
+for an LLM conversation's context and not built for remotes. Build, if a
+remote's reach should be what it was handed: admit a `BlobOpen` only for a
+message the session was delivered, or only within the depth the remote's
+subscribe matcher allows, as a new refusal reason of the existing open answer
+— server-side, no wire version, the client plane already reports a refused
+open. Done = a remote's open of an attachment on a message beyond what it was
+delivered (or beyond its depth ceiling) is refused, with a test, and §9a
+states the narrower reach; or `docs/security-posture.md` §9a records that a
+remote's reach is the channel's window by decision and why. Code site
+(`TODO(remote-blob-open-without-delivery)`): the `BlobOpen` handler in
+`attach/server/src/blobs.rs`, where subscribe authority is re-derived.
+
 ## `attach-blob-write-io-failure-test`
 
 The attach server's `BlobWrite` handler has an arm for a filesystem error from
@@ -602,7 +630,14 @@ publishes; and after a restart an app's inbox holds blobs no conversation can
 name until its window turns over. A remote attacher on attach v6 is a
 producer against the same pool — bounded per session at 64 handles and
 4 × `max_blob_bytes` held, uploads and opened attachments together, across its
-sessions by `max_sessions`, and not over time. Decide whether a component or a
+sessions by `max_sessions`, and not over time. `api-request` is a producer
+against the same pool — an answer it writes into a blob on a caller's behalf
+(`response_attachment`), bounded per call by `max_blob_bytes` and in flight by
+the tool's concurrency (8), and not over time. At rest it is the largest
+contributor named here: an answer stays on the caller's inbox for that inbox's
+window, so a provider instance whose tools ask for attachment answers holds up
+to its result inbox's depth × `max_blob_bytes` — 2 GiB at depth 32, against the
+1 GiB default pool — of blobs it has already read. Decide whether a component or a
 conversation gets a share of the budget, who is charged for a blob that is
 forwarded and so held by messages of several producers — a blob handed to a
 tool or returned by one included — and whether the share is operator
@@ -612,6 +647,27 @@ producer's write to be refused, with a test, and `docs/security-posture.md`
 §7.6 no longer states the exposure for either. Code site
 (`TODO(blob-budget-per-component)`):
 `PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION` in `brenn-wasm/src/lib.rs`.
+
+## `tool-result-attachments-to-caller-without-blobs`
+
+The tool executor publishes a result's attachments to the caller's inbox
+whatever the caller is granted (`Reply::send` in
+`brenn-tool-registry/src/executor.rs`). A component that is not granted `blobs`
+can open none of them, so a provided tool that answers such a caller with
+attachments leaves blobs on `brenn:tool-results/<slug>` that nobody can read,
+charged to the shared pool for that inbox's window. `api-request` refuses to
+write an answer into a blob for such a caller; a provider's completion has no
+such check. `GmailAttachment` (`GoogleGmailRead`) is the first tool in this
+repository that reaches it: every success is an attachment, and nothing refuses
+its grant to a component without `blobs`, because a tool does not declare that
+it answers attachments (`ToolDescriptor` has `accepts_attachments` only) and
+grant validation checks names and ACL keys. Decide what a result with
+attachments does for a component caller without `blobs`: it is delivered
+without them, it is replaced by an error, or the grant of a tool that answers
+attachments is refused to such a caller at validation — each is a contract
+components outside this repository build on. Done = a result's attachments
+never rest on the inbox of a component that cannot open them, with a test; or
+`docs/security-posture.md` §7.6 records that they may and why.
 
 ## `blob-durable-sync-on-async-task`
 
@@ -668,6 +724,36 @@ the head of `messaging_virtual_tools` in `brenn-lib/src/integration.rs`.
 Done = no messaging tool text directs an app without `MessagingPublish` to
 send to `brenn:`, with a test for an `EphemeralPublish`-only app over every
 messaging tool's description and schema.
+
+## `correctness-max-concurrency-one-does-not-bound-attachment-decodes-per-activation`
+
+The provider kit's `Run::answer` (`brenn-provider-kit/src/activation.rs`)
+stops advancing a request 240 s (`HOST_DEADLINE_MS`) after the activation
+that delivered it, but the host's deadline for the call counts from when
+the host takes it, before the call waits for the tool's permit
+(`ToolRegistry::invoke_for_llm`, the executor's `dequeued +
+PROVIDED_TOOL_CEILING`), and a nested provided call inherits the served
+call's deadline when that is earlier. An answer arriving between the
+host's deadline and the kit's cutoff is still advanced: a late
+`GmailAttachment` step 2 decodes up to 50 MB for nobody and can share an
+activation's 64 MiB write bound and fuel cap with a live request, failing
+it `internal`; a late `GmailDraft` step 1 issues `drafts.create` after
+its caller has been answered. Under `max_concurrency = 1` the window is
+the request's own permit wait. Closing it needs the host's deadline for a
+provided-tool request carried to the provider on the `provides` contract
+(or a way for a step to ask whether a request is still pending), and the
+kit's `answer` and backlog cutting on that instead of on `received_at_ms +
+HOST_DEADLINE_MS`. That is a WIT addition visible to out-of-tree
+providers; its shape (absolute deadline or remaining budget, and its
+relation to the activation's wall-clock `now`) needs a design.
+
+Code site
+(`TODO(correctness-max-concurrency-one-does-not-bound-attachment-decodes-per-activation)`):
+the age check in `Run::answer`.
+
+Done = no answer is advanced after the host has answered its caller, with
+a test that delivers a request whose host deadline started before its
+admission wait.
 
 ## `correctness-no-single-instance-guard-before-startup-side-effects`
 
@@ -727,35 +813,38 @@ a test; for (b), this entry and its comment removed, the limit staying in the
 reader's documentation. The `TODO(kit-payload-reader-cannot-read-304)` comment
 sits at `read_api_payload` in `brenn-provider-kit/src/answer.rs`.
 
-## `api-request-body-caps-bound-file-transfer`
+## `kit-request-attachment-outlives-window`
 
-A provider component cannot move an ordinary file through `api-request`. The
-request body rides inside the tool call's arguments, capped at 64 KiB
-(`MAX_ARGS_BYTES`, equal to `brenn_wasm::PROCESSOR_MAX_TOOL_ARGS_BYTES`) and
-base64-encoded when binary: an upload of under about 48 KiB. The answer is
-capped at the provider's `max_response_bytes`, whose ceiling is the
-compile-time `MAX_RESPONSE_BYTES_CEILING` (512 KiB, tied to
-`MAX_ASYNC_RESULT_BYTES`), again base64 when binary: a download of about
-380 KiB, and less under the bus default (see
-`api-request-read-limit-vs-bus-cap`). What the component then answers its own
-caller is bounded again, by the provider kit's `COMPACT_RESULT_CEILING`
-(256 KiB) and the bus cap. A WebDAV file component or a mail-attachment tool
-built on the provider kit is therefore limited to small files. The route is
-decided: a body that does not ride in the call, named by attachment on the
-tool call — the host holds the bytes and the component names them by handle,
-for upload and for download. The tool-call path it needs is built: a tool
-call and its result carry attachments by reference
-(`blobs.call-async`, `blobs.call-async-for` and `blobs.complete` in
-`brenn-wasm/wit/processor-0.3.wit`; `accepts_attachments` on a `provide`
-statement). What remains is `api-request` itself taking a request body and
-answering a response body as attachments, the provider kit's forms for
-handing and receiving them (its contract changes, which components built
-outside this repository pay for at their next pin move), and the component
-test. Done = a component test that uploads and downloads a body larger than
-today's caps through the kit. The
-`TODO(api-request-body-caps-bound-file-transfer)` comments sit at
-`MAX_ARGS_BYTES` and `MAX_ASYNC_RESULT_BYTES` in
-`brenn-tool-registry/src/descriptor.rs`.
+A provider's request carries the attachments its caller gave, and a component
+reaches one only by its message's place in the `tool-requests` window. The
+window holds the last Σ `max_concurrency` requests, the pending table holds no
+attachments (`PendingCall` in `brenn-tool-registry/src/provided.rs`), and a
+request still pending is displaced when that many newer requests arrive. The
+kit therefore answers `internal` when a queued first step or a later step
+needs a request's attachment that has left the window
+(`OpenError::LeftWindow`). Build: the host holds a pending request's
+attachments for as long as the request is pending, and a function of the
+`blobs` interface opens one by pending id — a WIT addition under the
+interface's version rule. Done = a kit request's attachment opens in any
+activation while the request is pending, with a test that displaces its
+message from the window first; or `docs/component-packages.md` records the
+window as the contract and why.
+
+## `kit-nested-call-body-built-in-activation`
+
+A kit component's nested call can carry a body blob only by forwarding one of
+its request's attachments (`Body::Attachment`). The kit has no form for a body
+the component builds — a MIME message wrapping an attachment, a transcoded
+file. The host allows it in the activation that built the blob: a sealed blob
+can be handed to `call_async_for_with_attachments` there, and the call's
+message then holds it. What it does not allow is a call the kit's loop queues
+past `CALL_BUDGET`, which is issued by a later activation that no longer holds
+the blob. Decide between issuing such a call only in the activation that built
+it, failing the request when the budget is spent — a contract components
+outside this repository then build on — and a way to keep a built blob across
+activations. Done = a kit component uploads a body it built from a request's
+attachment, with a test at the call budget; or the kit's documentation records
+forwarding as the only form and why.
 
 ## `agent-file-delivery-beyond-markdown`
 
@@ -858,6 +947,10 @@ refusal protects nothing and only blocks scripts from those tools: decide
 what, if anything, gates them for a script, and drop the `requires_approval`
 reason. Deferred until it blocks someone.
 
+## `gmail-attachment-real-bridge-run`
+
+`GmailAttachment`'s answer to a conversation is tested at the bridge level: the hook path answers `{"result","message_id","attachments"}` with no blob id. No test runs it through a real bridge, in the manner of `blob_conversation_e2e.rs`, to the bytes on disk. Done = a real-bridge run in which a conversation calls `GmailAttachment` and `brenn-tool save` of the attachment it was handed writes the stub's decoded bytes.
+
 ## `gmail-filters-tier-3`
 
 Gmail filter tools (`GmailFilters`, `GmailFilterCreate`, `GmailFilterDelete`,
@@ -903,6 +996,10 @@ thread is read again narrower, and any other read fails naming why. What
 stays open here is the configuration question above; a sender who fills
 `From` or `Subject` is unreadable through the tools under any pair, which the
 operator guide states.
+
+## `api-request-transfer-time-bound`
+
+`api-request` bounds a whole request, bodies included, at `API_TIMEOUT` (60 s), whatever the size of an attachment it sends or receives: a 64 MiB blob needs about 9 Mbit/s. `PROVIDED_TOOL_CEILING` (240 s) and the provider kit's `NESTED_WORST_CASE_MS` are sized on that timeout, inside the 300 s hook and CLI windows. Decide whether a transfer by attachment gets a bound that grows with its size, and what then happens to the ceiling and the kit's constants. Done = a transfer of `max_blob_bytes` at a stated minimum rate completes, with the ceilings re-derived and a test; or `docs/config-dsl.md` records the 60 s bound as the contract.
 
 ## `errhandling-gmail-403-always-denied-with-scope-hint`
 
@@ -4628,6 +4725,23 @@ a read that stops at the newest message per device — a newest-first paged
 `MessageStore` read, or a per-channel newest-per-key query — and decide whether
 it is a store-trait method every family may use. Done = the admission read and
 the tool's read cost O(devices) regardless of window size.
+
+## `quality-blobstoreslot-copies-the-late-attach-newtype`
+
+Three slots attach a messaging handle after the registry is built, each its
+own type: `BlobStoreSlot` (`brenn-oauth/src/tools/mod.rs`),
+`DeviceLocationBus` (`brenn-device-location/src/lib.rs`) and
+`ProviderRuntime.messenger` with its `attach`
+(`brenn-tool-registry/src/provided.rs`). Each is threaded as its own
+constructor parameter and attached by its own line in `run_server` and in the
+reload rig (`brenn-bootstrap/src/reload/driver.rs`), and a tool that next needs
+the bus or the store late adds a fourth. One generic late-attach type (an
+`Arc<OnceLock<Arc<T>>>` that panics on a second attach) in `brenn-lib` would
+serve all three, but they disagree on a missed attach — device-location
+panics, `api-request` answers `Internal` "no blob store is attached" — so the
+generic type needs a decision on that policy, and on whether a consumer is
+handed the whole messenger or only the piece it uses. Done = one late-attach
+type used by every such slot, with one missed-attach policy.
 
 ## `quality-system-family-classification-triplicated`
 

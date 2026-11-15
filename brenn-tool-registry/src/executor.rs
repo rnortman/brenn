@@ -96,12 +96,20 @@ use super::tool::{RegisteredTool, ToolCtx, ToolOutput};
 /// code-built policy (bootstrap) grants publish on exactly `brenn:tool-results/*`.
 pub const TOOL_EXECUTOR_COMPONENT: &str = "tool-executor";
 
-/// Per-caller resolved tool grants, keyed by the caller's `ParticipantId`
-/// string (`wasm:<slug>`) then by canonical tool name.
+/// One caller's entry in the caller table: its resolved tool grants by
+/// canonical tool name, and whether its instance is granted `blobs`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallerGrants {
+    pub tools: BTreeMap<String, ResolvedToolGrant>,
+    pub blobs: bool,
+}
+
+/// Per-caller grants, keyed by the caller's `ParticipantId` string
+/// (`wasm:<slug>`).
 ///
 /// The value the messaging plan derives from the document's consumers and that
 /// [`ToolCallerGrants`] is built from and edited to.
-pub type CallerGrantTable = HashMap<String, BTreeMap<String, ResolvedToolGrant>>;
+pub type CallerGrantTable = HashMap<String, CallerGrants>;
 
 /// Per-caller resolved tool grants, keyed by the caller's `ParticipantId` string
 /// (`wasm:<slug>`) then by canonical tool name. Built at bootstrap from the
@@ -152,15 +160,15 @@ impl ToolCallerGrants {
         self.inner.read().expect("tool caller grants lock poisoned")
     }
 
-    /// Install one caller's whole grant set, replacing whatever it held. A
-    /// caller with no grants is removed rather than stored empty, so presence in
+    /// Install one caller's whole entry, replacing whatever it held. A caller
+    /// with no tool grants is removed rather than stored empty, so presence in
     /// the table means "may address some tool".
-    pub fn set_caller(&self, caller: String, grants: BTreeMap<String, ResolvedToolGrant>) {
+    pub fn set_caller(&self, caller: String, grants: CallerGrants) {
         let mut inner = self
             .inner
             .write()
             .expect("tool caller grants lock poisoned");
-        if grants.is_empty() {
+        if grants.tools.is_empty() {
             inner.remove(&caller);
         } else {
             inner.insert(caller, grants);
@@ -176,11 +184,13 @@ impl ToolCallerGrants {
             .remove(caller);
     }
 
-    /// `caller`'s resolved grant for `tool` as the table stands now, or `None`
-    /// if the caller may not address it. Owned, so the lock is released before
-    /// the grant is acted on.
-    pub fn grant(&self, caller: &str, tool: &str) -> Option<ResolvedToolGrant> {
-        self.read().get(caller).and_then(|g| g.get(tool)).cloned()
+    /// `caller`'s resolved grant for `tool` and whether it is granted `blobs`,
+    /// as the table stands now, or `None` if the caller may not address the
+    /// tool. Owned, so the lock is released before the grant is acted on.
+    pub fn grant(&self, caller: &str, tool: &str) -> Option<(ResolvedToolGrant, bool)> {
+        let table = self.read();
+        let entry = table.get(caller)?;
+        Some((entry.tools.get(tool)?.clone(), entry.blobs))
     }
 }
 
@@ -432,6 +442,9 @@ impl Reply {
             Err(e) => (Err(e), HeldAttachments::none()),
         };
         match addr {
+            // TODO(tool-result-attachments-to-caller-without-blobs): a result's
+            // attachments are published whatever the caller is granted, so a
+            // component without `blobs` can be answered blobs it cannot open.
             Some(addr) => {
                 let (body, attachments) = match build_result_body(
                     tool,
@@ -597,7 +610,7 @@ async fn admit_and_dispatch(
     };
 
     // Re-check the caller's grant for this tool against the current config.
-    let grant = match caller_grants.grant(&caller, &tool) {
+    let (grant, caller_opens_blobs) = match caller_grants.grant(&caller, &tool) {
         Some(g) => g,
         None => {
             warn!(seq, %caller, %tool, "tool executor: caller no longer granted this tool");
@@ -720,6 +733,7 @@ async fn admit_and_dispatch(
         acting_conversation_id: None,
         acting_user,
         deadline,
+        caller_opens_blobs,
     };
 
     // Spawn only the `execute` future (holding the permit) so a long pull never
@@ -1006,7 +1020,7 @@ mod tests {
                 let _open = gate.acquire().await.expect("the gate is never closed");
             }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok(json!({ "echoed": args }).into())
+            Ok(json!({ "echoed": args, "opens_blobs": ctx.caller_opens_blobs }).into())
         }
     }
 
@@ -1255,12 +1269,24 @@ mod tests {
         .to_string()
     }
 
+    /// One caller's entry: `tools`, and `blobs` granted.
+    fn entry(tools: BTreeMap<String, ResolvedToolGrant>) -> CallerGrants {
+        CallerGrants { tools, blobs: true }
+    }
+
     fn caller_grants(acl: Vec<AclClause>) -> Arc<ToolCallerGrants> {
+        caller_grants_blobs(acl, true)
+    }
+
+    fn caller_grants_blobs(acl: Vec<AclClause>, blobs: bool) -> Arc<ToolCallerGrants> {
         let mut per_caller = BTreeMap::new();
         per_caller.insert("apull".to_string(), grant(acl));
         Arc::new(ToolCallerGrants::new(HashMap::from([(
             CALLER.to_string(),
-            per_caller,
+            CallerGrants {
+                tools: per_caller,
+                blobs,
+            },
         )])))
     }
 
@@ -1275,10 +1301,10 @@ mod tests {
 
         grants.set_caller(
             CALLER.to_string(),
-            BTreeMap::from([(
+            entry(BTreeMap::from([(
                 "apull".to_string(),
                 grant(vec![clause(&[("repo", "brenn")])]),
-            )]),
+            )])),
         );
         assert!(grants.grant(CALLER, "apull").is_some());
         assert!(
@@ -1293,16 +1319,23 @@ mod tests {
         // Replacing the set is not merging it: the old tool is gone.
         grants.set_caller(
             CALLER.to_string(),
-            BTreeMap::from([(
-                "other".to_string(),
-                grant(vec![clause(&[("repo", "brenn")])]),
-            )]),
+            CallerGrants {
+                tools: BTreeMap::from([(
+                    "other".to_string(),
+                    grant(vec![clause(&[("repo", "brenn")])]),
+                )]),
+                blobs: false,
+            },
         );
         assert!(grants.grant(CALLER, "apull").is_none());
-        assert!(grants.grant(CALLER, "other").is_some());
+        assert_eq!(
+            grants.grant(CALLER, "other").map(|(_, blobs)| blobs),
+            Some(false),
+            "the `blobs` bit is replaced with the entry"
+        );
 
         // An empty set removes the caller; removing again is a no-op.
-        grants.set_caller(CALLER.to_string(), BTreeMap::new());
+        grants.set_caller(CALLER.to_string(), entry(BTreeMap::new()));
         assert!(grants.grant(CALLER, "other").is_none());
         grants.remove_caller(CALLER);
         assert!(grants.grant(CALLER, "other").is_none());
@@ -1414,6 +1447,26 @@ mod tests {
         assert_eq!(results[0]["outcome"]["err"]["kind"], "not_granted");
         assert_eq!(results[1]["call_id"], "after");
         assert_eq!(results[1]["outcome"]["ok"]["echoed"]["repo"], "brenn");
+    }
+
+    /// The tool is told whether its caller can open a blob, from the caller's
+    /// table entry as it stands at dequeue.
+    #[tokio::test]
+    async fn the_callers_blobs_grant_reaches_the_tool() {
+        for blobs in [false, true] {
+            let h = harness().await;
+            insert_request(&h, &request_body("c1", "brenn"), Some(h.results_uuid)).await;
+            let (alert, _hg) = noop_alert_dispatcher();
+            let exec = executor(
+                &h,
+                registry(StubAsync::new(4, Duration::ZERO)),
+                caller_grants_blobs(vec![clause(&[("repo", "brenn")])], blobs),
+                alert,
+            );
+            drain_and_join(&exec).await;
+            let result = read_result(&h).await;
+            assert_eq!(result["outcome"]["ok"]["opens_blobs"], blobs);
+        }
     }
 
     #[tokio::test]
@@ -2072,7 +2125,7 @@ mod tests {
             registry(StubAsync::new(4, Duration::ZERO)),
             Arc::new(ToolCallerGrants::new(HashMap::from([(
                 CALLER.to_string(),
-                per_caller,
+                entry(per_caller),
             )]))),
             alert,
         );
@@ -2266,10 +2319,10 @@ mod tests {
         let acl = vec![clause(&[("repo", "brenn")])];
         Arc::new(ToolCallerGrants::new(HashMap::from([(
             CALLER.to_string(),
-            BTreeMap::from([
+            entry(BTreeMap::from([
                 ("apull".to_string(), grant(acl.clone())),
                 ("echo-for-user".to_string(), grant(acl)),
-            ]),
+            ])),
         )])))
     }
 
@@ -2631,7 +2684,10 @@ mod tests {
             ))])),
             Arc::new(ToolCallerGrants::new(HashMap::from([(
                 CALLER.to_string(),
-                BTreeMap::from([(ATTACHMENT_ECHO.to_string(), grant(vec![]))]),
+                entry(BTreeMap::from([(
+                    ATTACHMENT_ECHO.to_string(),
+                    grant(vec![]),
+                )])),
             )]))),
             alert,
         )

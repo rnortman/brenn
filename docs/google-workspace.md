@@ -151,8 +151,8 @@ The cap also sizes what each result inbox can weigh: a full window is up to
 `retain_depth` × `max_body_bytes` before the component parses it — 32 ×
 384 KiB is 12 MiB for `gmail-read` and `calendar-read`, 16 × 384 KiB is
 6 MiB for the other three — against a guest memory of 16 MiB, and the request
-window is up to Σ × 64 KiB of arguments: 768 KiB for `gmail-read` and
-`calendar-read`, 128 KiB for `gmail-compose` and `gmail-organize`, 192 KiB for
+window is up to Σ × 64 KiB of arguments: 832 KiB for `gmail-read`, 768 KiB
+for `calendar-read`, 128 KiB for `gmail-compose` and `gmail-organize`, 192 KiB for
 `calendar-write`. An activation handed more than the guest can hold traps,
 and the host fails its new requests and alerts. That weight is the operator's to size (`docs/config-dsl.md`, the
 `provide` statement); nothing at load refuses it.
@@ -215,7 +215,7 @@ Five components answer the assistant's Gmail and Calendar tools with stamped
 
 | Package | Class | Tools |
 |---|---|---|
-| `google-gmail-read` | `GoogleGmailRead` | `GmailLabels`, `GmailSearch`, `GmailRead`, `GmailThread` |
+| `google-gmail-read` | `GoogleGmailRead` | `GmailLabels`, `GmailSearch`, `GmailRead`, `GmailThread`, `GmailAttachment` |
 | `google-gmail-compose` | `GoogleGmailCompose` | `GmailDraft` |
 | `google-gmail-organize` | `GoogleGmailOrganize` | `GmailModifyLabels` |
 | `google-calendar-read` | `GoogleCalendarRead` | `CalendarList`, `CalendarEvents`, `CalendarEvent`, `CalendarFreeBusy` |
@@ -245,7 +245,7 @@ Then the inbox tuning and the instances:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered: retain_depth ≥ 2 × Σ. gmail-read's Σ is 12, so 32 holds it.
+// re-delivered: retain_depth ≥ 2 × Σ. gmail-read's Σ is 13, so 32 holds it.
 channel at "brenn:tool-results/gmail-read" {
   push_depth = 1;
   retain_depth = 32;
@@ -268,7 +268,7 @@ channel at "brenn:tool-results/calendar-read" { push_depth = 1; retain_depth = 3
 channel at "brenn:tool-results/calendar-write" { push_depth = 1; retain_depth = 16; standing_retain_depth = 16; noise = alarm; }
 
 new gmail-read: GoogleGmailRead {
-  grants = [log, store, config, tools, provides];
+  grants = [log, store, config, tools, provides, blobs];
   store_path = "/var/lib/brenn/google-gmail-read.db";
   tool api-request {
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/labels"; }
@@ -276,6 +276,7 @@ new gmail-read: GoogleGmailRead {
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*"; }
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/threads/*"; }
+    allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*/attachments/*"; }
     rate_limit { burst = 60; sustained_per_minute = 120; }
   }
   config = {
@@ -358,6 +359,7 @@ agent PersonalAssistant {
   tool gmail-search {}
   tool gmail-read {}
   tool gmail-thread {}
+  tool gmail-attachment {}
   tool gmail-draft {}
   tool gmail-modify-labels {}
   tool calendar-list {}
@@ -380,8 +382,8 @@ sizes the inbox one instance's nested answers arrive on (the slug after the
 Google call outstanding, so at most Σ `max_concurrency` answers are
 outstanding at once, and an answer may be delivered twice: the window must
 hold 2 × Σ, `retain_depth ≥ 2 × Σ` for each class, rounded up to a power of
-two. `gmail-read`'s and `calendar-read`'s Σ is 12, so their blocks' 32 holds
-it; a tool joining either class that takes its Σ past 16 needs its block
+two. `gmail-read`'s Σ is 13 and `calendar-read`'s 12, so their blocks' 32
+holds it; a tool joining either class that takes its Σ past 16 needs its block
 raised. `gmail-compose`'s and `gmail-organize`'s Σ is 2 and
 `calendar-write`'s 3, which the family default of 16 holds; their blocks
 restate 16. The family default is too small for any class whose Σ is above 8
@@ -390,11 +392,46 @@ answered `internal` after the 240-second ceiling. Every block sets
 `push_depth = 1`, the inert channel rung, and `noise = alarm`, which makes a
 drop on that inbox an alert: without a block an inbox's overflow is silent.
 
+**What `GmailAttachment` leaves in the blob pool.** An attachment answer
+rests on the result's row in the inbox that received it until that inbox's
+window turns over, and holds its bytes in the blob pool (`[messaging]
+blob_budget_bytes`, 1 GiB by default) for that long. The rule for every
+deployment: size `blob_budget_bytes` at or above the sum, over the inboxes
+that receive attachment answers, of the inbox's depth × `max_blob_bytes`, or
+lower `max_blob_bytes`. The cases under it here:
+
+- *An `api-request` attachment answer.* Each fetch leaves Gmail's encoded
+  answer — the attachment's JSON, a third larger than the file — on
+  `brenn:tool-results/gmail-read`, dead weight once decoded, until 32 newer
+  results of any of the class's tools arrive there. At the largest attachment
+  `GmailAttachment` returns, 50,000,000 bytes, that inbox alone can hold
+  32 × about 66.7 MB, about 2.1 GB: twice the default pool. About 15 fetches
+  of the largest attachment in a row fill the default pool, and every other
+  producer in the deployment is then refused until the window turns over.
+- *A provided tool's attachment.* The decoded file rests on its caller's
+  inbox for that inbox's window: an app's `brenn:app-tool-results/<app-slug>`,
+  or a calling component's `brenn:tool-results/<slug>`. Every success of
+  `GmailAttachment` is such an attachment, so a component granted the tool
+  needs `blobs` to open what it is answered. Granted to a component without
+  `blobs`, the tool leaves up to that component's result-inbox depth × the
+  attachment size of blobs nobody can open, and they count in the sum
+  (`TODO.md`, `tool-result-attachments-to-caller-without-blobs`).
+
+For a `gmail-read` instance, set `blob_budget_bytes` for 32 × 4/3 × the
+largest attachment you mean to serve, plus what its callers' inboxes hold;
+or lower `max_blob_bytes`, which lowers the largest attachment the tool
+returns with it — a larger one is answered `invalid_args` naming
+`max_blob_bytes`. The inbox's depth cannot go below 2 × Σ = 26, so it is not
+the lever.
+
 **The clauses.** Each instance holds one clause per endpoint its own tools
 call, and nothing wider:
 
 - `gmail-read` — Gmail's label list, one label, the message search, one
-  message and one thread, all `GET`s.
+  message, one thread and one message's attachment, all `GET`s. The class
+  also requires `blobs`, which the instance grants: `GmailAttachment` asks
+  for the attachment's answer as a blob, decodes it by range and answers the
+  file as an attachment.
 - `gmail-compose` — the `GET` of one message, for a reply's original, and the
   `POST` for `drafts`, which creates a draft in the user's Drafts and sends
   nothing.
@@ -432,7 +469,8 @@ instance across every user it serves, keyed by the instance:
   search, one per message, and one for label names — so a burst of 60 admits
   two such searches without stalling. `GmailRead` and `GmailThread` are at
   most three: the read, one narrower read when the first is too large, and
-  label names.
+  label names. `GmailAttachment` is two: the message's part tree, then the
+  attachment.
 - `gmail-compose` — `GmailDraft` is one call, two for a reply (the
   original's headers, then the draft), so a burst of 10 admits five replies.
 - `gmail-organize` — `GmailModifyLabels` is one call whatever the number of
@@ -464,8 +502,8 @@ host containing `/` fails every activation with the key named.
 `gmail_readonly`, `gmail_compose`, `gmail_organize`, `calendar_readonly` and
 `calendar_events` scope sets (section 7, step 1). Each tool needs one:
 
-- `gmail_readonly` — `GmailLabels`, `GmailSearch`, `GmailRead` and
-  `GmailThread`, and the read of the original that a reply draft makes
+- `gmail_readonly` — `GmailLabels`, `GmailSearch`, `GmailRead`,
+  `GmailThread` and `GmailAttachment`, and the read of the original that a reply draft makes
   first.
 - `gmail_compose` — `GmailDraft`.
 - `gmail_organize` — `GmailModifyLabels`.
@@ -519,7 +557,14 @@ What the tools answer when the connection is not in place:
 
 **What an answer holds.** `GmailRead` answers the message's text, decoded,
 up to `max_chars` characters (12 000 by default, 200 to 60 000), and lists
-attachments without fetching them. A message too large to read whole —
+attachments without fetching them. An attachment Gmail serves separately,
+nested at most eight levels below the message's payload, is listed with a
+`part_id`, Gmail's immutable part id; `GmailAttachment` takes the message id
+and that `part_id` and answers the decoded file as an attachment of its
+result, `{"id", "part_id", "filename", "mime_type", "size", "attachment"}`,
+up to 50,000,000 bytes. An attachment listed without a `part_id` is carried
+inside the message, or nested deeper than eight levels (mail forwarded as an
+attachment several times over), and cannot be fetched with the tool. A message too large to read whole —
 over the read limit (`max_response_bytes`), or refused on the bus cap
 (`max_body_bytes`) — is answered with its headers, its attachments and
 Gmail's preview, `text` null and `text_omitted` saying why. Header values,
@@ -601,7 +646,7 @@ instructions (its system prompt or the `CLAUDE.md` it reads):
 
 ```
 You have Gmail tools: GmailLabels, GmailSearch, GmailRead, GmailThread,
-GmailDraft and GmailModifyLabels.
+GmailAttachment, GmailDraft and GmailModifyLabels.
 You have Google Calendar tools: CalendarList, CalendarEvents, CalendarEvent,
 CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
 - Pass `account` only when the user has several Google accounts connected;
@@ -612,6 +657,9 @@ CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
   calendar_events scope sets and relay its steps to the user.
 - GmailThread lists a thread's messages without their text; read a message's
   text with GmailRead.
+- GmailAttachment fetches an attachment GmailRead listed with a `part_id` and
+  hands you the file as an attachment: forward it with BrennSend, save it
+  with `brenn-tool save`, or hand it to another tool.
 - GmailDraft creates a draft the user sends from Gmail and never sends; a
   reply draft's answer says `in_thread: false` when Gmail filed it as a new
   conversation instead of in the original's — the draft is in Drafts and is
@@ -643,7 +691,7 @@ CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
   person on that person's calendar: there `organizer.self` and
   `self_response` are that person's, and the user's own response is the
   user's entry in `attendees`."
-- For anything else (attachments, the profile, history, Calendar's colors
+- For anything else (the profile, history, Calendar's colors
   and settings), see docs/providers/google.md and call api-request
   with provider "google". Brenn attaches the user's token; never send an
   Authorization header.
@@ -884,12 +932,13 @@ sections 3 and 5 in place.
 For Gmail endpoints the components do not wrap, and for Calendar's colors
 and settings, the assistant can call Google itself through `api-request`.
 `docs/providers/google.md` lists the endpoints with an example call each:
-the Gmail profile, attachments, a message in another form, history, thread
-listings and draft listings; Calendar's colors and settings; and Calendar's
+the Gmail profile, attachments by their `attachmentId` (an answer asked for
+with `response_attachment` comes back whole as a blob of Google's JSON), a
+message in another form, history, thread listings and draft listings; Calendar's colors and settings; and Calendar's
 events in a window for a caller without a user, as the automation below is.
 For the assistant, the calendar list, events, one event and free/busy,
-creating, changing and deleting events, draft creation and label changes are
-the components' tools (section 5). Each host it names must be in the provider's `api_hosts`
+creating, changing and deleting events, draft creation, label changes and
+fetching an attachment GmailRead lists are the components' tools (section 5). Each host it names must be in the provider's `api_hosts`
 (section 3) and admitted by a clause of the agent's grant.
 
 The assistant, reading only, beside its other grants:

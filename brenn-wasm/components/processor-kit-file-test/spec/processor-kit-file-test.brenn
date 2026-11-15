@@ -1,0 +1,28 @@
+/// Provider-kit file-transfer test fixture, served by the kit's
+/// `serve_with_blobs`. `kit-file-put` forwards its `file` attachment as a
+/// `PUT`'s body, after a `HEAD` of the same path when `head` is true, so the
+/// body is then opened from window context in a later activation.
+/// `kit-file-get` asks for a `GET`'s body as an attachment and forwards it as
+/// its own attachment `file`.
+///
+/// The instance's `config` names `provider`, the OAuth provider every call
+/// names, and `host`, the `host[:port]` every call reaches.
+component ProcessorKitFileTest {
+  abi = processor;
+  requires = [log, store, config, tools, provides, blobs];
+  in tool-results;
+  in tool-requests;
+  provide kit-file-put {
+    mcp_name = "KitFilePut";
+    description = "Test fixture: PUT the attachment `file` to `path`, after a HEAD of it when `head` is true.";
+    input_schema = """{ "type": "object", "properties": { "path": { "type": "string", "pattern": "^/[A-Za-z0-9/_.-]{0,255}$" }, "head": { "type": "boolean" } }, "required": ["path"], "additionalProperties": false }""";
+    accepts_attachments = true;
+    max_concurrency = 2;
+  }
+  provide kit-file-get {
+    mcp_name = "KitFileGet";
+    description = "Test fixture: GET `path` and answer its body as the attachment `file`.";
+    input_schema = """{ "type": "object", "properties": { "path": { "type": "string", "pattern": "^/[A-Za-z0-9/_.-]{0,255}$" } }, "required": ["path"], "additionalProperties": false }""";
+    max_concurrency = 2;
+  }
+}

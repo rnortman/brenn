@@ -16,25 +16,31 @@ use super::*;
 use std::collections::HashMap;
 
 use brenn_lib::config::{PACKAGED, config_from_dsl};
-use brenn_lib::messaging::config::ProvidedToolDecl;
+use brenn_lib::messaging::config::WasmConsumerConfigRaw;
 use brenn_messaging::MountDebt;
+use brenn_messaging_store::blob::BlobLimits;
 use brenn_oauth::testutil;
 use brenn_tool_registry::ToolError;
 use serde_json::json;
 
-use super::provider_rig::CallerSetup;
+use super::provider_rig::{CallerSetup, ConversationSetup};
 use super::stub_rig::{self, Pairs, StubProvider, StubRig, pairs};
 
 /// One Workspace component under test: its artifact, its packaged
-/// specification, its class, the instance's slug, and the one host key its
-/// `config` names.
+/// specification, its class, the instance's slug, the one host key its
+/// `config` names, and the grants its class requires, as an instance's
+/// `grants` list is written.
 pub(super) struct GoogleClass {
     pub wasm: &'static str,
     pub spec: &'static str,
     pub class: &'static str,
     pub slug: &'static str,
     pub host_key: &'static str,
+    pub grants: &'static str,
 }
+
+/// The grants of a class that handles no attachments.
+const PROVIDER_GRANTS: &str = "log, store, config, tools, provides";
 
 pub(super) const GMAIL_READ: GoogleClass = GoogleClass {
     wasm: concat!(
@@ -48,6 +54,7 @@ pub(super) const GMAIL_READ: GoogleClass = GoogleClass {
     class: "GoogleGmailRead",
     slug: "gmail-read",
     host_key: "gmail_host",
+    grants: "log, store, config, tools, provides, blobs",
 };
 
 pub(super) const GMAIL_COMPOSE: GoogleClass = GoogleClass {
@@ -62,6 +69,7 @@ pub(super) const GMAIL_COMPOSE: GoogleClass = GoogleClass {
     class: "GoogleGmailCompose",
     slug: "gmail-compose",
     host_key: "gmail_host",
+    grants: PROVIDER_GRANTS,
 };
 
 pub(super) const GMAIL_ORGANIZE: GoogleClass = GoogleClass {
@@ -76,6 +84,7 @@ pub(super) const GMAIL_ORGANIZE: GoogleClass = GoogleClass {
     class: "GoogleGmailOrganize",
     slug: "gmail-organize",
     host_key: "gmail_host",
+    grants: PROVIDER_GRANTS,
 };
 
 pub(super) const CALENDAR_READ: GoogleClass = GoogleClass {
@@ -90,6 +99,7 @@ pub(super) const CALENDAR_READ: GoogleClass = GoogleClass {
     class: "GoogleCalendarRead",
     slug: "calendar-read",
     host_key: "calendar_host",
+    grants: PROVIDER_GRANTS,
 };
 
 pub(super) const CALENDAR_WRITE: GoogleClass = GoogleClass {
@@ -104,6 +114,7 @@ pub(super) const CALENDAR_WRITE: GoogleClass = GoogleClass {
     class: "GoogleCalendarWrite",
     slug: "calendar-write",
     host_key: "calendar_host",
+    grants: PROVIDER_GRANTS,
 };
 
 /// The component that calls a provided tool on its own account.
@@ -122,20 +133,21 @@ pub(super) const WORK_BEARER: &str = "AT-alice-work";
 /// stub's host for any user.
 pub(super) type Clauses<'a> = &'a [(&'a str, &'a str)];
 
-/// `class`'s `provide` statements, lowered from its packaged specification
-/// under one instance of the class.
-fn provided(class: &GoogleClass) -> Vec<ProvidedToolDecl> {
+/// One instance of `class`, lowered from its packaged specification: its
+/// `provide` statements and its grants.
+fn lowered(class: &GoogleClass) -> WasmConsumerConfigRaw {
     let GoogleClass {
         spec,
         class: name,
         slug,
+        grants,
         ..
     } = class;
     let text = std::fs::read_to_string(spec).unwrap_or_else(|e| panic!("read {spec}: {e}"));
     let config = config_from_dsl(&format!(
         r#"{PACKAGED}{text}{PACKAGED}
 new {slug}: {name} {{
-    grants = [log, store, config, tools, provides];
+    grants = [{grants}];
     store_path = "/var/lib/brenn/google-{slug}.db";
     tool api-request {{}}
 }}
@@ -146,15 +158,44 @@ new {slug}: {name} {{
         .into_iter()
         .find(|consumer| consumer.slug == *slug)
         .expect("the instance lowers")
-        .provides
 }
 
 /// The accounts alice has connected: the account and its access token.
 pub(super) type Connected<'a> = &'a [(&'a str, &'a str)];
 
+/// How a rig differs from [`rig`]'s; each field's default is that rig's.
+pub(super) struct RigOptions<'a> {
+    /// The accounts alice has connected; her one account by default.
+    pub connected: Connected<'a>,
+    /// The calling component, if any.
+    pub caller: Option<CallerSetup<'a>>,
+    /// The most `api-request` reads of each of Google's answers; the
+    /// provider's default when `None`.
+    pub max_response_bytes: Option<usize>,
+    /// The blob store's limits when the class is granted `blobs`;
+    /// production defaults when `None`.
+    pub blob_limits: Option<BlobLimits>,
+    /// Whether the rig holds app [`APP`], whose conversations read [`SRC`]
+    /// and are granted every tool the class provides and `api-request` under
+    /// the rig's clauses.
+    pub conversations: bool,
+}
+
+impl Default for RigOptions<'_> {
+    fn default() -> Self {
+        RigOptions {
+            connected: &[(ACCOUNT, BEARER)],
+            caller: None,
+            max_response_bytes: None,
+            blob_limits: None,
+            conversations: false,
+        }
+    }
+}
+
 /// The rig for `class` with `clauses` and alice's one account connected.
 pub(super) async fn rig(class: &GoogleClass, clauses: Clauses<'_>) -> StubRig {
-    rig_with(class, clauses, &[(ACCOUNT, BEARER)], None).await
+    rig_built(class, clauses, RigOptions::default()).await
 }
 
 /// Stand up the rig for `class`: the provider's `api-request` grant holds
@@ -166,7 +207,16 @@ pub(super) async fn rig_with(
     connected: Connected<'_>,
     caller: Option<CallerSetup<'_>>,
 ) -> StubRig {
-    rig_configured(class, clauses, connected, caller, |_| {}).await
+    rig_built(
+        class,
+        clauses,
+        RigOptions {
+            connected,
+            caller,
+            ..RigOptions::default()
+        },
+    )
+    .await
 }
 
 /// The rig for `class` with `clauses` and alice's one account connected,
@@ -177,41 +227,119 @@ pub(super) async fn rig_reading_at_most(
     clauses: Clauses<'_>,
     max_response_bytes: usize,
 ) -> StubRig {
-    rig_configured(class, clauses, &[(ACCOUNT, BEARER)], None, |provider| {
-        provider.raw.max_response_bytes = max_response_bytes;
-    })
+    rig_built(
+        class,
+        clauses,
+        RigOptions {
+            max_response_bytes: Some(max_response_bytes),
+            ..RigOptions::default()
+        },
+    )
     .await
 }
 
-/// [`rig_with`], with `configure` applied to the OAuth provider's
-/// configuration before the service is built.
-async fn rig_configured(
+/// The app whose conversations a rig built with
+/// [`RigOptions::conversations`] holds.
+pub(super) const APP: &str = "pa";
+/// The system principal that publishes on `brenn:src`.
+pub(super) const PRODUCER: &str = "blob-producer";
+/// The channel the producer publishes the files a conversation is shown on.
+pub(super) const SRC: &str = "brenn:src";
+
+/// App [`APP`]: reads [`SRC`], granted `tools` with no clauses and
+/// `api-request` under `clauses` on the stub's `host`.
+fn conversations(tools: &[String], clauses: Clauses<'_>, host: &str) -> ConversationSetup {
+    use brenn_envelope::grants::AppCapability;
+    use brenn_lib::access::acl::ChannelMatcher;
+    use brenn_tool_registry::testutil::{clause, grant};
+
+    let mut app = crate::test_support::app_config::default_test_app_config(APP, APP);
+    let policy = app.policy_mut();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy
+        .acls
+        .brenn_subscribe
+        .push(ChannelMatcher::Exact("src".to_string()));
+    for tool in tools {
+        policy.tool_grants.insert(tool.clone(), grant(vec![]));
+    }
+    policy.tool_grants.insert(
+        "api-request".to_string(),
+        grant(
+            clauses
+                .iter()
+                .map(|&(method, path)| {
+                    clause(&[
+                        ("provider", OAUTH_PROVIDER),
+                        ("user", "*"),
+                        ("method", method),
+                        ("host", host),
+                        ("path", path),
+                    ])
+                })
+                .collect(),
+        ),
+    );
+    ConversationSetup {
+        apps: IndexMap::from([(APP.to_string(), app)]),
+        channels: vec![brenn_messaging::testutils::test_channel_entry(
+            "src",
+            vec![],
+        )],
+        producer: PRODUCER,
+    }
+}
+
+/// Stand up the rig for `class`: the provider's `api-request` grant holds
+/// `clauses`, and the rest is as `options` states.
+pub(super) async fn rig_built(
     class: &GoogleClass,
     clauses: Clauses<'_>,
-    connected: Connected<'_>,
-    caller: Option<CallerSetup<'_>>,
-    configure: impl FnOnce(&mut brenn_lib::config::OAuthProviderConfig),
+    options: RigOptions<'_>,
 ) -> StubRig {
+    let RigOptions {
+        connected,
+        caller,
+        max_response_bytes,
+        blob_limits,
+        conversations: with_conversations,
+    } = options;
     let started = stub_rig::start().await;
     let host = started.host.clone();
     let (name, mut provider) = testutil::provider_config(OAUTH_PROVIDER, &started.base);
-    configure(&mut provider);
+    if let Some(max_response_bytes) = max_response_bytes {
+        provider.raw.max_response_bytes = max_response_bytes;
+    }
     let (service, vault) = testutil::service(vec![(name, provider)]);
     for (account, bearer) in connected {
         let mut credential = testutil::credential(OAUTH_PROVIDER, account, "RT-alice");
         credential.access_token = bearer.to_string();
         service.vault().store("alice", &credential).await;
     }
+    let instance = lowered(class);
+    let conversations = with_conversations.then(|| {
+        let tools: Vec<String> = instance
+            .provides
+            .iter()
+            .map(|decl| decl.name.clone())
+            .collect();
+        conversations(&tools, clauses, &host)
+    });
+    let api_blobs = brenn_oauth::tools::BlobStoreSlot::default();
     StubRig::build(
         started,
         StubProvider {
             slug: class.slug,
             wasm: class.wasm,
-            decls: provided(class),
+            decls: instance.provides,
+            grants: instance.grants.into_iter().collect(),
+            blob_limits,
             native: brenn_oauth::tools::registered(
                 Some(&service),
                 brenn_lib::config::ApiKeyTable::empty(),
+                api_blobs.clone(),
             ),
+            api_blobs,
             clauses: clauses
                 .iter()
                 .map(|&(method, path)| {
@@ -228,6 +356,7 @@ async fn rig_configured(
                 (class.host_key.to_string(), host),
             ]),
             caller,
+            conversations,
             vault,
         },
     )

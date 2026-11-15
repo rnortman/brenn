@@ -21,6 +21,8 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
+use crate::blocking::blocking;
+
 /// The only file format version this build reads or writes.
 const FORMAT_VERSION: u32 = 1;
 
@@ -256,17 +258,6 @@ impl Vault {
     #[cfg(test)]
     fn locked_paths(&self) -> usize {
         self.locks.lock().unwrap().len()
-    }
-}
-
-/// Run `f` on the blocking pool; a panic in it is resumed here.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(value) => value,
-        Err(e) => match e.try_into_panic() {
-            Ok(panic) => std::panic::resume_unwind(panic),
-            Err(e) => panic!("vault: blocking I/O task did not complete: {e}"),
-        },
     }
 }
 

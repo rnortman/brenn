@@ -1,0 +1,14 @@
+[package]
+name = "brenn-processor-kit-file-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+brenn-guest = { path = "../guest" }
+brenn-provider-kit = { version = "0.1.0", path = "../host-crates/brenn-provider-kit" }
+brenn-provider-kit-guest = { path = "../provider-kit-guest" }
+serde_json = "1"

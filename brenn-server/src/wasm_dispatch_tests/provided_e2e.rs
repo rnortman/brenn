@@ -105,6 +105,7 @@ async fn rig(provider_acl: Vec<&[(&str, &str)]>, caller_args: Value) -> Rig {
             brenn_lib::config::ApiKeyTable::new(std::sync::Arc::new(BTreeMap::from([
                 testutil::key_provider_config("maps", &base),
             ]))),
+            brenn_oauth::tools::BlobStoreSlot::default(),
         ),
         grants,
         component: ProcessorLoadSpec {
@@ -119,6 +120,7 @@ async fn rig(provider_acl: Vec<&[(&str, &str)]>, caller_args: Value) -> Rig {
             args: caller_args,
         }),
         conversations: None,
+        blob_limits: None,
     })
     .await;
 
@@ -140,6 +142,7 @@ impl Rig {
                 self.registry.clone().into(),
                 self.provider_grants.clone(),
                 slug.to_string(),
+                false,
                 self.alert.clone(),
             )),
         )

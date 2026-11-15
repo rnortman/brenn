@@ -6,6 +6,7 @@
 //! in [`tools`] act through it on a conversation owner's behalf. `api-request`
 //! also sends the deployment's keys for the `api_key_provider`s.
 
+mod blocking;
 pub mod flow;
 pub mod http;
 pub mod path_template;

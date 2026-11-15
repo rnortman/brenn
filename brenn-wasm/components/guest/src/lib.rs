@@ -2652,6 +2652,55 @@ pub mod provides {
         }
     }
 
+    /// Why [`open_request_attachment`] gave no handle.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum RequestAttachmentError {
+        /// No message of this activation's `tool-requests` window, new or
+        /// context, carries the request: newer requests displaced it.
+        NotInWindow,
+        /// The request's message is in the window and the host refused the
+        /// open.
+        Open(crate::blobs::OpenError),
+        /// The window holds a request body that [`Activation::tool_requests`]
+        /// would refuse, with the diagnostic. The body is host-built, so this
+        /// is a host fault.
+        ///
+        /// [`Activation::tool_requests`]: crate::Activation::tool_requests
+        Malformed(String),
+    }
+
+    /// A handle to attachment `name` of the request `id`, wherever its message
+    /// sits in this activation's `tool-requests` window, new or context.
+    ///
+    /// [`ToolRequest::open`] reaches a request only in the activation that
+    /// delivers it new; this reaches it in any later activation for as long
+    /// as its message stays among the window's context. Once newer requests
+    /// displace it the answer is [`RequestAttachmentError::NotInWindow`],
+    /// whether or not the request is still pending.
+    ///
+    /// **Requires grant:** `"blobs"`.
+    pub fn open_request_attachment(
+        activation: &crate::Activation,
+        id: &PendingId,
+        name: &str,
+    ) -> Result<crate::blobs::Blob, RequestAttachmentError> {
+        let window = activation
+            .reserved_window(brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT)
+            .map_err(|e| RequestAttachmentError::Malformed(e.to_string()))?;
+        for message in window
+            .context_messages()
+            .iter()
+            .chain(window.new_messages())
+        {
+            let request = parse_request(message)
+                .map_err(|e| RequestAttachmentError::Malformed(e.to_string()))?;
+            if request.id == *id {
+                return request.open(name).map_err(RequestAttachmentError::Open);
+            }
+        }
+        Err(RequestAttachmentError::NotInWindow)
+    }
+
     fn complete_raw(id: &PendingId, outcome_json: &str) -> Result<(), Error> {
         raw::complete(&id.0, outcome_json).map_err(|e| match e {
             CompleteError::NotPending => Error::NotPending(format!("complete {id}: not-pending")),

@@ -188,6 +188,7 @@ mod tests {
             ("processor-config", Family::Guest),
             ("processor-demo", Family::Guest),
             ("processor-dual", Family::Guest),
+            ("processor-kit-file-test", Family::Guest),
             ("processor-log", Family::Guest),
             ("processor-mqtt-test", Family::Guest),
             ("processor-multiport", Family::Guest),

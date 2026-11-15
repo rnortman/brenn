@@ -9,17 +9,20 @@
 
 use super::*;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use brenn_lib::messaging::config::ProvidedToolDecl;
+use brenn_lib::messaging::config::{MessagingGlobalConfig, ProvidedToolDecl};
 use brenn_lib::tools::ResolvedToolGrant;
+use brenn_messaging_store::blob::{BlobLimits, BlobUsage};
 use brenn_oauth::testutil;
+use brenn_oauth::tools::BlobStoreSlot;
 use brenn_tool_registry::testutil::{clause, grant};
-use brenn_tool_registry::{RegisteredTool, ToolError};
+use brenn_tool_registry::{HeldAttachments, RegisteredTool, ToolError, ToolOutput};
 use serde_json::Value;
 
-use super::provider_rig::{CallerSetup, ProviderRig, ProviderSetup};
+use super::provider_rig::{CallerSetup, ConversationSetup, ProviderRig, ProviderSetup};
+use crate::active_bridge::ActiveBridge;
 
 /// The store namespace a provider component keeps its in-flight rows in.
 const INFLIGHT_NS: &str = "inflight";
@@ -55,9 +58,42 @@ pub(super) struct StubProvider<'a> {
     /// clause is on the stub's host.
     pub clauses: Vec<Vec<(&'a str, &'a str)>>,
     pub config: HashMap<String, String>,
+    /// The component's grants, as its instance holds them.
+    pub grants: BTreeSet<ComponentGrant>,
+    /// The blob store's limits when the grants hold `blobs`;
+    /// [`production_blob_limits`] when `None`.
+    pub blob_limits: Option<BlobLimits>,
+    /// The slot the `native` tools' `api-request` was built over; the rig
+    /// attaches its blob store there, when it has one.
+    pub api_blobs: BlobStoreSlot,
     pub caller: Option<CallerSetup<'a>>,
+    /// Apps whose conversations call the registry, if the suite has any.
+    pub conversations: Option<ConversationSetup>,
     /// The OAuth service's vault, held for the rig's life.
     pub vault: tempfile::TempDir,
+}
+
+/// The blob store limits a deployment runs with when it states none.
+pub(super) fn production_blob_limits() -> BlobLimits {
+    let defaults = MessagingGlobalConfig::default();
+    BlobLimits {
+        max_blob_bytes: defaults.max_blob_bytes,
+        budget_bytes: defaults.blob_budget_bytes,
+    }
+}
+
+/// `n` bytes no two runs of which repeat at a short period, for files moved
+/// through the rig.
+pub(super) fn file_bytes(n: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
 }
 
 /// The provider rig, with the store the component keeps and the stub its
@@ -67,6 +103,8 @@ pub(super) struct StubRig {
     pub stub: testutil::Stub,
     /// The stub's `host:port`.
     pub host: String,
+    /// The apps of a rig built with conversations.
+    apps: Option<Arc<IndexMap<String, brenn_lib::config::AppConfig>>>,
     _dir: tempfile::TempDir,
     _vault: tempfile::TempDir,
 }
@@ -125,8 +163,8 @@ pub(super) fn assert_could_not_be_issued(answer: Result<Value, ToolError>) {
 
 impl StubRig {
     /// Build the provider over `started`'s stub: its `api-request` grant holds
-    /// `setup.clauses` on the stub's host, and it holds every grant a
-    /// provider component needs, with its store open.
+    /// `setup.clauses` on the stub's host, and it holds `setup.grants`, with
+    /// its store open and, when the grants hold `blobs`, a blob store.
     pub async fn build(started: Started, setup: StubProvider<'_>) -> StubRig {
         let Started { host, stub, .. } = started;
         let grants: BTreeMap<String, ResolvedToolGrant> = BTreeMap::from([(
@@ -145,6 +183,10 @@ impl StubRig {
         )]);
         let dir = tempfile::tempdir().expect("a store directory");
         let store_path = dir.path().join(format!("{}.db", setup.slug));
+        let apps = setup
+            .conversations
+            .as_ref()
+            .map(|conversations| Arc::new(conversations.apps.clone()));
         let base = ProviderRig::build(ProviderSetup {
             slug: setup.slug,
             decls: setup.decls,
@@ -153,30 +195,42 @@ impl StubRig {
             component: ProcessorLoadSpec {
                 config: setup.config,
                 store_path: Some(&store_path),
-                grants: [
-                    ComponentGrant::Log,
-                    ComponentGrant::Store,
-                    ComponentGrant::Config,
-                    ComponentGrant::Tools,
-                    ComponentGrant::Provides,
-                ]
-                .into_iter()
-                .collect(),
+                grants: setup.grants,
                 ..ProcessorLoadSpec::minimal(Path::new(setup.wasm), setup.slug)
             },
             caller: setup.caller,
-            conversations: None,
+            conversations: setup.conversations,
+            blob_limits: Some(setup.blob_limits.unwrap_or_else(production_blob_limits)),
         })
         .await;
         base.provider.component.open_store();
+        if let Some(store) = base.messenger.blob_store() {
+            setup.api_blobs.attach(store.clone());
+        }
 
         StubRig {
             base,
             stub,
             host,
+            apps,
             _dir: dir,
             _vault: setup.vault,
         }
+    }
+
+    /// A fresh conversation of `app_slug` acting for `username`; panics on a
+    /// rig built without conversations.
+    pub async fn conversation(&self, app_slug: &str, username: &str) -> Arc<ActiveBridge> {
+        ActiveBridge::test_new_for_conversation(
+            self.messenger.clone(),
+            self.apps
+                .clone()
+                .expect("the rig was built with conversations"),
+            app_slug,
+            username,
+            self.registry.clone(),
+        )
+        .await
     }
 
     /// Run the one nested call the provider issued, and wait for its result
@@ -195,6 +249,29 @@ impl StubRig {
             self.run_nested().await;
             self.serve().await;
         }
+    }
+
+    /// Call `mcp_name` as alice with `args`, handing it `attachments`, and
+    /// [`run`](Self::run) the request through `steps` nested calls; the whole
+    /// output, once the request is [finished](Self::assert_finished).
+    pub async fn call_running(
+        &self,
+        mcp_name: &str,
+        args: Value,
+        attachments: HeldAttachments,
+        steps: usize,
+    ) -> Result<ToolOutput, ToolError> {
+        let call = self.call_for_alice_with(mcp_name, args, attachments);
+        let request = self.requested_id().await;
+        self.run(steps).await;
+        let answer = call.await.unwrap();
+        self.assert_finished(&request);
+        answer
+    }
+
+    /// The blob store's usage.
+    pub fn blob_usage(&self) -> BlobUsage {
+        self.messenger.blob_store().expect("a blob store").usage()
     }
 
     /// The stub's answer to a request for `path`.

@@ -130,6 +130,9 @@ pub(crate) struct ReloadEnv {
     /// snapshotted, for the reason `apps` is: the baseline is what
     /// `api-request` is sending now, and commit swaps this same table.
     pub api_keys: brenn_lib::config::ApiKeyTable,
+    /// The blob store slot boot's `api-request` reads, handed to the one a
+    /// reload registers. A reload never replaces the store.
+    pub api_request_blobs: brenn_oauth::tools::BlobStoreSlot,
     /// The integration factories this process was built with. Immutable after
     /// construction; every reload resolves the same factories.
     pub integration_registry: Arc<brenn_lib::integration::IntegrationRegistry>,
@@ -970,6 +973,7 @@ impl ReloadDriver {
                 &apps,
                 &self.env.provider_runtime,
                 &self.env.api_keys,
+                &self.env.api_request_blobs,
             );
             tools.candidate.validate_config(&apps);
             brenn_lib::config::assert_vault_disjoint_from_apps(candidate, &apps);
@@ -2622,7 +2626,12 @@ channel scratch at "ephemeral:scratch" {{
             brenn_lib::config::resolve_api_key_providers(&document.config),
         ));
         let mut native_tools = native_tools;
-        native_tools.extend(brenn_oauth::tools::registered(None, api_keys.clone()));
+        let api_request_blobs = brenn_oauth::tools::BlobStoreSlot::default();
+        native_tools.extend(brenn_oauth::tools::registered(
+            None,
+            api_keys.clone(),
+            api_request_blobs.clone(),
+        ));
         let tool_registry = Arc::new(crate::build_tool_registry(
             native_tools,
             &document.config.wasm_consumers,
@@ -2655,6 +2664,12 @@ channel scratch at "ephemeral:scratch" {{
         .0;
         let messenger = result.messenger.clone().expect("messaging must be up");
         provider_runtime.attach(messenger.clone());
+        api_request_blobs.attach(
+            messenger
+                .blob_store()
+                .expect("the rig's messaging installs a blob store")
+                .clone(),
+        );
         let router = result.router.clone().expect("the wake router must be up");
         // The executor's positions on its request channels, attached whether or
         // not its task runs, as `run_server` attaches them before anything can
@@ -2882,6 +2897,7 @@ channel scratch at "ephemeral:scratch" {{
                 build_id: TEST_BUILD_ID,
                 apps: messenger.app_table(),
                 api_keys: api_keys.clone(),
+                api_request_blobs,
                 integration_registry: Arc::new(brenn_lib::integration::IntegrationRegistry::new(
                     vec![],
                 )),
@@ -6916,12 +6932,14 @@ new grinder: Demo {
     /// answers it right now.
     fn may_pull(grants: &brenn_tool_registry::ToolCallerGrants, slug: &str, repo: &str) -> bool {
         let caller = brenn_lib::messaging::ParticipantId::for_wasm(slug);
-        grants.grant(caller.as_str(), "apull").is_some_and(|grant| {
-            grant.acl_allows(&std::collections::BTreeMap::from([(
-                "repo".to_string(),
-                repo.to_string(),
-            )]))
-        })
+        grants
+            .grant(caller.as_str(), "apull")
+            .is_some_and(|(grant, _)| {
+                grant.acl_allows(&std::collections::BTreeMap::from([(
+                    "repo".to_string(),
+                    repo.to_string(),
+                )]))
+            })
     }
 
     /// The async tool executor's per-caller grant table across a consumer's
@@ -7047,6 +7065,90 @@ new sifter: Plain {{
             "and holds no caller key at all, as a fresh boot of the same document would: {:?}",
             grants.snapshot(),
         );
+    }
+
+    /// A document whose `sifter` holds an async grant on `apull`, granted (and
+    /// its class requiring) `blobs` beside it iff `blobs`.
+    fn document_with_tool_grants_and_blobs(blobs: bool) -> String {
+        let grants = if blobs {
+            "ports, tools, blobs"
+        } else {
+            "ports, tools"
+        };
+        document(&format!(
+            r#"channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+{PACKAGED}component Demo {{
+    abi = processor;
+    requires = [{grants}];
+    in inbound;
+    in tool-results;
+    out digest;
+}}
+{PACKAGED}
+new sifter: Demo {{
+    grants = [{grants}];
+    in inbound <- work {{ push_depth = 4; }}
+    out digest -> sink;
+    tool apull {{ allow {{ repo = "brenn"; }} }}
+}}
+"#
+        ))
+    }
+
+    /// Whether the executor's table says `slug` is granted `blobs`, read
+    /// beside its `apull` grant.
+    fn opens_blobs(grants: &brenn_tool_registry::ToolCallerGrants, slug: &str) -> bool {
+        let caller = brenn_lib::messaging::ParticipantId::for_wasm(slug);
+        grants
+            .grant(caller.as_str(), "apull")
+            .map(|(_, blobs)| blobs)
+            .expect("the consumer is granted `apull`")
+    }
+
+    /// The `blobs` bit in the executor's table follows the instance's grant
+    /// across a reload, in both directions: it is what a tool reads to decide
+    /// whether to answer that caller with a blob.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tool_grant_tables_blobs_bit_follows_a_reload() {
+        let components = tempfile::tempdir().expect("a components root");
+        let roots = vec![components.path().to_path_buf()];
+        let tree = Tree::holding(&document_with_tool_grants_and_blobs(true));
+        let install = || install_package(components.path(), &staged_module(&tree));
+        install();
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: roots,
+                native_tools: vec![async_pull_tool()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let grants = booted
+            .tool_caller_grants
+            .clone()
+            .expect("a document holding an async tool grant mints the executor's table");
+        assert!(opens_blobs(&grants, "sifter"), "booted with `blobs`");
+
+        tree.write(&document_with_tool_grants_and_blobs(false));
+        install();
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.consumers_changed, vec!["sifter".to_string()]);
+        assert!(!opens_blobs(&grants, "sifter"), "`blobs` withdrawn");
+
+        tree.write(&document_with_tool_grants_and_blobs(true));
+        install();
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.consumers_changed, vec!["sifter".to_string()]);
+        assert!(opens_blobs(&grants, "sifter"), "`blobs` granted again");
     }
 
     // ---------------------------------------------------------------------

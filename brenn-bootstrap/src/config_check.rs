@@ -2829,6 +2829,7 @@ new git-sync-consumer: GitSyncConsumer {{
         );
         assert_eq!(
             plan.tool_caller_grants["wasm:git-sync-consumer"]
+                .tools
                 .keys()
                 .collect::<Vec<_>>(),
             vec!["git-repo-pull"],

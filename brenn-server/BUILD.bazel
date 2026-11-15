@@ -73,10 +73,11 @@ rust_library(
 # `data` is the thirteen components this crate's tests actually open, one
 # fixture target each — not the whole set. Runfiles are inputs to the test
 # action, so every component named here is an edge from a guest crate to all
-# ~1,350 tests; the others cost nothing when they change. The six
-# specifications listed are the five Google Workspace classes and the
-# `google-maps-tools` class, whose `provide` statements the e2e rigs lower;
-# each component's fixture already depends on its own.
+# ~1,350 tests; the others cost nothing when they change. The seven
+# specifications listed are the five Google Workspace classes, the
+# `google-maps-tools` class and the `processor-kit-file-test` fixture, whose
+# `provide` statements the e2e rigs lower; each component's fixture already
+# depends on its own.
 #
 # TODO(bazel-fixture-list-guard): which thirteen those are was derived by reading
 # this crate's artifact-stem call sites, and nothing holds the list to them. A
@@ -102,6 +103,7 @@ rust_test(
         "//:config/specs/google-gmail-read.brenn",
         "//:config/specs/google-maps-tools.brenn",
         "//brenn-tool",
+        "//brenn-wasm/components/processor-kit-file-test:spec/processor-kit-file-test.brenn",
         "//brenn-wasm:fixture_git_forge_parser",
         "//brenn-wasm:fixture_git_sync_consumer",
         "//brenn-wasm:fixture_google_calendar_read",
@@ -112,6 +114,7 @@ rust_test(
         "//brenn-wasm:fixture_google_maps_tools",
         "//brenn-wasm:fixture_processor_blob_provider_test",
         "//brenn-wasm:fixture_processor_blobs_test",
+        "//brenn-wasm:fixture_processor_kit_file_test",
         "//brenn-wasm:fixture_processor_provider_test",
         "//brenn-wasm:fixture_processor_tool_test",
         "//brenn-wasm:fixture_replay",

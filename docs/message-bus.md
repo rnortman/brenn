@@ -337,7 +337,12 @@ or trap publishes nothing and deletes everything it made. A conversation
 does too, by name, below. Host code's
 `Messenger::publish_from_system_with_attachments` is a further publishing
 entry; the tool substrate publishes a call's request and result through it
-(below). A remote attacher on attach v6 does, by handle, below. Pages and
+(below). The host tool `api-request` creates one on a caller's behalf: asked
+with `response_attachment`, it streams a 2xx answer's body into a new blob
+and answers it as an attachment of the result, and only for a caller that can
+open it — a conversation, or a component granted `blobs`
+(`docs/config-dsl.md`, "The OAuth tools"). Its `body_attachment` sends an
+attachment the call carries as the request body. A remote attacher on attach v6 does, by handle, below. Pages and
 v4/v5 remotes see references as metadata only, and no surface host serves
 the interface. A remote's replay store and a page's rings do not hold the
 blob, so a reference there can outlive it. `ports.publish` and its siblings
@@ -573,8 +578,7 @@ at the next start — and one a durable
 row names is redeemable while the row stays in its window.
 
 What is not built: the `blobs` interface on a page, save and attach for a
-conversation without a shell tool, connectors that produce blobs, the
-surface's handling of them, attachments on `calls.call` and
+conversation without a shell tool, a surface's handling of blobs, attachments on `calls.call` and
 `tools.call-fast`, and transfer of bytes to a page.
 
 ### 2.1.3 Limits on a remote's stream of messages

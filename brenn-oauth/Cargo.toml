@@ -13,16 +13,21 @@ testutils = ["dep:axum", "dep:tempfile", "brenn-lib/testutils", "brenn-obs/testu
 
 # Reaches down to brenn-tool-registry for the tool traits, to brenn-lib for the
 # resolved provider config and `SecretString`, to brenn-obs for the operator
-# alert a provider's protocol breach raises. Nothing above is named here:
+# alert a provider's protocol breach raises, to brenn-messaging-store and
+# brenn-envelope for the blobs `api-request` streams bodies from and into. Nothing above is named here:
 # brenn-server serves the callback route over the service this crate builds.
 [dependencies]
 async-trait = "0.1.89"
 base64ct = { version = "1.8.3", features = ["alloc"] }
+bytes = "1.11.1"
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry" }
 chrono = { version = "0.4.44", features = ["serde"] }
 hex = "0.4.3"
+http-body = "1.0.1"
 percent-encoding = "2.3.2"
 rand = "0.10"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "form"] }
@@ -38,10 +43,14 @@ tempfile = { version = "3.27.0", optional = true }
 
 [dev-dependencies]
 axum = "0.8.8"
-brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store", features = ["testutils"] }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
 brenn-provider-kit = { version = "0.1.0", path = "../brenn-provider-kit" }
 brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry", features = ["testutils"] }
+http-body-util = "0.1.3"
 tempfile = "3.27.0"
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
+# "no-env-filter" makes `#[traced_test]` capture unconditionally; without it
+# tracing-test applies a default env filter and `logs_contain` assertions fail.
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }

@@ -618,6 +618,7 @@ impl ToolRegistry {
             acting_conversation_id,
             acting_user,
             deadline: None,
+            caller_opens_blobs: true,
         };
 
         let invoke_started = Instant::now();
@@ -1291,7 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_for_llm_passes_the_acting_user_through() {
+    async fn invoke_for_llm_passes_the_acting_user_through_and_opens_blobs() {
         let reg = bound_registry();
         let (alert, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let user = ActingUser {
@@ -1311,7 +1312,10 @@ mod tests {
             )
             .await
             .expect("acting-user call succeeds");
-        assert_eq!(out.value, json!({ "id": 7, "username": "alice" }));
+        assert_eq!(
+            out.value,
+            json!({ "id": 7, "username": "alice", "opens_blobs": true })
+        );
     }
 
     #[tokio::test]

@@ -8,7 +8,9 @@ policy_srcs()
 exports_files(["Cargo.toml"])
 
 FIRST_PARTY_DEPS = [
+    "//brenn-envelope",
     "//brenn-lib",
+    "//brenn-messaging-store",
     "//brenn-obs",
     "//brenn-tool-registry",
 ]
@@ -41,7 +43,6 @@ rust_test(
     rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS + [
-        "//brenn-envelope",
         "//brenn-provider-kit",
     ],
 )

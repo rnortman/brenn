@@ -63,6 +63,9 @@ pub struct ToolCtx {
     /// the call site that admitted it and covering admission as well as
     /// execution. `None` for a native tool, which ignores it.
     pub deadline: Option<tokio::time::Instant>,
+    /// Whether the caller can open a blob a tool answers with: a component iff
+    /// its instance is granted `blobs`; a conversation always.
+    pub caller_opens_blobs: bool,
 }
 
 impl ToolCtx {
@@ -96,6 +99,7 @@ mod tests {
             acting_conversation_id: None,
             acting_user,
             deadline: None,
+            caller_opens_blobs: false,
         }
     }
 

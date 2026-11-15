@@ -1069,6 +1069,57 @@ const PROCESSOR_EPOCH_DEADLINE_TICKS: u64 = 300;
 pub const PROCESSOR_FUEL_PER_ENVELOPE: u64 = 10_000_000;
 /// Minimum fuel even for an empty window (startup/invocation overhead).
 pub const PROCESSOR_FUEL_MINIMUM: u64 = 50_000_000;
+/// Fuel added per byte of attachment on the new messages of an activation of
+/// a component granted `blobs`.
+///
+/// An attachment is input the envelope count does not weigh, and a component
+/// that transforms a blob by range needs CPU in proportion to its size; it
+/// cannot learn its fuel or refuse by size before a trap. `GmailAttachment`'s
+/// base64url decode, read and written through the kit by range, was measured
+/// at about 79 fuel per byte of the encoded answer; 128 leaves it 1.6 times
+/// that. Forwarding a blob costs no fuel.
+pub const PROCESSOR_FUEL_PER_ATTACHMENT_BYTE: u64 = 128;
+/// The most fuel attachment bytes add to one activation: the rate times the
+/// activation's blob write bound, so the most an activation gains is bounded
+/// whatever arrives. The epoch deadline stays the wall-clock bound.
+pub const PROCESSOR_MAX_ATTACHMENT_FUEL: u64 =
+    PROCESSOR_FUEL_PER_ATTACHMENT_BYTE * PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION;
+
+/// The summed size of the attachments on the new messages of `activation`'s
+/// input windows. Context messages add nothing: their bytes were weighed on
+/// the activation that delivered them new.
+fn new_attachment_bytes(activation: &HostActivation) -> u64 {
+    activation
+        .ports
+        .iter()
+        .flat_map(|pw| pw.new_envelopes())
+        .flat_map(|envelope| envelope.attachments.iter())
+        .fold(0u64, |sum, (_, blob)| sum.saturating_add(blob.size))
+}
+
+/// The fuel `activation` runs on: [`processor_fuel`] over its envelope count
+/// and, when `blobs_granted`, the attachment bytes it delivers new.
+fn activation_fuel(activation: &HostActivation, blobs_granted: bool) -> u64 {
+    let total_envelopes: usize = activation.ports.iter().map(|pw| pw.envelopes.len()).sum();
+    processor_fuel(
+        total_envelopes,
+        blobs_granted.then(|| new_attachment_bytes(activation)),
+    )
+}
+
+/// An activation's fuel: the envelope rule, plus the attachment rule for a
+/// component granted `blobs`. `new_attachment_bytes` is `None` for a component
+/// without the grant, which gains nothing whatever its messages carry.
+fn processor_fuel(total_envelopes: usize, new_attachment_bytes: Option<u64>) -> u64 {
+    let envelopes =
+        PROCESSOR_FUEL_MINIMUM.max(PROCESSOR_FUEL_PER_ENVELOPE * (total_envelopes as u64));
+    let attachments = new_attachment_bytes.map_or(0, |bytes| {
+        bytes
+            .saturating_mul(PROCESSOR_FUEL_PER_ATTACHMENT_BYTE)
+            .min(PROCESSOR_MAX_ATTACHMENT_FUEL)
+    });
+    envelopes + attachments
+}
 /// Maximum memory a guest may grow to (bytes). 16 MiB per activation.
 ///
 /// Cap excess is a deterministic trap: `trap_on_grow_failure(true)` is set on
@@ -4601,7 +4652,7 @@ impl ProcessorComponent {
 
     fn make_store(
         &self,
-        total_envelope_count: usize,
+        fuel: u64,
         publish_budget_by_sink: HashMap<SinkKey, u64>,
         call_chain: Vec<String>,
     ) -> Store<ProcessorData> {
@@ -4645,8 +4696,6 @@ impl ProcessorComponent {
             },
         );
         store.limiter(|d| &mut d.limits);
-        let fuel =
-            PROCESSOR_FUEL_MINIMUM.max(PROCESSOR_FUEL_PER_ENVELOPE * (total_envelope_count as u64));
         store
             .set_fuel(fuel)
             .unwrap_or_else(|e| panic!("failed to set fuel on processor store: {e}"));
@@ -4708,14 +4757,20 @@ impl ProcessorComponent {
         activation: HostActivation,
         inbound_chain: Vec<String>,
     ) -> ProcessorOutcome {
-        let total_envelopes: usize = activation.ports.iter().map(|pw| pw.envelopes.len()).sum();
+        let fuel = self.fuel_for(&activation);
         let grant_input_mt = compute_grant_input_mt(&self.input_amplification_mt, &activation);
         let mut carry = self.lock_carry_for_activation();
         let budgets = self.seed_publish_budgets(&carry, grant_input_mt);
         let mut chain = inbound_chain;
         chain.push(self.slug.to_string());
-        let store = self.make_store(total_envelopes, budgets, chain);
+        let store = self.make_store(fuel, budgets, chain);
         Self::invoke(store, activation, &self.processor_pre, &mut carry)
+    }
+
+    /// The fuel `activation` runs on; the `blobs` grant is the blob seam's
+    /// presence, asserted equal at load.
+    fn fuel_for(&self, activation: &HostActivation) -> u64 {
+        activation_fuel(activation, self.blob_host.is_some())
     }
 
     /// Acquire the per-component carry lock for the duration of one activation.
@@ -4758,16 +4813,13 @@ impl ProcessorComponent {
         epoch_deadline: u64,
         fuel: u64,
     ) -> ProcessorOutcome {
-        // Base store (fuel overridden below); still computes the activation-derived
-        // input grant so multi-envelope budget tests driven through this path see a
+        // The fuel is the override; still computes the activation-derived input
+        // grant so multi-envelope budget tests driven through this path see a
         // real per-sink budget.
         let grant_input_mt = compute_grant_input_mt(&self.input_amplification_mt, &activation);
         let mut carry = self.lock_carry_for_activation();
         let budgets = self.seed_publish_budgets(&carry, grant_input_mt);
-        let mut store = self.make_store(0, budgets, vec![self.slug.to_string()]);
-        store
-            .set_fuel(fuel)
-            .unwrap_or_else(|e| panic!("handle_with_limits: set_fuel: {e}"));
+        let mut store = self.make_store(fuel, budgets, vec![self.slug.to_string()]);
         // The override is the whole budget for this activation, so the deadline
         // and the budget the callback re-arms against move together.
         Self::arm_epoch(&mut store, epoch_deadline);
@@ -4791,11 +4843,11 @@ impl ProcessorComponent {
         activation: HostActivation,
         memory_limit_bytes: usize,
     ) -> ProcessorOutcome {
-        let total_envelopes: usize = activation.ports.iter().map(|pw| pw.envelopes.len()).sum();
+        let fuel = self.fuel_for(&activation);
         let grant_input_mt = compute_grant_input_mt(&self.input_amplification_mt, &activation);
         let mut carry = self.lock_carry_for_activation();
         let budgets = self.seed_publish_budgets(&carry, grant_input_mt);
-        let mut store = self.make_store(total_envelopes, budgets, vec![self.slug.to_string()]);
+        let mut store = self.make_store(fuel, budgets, vec![self.slug.to_string()]);
         // Override the memory_size limit on the already-constructed store's ProcessorData.
         // StoreLimits is not mutable after construction; instead we replace the entire limits
         // field. The rest of the store settings (fuel, epoch, etc.) come from make_store.
@@ -7661,6 +7713,120 @@ mod processor_store_host_tests {
 // Direct trait-impl tests for `do_call` on ProcessorData: the host's three
 // dispositions for a named port (trap, `unwired`, reach the peer), the budget it
 // shares with publishes, and the `SyncAnswer` → `call-error` mapping.
+
+#[cfg(test)]
+mod attachment_fuel_tests {
+    use super::*;
+    use brenn_envelope::testutils::fixture_envelope;
+    use brenn_envelope::{AttachmentName, Attachments, BlobId, BlobRef};
+    use std::collections::BTreeMap;
+
+    /// An envelope carrying one attachment per entry of `sizes`.
+    fn carrying(id: &str, sizes: &[u64]) -> Arc<MessageEnvelope> {
+        let mut envelope = fixture_envelope("ephemeral:in", id, MessageBody::text("x"));
+        let map: BTreeMap<AttachmentName, BlobRef> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| {
+                let name = AttachmentName::new(format!("a{i}")).expect("fixture name");
+                let blob = BlobRef {
+                    id: BlobId::new(format!("blob-{id}-{i}")),
+                    size,
+                    content_type: "application/octet-stream".to_string(),
+                };
+                (name, blob)
+            })
+            .collect();
+        envelope.attachments = Attachments::from_map(map);
+        Arc::new(envelope)
+    }
+
+    fn activation(ports: Vec<(Vec<Arc<MessageEnvelope>>, u32)>) -> HostActivation {
+        HostActivation {
+            ports: ports
+                .into_iter()
+                .enumerate()
+                .map(|(i, (envelopes, new_from))| HostPortWindow {
+                    port: format!("in{i}"),
+                    envelopes,
+                    new_from,
+                    dropped: 0,
+                })
+                .collect(),
+            deferred: Vec::new(),
+            now: None,
+            sync: None,
+        }
+    }
+
+    #[test]
+    fn only_new_messages_attachments_count() {
+        // Port 0: one context message (1,000 bytes) then two new ones.
+        // Port 1: a pure-context window.
+        let a = activation(vec![
+            (
+                vec![
+                    carrying("c", &[1_000]),
+                    carrying("n1", &[10, 20]),
+                    carrying("n2", &[]),
+                ],
+                1,
+            ),
+            (vec![carrying("c2", &[5_000])], 1),
+        ]);
+        assert_eq!(new_attachment_bytes(&a), 30);
+    }
+
+    #[test]
+    fn a_component_granted_blobs_gains_fuel_per_new_attachment_byte() {
+        let base = processor_fuel(3, None);
+        assert_eq!(base, PROCESSOR_FUEL_MINIMUM);
+        assert_eq!(processor_fuel(3, Some(0)), base);
+        assert_eq!(
+            processor_fuel(3, Some(1_000_000)),
+            base + 1_000_000 * PROCESSOR_FUEL_PER_ATTACHMENT_BYTE
+        );
+        // The envelope rule above its floor is kept and added to.
+        assert_eq!(
+            processor_fuel(10, Some(1)),
+            10 * PROCESSOR_FUEL_PER_ENVELOPE + PROCESSOR_FUEL_PER_ATTACHMENT_BYTE
+        );
+    }
+
+    #[test]
+    fn attachment_fuel_is_capped() {
+        let base = processor_fuel(1, None);
+        assert_eq!(PROCESSOR_MAX_ATTACHMENT_FUEL, 8_589_934_592);
+        let at_cap = PROCESSOR_MAX_ATTACHMENT_FUEL / PROCESSOR_FUEL_PER_ATTACHMENT_BYTE;
+        assert_eq!(
+            processor_fuel(1, Some(at_cap)),
+            base + PROCESSOR_MAX_ATTACHMENT_FUEL
+        );
+        assert_eq!(
+            processor_fuel(1, Some(at_cap + 1)),
+            base + PROCESSOR_MAX_ATTACHMENT_FUEL
+        );
+        assert_eq!(
+            processor_fuel(1, Some(u64::MAX)),
+            base + PROCESSOR_MAX_ATTACHMENT_FUEL
+        );
+    }
+
+    #[test]
+    fn the_grant_decides_and_context_adds_nothing() {
+        let a = activation(vec![(
+            vec![carrying("c", &[4_000_000]), carrying("n", &[1_000_000])],
+            1,
+        )]);
+        assert_eq!(activation_fuel(&a, false), PROCESSOR_FUEL_MINIMUM);
+        assert_eq!(
+            activation_fuel(&a, true),
+            PROCESSOR_FUEL_MINIMUM + 1_000_000 * PROCESSOR_FUEL_PER_ATTACHMENT_BYTE
+        );
+        let context_only = activation(vec![(vec![carrying("c", &[4_000_000])], 1)]);
+        assert_eq!(activation_fuel(&context_only, true), PROCESSOR_FUEL_MINIMUM);
+    }
+}
 
 #[cfg(test)]
 mod epoch_extension_tests {

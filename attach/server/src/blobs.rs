@@ -599,6 +599,8 @@ pub async fn handle_blob_open(
     }
     // The same words a `Subscribe` there earns: outside the grants, "not
     // yours" and "no such channel" stay one answer.
+    // TODO(remote-blob-open-without-delivery): admits any message in the
+    // channel's window, delivered to this session or not.
     if ctx.profile.subscribable(channel).is_none() {
         return ctx.violation(format!(
             "BlobOpen on unsubscribable channel {}",

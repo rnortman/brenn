@@ -32,7 +32,8 @@ use brenn_tool_registry::bus_wiring::{
 use brenn_tool_registry::executor::TOOL_EXECUTOR_COMPONENT;
 use brenn_tool_registry::testutil::{clause, grant};
 use brenn_tool_registry::{
-    GitRepoPullTool, RegisteredTool, ToolCallerGrants, ToolExecutor, ToolRegistry, WasmToolHost,
+    CallerGrants, GitRepoPullTool, RegisteredTool, ToolCallerGrants, ToolExecutor, ToolRegistry,
+    WasmToolHost,
 };
 use git_fixture::scratch::scratch_remote_and_clone_behind_by_one;
 
@@ -173,6 +174,7 @@ async fn consumer_harness(
         Arc::clone(&registry).into(),
         tool_grants.clone(),
         slug.to_string(),
+        false,
         alert_dispatcher.clone(),
     ));
 
@@ -367,7 +369,10 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
     // Step 2: the executor pulls the fixture and publishes the result.
     let caller_grants = Arc::new(ToolCallerGrants::new(HashMap::from([(
         guest_sub.as_str().to_string(),
-        harness.tool_grants.clone(),
+        CallerGrants {
+            tools: harness.tool_grants.clone(),
+            blobs: false,
+        },
     )])));
     let (exec_alert, _h) = noop_alert_dispatcher();
     let executor = ToolExecutor::new(

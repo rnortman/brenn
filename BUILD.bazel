@@ -190,6 +190,7 @@ filegroup(
         "//brenn-wasm/components/processor-demo:policy_srcs",
         "//brenn-wasm/components/processor-dual:policy_srcs",
         "//brenn-wasm/components/processor-exhaust:policy_srcs",
+        "//brenn-wasm/components/processor-kit-file-test:policy_srcs",
         "//brenn-wasm/components/processor-log:policy_srcs",
         "//brenn-wasm/components/processor-mem-exhaust:policy_srcs",
         "//brenn-wasm/components/processor-mqtt-test:policy_srcs",

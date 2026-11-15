@@ -845,6 +845,17 @@ impl HeldAttachments {
         &self.holds
     }
 
+    /// The hold on the blob `name` gives, when it gives one.
+    pub fn hold(&self, name: &AttachmentName) -> Option<&BlobHold> {
+        let reference = self.refs.get(name)?;
+        Some(
+            self.holds
+                .iter()
+                .find(|hold| hold.id() == &reference.id)
+                .expect("every blob a name gives is held"),
+        )
+    }
+
     /// The references and the holds, for a store that keeps the holds beside
     /// a message naming the references.
     pub fn into_parts(self) -> (Attachments, BlobHolds) {

@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use brenn_lib::config::{API_REQUEST_TOOL, ApiKeyTable, AppConfig, BrennConfig};
+use brenn_oauth::tools::BlobStoreSlot;
 use brenn_tool_registry::tool::AsyncTool as _;
 use brenn_tool_registry::{ProviderRuntime, RegisteredTool, ToolRegistry};
 use indexmap::IndexMap;
@@ -64,6 +65,7 @@ pub(crate) fn candidate_tools(
     apps: &IndexMap<String, AppConfig>,
     runtime: &Arc<ProviderRuntime>,
     keys: &ApiKeyTable,
+    blobs: &BlobStoreSlot,
 ) -> ToolsDelta {
     let providing = running.providing_instances();
     let arriving: Vec<_> = candidate
@@ -86,7 +88,11 @@ pub(crate) fn candidate_tools(
             false,
             !candidate.api_key_providers.is_empty(),
         ) {
-        vec![brenn_oauth::tools::api_request(None, keys.clone())]
+        vec![brenn_oauth::tools::api_request(
+            None,
+            keys.clone(),
+            blobs.clone(),
+        )]
     } else {
         Vec::new()
     };
@@ -165,7 +171,11 @@ mod tests {
             false,
             !config.api_key_providers.is_empty(),
         ) {
-            vec![brenn_oauth::tools::api_request(None, no_keys())]
+            vec![brenn_oauth::tools::api_request(
+                None,
+                no_keys(),
+                BlobStoreSlot::default(),
+            )]
         } else {
             Vec::new()
         };
@@ -197,7 +207,14 @@ mod tests {
             ],
             false,
         );
-        let delta = candidate_tools(&running, &after, &IndexMap::new(), &runtime, &no_keys());
+        let delta = candidate_tools(
+            &running,
+            &after,
+            &IndexMap::new(),
+            &runtime,
+            &no_keys(),
+            &BlobStoreSlot::default(),
+        );
         assert_eq!(delta.added, ["shout", "whisper"]);
         assert_eq!(delta.candidate.provided_by("shout"), Some("new"));
         assert_eq!(delta.candidate.provided_by("echo"), Some("old"));
@@ -215,7 +232,14 @@ mod tests {
         let runtime = runtime();
         let config = document(vec![provider("old", vec![decl("echo", "Echo")])], true);
         let running = booted(&config, &runtime);
-        let delta = candidate_tools(&running, &config, &IndexMap::new(), &runtime, &no_keys());
+        let delta = candidate_tools(
+            &running,
+            &config,
+            &IndexMap::new(),
+            &runtime,
+            &no_keys(),
+            &BlobStoreSlot::default(),
+        );
         assert!(delta.added.is_empty());
         assert!(Arc::ptr_eq(&running, &delta.candidate));
     }
@@ -227,18 +251,39 @@ mod tests {
         let with = document(vec![], true);
 
         let bare = booted(&without, &runtime);
-        let delta = candidate_tools(&bare, &with, &IndexMap::new(), &runtime, &no_keys());
+        let delta = candidate_tools(
+            &bare,
+            &with,
+            &IndexMap::new(),
+            &runtime,
+            &no_keys(),
+            &BlobStoreSlot::default(),
+        );
         assert_eq!(delta.added, ["api-request"]);
         assert!(delta.candidate.get("api-request").is_some());
 
-        let delta = candidate_tools(&bare, &without, &IndexMap::new(), &runtime, &no_keys());
+        let delta = candidate_tools(
+            &bare,
+            &without,
+            &IndexMap::new(),
+            &runtime,
+            &no_keys(),
+            &BlobStoreSlot::default(),
+        );
         assert!(
             delta.added.is_empty(),
             "no provider declared, nothing added"
         );
 
         let holding = booted(&with, &runtime);
-        let delta = candidate_tools(&holding, &with, &IndexMap::new(), &runtime, &no_keys());
+        let delta = candidate_tools(
+            &holding,
+            &with,
+            &IndexMap::new(),
+            &runtime,
+            &no_keys(),
+            &BlobStoreSlot::default(),
+        );
         assert!(delta.added.is_empty(), "already registered, nothing added");
     }
 
@@ -249,7 +294,14 @@ mod tests {
         let running = booted(&document(vec![], false), &runtime);
         let reserved = brenn_envelope::addressing::CORE_VIRTUAL_TOOL_NAMES[0];
         let after = document(vec![provider("new", vec![decl("echo", reserved)])], false);
-        candidate_tools(&running, &after, &IndexMap::new(), &runtime, &no_keys());
+        candidate_tools(
+            &running,
+            &after,
+            &IndexMap::new(),
+            &runtime,
+            &no_keys(),
+            &BlobStoreSlot::default(),
+        );
     }
 
     #[tokio::test]
@@ -262,7 +314,14 @@ mod tests {
         let lookalike = || provider("s", vec![decl(API_REQUEST_TOOL, "ApiRequestLookalike")]);
         let running = booted(&document(vec![lookalike()], false), &runtime);
         let after = document(vec![lookalike()], true);
-        candidate_tools(&running, &after, &IndexMap::new(), &runtime, &no_keys());
+        candidate_tools(
+            &running,
+            &after,
+            &IndexMap::new(),
+            &runtime,
+            &no_keys(),
+            &BlobStoreSlot::default(),
+        );
     }
 
     #[tokio::test]
@@ -278,6 +337,13 @@ mod tests {
             ],
             false,
         );
-        candidate_tools(&running, &after, &IndexMap::new(), &runtime, &no_keys());
+        candidate_tools(
+            &running,
+            &after,
+            &IndexMap::new(),
+            &runtime,
+            &no_keys(),
+            &BlobStoreSlot::default(),
+        );
     }
 }

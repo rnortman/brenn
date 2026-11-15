@@ -567,6 +567,7 @@ fn read_body(labels: &[&str], text_data: Option<&str>) -> String {
                     "body": text_body,
                 },
                 {
+                    "partId": "1",
                     "mimeType": "application/pdf",
                     "filename": "Q3 report.pdf",
                     "headers": [
@@ -596,7 +597,7 @@ fn read_answer(labels: &[&str], rest: serde_json::Value) -> serde_json::Value {
         "message_id": "<m1@example.com>",
         "internal_date": "2026-10-31T14:05:09Z",
         "attachments": [{ "filename": "Q3 report.pdf", "mime_type": "application/pdf",
-                          "size": 48213, "inline": false }],
+                          "size": 48213, "inline": false, "part_id": "1" }],
     });
     for (key, value) in rest.as_object().unwrap() {
         answer[key] = value.clone();
@@ -782,10 +783,10 @@ async fn a_read_past_the_limit_falls_back_to_the_structure() {
                     (
                         "fields",
                         "id,threadId,labelIds,snippet,internalDate,sizeEstimate,\
-                         payload(mimeType,filename,headers,body(size,attachmentId),\
-                         parts(mimeType,filename,headers,body(size,attachmentId),\
-                         parts(mimeType,filename,headers,body(size,attachmentId),\
-                         parts(mimeType,filename,headers,body(size,attachmentId)))))",
+                         payload(partId,mimeType,filename,headers,body(size,attachmentId),\
+                         parts(partId,mimeType,filename,headers,body(size,attachmentId),\
+                         parts(partId,mimeType,filename,headers,body(size,attachmentId),\
+                         parts(partId,mimeType,filename,headers,body(size,attachmentId)))))",
                     ),
                 ]),
             ),

@@ -517,6 +517,10 @@ fn held_attachments_records_refs_and_one_hold_per_blob() {
     assert_eq!(held.refs().get(&name("photo-again")), Some(&a.reference()));
     assert_eq!(held.refs().get(&name("thumb")), Some(&b.reference()));
     assert_eq!(held.holds().len(), 2);
+    assert_eq!(held.hold(&name("photo")).unwrap().id(), a.id());
+    assert_eq!(held.hold(&name("photo-again")).unwrap().id(), a.id());
+    assert_eq!(held.hold(&name("thumb")).unwrap().id(), b.id());
+    assert!(held.hold(&name("absent")).is_none());
 
     // The set alone keeps both blobs.
     drop(a);

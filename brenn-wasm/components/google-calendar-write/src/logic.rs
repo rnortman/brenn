@@ -117,11 +117,21 @@ impl Logic for CalendarWrites {
     type Tool = Provided;
     type Settings = Settings;
 
-    fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
+    fn plan(
+        tool: Provided,
+        args: &Value,
+        _: &brenn_provider_kit::Step<'_>,
+        settings: &Settings,
+    ) -> Result<Call, String> {
         plan(tool, args, settings)
     }
 
-    fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
+    fn advance(
+        state: &InFlight,
+        outcome: Result<Value, NestedError>,
+        _: &mut brenn_provider_kit::Step<'_>,
+        settings: &Settings,
+    ) -> Next {
         advance(state, outcome, settings)
     }
 }
@@ -859,6 +869,7 @@ mod tests {
                 query: event_write_query_with("externalOnly"),
                 headers: BTreeMap::new(),
                 body: call.body.clone(),
+                response_attachment: None,
             }
         );
         assert_eq!(
@@ -1372,6 +1383,7 @@ mod tests {
                 ]),
                 headers: BTreeMap::new(),
                 body: None,
+                response_attachment: None,
             }
         );
         let (row, call) = delete_after_read(args, &delete_read(json!({})));
@@ -1390,6 +1402,7 @@ mod tests {
                 ]),
                 headers: BTreeMap::new(),
                 body: None,
+                response_attachment: None,
             }
         );
         assert_eq!(

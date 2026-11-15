@@ -578,7 +578,12 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
             brenn_lib::messaging::ParticipantId::for_wasm(&consumer.slug)
                 .as_str()
                 .to_owned(),
-            consumer.policy.tool_grants.clone(),
+            brenn_tool_registry::CallerGrants {
+                tools: consumer.policy.tool_grants.clone(),
+                blobs: consumer
+                    .grants
+                    .contains(&brenn_lib::messaging::ComponentGrant::Blobs),
+            },
         );
     }
 
@@ -1301,7 +1306,8 @@ mod tests {
     /// The table names exactly the consumers that hold grants, keyed by the
     /// participant id the executor re-checks a dequeued request under. A
     /// consumer with no grants has no entry, so presence keeps meaning "may
-    /// address some tool".
+    /// address some tool". Each entry carries whether the instance is granted
+    /// `blobs`.
     #[test]
     fn the_plan_carries_one_grant_entry_per_granted_consumer() {
         let mut granted = brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
@@ -1320,6 +1326,9 @@ mod tests {
             )])],
             rate_limit: None,
         }];
+        let mut holder = granted.clone();
+        holder.slug = "holder".to_string();
+        holder.grants = vec![brenn_lib::messaging::ComponentGrant::Blobs];
         let mut ungranted = brenn_lib::messaging::config::WasmConsumerConfigRaw::minimal(
             "quiet",
             "processor-demo",
@@ -1336,14 +1345,18 @@ mod tests {
         config
             .channels
             .push(durable_channel("brenn:work", Depth::Bounded(4)));
-        config.wasm_consumers = vec![granted, ungranted];
+        config.wasm_consumers = vec![granted, holder, ungranted];
 
         let plan = plan_of(&config);
         let mut callers: Vec<&String> = plan.tool_caller_grants.keys().collect();
         callers.sort();
-        assert_eq!(callers, vec!["wasm:puller"]);
+        assert_eq!(callers, vec!["wasm:holder", "wasm:puller"]);
         let grants = &plan.tool_caller_grants["wasm:puller"];
-        assert_eq!(grants.keys().collect::<Vec<_>>(), vec!["apull"]);
+        assert_eq!(grants.tools.keys().collect::<Vec<_>>(), vec!["apull"]);
+        assert!(!grants.blobs, "`puller` is not granted `blobs`");
+        let grants = &plan.tool_caller_grants["wasm:holder"];
+        assert_eq!(grants.tools.keys().collect::<Vec<_>>(), vec!["apull"]);
+        assert!(grants.blobs, "`holder` is granted `blobs`");
     }
 
     /// A `fatal` inbox tuning block is refused by the tuning-table build, before

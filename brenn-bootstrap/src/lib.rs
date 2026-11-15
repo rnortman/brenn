@@ -679,6 +679,9 @@ pub async fn run_server(
     // provider runtime's.
     let (device_location_tools, device_location_bus) =
         brenn_device_location::registered(db.clone());
+    // The blob store `api-request` streams bodies from and into, attached
+    // beside the provider runtime's messenger.
+    let api_request_blobs = brenn_oauth::tools::BlobStoreSlot::default();
     let tool_registry_core: std::sync::Arc<brenn_tool_registry::ToolRegistry> = {
         let git_repo_pull = brenn_tool_registry::GitRepoPullTool::new(
             repo_sync_result.clones.clone(),
@@ -691,6 +694,7 @@ pub async fn run_server(
         tools.extend(brenn_oauth::tools::registered(
             oauth_service.as_ref(),
             api_key_table.clone(),
+            api_request_blobs.clone(),
         ));
         tools.extend(device_location_tools);
         let registry = build_tool_registry(tools, &config.wasm_consumers, &apps, &provider_runtime);
@@ -841,6 +845,12 @@ pub async fn run_server(
     if let Some(messenger) = messenger {
         provider_runtime.attach(messenger.clone());
         device_location_bus.attach(messenger.clone());
+        api_request_blobs.attach(
+            messenger
+                .blob_store()
+                .expect("boot's messaging always installs a blob store")
+                .clone(),
+        );
     }
 
     // Unconditional: a broken install is refused independently of what today's
@@ -1353,6 +1363,7 @@ pub async fn run_server(
                 build_id,
                 apps: app_table.clone(),
                 api_keys: api_key_table.clone(),
+                api_request_blobs: api_request_blobs.clone(),
                 integration_registry: integration_registry.clone(),
                 runtime_dir: runtime_dir.clone(),
                 tool_registry: state.tools.clone(),

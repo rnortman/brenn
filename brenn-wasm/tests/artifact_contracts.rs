@@ -31,6 +31,7 @@ const SDK_COMPONENTS: &[&str] = &[
     "processor-config",
     "processor-demo",
     "processor-dual",
+    "processor-kit-file-test",
     "processor-log",
     "processor-mqtt-test",
     "processor-multiport",

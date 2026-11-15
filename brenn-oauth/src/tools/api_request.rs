@@ -31,11 +31,13 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use base64ct::{Base64, Encoding};
+use brenn_envelope::{AttachmentName, check_content_type};
 use brenn_lib::config::{
     API_REQUEST_TOOL, AccountKeys, AccountLookup, ApiKeyProviderConfig, ApiKeyTable, ApiKeys,
     OAuthProviderConfig, TRANSPORT_HEADERS,
 };
 use brenn_lib::tools::AclClause;
+use brenn_messaging_store::blob::{BlobHold, BlobStore};
 use brenn_tool_registry::{
     AclDenied, AsyncTool, ENVELOPE_MARGIN, HeldAttachments, Idempotency, MAX_ASYNC_RESULT_BYTES,
     ToolClass, ToolCtx, ToolDescriptor, ToolError, ToolOutput, UserBinding,
@@ -45,10 +47,14 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
-use crate::http::{ApiCall, ApiResponse, Auth, CallFailure, OAuthHttp, Refreshed};
+use crate::blocking::blocking;
+use crate::http::{
+    Answered, ApiCall, Auth, CallFailure, IntoBlob, OAuthHttp, Refreshed, RequestBody,
+};
 use crate::path_template::{
     ANY_PATH, RequestPath, build_url, decode_path, display_path, template_admits, validate_template,
 };
+use crate::tools::BlobStoreSlot;
 use crate::{CallSite, OAuthService};
 
 const NAME: &str = API_REQUEST_TOOL;
@@ -94,6 +100,19 @@ struct ApiArgs {
     body: Option<String>,
     #[serde(default)]
     body_base64: Option<String>,
+    /// The request body is the call's attachment of this name.
+    #[serde(default)]
+    body_attachment: Option<String>,
+    /// A 2xx response body is answered as the result's attachment of this
+    /// name.
+    #[serde(default)]
+    response_attachment: Option<String>,
+}
+
+/// Where a 2xx response body is written instead of the result's value.
+struct AnswerInto {
+    name: AttachmentName,
+    store: Arc<BlobStore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,7 +364,9 @@ struct Prepared {
     destination: Option<RequestPath>,
     query: Vec<(String, String)>,
     headers: HeaderMap,
-    body: Option<Vec<u8>>,
+    body: Option<RequestBody>,
+    /// Set when the caller asked for the response body as an attachment.
+    answer_into: Option<AnswerInto>,
 }
 
 impl Prepared {
@@ -419,6 +440,119 @@ impl Prepared {
         }
     }
 
+    /// The tool's answer to `answered`: a 2xx body written into the blob the
+    /// caller asked for, any other body read inline up to `limit` exactly as
+    /// without `response_attachment`.
+    async fn answer(
+        &self,
+        answered: Answered,
+        limit: usize,
+        site: LogSite<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        let into = match &self.answer_into {
+            Some(into) if (200..300).contains(&answered.status) => into,
+            _ => {
+                let response = answered
+                    .read(limit)
+                    .await
+                    .map_err(|text| self.transport_failed(site.user, site.account, &text))?;
+                let sent = Sent {
+                    status: response.status,
+                    bytes: Some(
+                        response
+                            .content_length
+                            .unwrap_or(response.body.len() as u64),
+                    ),
+                    truncated: response.truncated,
+                    attachment: None,
+                };
+                site.log(self, sent);
+                return Ok(bounded_result(response)?.into());
+            }
+        };
+        let status = answered.status;
+        let declared = answered.content_length;
+        let headers = headers_json(&answered.headers);
+        let content_type = answer_content_type(&answered.headers);
+        let written = answered
+            .read_into(&into.store, &content_type)
+            .await
+            .map_err(|text| self.transport_failed(site.user, site.account, &text))?;
+        let (value, hold, sent) = match written {
+            IntoBlob::Sealed(hold) => {
+                let size = hold.reference().size;
+                let value = serde_json::json!({
+                    "status": status,
+                    "headers": headers,
+                    "bytes": size,
+                    "attachment": into.name.as_str(),
+                });
+                (value, Some(hold), (Some(size), "sealed"))
+            }
+            IntoBlob::TooLarge => {
+                let value = serde_json::json!({
+                    "error": "response_too_large",
+                    "status": status,
+                    "headers": headers,
+                    "bytes": declared,
+                    "limit": into.store.limits().max_blob_bytes,
+                });
+                (value, None, (declared, "response_too_large"))
+            }
+            IntoBlob::BudgetExhausted => {
+                // A full pool refuses every producer in the deployment, so it
+                // is reported above the completion line.
+                let usage = into.store.usage();
+                warn!(
+                    provider = %self.provider,
+                    caller = %site.caller,
+                    user = %site.user,
+                    account = %site.account,
+                    request = %self.line(),
+                    declared_bytes = declared,
+                    charged_bytes = usage.charged_bytes,
+                    budget_bytes = into.store.limits().budget_bytes,
+                    "api-request: blob store full; answer refused"
+                );
+                let value = serde_json::json!({
+                    "error": "blob_store_full",
+                    "status": status,
+                    "headers": headers,
+                });
+                (value, None, (declared, "blob_store_full"))
+            }
+        };
+        let size = serde_json::to_vec(&value)
+            .expect("a JSON value serializes")
+            .len();
+        if size > RESULT_BUDGET {
+            if let Some(hold) = hold {
+                // The last hold on the blob: its file is unlinked where it
+                // drops, so it drops on the blocking pool.
+                blocking(move || drop(hold)).await;
+            }
+            return Err(ToolError::Internal(format!(
+                "{NAME}: the response's status and headers alone exceed the {RESULT_BUDGET}-byte \
+                 result budget"
+            )));
+        }
+        site.log(
+            self,
+            Sent {
+                status,
+                bytes: sent.0,
+                truncated: false,
+                attachment: Some(sent.1),
+            },
+        );
+        let attachments = match hold {
+            None => HeldAttachments::none(),
+            Some(hold) => HeldAttachments::new([(into.name.clone(), hold)])
+                .expect("one attachment under a checked name is a valid set"),
+        };
+        Ok(ToolOutput { value, attachments })
+    }
+
     /// A request that got no answer, logged with its scrubbed text, as the
     /// tool's error. `account` is `-` on a deployment-key provider.
     fn transport_failed(&self, user: &str, account: &str, text: &str) -> ToolError {
@@ -440,7 +574,7 @@ impl Prepared {
         user: &str,
         account: &str,
         refreshed: Option<bool>,
-        response: &ApiResponse,
+        sent: Sent<'_>,
         started: Instant,
     ) {
         info!(
@@ -451,14 +585,44 @@ impl Prepared {
             host = %self.host,
             path = %display_path(&self.path),
             destination = self.destination.as_ref().map(display_path).as_deref(),
-            status = response.status,
-            bytes = response.content_length.unwrap_or(response.body.len() as u64),
-            truncated = response.truncated,
+            status = sent.status,
+            bytes = sent.bytes,
+            truncated = sent.truncated,
+            attachment = sent.attachment,
             elapsed_ms = started.elapsed().as_millis() as u64,
             refreshed,
             "api-request"
         );
     }
+}
+
+/// Who a request was sent as and when it started, for its completion line.
+struct LogSite<'a> {
+    /// The principal that made the call.
+    caller: &'a str,
+    user: &'a str,
+    /// `-` on a deployment-key provider.
+    account: &'a str,
+    /// Set on an OAuth provider only.
+    refreshed: Option<bool>,
+    started: Instant,
+}
+
+impl LogSite<'_> {
+    fn log(&self, request: &Prepared, sent: Sent<'_>) {
+        request.log_sent(self.user, self.account, self.refreshed, sent, self.started);
+    }
+}
+
+/// What the completion line records of an answer.
+struct Sent<'a> {
+    status: u16,
+    /// The body's length: as declared, else as read; `None` for a body refused
+    /// before its length was known.
+    bytes: Option<u64>,
+    truncated: bool,
+    /// For an answer asked for as an attachment, what became of it.
+    attachment: Option<&'a str>,
 }
 
 /// The request line as logs and refusals name it, followed by ` to ` and
@@ -477,7 +641,16 @@ fn request_line(
     }
 }
 
-fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, ToolError> {
+/// The call `args` and `attachments` describe, checked against everything but
+/// the credential. `blobs` is the store an attachment answer is written into;
+/// `ctx` says whether the caller could open one.
+fn prepare(
+    provider: &ResolvedProvider<'_>,
+    ctx: &ToolCtx,
+    args: ApiArgs,
+    attachments: &HeldAttachments,
+    blobs: Option<&Arc<BlobStore>>,
+) -> Result<Prepared, ToolError> {
     let invalid = |detail: String| ToolError::InvalidArgs(format!("{NAME}: {detail}"));
     let key_header = provider.key_header();
     if provider.is_deployment_key() && args.account.is_some() {
@@ -548,22 +721,85 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
             HeaderValue::from_str(uri.as_str()).expect("a serialized URL is a valid header value"),
         );
     }
-    let body = match (args.body, args.body_base64) {
-        (Some(_), Some(_)) => {
-            return Err(invalid(
-                "`body` and `body_base64` are mutually exclusive".to_string(),
-            ));
-        }
-        (Some(text), None) => Some(text.into_bytes()),
-        (None, Some(encoded)) => Some(
+    let sources: Vec<&str> = [
+        ("body", args.body.is_some()),
+        ("body_base64", args.body_base64.is_some()),
+        ("body_attachment", args.body_attachment.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, given)| given.then_some(name))
+    .collect();
+    if sources.len() > 1 {
+        return Err(invalid(format!(
+            "`body`, `body_base64` and `body_attachment` are mutually exclusive; given: \
+             {sources:?}"
+        )));
+    }
+    let body_blob =
+        body_attachment(args.body_attachment.as_deref(), attachments).map_err(invalid)?;
+    let body = match (args.body, args.body_base64, body_blob) {
+        (Some(text), None, None) => Some(RequestBody::Bytes(text.into_bytes())),
+        (None, Some(encoded), None) => Some(RequestBody::Bytes(
             Base64::decode_vec(&encoded)
                 .map_err(|_| invalid("`body_base64` is not padded standard base64".to_string()))?,
-        ),
-        (None, None) => None,
+        )),
+        (None, None, Some(hold)) => Some(RequestBody::Blob(Arc::new(hold))),
+        (None, None, None) => None,
+        _ => unreachable!("at most one body source is given, checked above"),
     };
-    if body.is_some() && !headers.contains_key(CONTENT_TYPE) {
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if !headers.contains_key(CONTENT_TYPE) {
+        match &body {
+            None => {}
+            Some(RequestBody::Bytes(_)) => {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            }
+            Some(RequestBody::Blob(hold)) => {
+                let content_type = hold.reference().content_type;
+                let value = HeaderValue::from_str(&content_type).map_err(|_| {
+                    ToolError::Internal(format!(
+                        "{NAME}: the body attachment's content type {content_type:?} is not a \
+                         valid header value"
+                    ))
+                })?;
+                headers.insert(CONTENT_TYPE, value);
+            }
+        }
     }
+    let answer_into = match args.response_attachment {
+        None => None,
+        Some(name) => {
+            let name = AttachmentName::new(name)
+                .map_err(|e| invalid(format!("`response_attachment`: {e}")))?;
+            if !ctx.caller_opens_blobs {
+                warn!(
+                    caller = ctx.caller.as_str(),
+                    request = %request_line(
+                        &args.provider,
+                        &args.method,
+                        &args.host,
+                        &path,
+                        destination.as_ref(),
+                    ),
+                    "api-request: `response_attachment` refused; caller is not granted `blobs`"
+                );
+                return Err(ToolError::Denied(format!(
+                    "{NAME}: `response_attachment`: caller {} is not granted `blobs` and could \
+                     not open the answer",
+                    ctx.caller.as_str()
+                )));
+            }
+            let store = blobs.ok_or_else(|| {
+                ToolError::Internal(format!(
+                    "{NAME}: `response_attachment` needs a blob store, and no blob store is \
+                     attached in this process"
+                ))
+            })?;
+            Some(AnswerInto {
+                name,
+                store: Arc::clone(store),
+            })
+        }
+    };
     Ok(Prepared {
         provider: args.provider,
         account: args.account,
@@ -575,7 +811,46 @@ fn prepare(provider: &ResolvedProvider<'_>, args: ApiArgs) -> Result<Prepared, T
         query,
         headers,
         body,
+        answer_into,
     })
+}
+
+/// The hold on the attachment `name` names, when it names one; refused unless
+/// it names an attachment the call carries and the call carries no other.
+fn body_attachment(
+    name: Option<&str>,
+    attachments: &HeldAttachments,
+) -> Result<Option<BlobHold>, String> {
+    let refs = attachments.refs();
+    let named = match name {
+        None => None,
+        Some(name) => {
+            let found = AttachmentName::new(name)
+                .ok()
+                .and_then(|name| attachments.hold(&name).map(|hold| (name, hold.clone())));
+            let Some((name, hold)) = found else {
+                let carried: Vec<&str> = refs.iter().map(|(name, _)| name.as_str()).collect();
+                return Err(format!(
+                    "`body_attachment` {name:?} names no attachment of the call; it carries \
+                     {carried:?}"
+                ));
+            };
+            Some((name, hold))
+        }
+    };
+    let unused: Vec<&str> = refs
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| named.as_ref().is_none_or(|(used, _)| used != *name))
+        .map(AttachmentName::as_str)
+        .collect();
+    if !unused.is_empty() {
+        return Err(format!(
+            "the call carries attachments nothing uses: {unused:?}; the only attachment {NAME} \
+             takes is the body `body_attachment` names"
+        ));
+    }
+    Ok(named.map(|(_, hold)| hold))
 }
 
 /// A usable access token, or the provider's refusal of the credential.
@@ -626,22 +901,46 @@ fn escaped_len(c: char) -> usize {
     }
 }
 
-/// The response as the tool's result, shortened until it serializes within
-/// [`RESULT_BUDGET`].
-fn bounded_result(response: ApiResponse) -> Result<serde_json::Value, ToolError> {
-    let mut headers = serde_json::Map::new();
-    for name in response.headers.keys() {
-        let values: Vec<String> = response
-            .headers
+/// A response's headers as the result carries them: each name once, its
+/// values joined by `", "`.
+fn headers_json(headers: &HeaderMap) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for name in headers.keys() {
+        let values: Vec<String> = headers
             .get_all(name)
             .iter()
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
             .collect();
-        headers.insert(
+        out.insert(
             name.as_str().to_string(),
             serde_json::Value::String(values.join(", ")),
         );
     }
+    out
+}
+
+/// The content type an answer's blob gets: the response's `Content-Type`
+/// when it carries exactly one the store accepts, else
+/// `application/octet-stream`.
+fn answer_content_type(headers: &HeaderMap) -> String {
+    let mut values = headers.get_all(CONTENT_TYPE).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => value
+            .to_str()
+            .ok()
+            .filter(|value| check_content_type(value).is_ok())
+            .map_or_else(|| OCTET_STREAM.to_string(), str::to_string),
+        _ => OCTET_STREAM.to_string(),
+    }
+}
+
+/// The content type of a blob whose bytes have no usable declared type.
+const OCTET_STREAM: &str = "application/octet-stream";
+
+/// The response as the tool's result, shortened until it serializes within
+/// [`RESULT_BUDGET`].
+fn bounded_result(response: crate::http::ApiResponse) -> Result<serde_json::Value, ToolError> {
+    let headers = headers_json(&response.headers);
     let bytes = match (response.content_length, response.truncated) {
         (Some(length), _) => serde_json::json!(length),
         (None, false) => serde_json::json!(response.body.len()),
@@ -716,13 +1015,15 @@ pub struct ApiRequestTool {
     /// Sends every API request: a clone of the service's client when there is
     /// a service, so requests and refreshes share one pool.
     http: OAuthHttp,
+    /// The store a body attachment answer is written into.
+    blobs: BlobStoreSlot,
 }
 
 impl ApiRequestTool {
     /// # Panics
     ///
     /// A provider name is declared as both kinds in the table as it stands.
-    pub fn new(oauth: Option<Arc<OAuthService>>, keys: ApiKeyTable) -> Self {
+    pub fn new(oauth: Option<Arc<OAuthService>>, keys: ApiKeyTable, blobs: BlobStoreSlot) -> Self {
         if let Some(service) = &oauth {
             let initial = keys.load();
             for name in service.provider_names() {
@@ -754,7 +1055,12 @@ impl ApiRequestTool {
                               `oauth-connect` and relay its steps; after the user says done, \
                               `oauth-accounts` confirms. With several accounts for a provider, \
                               name `account`; `account` is refused on an API-key provider \
-                              holding one deployment key.",
+                              holding one deployment key. To send a file, attach it to the \
+                              call and name it in `body_attachment`. For a large or binary \
+                              answer, name `response_attachment`: a 2xx body comes back as an \
+                              attachment of that name, to forward with `BrennSend`, save with \
+                              `brenn-tool save` or hand to another tool, and a non-2xx answer \
+                              comes back inline as usual.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -817,6 +1123,23 @@ impl ApiRequestTool {
                             "description": "Binary body, standard padded base64. Not with \
                                             `body`.",
                         },
+                        "body_attachment": {
+                            "type": "string",
+                            "description": "The name of an attachment of this call whose \
+                                            bytes are the body, sent as they are; \
+                                            Content-Type defaults to the attachment's. Not \
+                                            with `body` or `body_base64`.",
+                        },
+                        "response_attachment": {
+                            "type": "string",
+                            "description": "Answer a 2xx response body as an attachment of \
+                                            this name instead of inline; the result then \
+                                            carries `status`, `headers`, `bytes` and \
+                                            `attachment`. An answer larger than the host \
+                                            allows is `error: \"response_too_large\"`; a \
+                                            full blob store is `error: \
+                                            \"blob_store_full\"`.",
+                        },
                     },
                     "required": ["provider", "method", "host", "path"],
                     "additionalProperties": false,
@@ -826,11 +1149,12 @@ impl ApiRequestTool {
                 idempotency: Idempotency::Natural,
                 auto_approve: true,
                 user_binding: UserBinding::ActingOrLentUser,
-                accepts_attachments: false,
+                accepts_attachments: true,
             },
             oauth,
             keys,
             http,
+            blobs,
         }
     }
 
@@ -1014,7 +1338,7 @@ impl AsyncTool for ApiRequestTool {
         &self,
         ctx: &ToolCtx,
         args: serde_json::Value,
-        _attachments: HeldAttachments,
+        attachments: HeldAttachments,
     ) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
         let args: ApiArgs = serde_json::from_value(args)
@@ -1023,7 +1347,7 @@ impl AsyncTool for ApiRequestTool {
         // it resolved here, whatever a reload stores meanwhile.
         let keys = self.keys.load();
         let provider = resolve(self.oauth.as_deref(), &keys, &args.provider)?;
-        let request = prepare(&provider, args)?;
+        let request = prepare(&provider, ctx, args, &attachments, self.blobs.get())?;
         // A caller with no acting user can be replayed from its channel
         // window, so it only reads, whatever the credential. A stamped
         // component call is its user's and is bounded by its clause alone.
@@ -1035,7 +1359,7 @@ impl AsyncTool for ApiRequestTool {
                 request.line()
             )));
         }
-        let value = match provider {
+        match provider {
             ResolvedProvider::Key(config) => match &config.keys {
                 ApiKeys::Deployment(key) => {
                     self.execute_key(ctx, config, key.expose(), request, started)
@@ -1050,8 +1374,7 @@ impl AsyncTool for ApiRequestTool {
                 self.execute_oauth(ctx, service, config, request, started)
                     .await
             }
-        }?;
-        Ok(value.into())
+        }
     }
 }
 
@@ -1065,7 +1388,7 @@ impl ApiRequestTool {
         key: &str,
         request: Prepared,
         started: Instant,
-    ) -> Result<serde_json::Value, ToolError> {
+    ) -> Result<ToolOutput, ToolError> {
         request.admits(
             &ctx.grant.acl,
             Attr::Absent,
@@ -1076,8 +1399,14 @@ impl ApiRequestTool {
             .acting_user
             .as_ref()
             .map_or("-", |acting| acting.username.as_str());
-        self.send_key(config, key, &request, user, "-", started)
-            .await
+        let site = LogSite {
+            caller: ctx.caller.as_str(),
+            user,
+            account: "-",
+            refreshed: None,
+            started,
+        };
+        self.send_key(config, key, &request, site).await
     }
 
     /// One request with the acting (or lent) user's key for the account the
@@ -1090,7 +1419,7 @@ impl ApiRequestTool {
         keys: &AccountKeys,
         request: Prepared,
         started: Instant,
-    ) -> Result<serde_json::Value, ToolError> {
+    ) -> Result<ToolOutput, ToolError> {
         let user = request.credential_user(ctx)?;
         let provider = &request.provider;
         // TODO(per-agent-account-bound): every account of the acting user is
@@ -1121,32 +1450,37 @@ impl ApiRequestTool {
             }
         };
         request.admit(ctx, &user, account)?;
-        self.send_key(config, key, &request, &user, account, started)
-            .await
+        let site = LogSite {
+            caller: ctx.caller.as_str(),
+            user: &user,
+            account,
+            refreshed: None,
+            started,
+        };
+        self.send_key(config, key, &request, site).await
     }
 
     /// Send `request` once with `key` in the provider's header, and log it
-    /// under `user` and `account` (`-` where there is none).
+    /// at `site`.
     async fn send_key(
         &self,
         config: &ApiKeyProviderConfig,
         key: &str,
         request: &Prepared,
-        user: &str,
-        account: &str,
-        started: Instant,
-    ) -> Result<serde_json::Value, ToolError> {
+        site: LogSite<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let auth = Auth::Header {
             name: &config.header,
             value: key,
         };
-        let response = self
+        let answered = self
             .http
-            .api(request.call(), auth, config.raw.max_response_bytes)
+            .send(request.call(), auth)
             .await
-            .map_err(|text| request.transport_failed(user, account, &text))?;
-        request.log_sent(user, account, None, &response, started);
-        bounded_result(response)
+            .map_err(|text| request.transport_failed(site.user, site.account, &text))?;
+        request
+            .answer(answered, config.raw.max_response_bytes, site)
+            .await
     }
 
     /// One request with a user's OAuth credential, refreshed and resent once
@@ -1158,7 +1492,7 @@ impl ApiRequestTool {
         config: &OAuthProviderConfig,
         request: Prepared,
         started: Instant,
-    ) -> Result<serde_json::Value, ToolError> {
+    ) -> Result<ToolOutput, ToolError> {
         let user = request.credential_user(ctx)?;
         let account = match &request.account {
             Some(account) => account.clone(),
@@ -1170,7 +1504,8 @@ impl ApiRequestTool {
                         &request.provider,
                         None,
                         "no account is connected for this provider",
-                    ));
+                    )
+                    .into());
                 }
             },
         };
@@ -1178,7 +1513,7 @@ impl ApiRequestTool {
 
         let mut rejected: Option<String> = None;
         let mut refreshed = false;
-        let response = loop {
+        let answered = loop {
             let token = Self::token(
                 service,
                 config,
@@ -1199,24 +1534,18 @@ impl ApiRequestTool {
                 }
                 Token::Invalid(detail) => {
                     info!(provider = %request.provider, user = %user, account = %account, refreshed, "api-request: credential invalid");
-                    return Ok(credential_invalid(
-                        &request.provider,
-                        Some(&account),
-                        &detail,
-                    ));
+                    return Ok(
+                        credential_invalid(&request.provider, Some(&account), &detail).into(),
+                    );
                 }
             };
-            let response = self
+            let answered = self
                 .http
-                .api(
-                    request.call(),
-                    Auth::Bearer(&access),
-                    config.raw.max_response_bytes,
-                )
+                .send(request.call(), Auth::Bearer(&access))
                 .await
                 .map_err(|text| request.transport_failed(&user, &account, &text))?;
-            if response.status != 401 {
-                break response;
+            if answered.status != 401 {
+                break answered;
             }
             if fresh {
                 info!(provider = %request.provider, user = %user, account = %account, refreshed, "api-request: 401 on a fresh token; credential invalid");
@@ -1224,14 +1553,23 @@ impl ApiRequestTool {
                     &request.provider,
                     Some(&account),
                     "the provider refused a freshly obtained access token (HTTP 401)",
-                ));
+                )
+                .into());
             }
             // A 401 on a stored token that had not yet expired: refresh once
-            // and resend.
+            // and resend, a body blob streamed again from its start.
             rejected = Some(access);
         };
-        request.log_sent(&user, &account, Some(refreshed), &response, started);
-        bounded_result(response)
+        let site = LogSite {
+            caller: ctx.caller.as_str(),
+            user: &user,
+            account: &account,
+            refreshed: Some(refreshed),
+            started,
+        };
+        request
+            .answer(answered, config.raw.max_response_bytes, site)
+            .await
     }
 }
 
@@ -1296,7 +1634,11 @@ mod tests {
             .store("alice", &credential("google", "alice@example.com", "RT-a"))
             .await;
         Fixture {
-            tool: ApiRequestTool::new(Some(svc.clone()), ApiKeyTable::empty()),
+            tool: ApiRequestTool::new(
+                Some(svc.clone()),
+                ApiKeyTable::empty(),
+                BlobStoreSlot::default(),
+            ),
             svc,
             stub,
             host: base.trim_start_matches("http://").to_string(),
@@ -1741,7 +2083,7 @@ mod tests {
     #[tokio::test]
     async fn validate_clause_checks_path_templates() {
         let (svc, _dir) = service(vec![provider_config("google", "http://127.0.0.1:9")]);
-        let tool = ApiRequestTool::new(Some(svc), ApiKeyTable::empty());
+        let tool = ApiRequestTool::new(Some(svc), ApiKeyTable::empty(), BlobStoreSlot::default());
         assert_eq!(tool.validate_clause(&clause(&[("path", "/a/*/b")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("path", "*")])), Ok(()));
         assert_eq!(tool.validate_clause(&clause(&[("path", "/a/")])), Ok(()));
@@ -2329,7 +2671,7 @@ mod tests {
         let (svc, dir) = service(vec![provider_config("google", &base)]);
         let keys = BTreeMap::from([key_provider_config("maps", &base)]);
         KeyFixture {
-            tool: ApiRequestTool::new(Some(svc), table(keys)),
+            tool: ApiRequestTool::new(Some(svc), table(keys), BlobStoreSlot::default()),
             stub,
             host: base.trim_start_matches("http://").to_string(),
             _dir: dir,
@@ -2384,7 +2726,11 @@ mod tests {
     async fn a_call_in_flight_completes_with_the_key_it_started_with() {
         let (base, stub) = start_stub().await;
         let keys = table(BTreeMap::from([key_provider_config("maps", &base)]));
-        let tool = Arc::new(ApiRequestTool::new(None, keys.clone()));
+        let tool = Arc::new(ApiRequestTool::new(
+            None,
+            keys.clone(),
+            BlobStoreSlot::default(),
+        ));
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         stub.lock().unwrap().api_gate = Some(gate.clone());
         let args = serde_json::json!({
@@ -2505,7 +2851,7 @@ mod tests {
             key_accounts_provider_config("mail", &base),
         ]);
         KeyFixture {
-            tool: ApiRequestTool::new(Some(svc), table(keys)),
+            tool: ApiRequestTool::new(Some(svc), table(keys), BlobStoreSlot::default()),
             stub,
             host: base.trim_start_matches("http://").to_string(),
             _dir: dir,
@@ -2718,7 +3064,11 @@ mod tests {
         let (base, stub) = start_stub().await;
         let (name, mut config) = key_provider_config("maps", &base);
         config.raw.max_response_bytes = 9;
-        let tool = ApiRequestTool::new(None, table(BTreeMap::from([(name, config)])));
+        let tool = ApiRequestTool::new(
+            None,
+            table(BTreeMap::from([(name, config)])),
+            BlobStoreSlot::default(),
+        );
         stub.lock().unwrap().api_body = b"abcdefghijklmnop".to_vec();
         let args = serde_json::json!({
             "provider": "maps", "method": "GET",
@@ -2975,7 +3325,7 @@ mod tests {
         let base = "http://127.0.0.1:9";
         let (svc, _dir) = service(vec![provider_config("maps", base)]);
         let keys = BTreeMap::from([key_provider_config("maps", base)]);
-        ApiRequestTool::new(Some(svc), table(keys));
+        ApiRequestTool::new(Some(svc), table(keys), BlobStoreSlot::default());
     }
 
     /// The ` ```json ` blocks of the provider document at `relative` (from the

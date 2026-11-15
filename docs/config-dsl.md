@@ -625,6 +625,48 @@ tool api-request {
 }
 ```
 
+**Bodies, and answers as attachments.** A request body comes from one of
+three arguments, and at most one may be given: `body`, text sent as written;
+`body_base64`, bytes in standard base64; or `body_attachment`, the name of an
+attachment the call carries, whose bytes are sent as they are. Text and base64
+ride in the call's arguments and are bounded by them (64 KiB, about 48 KiB of
+bytes in base64). An attachment is bounded only by the deployment's largest
+blob (`max_blob_bytes`) and is streamed, never held whole. A component hands
+the attachment through `blobs.call-async`; a conversation through the
+reserved `attachments` argument (`{"<name>": {"message_id", "name"}}`). A
+call whose attachment `body_attachment` does not name, or that carries more
+than one, is refused `invalid_args` naming the unused one: nothing handed to
+the tool is ignored. Without a caller `Content-Type`, the blob's content type
+is sent as `Content-Type`; `Content-Length` is the blob's size and is Brenn's
+to set.
+
+`response_attachment` names an attachment of the result: a 2xx answer's body
+comes back as that attachment instead of inside the value, and the value is
+`{"status", "headers", "bytes", "attachment"}`. An empty 2xx, a `HEAD`
+included, is an empty attachment. A non-2xx answer is answered inline exactly
+as without the argument, so an API's error is read the same way either way.
+`max_response_bytes` bounds an inline answer, and cuts it with `truncated`;
+it does not bound an attachment answer, which `max_blob_bytes` bounds and
+which is never cut. Two refusals are answers, not errors, and leave no blob:
+`{"error": "response_too_large", "status", "headers", "bytes", "limit"}` when
+the body passes `max_blob_bytes` (`bytes` is the declared length, or `null`),
+and `{"error": "blob_store_full", "status", "headers"}` when the blob pool
+(`blob_budget_bytes`) cannot hold it. A component whose instance is not
+granted `blobs` cannot open an attachment, so its `response_attachment` is
+refused `denied` naming the grant, before anything is sent; a conversation
+is always admitted. The whole transfer, bodies included, must finish inside
+`api-request`'s 60 s timeout.
+
+An attachment answer rests on the result's row in the caller's inbox — a
+component's `brenn:tool-results/<slug>`, an app's
+`brenn:app-tool-results/<app-slug>` — until that inbox's window turns over,
+and holds its bytes in the blob pool for that long, after the caller has
+read it. Size `blob_budget_bytes` at or above the sum, over the inboxes that
+receive attachment answers, of the inbox's depth × `max_blob_bytes`, or lower
+`max_blob_bytes`. An `api-request` attachment answer and a provided tool's
+attachment (`GmailAttachment`'s file, for one) both count. When the pool is
+full every producer in the deployment is refused until a window turns over.
+
 #### The device-location tool
 
 `device-location` (MCP `mcp__brenn__DeviceLocation`) is always registered;
@@ -840,8 +882,9 @@ No other attribute or block is accepted inside an `account`.
 #### `api-request` on a key provider
 
 A key provider is called through `api-request`, named by its block's name as
-`provider`. The `method`, `host` and `path` keys, the path template, and the
-request rules are those of *The OAuth tools*. What differs:
+`provider`. The `method`, `host` and `path` keys, the path template, the
+request rules, and the body and attachment forms (`body_attachment`,
+`response_attachment`) are those of *The OAuth tools*. What differs:
 
 - **Whose key.** On the deployment form every caller sends the same key: it
   is the deployment's, not a user's, there is no account to connect and no

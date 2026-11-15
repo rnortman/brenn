@@ -1,5 +1,5 @@
 {
-  "checksum": "ef2a79dc28f88f327cccbfcb48023275e33aff6a9c3380c32f0d724d937b279c",
+  "checksum": "1b2f916123f9dcb36e5e709c1a644e7dd545b6395b62ab091a0baed23aea0ee7",
   "crates": {
     "anyhow 1.0.104": {
       "name": "anyhow",
@@ -790,6 +790,33 @@
             {
               "id": "wit-bindgen-rt 0.44.0",
               "target": "wit_bindgen_rt"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-processor-kit-file-test 0.1.0": {
+      "name": "brenn-processor-kit-file-test",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "serde_json 1.0.151",
+              "target": "serde_json"
             }
           ],
           "selects": {}
@@ -4541,6 +4568,7 @@
     "brenn-processor-demo 0.1.0": "brenn-wasm/components/processor-demo",
     "brenn-processor-dual 0.1.0": "brenn-wasm/components/processor-dual",
     "brenn-processor-exhaust 0.1.0": "brenn-wasm/components/processor-exhaust",
+    "brenn-processor-kit-file-test 0.1.0": "brenn-wasm/components/processor-kit-file-test",
     "brenn-processor-log 0.1.0": "brenn-wasm/components/processor-log",
     "brenn-processor-mem-exhaust 0.1.0": "brenn-wasm/components/processor-mem-exhaust",
     "brenn-processor-mqtt-test 0.1.0": "brenn-wasm/components/processor-mqtt-test",

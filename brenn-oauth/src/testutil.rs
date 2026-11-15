@@ -147,6 +147,12 @@ pub struct StubState {
     pub api_body: Vec<u8>,
     /// API response bodies by exact request path, query excluded.
     pub api_bodies: BTreeMap<String, Vec<u8>>,
+    /// The `Content-Type` of every API response to an exact path, query
+    /// excluded; `None` sends none. A path with no entry is answered with the
+    /// framework's default.
+    pub api_content_types: BTreeMap<String, Option<String>>,
+    /// Send every API response body with no declared length (chunked).
+    pub api_chunked: bool,
     /// Every API request, as received.
     pub api_seen: Vec<ApiSeen>,
     /// When set, every API request is recorded and then held until it takes
@@ -174,6 +180,7 @@ pub async fn start_stub() -> (String, Stub) {
         .route("/userinfo", get(userinfo))
         .route("/revoke", post(revoke))
         .fallback(api)
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -237,7 +244,7 @@ async fn api(
     uri: axum::http::Uri,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let gate = {
         let mut s = stub.lock().unwrap();
         s.api_seen.push(ApiSeen {
@@ -279,7 +286,41 @@ async fn api(
         Some((_, body)) => body,
         None => s.api_bodies.get(uri.path()).unwrap_or(&s.api_body).clone(),
     };
-    (status, response_headers, body)
+    let content_type = s.api_content_types.get(uri.path()).cloned();
+    if content_type.is_none() && !s.api_chunked {
+        return (status, response_headers, body).into_response();
+    }
+    if let Some(Some(content_type)) = content_type {
+        response_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            content_type.parse().unwrap(),
+        );
+    }
+    let body = if s.api_chunked {
+        axum::body::Body::new(Unsized(Some(bytes::Bytes::from(body))))
+    } else {
+        axum::body::Body::from(body)
+    };
+    let mut response = axum::response::Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = response_headers;
+    response
+}
+
+/// A body sent in one frame with no declared length, so the server frames
+/// it chunked.
+struct Unsized(Option<bytes::Bytes>);
+
+impl http_body::Body for Unsized {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.take().map(|bytes| Ok(http_body::Frame::data(bytes))))
+    }
 }
 
 /// The Brenn user the fixtures act for.
@@ -304,6 +345,7 @@ pub fn tool_ctx(
         acting_conversation_id: Some(7),
         acting_user: user,
         deadline: None,
+        caller_opens_blobs: true,
     }
 }
 

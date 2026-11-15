@@ -33,8 +33,8 @@ use brenn_tool_registry::bus_wiring::{
 use brenn_tool_registry::executor::TOOL_EXECUTOR_COMPONENT;
 use brenn_tool_registry::testutil::{clause, grant};
 use brenn_tool_registry::{
-    GitRepoPullTool, GrantOwner, RegisteredTool, ToolCallerGrants, ToolExecutor, ToolRegistry,
-    WasmToolHost,
+    CallerGrants, GitRepoPullTool, GrantOwner, RegisteredTool, ToolCallerGrants, ToolExecutor,
+    ToolRegistry, WasmToolHost,
 };
 use git_fixture::scratch::scratch_remote_and_clone_behind_by_one;
 
@@ -172,6 +172,7 @@ async fn tool_harness(
         Arc::clone(&registry).into(),
         tool_grants.clone(),
         slug.to_string(),
+        false,
         alert_dispatcher.clone(),
     ));
 
@@ -333,7 +334,10 @@ async fn execute_and_read_result(
 ) -> serde_json::Value {
     let caller_grants = Arc::new(ToolCallerGrants::new(HashMap::from([(
         harness.guest_sub.as_str().to_string(),
-        harness.tool_grants.clone(),
+        CallerGrants {
+            tools: harness.tool_grants.clone(),
+            blobs: false,
+        },
     )])));
     let (exec_alert, _exec_alert_handle) = noop_alert_dispatcher();
     let executor = ToolExecutor::new(
@@ -466,6 +470,7 @@ async fn guest_api_request_reads_with_a_lent_credential() {
     let registry = Arc::new(ToolRegistry::new(brenn_oauth::tools::registered(
         Some(&service),
         brenn_lib::config::ApiKeyTable::empty(),
+        brenn_oauth::tools::BlobStoreSlot::default(),
     )));
 
     let host = base

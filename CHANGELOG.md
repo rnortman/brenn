@@ -4,6 +4,46 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Large files through `api-request`, and a new `GmailAttachment` tool.**
+  The host tool `api-request` (the way components and agents call an
+  OAuth-protected API) can now send a request body from a blob attachment
+  and return a successful response body as an attachment, streaming both,
+  instead of squeezing them through JSON size caps. Gmail attachments up to
+  50 MB can now be fetched.
+  - **BREAKING for operators of `GoogleGmailRead`:** the class now requires
+    the `blobs` grant and is refused at load without it. Add `blobs` to the
+    `gmail-read` instance's `grants`, and allow
+    `GET gmail.googleapis.com/gmail/v1/users/me/messages/*/attachments/*` in
+    its `api-request` grant. Each fetch's answer stays in the blob pool for
+    the result inbox's window of 32, up to about 2.1 GB at the largest size,
+    twice the default 1 GiB `blob_budget_bytes`; raise that or lower
+    `max_blob_bytes`. See `docs/google-workspace.md`.
+  - **For operators generally:** `api-request` now consumes the blob pool, up
+    to `max_blob_bytes` per call and eight calls in flight; attachment
+    answers are bounded by `max_blob_bytes`, not `max_response_bytes`. Size
+    `blob_budget_bytes` to at least inbox depth × `max_blob_bytes`, summed
+    over inboxes receiving attachment answers. A full pool refuses new blobs
+    until a window turns over. See `docs/security-posture.md` §7.6 and §9f.
+  - **For agents and app authors:** `api-request` takes `body_attachment`
+    (send a named attachment as the body) and `response_attachment` (return a
+    2xx body as a named attachment). Oversized answers report
+    `response_too_large`; a full pool, `blob_store_full`. `GmailRead` now
+    lists a `part_id` per attachment, which `GmailAttachment` (`id`,
+    `part_id`) uses. See `docs/config-dsl.md`, "The OAuth tools".
+  - **BREAKING for component authors using `brenn-provider-kit` /
+    `brenn-provider-kit-guest`:** the kit gains attachment support
+    (`serve_with_blobs`, blob methods on `Step`,
+    `ApiCall::answer_as_attachment`, `read_api_blob`), and several types
+    change shape: `Logic::plan`/`advance` take a `Step`, hand-written `Host`s
+    implement `Blobs`, `Body` gains an `Attachment` variant, and some structs
+    gain fields. Components that keep calling `serve` keep their grants. The
+    kit also stops advancing a nested call answer arriving more than 240 s
+    after its activation. See `docs/component-packages.md`, "Contract
+    evolution" and "A tool provider on the kit".
+  - **For WASM component authors:** `response_attachment` is refused to an
+    instance without the `blobs` grant. Instances with `blobs` get extra fuel
+    (128 per byte) for attachments on newly delivered messages. `brenn-guest`
+    gains `provides::open_request_attachment`. No WIT changed.
 - **Remote attachers can move blob bytes: attach protocol v6.** A native
   daemon connected over the remote websocket (a "remote attacher") can now
   read, upload and forward blobs — the large binary attachments on bus
