@@ -4,6 +4,11 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.36.0] — 2026-11-15
+
+A huge release; the headline is binary messages and blob attachments on the
+message bus, plus python bindings for the bus.
+
 - **Python programs can attach to the bus: the `brenn_bus` extension
   module.** A Python program attaches to a server's remote route as a remote
   attacher, publishes text and byte bodies, subscribes, reads deliveries, and
