@@ -1,0 +1,36 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//attach/client",
+    "//attach/proto",
+    "//brenn-envelope",
+]
+
+rust_library(
+    name = "blocking",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_attach_blocking",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# The supervisor against a scripted transport: no socket is opened.
+# CARGO_MANIFEST_DIR resolves from the runfiles root, where Bazel tests start.
+rust_test(
+    name = "blocking_test",
+    crate = ":blocking",
+    data = ["//docs:python-binding.md"],
+    edition = "2024",
+    rustc_env = {"CARGO_MANIFEST_DIR": "attach/blocking"},
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+

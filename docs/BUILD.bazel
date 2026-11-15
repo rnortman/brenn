@@ -13,4 +13,5 @@ exports_files([
     "google-workspace.md",
     "providers/google-maps.md",
     "providers/google.md",
+    "python-binding.md",
 ])

@@ -1,0 +1,30 @@
+[package]
+name = "brenn-attach-blocking"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A blocking, thread-safe bus attacher: one background thread supervises the attachment, and any thread calls in"
+
+[dependencies]
+brenn-attach-client = { path = "../client" }
+brenn-attach-proto = { path = "../proto" }
+brenn-envelope = { path = "../../brenn-envelope" }
+tokio = { version = "1.50.0", features = ["rt", "time", "net", "macros", "sync"] }
+# The websocket handshake runs here over a stream this crate opened, so a
+# `wss://` dial needs no TLS feature on tokio-tungstenite: naming one would
+# change every workspace member's build.
+tokio-tungstenite = "0.29.0"
+# The same TLS stack and provider brenn-mqtt links. The provider is passed to
+# the config builder and never installed as a process default; `ring` must not
+# be named, or rustls has no default provider for any other member.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
+
+# The supervisor tests build envelopes and resume cursors for a scripted server.
+[dev-dependencies]
+chrono = { version = "0.4.44", default-features = false, features = ["alloc"] }
+serde_json = "1.0.149"
+uuid = "1.23.0"
+

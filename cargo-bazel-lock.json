@@ -1,5 +1,5 @@
 {
-  "checksum": "fa571896f0429843c2940d04b3e211de60ac4f71cbd1f9f14a0ad0808ff42e90",
+  "checksum": "b276e864fdd8f89cb57fdc40971f5d4eb232e127187bdf1e36d97cbbe2d9e21e",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2455,6 +2455,83 @@
       "license_ids": [],
       "license_file": null
     },
+    "brenn-attach-blocking 0.1.0": {
+      "name": "brenn-attach-blocking",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_attach_blocking",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_attach_blocking",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "rustls 0.23.46",
+              "target": "rustls"
+            },
+            {
+              "id": "rustls-native-certs 0.8.4",
+              "target": "rustls_native_certs"
+            },
+            {
+              "id": "rustls-pki-types 1.14.1",
+              "target": "rustls_pki_types"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            },
+            {
+              "id": "tokio-rustls 0.26.4",
+              "target": "tokio_rustls"
+            },
+            {
+              "id": "tokio-tungstenite 0.29.0",
+              "target": "tokio_tungstenite"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
+              "id": "serde_json 1.0.150",
+              "target": "serde_json"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
     "brenn-attach-client 0.1.0": {
       "name": "brenn-attach-client",
       "version": "0.1.0",
@@ -2634,6 +2711,71 @@
             {
               "id": "chrono 0.4.45",
               "target": "chrono"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2024",
+        "version": "0.1.0"
+      },
+      "license": null,
+      "license_ids": [],
+      "license_file": null
+    },
+    "brenn-attach-python 0.1.0": {
+      "name": "brenn-attach-python",
+      "version": "0.1.0",
+      "package_url": null,
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "brenn_attach_python",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "brenn_attach_python",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "pyo3 0.29.3",
+              "target": "pyo3"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "rcgen 0.14.8",
+              "target": "rcgen"
+            },
+            {
+              "id": "rustls 0.23.46",
+              "target": "rustls"
+            },
+            {
+              "id": "rustls-pki-types 1.14.1",
+              "target": "rustls_pki_types"
+            },
+            {
+              "id": "tokio 1.54.1",
+              "target": "tokio"
+            },
+            {
+              "id": "tokio-rustls 0.26.4",
+              "target": "tokio_rustls"
             }
           ],
           "selects": {}
@@ -20648,6 +20790,429 @@
       ],
       "license_file": null
     },
+    "pyo3 0.29.3": {
+      "name": "pyo3",
+      "version": "0.29.3",
+      "package_url": "https://github.com/pyo3/pyo3",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pyo3/0.29.3/download",
+          "sha256": "700d18fa267b73b9b521fd7e13580e2f446916f176cacee1ab63fcc8191f1655"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "pyo3",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pyo3",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "abi3",
+            "abi3-py313",
+            "abi3-py314",
+            "abi3-py315",
+            "chrono",
+            "default",
+            "extension-module",
+            "macros",
+            "pyo3-macros"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
+              "id": "libc 0.2.186",
+              "target": "libc"
+            },
+            {
+              "id": "once_cell 1.21.4",
+              "target": "once_cell"
+            },
+            {
+              "id": "pyo3-ffi 0.29.3",
+              "target": "pyo3_ffi"
+            }
+          ],
+          "selects": {
+            "cfg(not(target_has_atomic = \"64\"))": [
+              {
+                "id": "portable-atomic 1.13.1",
+                "target": "portable_atomic"
+              }
+            ]
+          }
+        },
+        "extra_deps": {
+          "common": [
+            ":build_script_build"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "pyo3-macros 0.29.3",
+              "target": "pyo3_macros"
+            }
+          ],
+          "selects": {}
+        },
+        "version": "0.29.3"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "pyo3-build-config 0.29.3",
+              "target": "pyo3_build_config"
+            }
+          ],
+          "selects": {}
+        },
+        "link_deps": {
+          "common": [
+            {
+              "id": "pyo3-ffi 0.29.3",
+              "target": "pyo3_ffi"
+            }
+          ],
+          "selects": {}
+        },
+        "build_script_env": {
+          "common": {
+            "PYO3_NO_PYTHON": "1"
+          },
+          "selects": {}
+        },
+        "links": "pyo3-python"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "pyo3-build-config 0.29.3": {
+      "name": "pyo3-build-config",
+      "version": "0.29.3",
+      "package_url": "https://github.com/pyo3/pyo3",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pyo3-build-config/0.29.3/download",
+          "sha256": "7b3fc0c4d08f6bb10e71fe39dfb9e2f59c6eb6854e22ec8092f50c69a4499adb"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "pyo3_build_config",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pyo3_build_config",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "extension-module"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "target-lexicon 0.13.5",
+              "target": "target_lexicon"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.29.3"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "pyo3-ffi 0.29.3": {
+      "name": "pyo3-ffi",
+      "version": "0.29.3",
+      "package_url": "https://github.com/pyo3/pyo3",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pyo3-ffi/0.29.3/download",
+          "sha256": "dfc0b8e19df29aad7086cf977bb0c2a2f143e30567eb113e9cf72b62ca698330"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "pyo3_ffi",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pyo3_ffi",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "abi3",
+            "abi3-py313",
+            "abi3-py314",
+            "abi3-py315",
+            "default",
+            "extension-module"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "libc 0.2.186",
+              "target": "libc"
+            }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            ":build_script_build"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.29.3"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "pyo3-build-config 0.29.3",
+              "target": "pyo3_build_config"
+            }
+          ],
+          "selects": {}
+        },
+        "build_script_env": {
+          "common": {
+            "PYO3_NO_PYTHON": "1"
+          },
+          "selects": {}
+        },
+        "links": "python"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "pyo3-macros 0.29.3": {
+      "name": "pyo3-macros",
+      "version": "0.29.3",
+      "package_url": "https://github.com/pyo3/pyo3",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pyo3-macros/0.29.3/download",
+          "sha256": "6100e8a4b5eba53afaa5ed078364851a0b2499c553a44c31026b929049b49dc6"
+        }
+      },
+      "targets": [
+        {
+          "ProcMacro": {
+            "crate_name": "pyo3_macros",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pyo3_macros",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "proc-macro2 1.0.106",
+              "target": "proc_macro2"
+            },
+            {
+              "id": "pyo3-macros-backend 0.29.3",
+              "target": "pyo3_macros_backend"
+            },
+            {
+              "id": "quote 1.0.45",
+              "target": "quote"
+            },
+            {
+              "id": "syn 2.0.117",
+              "target": "syn"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.29.3"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "pyo3-macros-backend 0.29.3": {
+      "name": "pyo3-macros-backend",
+      "version": "0.29.3",
+      "package_url": "https://github.com/pyo3/pyo3",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pyo3-macros-backend/0.29.3/download",
+          "sha256": "6143877a16e82b5a727b7127ff4cd86858a24a28d745d72f43e6f227c7b1bdb3"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "pyo3_macros_backend",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pyo3_macros_backend",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "heck 0.5.0",
+              "target": "heck"
+            },
+            {
+              "id": "proc-macro2 1.0.106",
+              "target": "proc_macro2"
+            },
+            {
+              "id": "quote 1.0.45",
+              "target": "quote"
+            },
+            {
+              "id": "syn 2.0.117",
+              "target": "syn"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.29.3"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "quanta 0.12.6": {
       "name": "quanta",
       "version": "0.12.6",
@@ -23569,43 +24134,19 @@
         ],
         "crate_features": {
           "common": [
-            "std"
+            "aws-lc-rs",
+            "aws_lc_rs",
+            "std",
+            "tls12"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
-            ],
-            "wasm32-wasip1": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
+            {
+              "id": "aws-lc-rs 1.18.1",
+              "target": "aws_lc_rs"
+            },
             {
               "id": "once_cell 1.21.4",
               "target": "once_cell"
@@ -23628,44 +24169,7 @@
               "target": "zeroize"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ]
-          }
+          "selects": {}
         },
         "extra_deps": {
           "common": [
@@ -23687,45 +24191,13 @@
           "**"
         ],
         "link_deps": {
-          "common": [],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ]
-          }
+          "common": [
+            {
+              "id": "aws-lc-rs 1.18.1",
+              "target": "aws_lc_rs"
+            }
+          ],
+          "selects": {}
         }
       },
       "license": "Apache-2.0 OR ISC OR MIT",
@@ -24047,32 +24519,18 @@
         "crate_features": {
           "common": [
             "alloc",
+            "aws-lc-rs",
             "default",
             "std"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "aws-lc-rs"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "aws-lc-rs"
-            ],
-            "wasm32-wasip1": [
-              "aws-lc-rs"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "aws-lc-rs"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "aws-lc-rs"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "aws-lc-rs"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
+            {
+              "id": "aws-lc-rs 1.18.1",
+              "target": "aws_lc_rs"
+            },
             {
               "id": "rustls-pki-types 1.14.1",
               "target": "rustls_pki_types",
@@ -24083,44 +24541,7 @@
               "target": "untrusted"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "aws-lc-rs 1.18.1",
-                "target": "aws_lc_rs"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "version": "0.103.16"
@@ -28390,37 +28811,28 @@
           "**"
         ],
         "crate_features": {
-          "common": [],
+          "common": [
+            "aws_lc_rs",
+            "tls12"
+          ],
           "selects": {
             "aarch64-apple-darwin": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
+              "aws-lc-rs"
             ],
             "aarch64-unknown-linux-gnu": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
+              "aws-lc-rs"
             ],
             "wasm32-wasip1": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
+              "aws-lc-rs"
             ],
             "x86_64-pc-windows-msvc": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
+              "aws-lc-rs"
             ],
             "x86_64-unknown-linux-gnu": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
+              "aws-lc-rs"
             ],
             "x86_64-unknown-nixos-gnu": [
-              "aws-lc-rs",
-              "aws_lc_rs",
-              "tls12"
+              "aws-lc-rs"
             ]
           }
         },
@@ -37415,9 +37827,11 @@
     "brenn 0.1.0": "brenn",
     "brenn-activation 0.1.0": "brenn-activation",
     "brenn-approval-rules 0.1.0": "brenn-approval-rules",
+    "brenn-attach-blocking 0.1.0": "attach/blocking",
     "brenn-attach-client 0.1.0": "attach/client",
     "brenn-attach-conformance 0.1.0": "attach/conformance",
     "brenn-attach-proto 0.1.0": "attach/proto",
+    "brenn-attach-python 0.1.0": "attach/python",
     "brenn-attach-server 0.1.0": "attach/server",
     "brenn-automation 0.1.0": "brenn-automation",
     "brenn-bootstrap 0.1.0": "brenn-bootstrap",
@@ -37637,6 +38051,7 @@
       "x86_64-unknown-linux-gnu",
       "x86_64-unknown-nixos-gnu"
     ],
+    "cfg(not(target_has_atomic = \"64\"))": [],
     "cfg(not(windows))": [
       "aarch64-apple-darwin",
       "aarch64-unknown-linux-gnu",
@@ -37735,6 +38150,7 @@
     "p256 0.14.0",
     "percent-encoding 2.3.2",
     "pulldown-cmark 0.13.6",
+    "pyo3 0.29.3",
     "rand 0.10.1",
     "rcgen 0.14.8",
     "regex 1.12.4",
@@ -37758,6 +38174,7 @@
     "tempfile 3.27.0",
     "thiserror 2.0.21",
     "tokio 1.54.1",
+    "tokio-rustls 0.26.4",
     "tokio-stream 0.1.18",
     "tokio-tungstenite 0.29.0",
     "toml 1.1.2+spec-1.1.0",

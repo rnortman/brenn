@@ -106,9 +106,11 @@ filegroup(
     name = "all_policy_srcs",
     srcs = [
         ":policy_srcs",
+        "//attach/blocking:policy_srcs",
         "//attach/client:policy_srcs",
         "//attach/conformance:policy_srcs",
         "//attach/proto:policy_srcs",
+        "//attach/python:policy_srcs",
         "//attach/server:policy_srcs",
         "//bazel/dist:policy_srcs",
         "//bazel/dist/tests:policy_srcs",

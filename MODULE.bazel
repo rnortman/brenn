@@ -234,6 +234,22 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
     ]
 ]
 
+# pyo3's two build scripts look for a Python interpreter unless told not to,
+# and would run whatever `python3` the action's PATH offers. The extension
+# module is built against the limited API, which needs no interpreter's
+# configuration.
+[
+    crate.annotation(
+        build_script_env = {"PYO3_NO_PYTHON": "1"},
+        crate = name,
+        repositories = ["crates"],
+    )
+    for name in [
+        "pyo3",
+        "pyo3-ffi",
+    ]
+]
+
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",

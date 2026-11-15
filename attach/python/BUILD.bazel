@@ -1,0 +1,99 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_shared_library")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//attach/blocking",
+    "//attach/client",
+    "//attach/proto",
+    "//brenn-envelope",
+]
+
+# The extension module, for the host platform. pyo3's features
+# (`abi3-py313`, `extension-module`) come from the hub, so no interpreter,
+# header or libpython takes part in the build.
+# TODO(python-binding-bazel-only-install): Bazel is the only way to build and
+# install the module; there is no wheel.
+rust_shared_library(
+    name = "brenn_bus_cdylib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_attach_python",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# CPython imports an abi3 module by `<module>.abi3.so`; the module name is the
+# `#[pymodule]` init symbol's, not the file's.
+genrule(
+    name = "brenn_bus_so",
+    srcs = [":brenn_bus_cdylib"],
+    outs = ["brenn_bus.abi3.so"],
+    cmd = "cp $(location :brenn_bus_cdylib) $@",
+)
+
+# The stub sits beside the module, where a type checker looks for it.
+py_library(
+    name = "brenn_bus",
+    data = [
+        "brenn_bus.pyi",
+        ":brenn_bus_so",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+# `legacy_create_init = 0`: a generated `__init__.py` in this package would
+# make `brenn_bus` resolve to something other than the extension module.
+py_test(
+    name = "brenn_bus_test",
+    size = "small",
+    srcs = ["brenn_bus_test.py"],
+    data = ["//docs:python-binding.md"],
+    env = {"BINDING_PAGE": "$(rootpath //docs:python-binding.md)"},
+    legacy_create_init = 0,
+    deps = [":brenn_bus"],
+)
+
+# The tests' TLS relay: a fresh authority per run, so no key is tracked.
+rust_binary(
+    name = "tls_front",
+    testonly = True,
+    srcs = ["tls_front/main.rs"],
+    edition = "2024",
+    deps = [
+        "@crates//:rcgen",
+        "@crates//:rustls",
+        "@crates//:rustls-pki-types",
+        "@crates//:tokio",
+        "@crates//:tokio-rustls",
+    ],
+)
+
+# The module against the real server, started from a config each test class
+# writes into its temporary directory, and through `tls_front` for `wss://`.
+py_test(
+    name = "brenn_bus_server_test",
+    size = "medium",
+    srcs = ["brenn_bus_server_test.py"],
+    data = [
+        ":tls_front",
+        "//:noop_mcp.py",
+        "//brenn",
+        "//brenn-tool",
+    ],
+    env = {
+        "BRENN_BIN": "$(rootpath //brenn)",
+        "BRENN_TOOL_BIN": "$(rootpath //brenn-tool)",
+        "NOOP_MCP": "$(rootpath //:noop_mcp.py)",
+        "TLS_FRONT_BIN": "$(rootpath :tls_front)",
+    },
+    legacy_create_init = 0,
+    tags = ["requires-network"],
+    deps = [":brenn_bus"],
+)

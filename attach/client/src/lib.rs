@@ -320,13 +320,14 @@ pub use brenn_attach_proto::{BodyError, Codec, MessageBody, MessageEnvelope, Ver
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::native::{
     NativeConnection, NativeConnector, insert_bearer_token, insert_session_cookie,
+    refuse_cleartext_bearer,
 };
 
-// Signature types of the two header helpers, re-exported so out-of-tree
-// attachers can name them without guessing this crate's tungstenite pin. Their
-// doc comments state the semver coupling to that pin.
+// Signature types of the header helpers and the cleartext guard, re-exported so
+// out-of-tree attachers can name them without guessing this crate's tungstenite
+// pin. Their doc comments state the semver coupling to that pin.
 #[cfg(not(target_arch = "wasm32"))]
-pub use tokio_tungstenite::tungstenite::http::{HeaderMap, header::InvalidHeaderValue};
+pub use tokio_tungstenite::tungstenite::http::{HeaderMap, Uri, header::InvalidHeaderValue};
 
 #[cfg(target_arch = "wasm32")]
 pub use transport::websys::{WebSysConnection, WebSysConnector};

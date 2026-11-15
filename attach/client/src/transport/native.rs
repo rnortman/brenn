@@ -15,6 +15,7 @@
 //! [`TransportEvent`]s.
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -156,6 +157,17 @@ impl TransportConnector for NativeConnector {
     }
 }
 
+/// The cleartext guard a [`NativeConnector`] built [`with_bearer`](NativeConnector::with_bearer)
+/// applies, for a connector that dials the socket itself: refuses a `ws://`
+/// `uri` bound for a non-loopback host, naming the bearer token it would have
+/// carried. `wss://` always passes.
+///
+/// `Uri` is tungstenite's `http` type, re-exported by this crate, with the same
+/// semver coupling to this crate's tungstenite pin as [`insert_bearer_token`].
+pub fn refuse_cleartext_bearer(uri: &Uri) -> Result<(), TransportError> {
+    reject_cleartext_to_remote(uri, &Credential::Bearer(String::new()))
+}
+
 /// Refuse to attach a credential to a cleartext `ws://` handshake bound for a
 /// non-loopback host: the secret would transit in the clear and a passive
 /// on-path observer could capture it. Covers both credentials — a bearer token
@@ -165,6 +177,9 @@ impl TransportConnector for NativeConnector {
 /// and this encodes that scoping structurally rather than leaving it to prose.
 fn reject_cleartext_to_remote(uri: &Uri, credential: &Credential) -> Result<(), TransportError> {
     if uri.scheme_str() == Some("ws") {
+        // TODO(quality-cleartext-guard-ipv6-bug-documented-not-fixed): `host()`
+        // keeps an IPv6 literal's brackets, so `ws://[::1]` parses as no address
+        // and is refused as non-loopback.
         let host = uri.host().unwrap_or_default();
         let is_loopback = host == "localhost"
             || host
@@ -181,12 +196,28 @@ fn reject_cleartext_to_remote(uri: &Uri, credential: &Credential) -> Result<(), 
     Ok(())
 }
 
-/// A live native WebSocket connection.
-pub struct NativeConnection {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+/// A live native WebSocket connection over the stream `S`.
+///
+/// [`NativeConnector`] produces one over its own `MaybeTlsStream`; a connector
+/// that opens the stream and runs the websocket handshake itself hands the
+/// result to [`NativeConnection::from_stream`] and gets the same message
+/// mapping, ping flush and close handling.
+pub struct NativeConnection<S = MaybeTlsStream<TcpStream>> {
+    ws: WebSocketStream<S>,
 }
 
-impl TransportConnection for NativeConnection {
+impl<S> NativeConnection<S> {
+    /// Wrap an established client websocket. The handshake is the caller's;
+    /// nothing is read or written here.
+    pub fn from_stream(ws: WebSocketStream<S>) -> Self {
+        Self { ws }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> TransportConnection for NativeConnection<S> {
+    // TODO(errhandling-blocked-write-stalls-supervisor-and-close): no write
+    // deadline; a peer that stops reading holds `send` and `close` until TCP
+    // gives up, and the embedder's loop with them.
     async fn send(&mut self, message: WireMessage) -> Result<(), TransportError> {
         let message = match message {
             WireMessage::Text(text) => Message::Text(text.into()),
@@ -392,6 +423,76 @@ mod tests {
         assert!(
             err.to_string().contains("bearer token"),
             "the refusal names the credential, got {err}"
+        );
+    }
+
+    /// The public guard refuses cleartext to a non-loopback host, naming the
+    /// bearer token, and passes loopback `ws://` and any `wss://`.
+    #[test]
+    fn refuse_cleartext_bearer_guards_only_cleartext_to_remote() {
+        let remote: Uri = "ws://192.0.2.1/remote/pod/ws".parse().unwrap();
+        let err = refuse_cleartext_bearer(&remote).expect_err("cleartext to a remote host");
+        assert!(err.to_string().contains("bearer token"), "got {err}");
+        for ok in [
+            "ws://127.0.0.1:9/remote/pod/ws",
+            "ws://localhost/remote/pod/ws",
+            "wss://192.0.2.1/remote/pod/ws",
+        ] {
+            let uri: Uri = ok.parse().unwrap();
+            refuse_cleartext_bearer(&uri).unwrap_or_else(|err| panic!("{ok}: {err}"));
+        }
+    }
+
+    /// A connection built from a stream the caller handshook itself carries
+    /// text and binary frames both ways and answers a ping, as one from the
+    /// stock connector does.
+    #[tokio::test]
+    async fn from_stream_carries_frames_and_answers_ping() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text("down".into())).await.unwrap();
+            ws.send(Message::Ping(vec![4].into())).await.unwrap();
+            ws.send(Message::Binary(vec![5, 6].into())).await.unwrap();
+            let mut seen = Vec::new();
+            while seen.len() < 3 {
+                match ws.next().await {
+                    Some(Ok(Message::Pong(payload))) => seen.push(("pong", payload.to_vec())),
+                    Some(Ok(Message::Text(text))) => seen.push(("text", text.as_bytes().to_vec())),
+                    Some(Ok(Message::Binary(bytes))) => seen.push(("binary", bytes.to_vec())),
+                    other => panic!("unexpected from the client: {other:?}"),
+                }
+            }
+            seen
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/remote/pod/ws"), tcp)
+            .await
+            .unwrap();
+        let mut conn = NativeConnection::from_stream(ws);
+        assert_eq!(
+            conn.next_event().await,
+            TransportEvent::Message(WireMessage::Text("down".into()))
+        );
+        assert_eq!(
+            conn.next_event().await,
+            TransportEvent::Message(WireMessage::Binary(vec![5, 6]))
+        );
+        conn.send(WireMessage::Text("up".into())).await.unwrap();
+        conn.send(WireMessage::Binary(vec![7])).await.unwrap();
+
+        let seen = server.await.unwrap();
+        assert_eq!(
+            seen,
+            [
+                ("pong", vec![4]),
+                ("text", b"up".to_vec()),
+                ("binary", vec![7])
+            ]
         );
     }
 

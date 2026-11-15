@@ -1,5 +1,84 @@
 # TODOs
 
+## `attach-blocking-second-loop-and-dial`
+
+`brenn-attach-blocking` holds a second copy of two things every embedder of
+`brenn-attach-client` needs. Its supervisor and brenn-pod's `brenn-bridge`
+are two implementations of one loop over the client: start the driver, run
+its connects, resubscribe on attach, fail publishes on detach, end on a run
+of unanswered attachments. Its `BlockingConnector` is a second dial beside
+the client crate's `NativeConnector`: the stock dial takes TLS from a
+`tokio-tungstenite` feature, which in this workspace would change every
+member's build, and reports every failure as text, so a rejected credential
+cannot be told from a network fault. A fix to one loop or one dial does not
+reach the other. Done when one crate in this repository owns the supervised
+attachment, the blocking crate is a face over it, brenn-pod's bridge can be
+built on it, and one dial path serves every embedder, TLS and the typed dial
+failure included.
+
+## `errhandling-blocked-write-stalls-supervisor-and-close`
+
+The attach client's `NativeConnection` has no write deadline. Its `send`
+feeds and flushes the websocket and waits until the kernel takes the bytes;
+its `close` flushes a close frame over the same socket. When the peer stops
+reading, or its host leaves the network without a reset, and the client has
+enough unflushed bytes that a write blocks (one large publish, or a run of
+publishes), both wait until TCP gives up, about fifteen minutes with the
+kernel's default retries. An embedder's loop awaits them inline, so for
+that whole time it runs no liveness check, reports no detach and serves no
+command. In `brenn-attach-blocking` `publish` and `subscribe` end in
+`Timeout` while `status()` says `Attached`, `unsubscribe` does not return,
+and `BlockingClient::close`, which joins the supervisor thread, does not
+return; in the Python binding `close()` and a
+`with` block's exit hang and Ctrl-C cannot interrupt them. brenn-pod's
+bridge awaits the same `send`. The fix bounds every write and the close
+flush by a deadline (the liveness window is the natural one), failing the
+write as a transport failure so the driver detaches and the embedder's
+close completes. It changes the client crate's behaviour, so it is
+announced to binders in the changelog. Done when a scripted test of a
+`NativeConnection` whose peer stops reading sees `send` and `close` return
+within the deadline, and a blocking client in that state detaches and
+closes within it.
+
+## `python-binding-bazel-only-install`
+
+The Python binding for the attach client is built by Bazel only: by this
+repository's gate, and by another Bazel workspace that pins this repository
+by commit. There is no wheel, no source distribution and no documented way
+to install it into an ordinary Python environment, and Cargo builds are
+unsupported here, so a Python author without a Bazel build cannot use it.
+Done when the binding's documentation page gives a supported way to install
+it into a plain Python environment on linux x86_64, and the gate installs it
+that way and attaches with the result.
+
+## `python-binding-no-blob-transfer`
+
+The Python binding for the attach client publishes and subscribes text and
+byte bodies and does not offer blob transfer: a Python attacher cannot
+upload a blob, attach one to a publish, or open and read one a delivery
+names. The client crate has all of it on attach v6 (`BlobPlane`). Done when
+a Python attacher can upload a file as a blob attached to a message and
+another can read it back by byte range, with every refusal the client
+reports reaching Python as a named value, and the binding's documentation
+page says so.
+
+## `quality-cleartext-guard-ipv6-bug-documented-not-fixed`
+
+The attach client's cleartext guard, `reject_cleartext_to_remote` in
+`attach/client/src/transport/native.rs`, refuses IPv6 loopback. It parses
+`uri.host()` as an `IpAddr`, and `http::Uri::host()` keeps an IPv6
+literal's brackets, so `"[::1]"` parses as no address and `ws://[::1]` is
+refused with "refusing to send the bearer token over cleartext ws:// to
+non-loopback host". The guard fails closed, so nothing leaks; but every
+embedder, the stock `NativeConnector`, `refuse_cleartext_bearer` and so
+`brenn-attach-blocking` and the Python binding, refuses IPv6 loopback over
+`ws://`. The fix strips the brackets before the parse, as
+`brenn-attach-blocking`'s connector already does for the TCP connect, and
+adds `ws://[::1]` to the loopback cases of the guard's test. It changes
+what the client crate accepts, so it is announced to binders in the
+changelog. Done when `ws://[::1]` passes the guard and the binding's
+documentation no longer says IPv6 loopback is refused.
+
 ## `agent-status-self-wake`
 
 A conversation that subscribes with a `push_depth` above zero to

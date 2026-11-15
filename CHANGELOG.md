@@ -4,6 +4,27 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Python programs can attach to the bus: the `brenn_bus` extension
+  module.** A Python program attaches to a server's remote route as a remote
+  attacher, publishes text and byte bodies, subscribes, and reads deliveries,
+  through `brenn-attach-client` and not a second implementation of the wire.
+  - **For Python authors:** a blocking, thread-safe API with a timeout on
+    every wait; publish outcomes are returned as values, every failure is a
+    named exception, and a rejected token ends the attachment instead of being
+    re-dialled. `wss://` works off loopback and can be told which authority to
+    trust (`ca_file`). One build loads under CPython 3.13 or later; it is
+    built by Bazel only, here or from another Bazel workspace that pins this
+    repository by commit. See `docs/python-binding.md`.
+  - **New crates:** `brenn-attach-blocking` (`attach/blocking`), the blocking
+    client the module maps, and `brenn-attach-python` (`attach/python`), the
+    module.
+  - **For binders of `brenn-attach-client` (additive):** `NativeConnection`
+    is generic over its stream (`NativeConnection<S>`, defaulting to the stock
+    connector's) and gains `NativeConnection::from_stream`, so a connector that
+    runs its own websocket handshake reuses the connection's framing;
+    `refuse_cleartext_bearer` is the stock connector's cleartext guard, public,
+    for such a connector to apply; `Uri` is re-exported beside `HeaderMap`.
+    No behaviour changed.
 - **Remote attachers can move blob bytes: attach protocol v6.** A native
   daemon connected over the remote websocket (a "remote attacher") can now
   read, upload and forward blobs — the large binary attachments on bus
