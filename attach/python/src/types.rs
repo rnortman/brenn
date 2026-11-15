@@ -5,8 +5,9 @@
 //! variant added upstream fails this crate's build.
 
 use brenn_attach_blocking::{
-    AttachmentFacts as Facts, Delivery as BlockingDelivery, DialFailure as BlockingDialFailure,
-    Event as BlockingEvent, PublishOutcome as Outcome, SubscribeAnswer, describe_detach,
+    AttachmentFacts as Facts, BlobFacts, Delivery as BlockingDelivery,
+    DialFailure as BlockingDialFailure, Event as BlockingEvent, OpenRefusal,
+    PublishOutcome as Outcome, ReadRefusal, SubscribeAnswer, UploadRefusal, describe_detach,
 };
 use brenn_attach_client::conn::DetachReason;
 use brenn_attach_proto::{GapInfo, GapReason};
@@ -23,6 +24,7 @@ pub struct PyFacts {
     participant_id: String,
     session_id: String,
     max_body_bytes: u64,
+    blobs: Option<PyBlobFacts>,
 }
 
 #[pymethods]
@@ -36,6 +38,7 @@ impl PyFacts {
                 "participant_id",
                 "session_id",
                 "max_body_bytes",
+                "blobs",
             ],
         )
     }
@@ -43,8 +46,14 @@ impl PyFacts {
     fn __repr__(&self) -> String {
         format!(
             "AttachmentFacts(protocol_version={}, participant_id={:?}, session_id={:?}, \
-             max_body_bytes={})",
-            self.protocol_version, self.participant_id, self.session_id, self.max_body_bytes
+             max_body_bytes={}, blobs={})",
+            self.protocol_version,
+            self.participant_id,
+            self.session_id,
+            self.max_body_bytes,
+            self.blobs
+                .as_ref()
+                .map_or_else(|| "None".to_string(), PyBlobFacts::__repr__)
         )
     }
 }
@@ -55,6 +64,77 @@ pub fn facts(facts: &Facts) -> PyFacts {
         participant_id: facts.participant_id.clone(),
         session_id: facts.session_id.clone(),
         max_body_bytes: facts.max_body_bytes,
+        blobs: facts.blobs.as_ref().map(blob_facts),
+    }
+}
+
+/// An attachment's blob door: the host's bounds on this session's blobs, and
+/// whether it may upload.
+#[pyclass(
+    module = "brenn_bus",
+    name = "BlobFacts",
+    frozen,
+    eq,
+    get_all,
+    from_py_object
+)]
+#[derive(Clone, PartialEq)]
+pub struct PyBlobFacts {
+    max_blob_bytes: u64,
+    max_chunk_bytes: u64,
+    max_handles: u32,
+    max_bytes_held: u64,
+    max_inflight_reads: u32,
+    upload: bool,
+}
+
+#[pymethods]
+impl PyBlobFacts {
+    #[classattr]
+    fn __match_args__(py: Python<'_>) -> PyResult<Bound<'_, PyTuple>> {
+        PyTuple::new(
+            py,
+            [
+                "max_blob_bytes",
+                "max_chunk_bytes",
+                "max_handles",
+                "max_bytes_held",
+                "max_inflight_reads",
+                "upload",
+            ],
+        )
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BlobFacts(max_blob_bytes={}, max_chunk_bytes={}, max_handles={}, \
+             max_bytes_held={}, max_inflight_reads={}, upload={})",
+            self.max_blob_bytes,
+            self.max_chunk_bytes,
+            self.max_handles,
+            self.max_bytes_held,
+            self.max_inflight_reads,
+            if self.upload { "True" } else { "False" }
+        )
+    }
+}
+
+fn blob_facts(door: &BlobFacts) -> PyBlobFacts {
+    let BlobFacts {
+        max_blob_bytes,
+        max_chunk_bytes,
+        max_handles,
+        max_bytes_held,
+        max_inflight_reads,
+        upload,
+    } = *door;
+    PyBlobFacts {
+        max_blob_bytes,
+        max_chunk_bytes,
+        max_handles,
+        max_bytes_held,
+        max_inflight_reads,
+        upload,
     }
 }
 
@@ -369,6 +449,18 @@ impl PyTextOnlyChannel {
     }
 }
 
+/// A blob the publish names was closed, refused or never sealed. Nothing was
+/// stored.
+#[pyclass(module = "brenn_bus", name = "AttachmentNotHeld", frozen, extends = PyPublishOutcome)]
+pub struct PyAttachmentNotHeld;
+
+#[pymethods]
+impl PyAttachmentNotHeld {
+    fn __repr__(&self) -> &'static str {
+        "AttachmentNotHeld()"
+    }
+}
+
 pub fn publish_outcome(py: Python<'_>, outcome: Outcome) -> PyResult<Py<PyAny>> {
     let base = PyClassInitializer::from(PyPublishOutcome);
     let made = match outcome {
@@ -380,6 +472,9 @@ pub fn publish_outcome(py: Python<'_>, outcome: Outcome) -> PyResult<Py<PyAny>> 
         }
         Outcome::TextOnlyChannel => {
             Bound::new(py, base.add_subclass(PyTextOnlyChannel))?.into_any()
+        }
+        Outcome::AttachmentNotHeld => {
+            Bound::new(py, base.add_subclass(PyAttachmentNotHeld))?.into_any()
         }
     };
     Ok(made.unbind())
@@ -466,6 +561,7 @@ pub struct PyDelivery {
     body: Py<PyBody>,
     seq: u64,
     dropped: u64,
+    attachments: Py<PyTuple>,
 }
 
 #[pymethods]
@@ -484,20 +580,189 @@ impl PyDelivery {
                 "body",
                 "seq",
                 "dropped",
+                "attachments",
             ],
         )
     }
 
-    fn __repr__(&self) -> String {
-        format!(
-            "Delivery(channel={:?}, message_id={:?}, sender={:?}, seq={}, dropped={}, body={})",
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let names = self
+            .attachments
+            .bind(py)
+            .iter()
+            .map(|attachment| {
+                Ok(format!(
+                    "{:?}",
+                    attachment.cast::<PyAttachment>()?.get().name
+                ))
+            })
+            .collect::<PyResult<Vec<String>>>()?;
+        Ok(format!(
+            "Delivery(channel={:?}, message_id={:?}, sender={:?}, seq={}, dropped={}, body={}, \
+             attachments=[{}])",
             self.channel,
             self.message_id,
             self.sender,
             self.seq,
             self.dropped,
             self.body.get().__repr__(),
+            names.join(", "),
+        ))
+    }
+}
+
+/// One attachment a delivered message names: its `name` in the message, and
+/// the blob's `size` in bytes and `content_type`. Open it with
+/// `Client.open_attachment`.
+#[pyclass(module = "brenn_bus", name = "Attachment", frozen, eq, get_all)]
+#[derive(PartialEq)]
+pub struct PyAttachment {
+    name: String,
+    size: u64,
+    content_type: String,
+}
+
+#[pymethods]
+impl PyAttachment {
+    #[classattr]
+    fn __match_args__(py: Python<'_>) -> PyResult<Bound<'_, PyTuple>> {
+        PyTuple::new(py, ["name", "size", "content_type"])
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Attachment(name={:?}, size={}, content_type={:?})",
+            self.name, self.size, self.content_type
         )
+    }
+}
+
+/// Why an upload made no blob.
+#[pyclass(
+    module = "brenn_bus",
+    name = "UploadRefusal",
+    eq,
+    eq_int,
+    skip_from_py_object
+)]
+#[derive(Clone, Copy, PartialEq)]
+pub enum PyUploadRefusal {
+    #[pyo3(name = "BLOB_TOO_LARGE")]
+    BlobTooLarge,
+    #[pyo3(name = "BUDGET_EXHAUSTED")]
+    BudgetExhausted,
+    #[pyo3(name = "HANDLE_LIMIT")]
+    HandleLimit,
+    #[pyo3(name = "BYTES_HELD_LIMIT")]
+    BytesHeldLimit,
+    #[pyo3(name = "STORAGE_FAILED")]
+    StorageFailed,
+    #[pyo3(name = "INCOMPLETE")]
+    Incomplete,
+}
+
+/// An upload refusal's member and the values it carries: `size`, `max`,
+/// `offset`, `len`, each None unless the refusal carries it.
+pub struct UploadFields {
+    pub reason: PyUploadRefusal,
+    pub size: Option<u64>,
+    pub max: Option<u64>,
+    pub offset: Option<u64>,
+    pub len: Option<u64>,
+}
+
+pub fn upload_refusal(refusal: UploadRefusal) -> UploadFields {
+    let bare = |reason| UploadFields {
+        reason,
+        size: None,
+        max: None,
+        offset: None,
+        len: None,
+    };
+    match refusal {
+        UploadRefusal::BlobTooLarge { size, max } => UploadFields {
+            size: Some(size),
+            max: Some(max),
+            ..bare(PyUploadRefusal::BlobTooLarge)
+        },
+        UploadRefusal::BudgetExhausted => bare(PyUploadRefusal::BudgetExhausted),
+        UploadRefusal::HandleLimit => bare(PyUploadRefusal::HandleLimit),
+        UploadRefusal::BytesHeldLimit => bare(PyUploadRefusal::BytesHeldLimit),
+        UploadRefusal::StorageFailed => bare(PyUploadRefusal::StorageFailed),
+        UploadRefusal::Incomplete { offset, len } => UploadFields {
+            offset: Some(offset),
+            len: Some(len),
+            ..bare(PyUploadRefusal::Incomplete)
+        },
+    }
+}
+
+/// Why an open made no blob.
+#[pyclass(
+    module = "brenn_bus",
+    name = "OpenRefusal",
+    eq,
+    eq_int,
+    skip_from_py_object
+)]
+#[derive(Clone, Copy, PartialEq)]
+pub enum PyOpenRefusal {
+    #[pyo3(name = "NOT_RETAINED")]
+    NotRetained,
+    #[pyo3(name = "NO_SUCH_ATTACHMENT")]
+    NoSuchAttachment,
+    #[pyo3(name = "TOOL_CHANNEL")]
+    ToolChannel,
+    #[pyo3(name = "HANDLE_LIMIT")]
+    HandleLimit,
+    #[pyo3(name = "BYTES_HELD_LIMIT")]
+    BytesHeldLimit,
+}
+
+/// An open refusal's member and the blob's `size`, set for `BYTES_HELD_LIMIT`.
+pub fn open_refusal(refusal: OpenRefusal) -> (PyOpenRefusal, Option<u64>) {
+    match refusal {
+        OpenRefusal::NotRetained => (PyOpenRefusal::NotRetained, None),
+        OpenRefusal::NoSuchAttachment => (PyOpenRefusal::NoSuchAttachment, None),
+        OpenRefusal::ToolChannel => (PyOpenRefusal::ToolChannel, None),
+        OpenRefusal::HandleLimit => (PyOpenRefusal::HandleLimit, None),
+        OpenRefusal::BytesHeldLimit { size } => (PyOpenRefusal::BytesHeldLimit, Some(size)),
+    }
+}
+
+/// Why a read ended before its last byte.
+#[pyclass(
+    module = "brenn_bus",
+    name = "ReadRefusal",
+    eq,
+    eq_int,
+    skip_from_py_object
+)]
+#[derive(Clone, Copy, PartialEq)]
+pub enum PyReadRefusal {
+    #[pyo3(name = "OUT_OF_RANGE")]
+    OutOfRange,
+    #[pyo3(name = "UNKNOWN_HANDLE")]
+    UnknownHandle,
+    #[pyo3(name = "NOT_SEALED")]
+    NotSealed,
+    #[pyo3(name = "TOO_MANY_READS")]
+    TooManyReads,
+    #[pyo3(name = "STORAGE_FAILED")]
+    StorageFailed,
+    #[pyo3(name = "CLOSED")]
+    Closed,
+}
+
+/// A read refusal's member and the blob's `size`, set for `OUT_OF_RANGE`.
+pub fn read_refusal(refusal: ReadRefusal) -> (PyReadRefusal, Option<u64>) {
+    match refusal {
+        ReadRefusal::OutOfRange { size } => (PyReadRefusal::OutOfRange, Some(size)),
+        ReadRefusal::UnknownHandle => (PyReadRefusal::UnknownHandle, None),
+        ReadRefusal::NotSealed => (PyReadRefusal::NotSealed, None),
+        ReadRefusal::TooManyReads => (PyReadRefusal::TooManyReads, None),
+        ReadRefusal::StorageFailed => (PyReadRefusal::StorageFailed, None),
+        ReadRefusal::Closed => (PyReadRefusal::Closed, None),
     }
 }
 
@@ -618,6 +883,24 @@ fn delivery(py: Python<'_>, delivery: BlockingDelivery) -> PyResult<Py<PyAny>> {
         seq,
         dropped,
     } = delivery;
+    let attachments = PyTuple::new(
+        py,
+        envelope
+            .attachments
+            .iter()
+            .map(|(name, blob)| {
+                Py::new(
+                    py,
+                    PyAttachment {
+                        name: name.as_str().to_string(),
+                        size: blob.size,
+                        content_type: blob.content_type.clone(),
+                    },
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?,
+    )?
+    .unbind();
     let made = PyClassInitializer::from(PyEvent).add_subclass(PyDelivery {
         channel,
         message_id: envelope.message_id.to_string(),
@@ -633,6 +916,7 @@ fn delivery(py: Python<'_>, delivery: BlockingDelivery) -> PyResult<Py<PyAny>> {
         )?,
         seq,
         dropped,
+        attachments,
     });
     Ok(Bound::new(py, made)?.into_any().unbind())
 }
@@ -671,6 +955,12 @@ pub fn event(py: Python<'_>, event: BlockingEvent) -> PyResult<Py<PyAny>> {
 /// Add every value class to the module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFacts>()?;
+    m.add_class::<PyBlobFacts>()?;
+    m.add_class::<PyAttachment>()?;
+    m.add_class::<PyUploadRefusal>()?;
+    m.add_class::<PyOpenRefusal>()?;
+    m.add_class::<PyReadRefusal>()?;
+    m.add_class::<PyAttachmentNotHeld>()?;
     m.add_class::<PyUrgency>()?;
     m.add_class::<PyBody>()?;
     m.add_class::<PyGap>()?;
@@ -694,3 +984,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDetached>()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

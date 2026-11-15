@@ -5,10 +5,19 @@
 //! `interrupted` check runs, so a host whose signals must be checked on the
 //! waiting thread can abandon any wait. An abandoned or timed-out call cancels
 //! its request: the supervisor forgets a publish's answer and releases a
-//! subscribe whether it is still pending or has since been acknowledged.
+//! subscribe whether it is still pending or has since been acknowledged. An
+//! abandoned upload or open is closed, and so is a blob its answer made
+//! before the cancel reached the supervisor. An abandoned read leaves its
+//! blob held; at most one window of it is fetched and dropped.
+//!
+//! Blob bytes are read from and written to files on the caller's thread, one
+//! chunk or one window at a time, never on the supervisor's.
 
 use std::collections::hash_map::RandomState;
+use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,21 +25,44 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use brenn_attach_client::TransportConnector;
+use brenn_attach_client::blobs::ChunkRange;
 use brenn_attach_client::driver::AttachDriver;
-use brenn_envelope::is_local_channel;
+use brenn_envelope::{check_content_type, is_local_channel};
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use tokio::sync::mpsc::UnboundedSender;
+use uuid::Uuid;
 
 use crate::connector::{BlockingConnector, DialCell, Trust, upgrade_request};
-use crate::supervisor::{Command, Core, Shared, Standing, Timings, conn_config, run};
+use crate::supervisor::{
+    Abandoned, Command, Core, Shared, Standing, Timings, UploadStep, conn_config, run,
+};
 use crate::{
-    AttachmentFacts, CallError, DialFailure, EVENT_CAPACITY, EndCause, Event, PublishOutcome,
-    PublishRequest, RecvError, ResumePolicy, Status, SubscribeAnswer, SubscriptionDepths,
+    AttachmentFacts, AttachmentName, Blob, CallError, DialFailure, EVENT_CAPACITY, EndCause, Event,
+    FileError, PublishAttachment, PublishOutcome, PublishRequest, ReadRefusal, RecvError,
+    ResumePolicy, Status, SubscribeAnswer, SubscriptionDepths,
 };
 
 /// The longest a blocking call waits before running its `interrupted` check.
 pub const WAIT_SLICE: Duration = Duration::from_millis(100);
+
+/// Each client's identity, so a [`Blob`] is never handed to another.
+static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
+
+/// Why a wait ended without an answer it can return as is.
+enum Gave {
+    /// The answer was an error.
+    Answer(CallError),
+    /// The caller's deadline or interrupt: the request must be cancelled.
+    Up(CallError),
+}
+
+fn file_error(path: &Path) -> impl Fn(io::Error) -> CallError + '_ {
+    move |error| CallError::File {
+        path: path.to_path_buf(),
+        error: FileError::from(&error),
+    }
+}
 
 /// What [`BlockingClient::attach`] needs.
 pub struct AttachParams {
@@ -85,6 +117,8 @@ pub struct BlockingClient {
     shared: Arc<Shared>,
     thread: Mutex<Option<JoinHandle<()>>>,
     next_id: AtomicU64,
+    /// This client's identity, carried by every [`Blob`] it makes.
+    id: u64,
 }
 
 impl BlockingClient {
@@ -129,6 +163,7 @@ impl BlockingClient {
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let seed = RandomState::new().build_hasher().finish();
         let config = conn_config(url, ident, timings, seed);
+        let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("brenn-attach".to_string())
@@ -139,7 +174,7 @@ impl BlockingClient {
                         .build()
                         .expect("a current-thread runtime builds");
                     let driver = AttachDriver::new(config, connector);
-                    let core = Core::new(thread_shared.clone(), dial);
+                    let core = Core::new(thread_shared.clone(), dial, id);
                     runtime.block_on(run(driver, core, receiver));
                 }));
                 if let Err(payload) = outcome {
@@ -157,6 +192,7 @@ impl BlockingClient {
             shared,
             thread: Mutex::new(Some(thread)),
             next_id: AtomicU64::new(1),
+            id,
         }
     }
 
@@ -233,7 +269,12 @@ impl BlockingClient {
         let id = self.next_id();
         let (reply, answer) = mpsc::channel();
         self.send(Command::Publish { id, request, reply })?;
-        self.await_reply(answer, Some(id), Some(timeout), interrupted)
+        self.await_reply(
+            answer,
+            Some(id),
+            Some(Instant::now() + timeout),
+            interrupted,
+        )
     }
 
     /// Hold `channel` and wait for the server's settlement.
@@ -260,7 +301,12 @@ impl BlockingClient {
             resume,
             reply,
         })?;
-        self.await_reply(answer, Some(id), Some(timeout), interrupted)
+        self.await_reply(
+            answer,
+            Some(id),
+            Some(Instant::now() + timeout),
+            interrupted,
+        )
     }
 
     /// Drop the hold on `channel`, in any state; no read yields an event of it
@@ -279,6 +325,274 @@ impl BlockingClient {
             reply,
         })?;
         self.await_reply(answer, None, None, interrupted)
+    }
+
+    /// Upload `bytes` as a blob of `content_type` and wait until it is sealed.
+    /// `timeout` bounds the whole upload.
+    pub fn upload_bytes(
+        &self,
+        content_type: &str,
+        bytes: &[u8],
+        timeout: Duration,
+        interrupted: &mut dyn FnMut() -> bool,
+    ) -> Result<Blob, CallError> {
+        let chunk = |range: ChunkRange| {
+            let start = usize::try_from(range.offset).expect("a range within the bytes");
+            Ok(bytes[start..start + range.len].to_vec())
+        };
+        self.upload(
+            content_type,
+            bytes.len() as u64,
+            chunk,
+            timeout,
+            interrupted,
+        )
+    }
+
+    /// Upload the regular file at `path`, as long as it is when opened, a
+    /// chunk at a time. Any other kind of file (a pipe, a device, a
+    /// directory) and a file that yields fewer bytes than its length end the
+    /// upload with [`CallError::File`]. `timeout` bounds the whole upload.
+    pub fn upload_file(
+        &self,
+        content_type: &str,
+        path: &Path,
+        timeout: Duration,
+        interrupted: &mut dyn FnMut() -> bool,
+    ) -> Result<Blob, CallError> {
+        let failed = file_error(path);
+        // The length of anything but a regular file is not what it yields,
+        // and the open of a FIFO with no writer blocks: both are refused,
+        // the FIFO before its open.
+        let regular = |metadata: fs::Metadata| {
+            if metadata.is_file() {
+                Ok(metadata.len())
+            } else {
+                Err(failed(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                )))
+            }
+        };
+        regular(fs::metadata(path).map_err(&failed)?)?;
+        let mut file = File::open(path).map_err(&failed)?;
+        let size = regular(file.metadata().map_err(&failed)?)?;
+        let chunk = |range: ChunkRange| {
+            let mut bytes = vec![0; range.len];
+            file.seek(SeekFrom::Start(range.offset)).map_err(&failed)?;
+            file.read_exact(&mut bytes).map_err(&failed)?;
+            Ok(bytes)
+        };
+        self.upload(content_type, size, chunk, timeout, interrupted)
+    }
+
+    /// One upload: the create, then each range the supervisor names, read by
+    /// `chunk` here and sent once the previous chunk is written.
+    fn upload(
+        &self,
+        content_type: &str,
+        size: u64,
+        mut chunk: impl FnMut(ChunkRange) -> Result<Vec<u8>, CallError>,
+        timeout: Duration,
+        interrupted: &mut dyn FnMut() -> bool,
+    ) -> Result<Blob, CallError> {
+        check_content_type(content_type).map_err(CallError::ContentType)?;
+        let deadline = Instant::now() + timeout;
+        let id = self.next_id();
+        let (reply, answer) = mpsc::channel();
+        self.send(Command::BlobCreate {
+            id,
+            content_type: content_type.to_string(),
+            size,
+            reply,
+        })?;
+        let error = loop {
+            match self.wait(&answer, Some(deadline), interrupted) {
+                Ok(UploadStep::Sealed(blob)) => return Ok(blob),
+                Ok(UploadStep::Chunk(range)) => match chunk(range) {
+                    Ok(bytes) => self.send(Command::BlobChunk { id, bytes })?,
+                    Err(error) => break error,
+                },
+                Err(Gave::Answer(error)) => return Err(error),
+                Err(Gave::Up(error)) => break error,
+            }
+        };
+        Err(self.abandon(id, Abandoned::Upload(answer), error))
+    }
+
+    /// Open the attachment `name` of the message `message_id` on `channel`
+    /// and wait until it is held.
+    pub fn open_blob(
+        &self,
+        channel: &str,
+        message_id: Uuid,
+        name: AttachmentName,
+        timeout: Duration,
+        interrupted: &mut dyn FnMut() -> bool,
+    ) -> Result<Blob, CallError> {
+        if is_local_channel(channel) {
+            return Err(CallError::LocalChannel);
+        }
+        let id = self.next_id();
+        let (reply, answer) = mpsc::channel();
+        self.send(Command::BlobOpen {
+            id,
+            channel: channel.to_string(),
+            message_id,
+            name,
+            reply,
+        })?;
+        match self.wait(&answer, Some(Instant::now() + timeout), interrupted) {
+            Ok(blob) => Ok(blob),
+            Err(Gave::Answer(error)) => Err(error),
+            Err(Gave::Up(error)) => Err(self.abandon(id, Abandoned::Open(answer), error)),
+        }
+    }
+
+    /// The bytes `[offset, offset + len)` of `blob`. `timeout` bounds the
+    /// whole read.
+    pub fn read_blob(
+        &self,
+        blob: &Blob,
+        offset: u64,
+        len: u64,
+        timeout: Duration,
+        interrupted: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<u8>, CallError> {
+        let mut bytes = Vec::new();
+        self.read_windows(blob, offset, len, timeout, interrupted, |window| {
+            // Sized at the first window, once the range has been checked.
+            if bytes.is_empty() {
+                bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+            }
+            bytes.extend_from_slice(&window);
+            Ok(())
+        })?;
+        Ok(bytes)
+    }
+
+    /// Write the whole of `blob` to a new file at `path`, a window at a time.
+    /// An existing file is [`CallError::File`]; on any failure the file is
+    /// removed. `timeout` bounds the whole read.
+    pub fn read_blob_to_file(
+        &self,
+        blob: &Blob,
+        path: &Path,
+        timeout: Duration,
+        interrupted: &mut dyn FnMut() -> bool,
+    ) -> Result<(), CallError> {
+        self.own(blob)?;
+        let failed = file_error(path);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(&failed)?;
+        let written = self.read_windows(blob, 0, blob.size, timeout, interrupted, |window| {
+            file.write_all(&window).map_err(&failed)
+        });
+        if written.is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+        }
+        written
+    }
+
+    /// Ask for `[offset, offset + len)` of `blob` one window at a time,
+    /// handing each to `sink` as it arrives. A window is the door's
+    /// `max_chunk_bytes` times `max_inflight_reads`: it bounds what the
+    /// supervisor buffers for this caller and what an abandoned read wastes.
+    fn read_windows(
+        &self,
+        blob: &Blob,
+        offset: u64,
+        len: u64,
+        timeout: Duration,
+        interrupted: &mut dyn FnMut() -> bool,
+        mut sink: impl FnMut(Vec<u8>) -> Result<(), CallError>,
+    ) -> Result<(), CallError> {
+        self.own(blob)?;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= blob.size)
+            .ok_or(CallError::ReadRefused(ReadRefusal::OutOfRange {
+                size: blob.size,
+            }))?;
+        let deadline = Instant::now() + timeout;
+        let mut at = offset;
+        loop {
+            let len = (end - at).min(self.window()?);
+            let id = self.next_id();
+            let (reply, answer) = mpsc::channel();
+            self.send(Command::BlobRead {
+                id,
+                handle: blob.handle,
+                offset: at,
+                len,
+                reply,
+            })?;
+            sink(self.await_reply(answer, Some(id), Some(deadline), interrupted)?)?;
+            at += len;
+            if at == end {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The read window of the most recent attachment's door. With no door,
+    /// no blob of this client is held.
+    fn window(&self) -> Result<u64, CallError> {
+        let door = self
+            .shared
+            .lock()
+            .facts
+            .as_ref()
+            .and_then(|facts| facts.blobs)
+            .ok_or(CallError::BlobGone)?;
+        Ok(door
+            .max_chunk_bytes
+            .saturating_mul(u64::from(door.max_inflight_reads))
+            .max(1))
+    }
+
+    /// Give `blob` up, in any state. A blob already closed, or gone with its
+    /// attachment, closes without error.
+    pub fn close_blob(
+        &self,
+        blob: &Blob,
+        interrupted: &mut dyn FnMut() -> bool,
+    ) -> Result<(), CallError> {
+        self.own(blob)?;
+        let (reply, answer) = mpsc::channel();
+        let closed = self
+            .send(Command::BlobClose {
+                handle: blob.handle,
+                reply,
+            })
+            .and_then(|()| self.await_reply(answer, None, None, interrupted));
+        match closed {
+            Err(CallError::Ended(_)) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// `blob` named `name`, for [`PublishRequest::attachments`]; another
+    /// client's blob is [`CallError::ForeignBlob`].
+    pub fn attachment(
+        &self,
+        blob: &Blob,
+        name: AttachmentName,
+    ) -> Result<PublishAttachment, CallError> {
+        self.own(blob)?;
+        Ok(PublishAttachment::new(name, blob.handle))
+    }
+
+    fn own(&self, blob: &Blob) -> Result<(), CallError> {
+        if blob.client == self.id {
+            Ok(())
+        } else {
+            Err(CallError::ForeignBlob)
+        }
     }
 
     /// The next event: subscription events first, in wire order, then the
@@ -355,39 +669,60 @@ impl BlockingClient {
         &self,
         answer: Receiver<Result<T, CallError>>,
         id: Option<u64>,
-        timeout: Option<Duration>,
+        deadline: Option<Instant>,
         interrupted: &mut dyn FnMut() -> bool,
     ) -> Result<T, CallError> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let cancel = |error: CallError| {
-            if let Some(id) = id {
-                let _ = self.commands.send(Command::Cancel { id });
+        match self.wait(&answer, deadline, interrupted) {
+            Ok(value) => Ok(value),
+            Err(Gave::Answer(error)) => Err(error),
+            Err(Gave::Up(error)) => {
+                if let Some(id) = id {
+                    let _ = self.commands.send(Command::Cancel { id });
+                }
+                Err(error)
             }
-            Err(error)
-        };
+        }
+    }
+
+    /// Wait for one reply until `deadline` or until `interrupted` asks.
+    fn wait<T>(
+        &self,
+        answer: &Receiver<Result<T, CallError>>,
+        deadline: Option<Instant>,
+        interrupted: &mut dyn FnMut() -> bool,
+    ) -> Result<T, Gave> {
         loop {
             let wait = match deadline {
                 None => WAIT_SLICE,
                 Some(deadline) => {
                     let now = Instant::now();
                     if now >= deadline {
-                        return cancel(CallError::Timeout);
+                        return Err(Gave::Up(CallError::Timeout));
                     }
                     WAIT_SLICE.min(deadline - now)
                 }
             };
             match answer.recv_timeout(wait) {
-                Ok(result) => return result,
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(error)) => return Err(Gave::Answer(error)),
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(CallError::Ended(self.await_end()));
+                    return Err(Gave::Answer(CallError::Ended(self.await_end())));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if interrupted() {
-                        return cancel(CallError::Interrupted);
+                        return Err(Gave::Up(CallError::Interrupted));
                     }
                 }
             }
         }
+    }
+
+    /// Hand upload or open `id` and its reply channel back to the supervisor,
+    /// which closes its handle and any blob an answer already sent made, and
+    /// return at once. Answers `error`.
+    fn abandon(&self, id: u64, answer: Abandoned, error: CallError) -> CallError {
+        let _ = self.commands.send(Command::Abandon { id, answer });
+        error
     }
 
     /// The end, once the supervisor has recorded it. A dropped reply channel

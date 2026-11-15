@@ -1,5 +1,5 @@
 {
-  "checksum": "b276e864fdd8f89cb57fdc40971f5d4eb232e127187bdf1e36d97cbbe2d9e21e",
+  "checksum": "e43f918424d355f5229c5f065a4ff899e01ccb59bb5232ce52714119bf4037c1",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2504,6 +2504,10 @@
             {
               "id": "tokio-tungstenite 0.29.0",
               "target": "tokio_tungstenite"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
             }
           ],
           "selects": {}
@@ -2517,10 +2521,6 @@
             {
               "id": "serde_json 1.0.150",
               "target": "serde_json"
-            },
-            {
-              "id": "uuid 1.24.0",
-              "target": "uuid"
             }
           ],
           "selects": {}

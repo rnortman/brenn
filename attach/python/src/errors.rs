@@ -7,12 +7,12 @@
 use brenn_attach_blocking::handle::AttachError;
 use brenn_attach_blocking::{CallError, EndCause, RecvError};
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::exceptions::{PyException, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
-use crate::types::{dial_failure, loss};
+use crate::types::{dial_failure, loss, open_refusal, read_refusal, upload_refusal};
 
 create_exception!(
     brenn_bus,
@@ -88,6 +88,45 @@ create_exception!(
     SupervisorPanicked,
     AttachmentEnded,
     "The thread that supervises the attachment panicked; `message` is the panic's."
+);
+
+create_exception!(
+    brenn_bus,
+    BlobsUnavailable,
+    BusError,
+    "The live attachment has no blob door: the server keeps no blob store."
+);
+create_exception!(
+    brenn_bus,
+    UploadNotGranted,
+    BusError,
+    "The blob door grants no upload: this remote may not publish, so may not upload."
+);
+create_exception!(
+    brenn_bus,
+    UploadRefused,
+    BusError,
+    "The upload made no blob. `reason` is an UploadRefusal; `size`, `max`, `offset` and `len` \
+     are None unless the reason carries them."
+);
+create_exception!(
+    brenn_bus,
+    OpenRefused,
+    BusError,
+    "The open made no blob. `reason` is an OpenRefusal; `size` is set for BYTES_HELD_LIMIT."
+);
+create_exception!(
+    brenn_bus,
+    ReadRefused,
+    BusError,
+    "The read ended before its last byte. `reason` is a ReadRefusal; `size` is set for \
+     OUT_OF_RANGE."
+);
+create_exception!(
+    brenn_bus,
+    BlobGone,
+    BusError,
+    "The blob was closed, or the attachment that held it has ended."
 );
 
 static ALREADY_SUBSCRIBED: PyOnceLock<Py<PyType>> = PyOnceLock::new();
@@ -216,7 +255,58 @@ pub fn call(py: Python<'_>, error: CallError) -> PyErr {
             CallError::Ended(cause) => ended(py, &cause),
             CallError::AlreadySubscribed => raise(&already_subscribed(py)?, message, &[]),
             CallError::NotSubscribed => raise(&not_subscribed(py)?, message, &[]),
-            CallError::LocalChannel | CallError::NoDepth => PyValueError::new_err(message),
+            CallError::LocalChannel
+            | CallError::NoDepth
+            | CallError::ForeignBlob
+            | CallError::ContentType(_) => PyValueError::new_err(message),
+            // TODO(test-blobs-unavailable-never-raised-from-binding): no test
+            // raises `BlobsUnavailable` through the module.
+            CallError::NoBlobDoor => raise(&py.get_type::<BlobsUnavailable>(), message, &[]),
+            CallError::UploadNotGranted => raise(&py.get_type::<UploadNotGranted>(), message, &[]),
+            CallError::BlobGone => raise(&py.get_type::<BlobGone>(), message, &[]),
+            CallError::UploadRefused(refusal) => {
+                let fields = upload_refusal(refusal);
+                raise(
+                    &py.get_type::<UploadRefused>(),
+                    message,
+                    &[
+                        ("reason", Bound::new(py, fields.reason)?.into_any()),
+                        ("size", fields.size.into_pyobject(py)?.into_any()),
+                        ("max", fields.max.into_pyobject(py)?.into_any()),
+                        ("offset", fields.offset.into_pyobject(py)?.into_any()),
+                        ("len", fields.len.into_pyobject(py)?.into_any()),
+                    ],
+                )
+            }
+            CallError::OpenRefused(refusal) => {
+                let (reason, size) = open_refusal(refusal);
+                raise(
+                    &py.get_type::<OpenRefused>(),
+                    message,
+                    &[
+                        ("reason", Bound::new(py, reason)?.into_any()),
+                        ("size", size.into_pyobject(py)?.into_any()),
+                    ],
+                )
+            }
+            CallError::ReadRefused(refusal) => {
+                let (reason, size) = read_refusal(refusal);
+                raise(
+                    &py.get_type::<ReadRefused>(),
+                    message,
+                    &[
+                        ("reason", Bound::new(py, reason)?.into_any()),
+                        ("size", size.into_pyobject(py)?.into_any()),
+                    ],
+                )
+            }
+            // `OSError(errno, strerror, filename)` becomes the subclass the
+            // number names (`FileExistsError`, `FileNotFoundError`, …); the
+            // filename is a `str`, as `open` gives it.
+            CallError::File { path, error } => {
+                PyOSError::new_err((error.os_error, error.detail, path.into_os_string()))
+            }
+            CallError::Fault { .. } => PyRuntimeError::new_err(message),
         })
     };
     built().unwrap_or_else(|err| err)
@@ -276,6 +366,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("Futile", py.get_type::<Futile>())?;
     m.add("ClientClosed", py.get_type::<ClientClosed>())?;
     m.add("SupervisorPanicked", py.get_type::<SupervisorPanicked>())?;
+    m.add("BlobsUnavailable", py.get_type::<BlobsUnavailable>())?;
+    m.add("UploadNotGranted", py.get_type::<UploadNotGranted>())?;
+    m.add("UploadRefused", py.get_type::<UploadRefused>())?;
+    m.add("OpenRefused", py.get_type::<OpenRefused>())?;
+    m.add("ReadRefused", py.get_type::<ReadRefused>())?;
+    m.add("BlobGone", py.get_type::<BlobGone>())?;
     m.add("AlreadySubscribed", already_subscribed(py)?)?;
     m.add("NotSubscribed", not_subscribed(py)?)?;
     Ok(())

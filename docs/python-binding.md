@@ -1,7 +1,7 @@
 # The Python binding: `brenn_bus`
 
 `brenn_bus` lets a Python program attach to a brenn server as a remote
-attacher, publish, subscribe and read. It is a CPython extension module over
+attacher, publish, subscribe and read, and move blobs. It is a CPython extension module over
 `brenn-attach-client`, so the wire is spoken by the same Rust code every other
 attacher uses; the module only maps it onto Python.
 
@@ -26,7 +26,7 @@ with brenn_bus.attach(
     ca_file="/etc/lab/lab-ca.pem",
     timeout=30,
 ) as client:
-    print(client.facts().protocol_version)        # 5
+    print(client.facts().protocol_version)        # 6
 
     answer = client.subscribe("ephemeral:lab.status", push_depth=8,
                               retain_depth=8, timeout=10)
@@ -53,7 +53,8 @@ with brenn_bus.attach(
 
 Every timeout is in seconds, keyword-only, with no default; it must be finite
 and not negative. The publish outcomes, the events, `Subscribed`,
-`AttachmentFacts`, `Loss` and `DialFailure` support `match` by position, in
+`AttachmentFacts`, `BlobFacts`, `Attachment`, `Loss` and `DialFailure`
+support `match` by position, in
 the field order this page writes them. `Body` and the exceptions do not: read
 their fields as attributes (`except CredentialRejected as e: e.status`).
 
@@ -92,7 +93,9 @@ guard. Anything off the machine is `wss://`.
 `client.facts()` returns the most recent attachment's `AttachmentFacts`:
 `protocol_version`, `participant_id` (the server's name for this attacher, the
 `sender` of what it publishes), `session_id` (new at every attachment),
-`max_body_bytes` (the server's body cap).
+`max_body_bytes` (the server's body cap), `blobs` (the attachment's blob
+door, a `BlobFacts`, or `None` when the server keeps no blob store; see
+"Blobs").
 
 ### One attachment, supervised
 
@@ -113,16 +116,22 @@ once the attachment is over.
 Every blocking call releases the GIL, so other Python threads run while it
 waits. On the main thread a wait also runs the interpreter's signal handlers
 at least every 100 ms, so Ctrl-C (or any handler that raises) interrupts it:
-the handler's exception is raised, and a publish or subscribe it abandoned is
-cancelled as a timeout cancels it. On any other thread CPython runs no signal
+the handler's exception is raised, and a publish, subscribe or blob call it
+abandoned is cancelled as a timeout cancels it. On any other thread CPython runs no signal
 handler, so only the call's own timeout ends a wait. `close()` is not
 interrupted on any thread.
 
 ## Publishing
 
 ```python
-client.publish(channel, body, *, timeout, urgency=Urgency.NORMAL) -> PublishOutcome
+client.publish(channel, body, *, timeout, urgency=Urgency.NORMAL, attachments=None)
+    -> PublishOutcome
 ```
+
+`attachments` maps each attachment's name to a `Blob` this client holds (see
+"Blobs"). A name is 1 to 64 bytes, the first an ASCII letter or digit, the
+rest letters, digits, `.`, `_` or `-`; another name, or another client's
+`Blob`, is a `ValueError`.
 
 A `Body` is bytes plus an optional content type:
 
@@ -144,6 +153,7 @@ outcome, each a subclass of `PublishOutcome`:
 | `RateLimited()` | The remote's server-side send budget refused it (`docs/message-bus.md` §2.1.3). |
 | `BodyTooLarge(len, max)` | The body is `len` bytes; the server's cap is `max`. |
 | `TextOnlyChannel()` | A body that is not text, to a channel that is not `non_text`. |
+| `AttachmentNotHeld()` | A blob the publish names was closed, gone with an earlier attachment, or never sealed. Nothing was stored. |
 
 `Urgency` is `VERY_LOW`, `LOW`, `NORMAL` or `HIGH`.
 
@@ -189,7 +199,7 @@ is a subclass of `Event`:
 
 | Event | Meaning |
 |---|---|
-| `Delivery(channel, message_id, sender, publish_ts, reply_to, urgency, body, seq, dropped)` | One message. `message_id` is the UUID as a string; `sender` the publisher's participant id; `publish_ts` an aware UTC `datetime`; `reply_to` a channel or `None`; `seq` the channel's sequence number; `dropped` how many messages this subscription lost since the previous delivery. |
+| `Delivery(channel, message_id, sender, publish_ts, reply_to, urgency, body, seq, dropped, attachments)` | One message. `message_id` is the UUID as a string; `sender` the publisher's participant id; `publish_ts` an aware UTC `datetime`; `reply_to` a channel or `None`; `seq` the channel's sequence number; `dropped` how many messages this subscription lost since the previous delivery; `attachments` a tuple of `Attachment(name, size, content_type)`, in name order, empty for a message that names no blob. |
 | `Resubscribed(channel, replay_count, gap)` | A held channel's settlement after a reattach. |
 | `SubscriptionDropped(channel)` | A held channel the server answered `Unavailable` on re-subscribe. The hold is gone. |
 | `Attached(facts)` | A new attachment after a drop. |
@@ -220,9 +230,146 @@ binding adds no buffer that loses a message silently:
   arrives as `dropped` on the next delivery or `gap` on the settlement.
 - A publish made while the buffer is full is not answered until the reader
   drains it, and so ends in `AnswerTimeout`.
+- A blob call is not answered while the buffer is full either, and ends the
+  same way; blob bytes themselves never enter the buffer.
 
 A client that holds a subscription must call `recv`. A client that only
 publishes fills nothing.
+
+## Blobs
+
+A blob is bytes a message names by reference, beside its body
+(`docs/message-bus.md`, §2.1.2a). A client moves blobs through its
+attachment's **blob door**, which `facts().blobs` describes as
+`BlobFacts(max_blob_bytes, max_chunk_bytes, max_handles, max_bytes_held,
+max_inflight_reads, upload)`:
+
+- `max_blob_bytes`: the largest blob the server stores;
+- `max_chunk_bytes`: the most bytes one wire chunk carries;
+- `max_handles`: the most blobs this attachment holds at once, uploads in
+  progress included;
+- `max_bytes_held`: the most blob bytes this attachment holds at once;
+- `max_inflight_reads`: the most read answers in flight; a read is asked for
+  `max_chunk_bytes × max_inflight_reads` bytes at a time;
+- `upload`: whether this remote may upload.
+
+`blobs` is `None` when the server keeps no blob store; an upload, an open,
+and a publish that names attachments then raise `BlobsUnavailable` with
+nothing sent.
+
+### A blob is held
+
+```python
+client.upload(data, *, content_type, timeout) -> Blob
+client.upload_file(path, *, content_type, timeout) -> Blob
+client.open_attachment(channel, message_id, name, *, timeout) -> Blob
+client.read_blob(blob, offset, length, *, timeout) -> bytes
+client.download_blob(blob, path, *, timeout) -> None
+blob.close() -> None
+```
+
+A `Blob` is a blob this client holds: one it uploaded, or an attachment it
+opened. It has `size` and `content_type`, and it lasts until `close()` (or
+the end of a `with` block, whose exit calls it), or until the attachment
+drops: **nothing held survives a reconnect**, and a `Blob` from an earlier
+attachment raises `BlobGone`. Collecting a `Blob` releases nothing. Each
+held blob counts against `max_handles` and `max_bytes_held` until it is
+closed, so close what you are done with. Closing a blob already closed or
+gone succeeds. A `Blob` belongs to the client that made it; passing it to
+another client is a `ValueError`.
+
+- `upload` sends `data`, a `bytes`, and returns once the server has sealed it.
+  `upload_file` sends the regular file at `path`, as long as it is when
+  opened, a chunk at a time; a file that is shorter by the time a chunk is
+  read raises `OSError` and the upload is abandoned. Any other kind of file
+  (a pipe, a device, a directory) raises `OSError` before anything is sent:
+  its length is not what it yields. Bytes from a pipe go through `upload`. `content_type` is a media type, by
+  the same rule as a `Body`'s.
+- `open_attachment` holds the attachment `name` of the message `message_id`
+  (a delivery's `message_id`) on `channel`. The message must still be in the
+  channel's window when it is opened; once opened, the blob stays readable
+  after the message is evicted.
+- `read_blob` returns `length` bytes from `offset`. A range past the end is
+  `ReadRefused` with `ReadRefusal.OUT_OF_RANGE` before anything is sent.
+  `download_blob` writes the whole blob to a new file at `path`; an existing
+  file is `FileExistsError`, and on any failure the file is removed.
+- To **publish** a blob, name it in `publish(…, attachments={"name": blob})`.
+  To **forward** an attachment, open it and name the opened blob in a
+  publish: no byte is read or sent again.
+
+```python
+with client.upload_file("run.wav", content_type="audio/wav", timeout=60) as wav:
+    client.publish("ephemeral:lab.runs", brenn_bus.Body.text("run 7"),
+                   timeout=10, attachments={"capture": wav})
+
+match client.recv(timeout=10):
+    case brenn_bus.Delivery(channel=channel, message_id=message_id,
+                            attachments=attachments):
+        for attachment in attachments:
+            with client.open_attachment(channel, message_id, attachment.name,
+                                        timeout=10) as blob:
+                client.download_blob(blob, attachment.name, timeout=60)
+```
+
+Every `timeout` bounds the whole call, however many chunks it moves. An
+upload or open that times out or is interrupted is cancelled and its handle
+closed, so the server keeps nothing for it. A read that times out leaves the
+blob held. An upload or open whose attachment drops first raises
+`ConnectionLost` and holds nothing: the server lets go of everything the
+attachment held, and no publish can have named a blob the call never
+returned.
+
+### What a remote must be granted
+
+- `publish` in the remote's `grants` to upload (`facts().blobs.upload`);
+  without it an upload raises `UploadNotGranted`.
+- publish authority on a channel (`acl publish`) to publish attachments to
+  it.
+- subscribe authority on a channel (`acl subscribe`) to open an attachment
+  of its messages. An open outside it is a statement outside the grant, and
+  the server closes the connection as for any other ("A statement the server
+  does not allow"): the call raises `ConnectionLost`.
+
+### Refusals
+
+The server's typed refusals, and the client's own checks against the door's
+bounds, are raised as `UploadRefused`, `OpenRefused` and `ReadRefused`, each
+with a `reason` from one enumeration.
+
+`UploadRefused(reason, size, max, offset, len)`: the upload made no blob.
+The fields a reason does not carry are `None`.
+
+| Reason | Meaning |
+|---|---|
+| `UploadRefusal.BLOB_TOO_LARGE` | `size` is over the per-blob cap `max`. |
+| `UploadRefusal.BUDGET_EXHAUSTED` | The server's blob store cannot reserve the size. |
+| `UploadRefusal.HANDLE_LIMIT` | This attachment holds `max_handles` blobs: close one. |
+| `UploadRefusal.BYTES_HELD_LIMIT` | The size would pass `max_bytes_held`: close a blob. |
+| `UploadRefusal.STORAGE_FAILED` | The server could not create the blob's file. |
+| `UploadRefusal.INCOMPLETE` | `[offset, offset + len)` was not written, a server-side write failure. Upload again. |
+
+`OpenRefused(reason, size)`: the open made no blob. `size` is set for
+`BYTES_HELD_LIMIT`.
+
+| Reason | Meaning |
+|---|---|
+| `OpenRefusal.NOT_RETAINED` | The message is not in the channel's window now, is parked, or the channel is gone. |
+| `OpenRefusal.NO_SUCH_ATTACHMENT` | The message names no attachment of that name. |
+| `OpenRefusal.TOOL_CHANNEL` | The channel is the tool substrate's, whose attachments are never opened over the bus. |
+| `OpenRefusal.HANDLE_LIMIT` | This attachment holds `max_handles` blobs: close one. |
+| `OpenRefusal.BYTES_HELD_LIMIT` | The blob's `size` would pass `max_bytes_held`. |
+
+`ReadRefused(reason, size)`: the read ended before its last byte. `size` is
+set for `OUT_OF_RANGE`.
+
+| Reason | Meaning |
+|---|---|
+| `ReadRefusal.OUT_OF_RANGE` | The range passes the blob's `size`. |
+| `ReadRefusal.UNKNOWN_HANDLE` | The server holds no such blob for this attachment. |
+| `ReadRefusal.NOT_SEALED` | The server found the blob an unsealed upload. |
+| `ReadRefusal.TOO_MANY_READS` | The server had `max_inflight_reads` answers in flight. |
+| `ReadRefusal.STORAGE_FAILED` | The server could not read the blob's file. |
+| `ReadRefusal.CLOSED` | The blob was closed, by another thread, during the read. |
 
 ## Failures
 
@@ -234,13 +381,21 @@ integer out of range (a negative depth) is an `OverflowError`.
 | Exception | Raised by | Cause |
 |---|---|---|
 | `AttachTimeout(last_failure)` | `attach` | No attachment within `timeout`. `last_failure` is the most recent `DialFailure`, or `None`. |
-| `NotAttached` | `publish`, `subscribe` | No live attachment at the moment of the call (between two attempts, or during one). |
-| `ConnectionLost(loss)` | `publish`, `subscribe` | The attachment dropped before the server answered. A publish may or may not have landed; a subscribe holds nothing. |
-| `AnswerTimeout` | `publish`, `subscribe` | No answer within `timeout`. The request is cancelled: a subscribe that timed out holds nothing, even if the server's answer arrives later. |
+| `NotAttached` | `publish`, `subscribe`, `upload`, `upload_file`, `open_attachment` | No live attachment at the moment of the call (between two attempts, or during one). |
+| `ConnectionLost(loss)` | `publish`, `subscribe`, the blob calls | The attachment dropped before the server answered. A publish may or may not have landed; a subscribe, upload or open holds nothing. |
+| `AnswerTimeout` | `publish`, `subscribe`, the blob calls | No answer within `timeout`. The request is cancelled: a subscribe, upload or open that timed out holds nothing, even if the server's answer arrives later. |
+| `BlobsUnavailable` | `publish` naming attachments, `upload`, `upload_file`, `open_attachment` | The attachment has no blob door: the server keeps no blob store. Nothing was sent. |
+| `UploadNotGranted` | `upload`, `upload_file` | The remote may not publish, so may not upload. Nothing was sent. |
+| `UploadRefused(reason, size, max, offset, len)` | `upload`, `upload_file` | The upload made no blob; see "Refusals". |
+| `OpenRefused(reason, size)` | `open_attachment` | The open made no blob; see "Refusals". |
+| `ReadRefused(reason, size)` | `read_blob`, `download_blob` | The read ended before its last byte; see "Refusals". |
+| `BlobGone` | `read_blob`, `download_blob` | The blob was closed, or the attachment that held it has ended. |
 | `AlreadySubscribed` | `subscribe` | The channel is already held, or its first subscribe is unanswered. Also a `ValueError`. |
 | `NotSubscribed` | `unsubscribe` | The channel is not held. Also a `ValueError`. |
 | `AttachmentEnded` | `attach`, then every call | The attachment is over for good; see below. |
-| `ValueError` | any | A bad argument: a timeout that is negative, NaN or infinite, both depths zero, a `local:` channel (the binding has no local router), or one of `attach`'s refusals. |
+| `ValueError` | any | A bad argument: a timeout that is negative, NaN or infinite, both depths zero, a `local:` channel (the binding has no local router), a malformed content type, attachment name or message id, a negative offset or length, another client's `Blob`, or one of `attach`'s refusals. |
+| `OSError` | `upload_file`, `download_blob` | A local file could not be opened, read, created or written: the subclass its `errno` names (`FileNotFoundError`, `FileExistsError`, …), with `filename` set; for a path `upload_file` is given that is not a regular file, `OSError` itself, with no `errno`. |
+| `RuntimeError` | `upload`, `upload_file` | A bug in the binding broke an upload; the upload made no blob, the attachment is still up, and an upload again meets the same bug. |
 
 `AttachmentEnded`'s subclasses. Once one is raised, every later call and read
 raises it too (after any subscription events still buffered have been read):
@@ -289,12 +444,14 @@ on both kernels' socket buffers), the client's background thread waits on that
 write. Until TCP gives up (about fifteen minutes with the kernel's default
 retries) or the server's end of the connection goes away:
 
-- `publish` and `subscribe` raise `AnswerTimeout` at their timeout;
+- `publish`, `subscribe`, `upload`, `upload_file`, `open_attachment`,
+  `read_blob` and `download_blob` raise `AnswerTimeout` at their timeout;
 - `status()` still returns `Attached`, and no `Detached` arrives; `recv`
   returns by its timeout as usual (it reads the client's buffer, not the
   connection);
-- `unsubscribe`, which takes no timeout, does not return. Ctrl-C interrupts it
-  on the main thread, and nothing interrupts it on any other thread;
+- `unsubscribe` and a `Blob`'s `close()` and `with` block's exit, which take
+  no timeout, do not return. Ctrl-C interrupts them on the main thread, and
+  nothing interrupts them on any other thread;
 - `close()` and a `with` block's exit do not return, and Ctrl-C does not
   interrupt them on any thread. The client's collection closes it, so letting
   the last reference go blocks the same way, and so does a program's exit
@@ -330,8 +487,9 @@ remote alice {
   subscribe the depth ceilings.
 - A channel carries bodies that are not text only if it is declared
   `non_text = true`; a byte body to any other channel is `TextOnlyChannel`.
-- The binding always attaches at attach protocol v5, which carries every body,
-  text or not, and is served a `non_text` channel.
+- The binding always attaches at attach protocol v6, which carries every body,
+  text or not, is served a `non_text` channel, and carries blobs. What a
+  remote must be granted to move them is under "Blobs".
 - The route is `/remote/<name>/ws` on the server's listener.
 
 ## Trust
@@ -352,10 +510,9 @@ raises `AttachTimeout` with that `last_failure`.
 
 ## Protocol version
 
-The binding offers attach protocol v5 exactly. v5 carries every body; v6 adds
-blob transfer, which the binding does not offer, and a v5 client is delivered
-what it was before. A server that does not speak v5 ends the attachment with
-`IncompatibleVersions`.
+The binding offers attach protocol v6 exactly: every body, and blob
+transfer. A server that does not speak v6 ends the attachment with
+`IncompatibleVersions`, whose `ours` is `(6, 6)`.
 
 ## Building from another Bazel workspace
 
@@ -454,14 +611,11 @@ linux aarch64.
 
 ## What is not offered
 
-- **Blob transfer.** A Python attacher cannot upload a blob, attach one to a
-  publish, or open and read one a delivery names
-  (`python-binding-no-blob-transfer` in `TODO.md`).
 - **Installation outside Bazel.** No wheel, no source distribution, no `pip
   install`; Cargo builds are unsupported in this repository
   (`python-binding-bazel-only-install` in `TODO.md`).
-- **Parts of a delivered message:** its blob attachments, `source`, `impetus`,
-  `transport` and deferral fields.
+- **Parts of a delivered message:** its `source`, `impetus`, `transport` and
+  deferral fields.
 - **Alerts, publish batches and deferred publishes.**
 - **`local:` channels.** The binding has no local router.
 - **An asyncio surface.** The API is blocking and thread-safe.

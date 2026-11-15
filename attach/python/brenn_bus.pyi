@@ -1,5 +1,5 @@
 """The brenn bus attachment: attach to a brenn server's remote route, publish,
-subscribe and read.
+subscribe and read, and move blobs.
 
 Every blocking call releases the GIL. On the main thread it runs the
 interpreter's signal handlers at least every 100 ms, so Ctrl-C interrupts the
@@ -8,6 +8,7 @@ wait; `close` is not interrupted. Timeouts are seconds.
 
 import datetime
 import os
+from collections.abc import Mapping
 from types import TracebackType
 from typing import ClassVar, final
 
@@ -31,7 +32,19 @@ class Client:
         *,
         timeout: float,
         urgency: Urgency = ...,
+        attachments: Mapping[str, Blob] | None = None,
     ) -> PublishOutcome: ...
+    def upload(self, data: bytes, *, content_type: str, timeout: float) -> Blob: ...
+    def upload_file(
+        self, path: str | os.PathLike[str], *, content_type: str, timeout: float
+    ) -> Blob: ...
+    def open_attachment(
+        self, channel: str, message_id: str, name: str, *, timeout: float
+    ) -> Blob: ...
+    def read_blob(self, blob: Blob, offset: int, length: int, *, timeout: float) -> bytes: ...
+    def download_blob(
+        self, blob: Blob, path: str | os.PathLike[str], *, timeout: float
+    ) -> None: ...
     def subscribe(
         self,
         channel: str,
@@ -53,8 +66,29 @@ class Client:
     ) -> bool: ...
 
 @final
+class Blob:
+    @property
+    def size(self) -> int: ...
+    @property
+    def content_type(self) -> str: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> Blob: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool: ...
+
+@final
 class AttachmentFacts:
-    __match_args__ = ("protocol_version", "participant_id", "session_id", "max_body_bytes")
+    __match_args__ = (
+        "protocol_version",
+        "participant_id",
+        "session_id",
+        "max_body_bytes",
+        "blobs",
+    )
     @property
     def protocol_version(self) -> int: ...
     @property
@@ -63,6 +97,67 @@ class AttachmentFacts:
     def session_id(self) -> str: ...
     @property
     def max_body_bytes(self) -> int: ...
+    @property
+    def blobs(self) -> BlobFacts | None: ...
+
+@final
+class BlobFacts:
+    __match_args__ = (
+        "max_blob_bytes",
+        "max_chunk_bytes",
+        "max_handles",
+        "max_bytes_held",
+        "max_inflight_reads",
+        "upload",
+    )
+    @property
+    def max_blob_bytes(self) -> int: ...
+    @property
+    def max_chunk_bytes(self) -> int: ...
+    @property
+    def max_handles(self) -> int: ...
+    @property
+    def max_bytes_held(self) -> int: ...
+    @property
+    def max_inflight_reads(self) -> int: ...
+    @property
+    def upload(self) -> bool: ...
+
+@final
+class Attachment:
+    __match_args__ = ("name", "size", "content_type")
+    @property
+    def name(self) -> str: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def content_type(self) -> str: ...
+
+@final
+class UploadRefusal:
+    BLOB_TOO_LARGE: ClassVar[UploadRefusal] = ...
+    BUDGET_EXHAUSTED: ClassVar[UploadRefusal] = ...
+    HANDLE_LIMIT: ClassVar[UploadRefusal] = ...
+    BYTES_HELD_LIMIT: ClassVar[UploadRefusal] = ...
+    STORAGE_FAILED: ClassVar[UploadRefusal] = ...
+    INCOMPLETE: ClassVar[UploadRefusal] = ...
+
+@final
+class OpenRefusal:
+    NOT_RETAINED: ClassVar[OpenRefusal] = ...
+    NO_SUCH_ATTACHMENT: ClassVar[OpenRefusal] = ...
+    TOOL_CHANNEL: ClassVar[OpenRefusal] = ...
+    HANDLE_LIMIT: ClassVar[OpenRefusal] = ...
+    BYTES_HELD_LIMIT: ClassVar[OpenRefusal] = ...
+
+@final
+class ReadRefusal:
+    OUT_OF_RANGE: ClassVar[ReadRefusal] = ...
+    UNKNOWN_HANDLE: ClassVar[ReadRefusal] = ...
+    NOT_SEALED: ClassVar[ReadRefusal] = ...
+    TOO_MANY_READS: ClassVar[ReadRefusal] = ...
+    STORAGE_FAILED: ClassVar[ReadRefusal] = ...
+    CLOSED: ClassVar[ReadRefusal] = ...
 
 @final
 class Urgency:
@@ -145,6 +240,9 @@ class BodyTooLarge(PublishOutcome):
 class TextOnlyChannel(PublishOutcome): ...
 
 @final
+class AttachmentNotHeld(PublishOutcome): ...
+
+@final
 class Subscribed:
     __match_args__ = ("replay_count", "gap")
     @property
@@ -169,6 +267,7 @@ class Delivery(Event):
         "body",
         "seq",
         "dropped",
+        "attachments",
     )
     @property
     def channel(self) -> str: ...
@@ -188,6 +287,8 @@ class Delivery(Event):
     def seq(self) -> int: ...
     @property
     def dropped(self) -> int: ...
+    @property
+    def attachments(self) -> tuple[Attachment, ...]: ...
 
 @final
 class Resubscribed(Event):
@@ -250,5 +351,24 @@ class ClientClosed(AttachmentEnded): ...
 class SupervisorPanicked(AttachmentEnded):
     message: str
 
+class BlobsUnavailable(BusError): ...
+class UploadNotGranted(BusError): ...
+
+class UploadRefused(BusError):
+    reason: UploadRefusal
+    size: int | None
+    max: int | None
+    offset: int | None
+    len: int | None
+
+class OpenRefused(BusError):
+    reason: OpenRefusal
+    size: int | None
+
+class ReadRefused(BusError):
+    reason: ReadRefusal
+    size: int | None
+
+class BlobGone(BusError): ...
 class AlreadySubscribed(BusError, ValueError): ...
 class NotSubscribed(BusError, ValueError): ...

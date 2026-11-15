@@ -10,10 +10,11 @@
 //! every gate still passing.
 //!
 //! Scope is the in-crate suite: `.rs` files under a package's `src/`, against
-//! the `rust_library`/`rust_binary` targets that package declares. Integration
-//! tests under `tests/` are separate `rust_test` targets over their own `srcs`,
-//! and a package declaring no Rust crate at all — the wasm guests, built by the
-//! component rules — is outside what this guard can say anything about.
+//! the `rust_library`/`rust_binary`/`rust_shared_library` targets that package
+//! declares. Integration tests under `tests/` are separate `rust_test` targets
+//! over their own `srcs`, and a package declaring no Rust crate at all — the
+//! wasm guests, built by the component rules — is outside what this guard can
+//! say anything about.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -128,7 +129,7 @@ pub fn attr_string(block: &str, key: &str) -> Option<String> {
 
 /// The Rust crates a BUILD file declares, by target name.
 fn declared_crates(build: &str) -> BTreeSet<String> {
-    ["rust_library", "rust_binary"]
+    ["rust_library", "rust_binary", "rust_shared_library"]
         .iter()
         .flat_map(|rule| call_blocks(build, rule))
         .filter_map(|block| attr_string(block, "name"))
@@ -291,6 +292,19 @@ mod tests {
             out[0]
         );
         assert!(out[0].contains("crate-a"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_shared_library_is_a_crate_whose_tests_need_a_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cdylib = "rust_shared_library(\n    name = \"module\",\n)\n";
+        let files = package(root, "module", cdylib, WITH_TESTS);
+        let found = packages_with_in_crate_tests(root, &files);
+        assert_eq!(violations_from(&found, root).len(), 1);
+        let test = "rust_test(\n    name = \"module_test\",\n    crate = \":module\",\n)\n";
+        std::fs::write(root.join("module/BUILD.bazel"), format!("{cdylib}{test}")).unwrap();
+        assert!(violations_from(&found, root).is_empty());
     }
 
     #[test]

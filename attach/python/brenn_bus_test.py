@@ -254,6 +254,19 @@ class ExceptionHierarchyTest(unittest.TestCase):
             self.assertTrue(issubclass(error, ValueError))
             self.assertEqual(error.__module__, "brenn_bus")
 
+    def test_blob_errors_are_bus_errors_and_not_ended(self) -> None:
+        for error in (
+            brenn_bus.BlobsUnavailable,
+            brenn_bus.UploadNotGranted,
+            brenn_bus.UploadRefused,
+            brenn_bus.OpenRefused,
+            brenn_bus.ReadRefused,
+            brenn_bus.BlobGone,
+        ):
+            self.assertTrue(issubclass(error, brenn_bus.BusError))
+            self.assertFalse(issubclass(error, brenn_bus.AttachmentEnded))
+            self.assertFalse(issubclass(error, ValueError))
+
     def test_every_end_is_an_attachment_ended(self) -> None:
         for error in (
             brenn_bus.CredentialRejected,
@@ -330,19 +343,41 @@ class DocumentationPageTest(unittest.TestCase):
         cls.page = pathlib.Path(os.environ["BINDING_PAGE"]).read_text()
 
     def test_the_tables_list_exactly_the_outcomes_events_and_exceptions(self) -> None:
-        # A table row's first cell opens with the class name in backticks.
-        rows = set(re.findall(r"^\| `(\w+)", self.page, re.MULTILINE))
+        # A table row's first cell opens with the class name in backticks,
+        # followed by its fields or the closing backtick.
+        rows = set(re.findall(r"^\| `(\w+)[`(]", self.page, re.MULTILINE))
         roots = (brenn_bus.PublishOutcome, brenn_bus.Event, brenn_bus.BusError)
         module = {
             name
             for name, value in vars(brenn_bus).items()
             if isinstance(value, type) and issubclass(value, roots) and value not in roots
         }
-        # `ValueError` is the builtin the binding raises for a bad argument.
-        self.assertEqual(rows, module | {"ValueError"})
+        # `ValueError` is the builtin the binding raises for a bad argument,
+        # `OSError` the one it raises for a local file, `RuntimeError` the one
+        # it raises for a bug of its own that left the attachment up.
+        self.assertEqual(rows, module | {"ValueError", "OSError", "RuntimeError"})
+
+    def test_the_refusal_tables_list_exactly_each_refusal(self) -> None:
+        # A refusal table's row opens with `<Enumeration>.<MEMBER>`.
+        rows = set(re.findall(r"^\| `(\w+Refusal\.\w+)`", self.page, re.MULTILINE))
+        module = {
+            f"{enum.__name__}.{name}"
+            for enum in (brenn_bus.UploadRefusal, brenn_bus.OpenRefusal, brenn_bus.ReadRefusal)
+            for name, value in vars(enum).items()
+            if isinstance(value, enum)
+        }
+        self.assertEqual(rows, module)
 
     def test_every_enumeration_member_is_named(self) -> None:
-        for enum in (brenn_bus.Urgency, brenn_bus.Gap, brenn_bus.LossKind, brenn_bus.DialFailureKind):
+        for enum in (
+            brenn_bus.Urgency,
+            brenn_bus.Gap,
+            brenn_bus.LossKind,
+            brenn_bus.DialFailureKind,
+            brenn_bus.UploadRefusal,
+            brenn_bus.OpenRefusal,
+            brenn_bus.ReadRefusal,
+        ):
             members = [name for name, value in vars(enum).items() if isinstance(value, enum)]
             self.assertTrue(members, enum.__name__)
             for member in members:

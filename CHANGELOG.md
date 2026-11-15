@@ -6,12 +6,15 @@ All notable changes to Brenn are documented here.
 
 - **Python programs can attach to the bus: the `brenn_bus` extension
   module.** A Python program attaches to a server's remote route as a remote
-  attacher, publishes text and byte bodies, subscribes, and reads deliveries,
-  through `brenn-attach-client` and not a second implementation of the wire.
-  - **For Python authors:** a blocking, thread-safe API with a timeout on
-    every wait; publish outcomes are returned as values, every failure is a
-    named exception, and a rejected token ends the attachment instead of being
-    re-dialled. `wss://` works off loopback and can be told which authority to
+  attacher, publishes text and byte bodies, subscribes, reads deliveries, and
+  moves blobs, through `brenn-attach-client` and not a second implementation
+  of the wire. It speaks attach protocol v6 exactly.
+  - **For Python authors:** upload bytes or a file as a blob and name it in a
+    publish; open, read by range or download to a file an attachment a
+    delivery names, or forward it without reading it. A blocking, thread-safe
+    API with a timeout on every wait; publish outcomes are returned as values,
+    every failure is a named exception, and a rejected token ends the
+    attachment instead of being re-dialled. `wss://` works off loopback and can be told which authority to
     trust (`ca_file`). One build loads under CPython 3.13 or later; it is
     built by Bazel only, here or from another Bazel workspace that pins this
     repository by commit. See `docs/python-binding.md`.

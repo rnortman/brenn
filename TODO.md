@@ -22,12 +22,13 @@ The attach client's `NativeConnection` has no write deadline. Its `send`
 feeds and flushes the websocket and waits until the kernel takes the bytes;
 its `close` flushes a close frame over the same socket. When the peer stops
 reading, or its host leaves the network without a reset, and the client has
-enough unflushed bytes that a write blocks (one large publish, or a run of
-publishes), both wait until TCP gives up, about fifteen minutes with the
-kernel's default retries. An embedder's loop awaits them inline, so for
-that whole time it runs no liveness check, reports no detach and serves no
-command. In `brenn-attach-blocking` `publish` and `subscribe` end in
-`Timeout` while `status()` says `Attached`, `unsubscribe` does not return,
+enough unflushed bytes that a write blocks (one large publish, a run of
+publishes, or an upload's chunks), both wait until TCP gives up, about
+fifteen minutes with the kernel's default retries. An embedder's loop awaits
+them inline, so for that whole time it runs no liveness check, reports no
+detach and serves no command. In `brenn-attach-blocking` `publish`,
+`subscribe` and every blob call but `close_blob` end in `Timeout` while
+`status()` says `Attached`, `unsubscribe` and `close_blob` do not return,
 and `BlockingClient::close`, which joins the supervisor thread, does not
 return; in the Python binding `close()` and a
 `with` block's exit hang and Ctrl-C cannot interrupt them. brenn-pod's
@@ -50,17 +51,6 @@ unsupported here, so a Python author without a Bazel build cannot use it.
 Done when the binding's documentation page gives a supported way to install
 it into a plain Python environment on linux x86_64, and the gate installs it
 that way and attaches with the result.
-
-## `python-binding-no-blob-transfer`
-
-The Python binding for the attach client publishes and subscribes text and
-byte bodies and does not offer blob transfer: a Python attacher cannot
-upload a blob, attach one to a publish, or open and read one a delivery
-names. The client crate has all of it on attach v6 (`BlobPlane`). Done when
-a Python attacher can upload a file as a blob attached to a message and
-another can read it back by byte range, with every refusal the client
-reports reaching Python as a named value, and the binding's documentation
-page says so.
 
 ## `quality-cleartext-guard-ipv6-bug-documented-not-fixed`
 
@@ -1156,6 +1146,26 @@ target's `version`.
 
 Done = `brenn-tool --version` and `brennfmt --version` report the release's
 build id, or the flag is gone from both.
+
+## `test-blobs-unavailable-never-raised-from-binding`
+
+No test makes a `brenn_bus` call raise `BlobsUnavailable`, the exception a
+caller catches to tell a host with no blob store. The blocking crate's tests
+hold that a doorless attachment answers `CallError::NoBlobDoor` with nothing
+sent; the binding's one-line mapping of it to the exception is checked by no
+test. Neither route in the tree reaches it: the real `brenn serve` the
+binding's server test starts always opens a blob store, so its `Welcome`
+always carries a door, and the python crate's Rust test runs with no
+interpreter, so it cannot build a Python exception. Covering it needs one of
+a scripted attach server the binding's tests can dial, a host configuration
+with no blob store, or an interpreter in the Rust test's build; which one is
+a choice about the binding's test fixtures.
+
+Code site (`TODO(test-blobs-unavailable-never-raised-from-binding)`):
+`attach/python/src/errors.rs`, at the `NoBlobDoor` arm of `call`.
+
+Done = a test makes an upload, an open and a publish naming attachments
+against a doorless attachment raise `BlobsUnavailable`.
 
 ## `test-downstream-llvm-pins-unguarded`
 

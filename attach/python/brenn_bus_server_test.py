@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from collections.abc import Callable
 
 import brenn_bus
@@ -31,8 +32,19 @@ OTHER_TEXT = "ephemeral:bus.other"
 MISSING = "ephemeral:empty.nothing"
 OUTSIDE_GRANT = "ephemeral:secret.x"
 MAX_BODY = 4096
+# Above one read window (the server's 256 KiB chunk times 4 reads in flight),
+# so a blob can span windows, and small enough to refuse one past it cheaply.
+MAX_BLOB = 3 * 1024 * 1024
+CHUNK = 256 * 1024
+WINDOW = 4 * CHUNK
 
-TOKENS = {"alice": "alice-token-7f3a9c", "bob": "bob-token-2d81e4"}
+TOKENS = {
+    "alice": "alice-token-7f3a9c",
+    "bob": "bob-token-2d81e4",
+    "carol": "carol-token-91b5d0",
+}
+# Remotes granted subscribe only; every other remote may publish too.
+SUBSCRIBE_ONLY = {"carol"}
 
 _CONFIG = """\
 server {{
@@ -44,7 +56,7 @@ server {{
 database {{ path = "{root}/brenn.db"; }}
 logging {{ log_dir = "{root}/logs"; }}
 claude_defaults {{ mcp_script_path = "{noop_mcp}"; }}
-messaging {{ max_body_bytes = {max_body}; }}
+messaging {{ max_body_bytes = {max_body}; max_blob_bytes = {max_blob}; }}
 
 uuid_pins {{
   "brenn:surface.index" = "4f8c915e-c61f-497e-940d-554a9aa8a266";
@@ -73,6 +85,14 @@ remote {slug} {{
     prefix "ephemeral:empty." {{ push_depth = 8, retain_depth = 8 }}
   ];
   acl publish [prefix "ephemeral:bus."];
+}}
+"""
+
+_SUBSCRIBE_ONLY_REMOTE = """
+remote {slug} {{
+  token_file = "{root}/{slug}.token";
+  grants = [subscribe];
+  acl subscribe [prefix "ephemeral:bus." {{ push_depth = 8, retain_depth = 8 }}];
 }}
 """
 
@@ -121,8 +141,8 @@ def _stop(process: subprocess.Popen[str]) -> None:
 
 
 class Server:
-    """One brenn server with remotes `alice` and `bob`, its state under a
-    private directory."""
+    """One brenn server with remotes `alice` and `bob`, and `carol`, who may
+    only subscribe, its state under a private directory."""
 
     def __init__(self, root: pathlib.Path) -> None:
         self.root = root
@@ -140,10 +160,16 @@ class Server:
                 root=root,
                 noop_mcp=_NOOP_MCP,
                 max_body=MAX_BODY,
+                max_blob=MAX_BLOB,
                 text=TEXT,
                 other_text=OTHER_TEXT,
                 bytes=BYTES,
-                remotes="".join(_REMOTE.format(slug=slug, root=root) for slug in TOKENS),
+                remotes="".join(
+                    (_SUBSCRIBE_ONLY_REMOTE if slug in SUBSCRIBE_ONLY else _REMOTE).format(
+                        slug=slug, root=root
+                    )
+                    for slug in TOKENS
+                ),
             )
         )
         self.process = subprocess.Popen(
@@ -249,18 +275,18 @@ def _wait_for(condition: Callable[[], bool], bound: float) -> bool:
 
 
 class SessionTest(ServerTestCase):
-    def test_two_attachers_negotiate_v5_as_distinct_participants(self) -> None:
+    def test_two_attachers_negotiate_v6_as_distinct_participants(self) -> None:
         alice = self.attach("alice")
         bob = self.attach("bob")
         facts = [alice.facts(), bob.facts()]
         for each in facts:
-            self.assertEqual(each.protocol_version, 5)
+            self.assertEqual(each.protocol_version, 6)
             self.assertTrue(each.participant_id)
             self.assertEqual(each.max_body_bytes, MAX_BODY)
         self.assertNotEqual(facts[0].participant_id, facts[1].participant_id)
         self.assertNotEqual(facts[0].session_id, facts[1].session_id)
         match alice.status():
-            case brenn_bus.Attached(brenn_bus.AttachmentFacts(5, participant, _, _)):
+            case brenn_bus.Attached(brenn_bus.AttachmentFacts(6, participant, _, _)):
                 self.assertEqual(participant, facts[0].participant_id)
             case status:
                 self.fail(f"status is {status!r}")
@@ -270,7 +296,7 @@ class SessionTest(ServerTestCase):
         path.write_text(TOKENS["alice"] + "\n")
         os.chmod(path, 0o600)
         client = self.attach("alice", token=None, token_file=path)
-        self.assertEqual(client.facts().protocol_version, 5)
+        self.assertEqual(client.facts().protocol_version, 6)
 
     def test_a_text_round_trip(self) -> None:
         alice = self.attach("alice")
@@ -442,6 +468,204 @@ class OutsideGrantTest(ServerTestCase):
             f"status is {alice.status()!r}",
         )
         self.publish_ok(alice, TEXT, brenn_bus.Body.text("after the refusal"))
+
+
+    def test_an_open_outside_the_grant_loses_the_connection(self) -> None:
+        alice = self.attach("alice")
+        with self.assertRaises(brenn_bus.ConnectionLost) as raised:
+            alice.open_attachment(OUTSIDE_GRANT, str(uuid.uuid4()), "photo", timeout=10.0)
+        self.assertIsNone(raised.exception.loss.code)
+        self.assertTrue(
+            _wait_for(lambda: isinstance(alice.status(), brenn_bus.Attached), 15.0),
+            f"status is {alice.status()!r}",
+        )
+
+
+def _named(delivery: brenn_bus.Delivery) -> list[tuple[str, int, str]]:
+    """A delivery's attachments, in the order it lists them, matched by
+    position."""
+    named: list[tuple[str, int, str]] = []
+    for attachment in delivery.attachments:
+        match attachment:
+            case brenn_bus.Attachment(name, size, content_type):
+                named.append((name, size, content_type))
+    return named
+
+
+class BlobTest(ServerTestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.dir = pathlib.Path(directory.name)
+
+    def published(
+        self, sender: brenn_bus.Client, reader: brenn_bus.Client, attachments: dict[str, brenn_bus.Blob]
+    ) -> brenn_bus.Delivery:
+        """A message naming `attachments`, published by `sender` to TEXT and
+        delivered to `reader`, which holds it."""
+        text = f"with blobs {uuid.uuid4()}"
+        outcome = sender.publish(
+            TEXT, brenn_bus.Body.text(text), timeout=5.0, attachments=attachments
+        )
+        self.assertIsInstance(outcome, brenn_bus.Ok)
+        return self.delivery_of(reader, text)
+
+    def delivery_of(self, reader: brenn_bus.Client, text: str) -> brenn_bus.Delivery:
+        """The delivery whose body is `text`, past the replay of the messages
+        earlier tests left on the class's server."""
+        while True:
+            delivery = self.next_delivery(reader)
+            if delivery.body.as_text() == text:
+                return delivery
+
+    def test_each_attacher_has_a_blob_door(self) -> None:
+        for slug in TOKENS:
+            with self.subTest(remote=slug):
+                facts = self.attach(slug).facts()
+                self.assertEqual(facts.protocol_version, 6)
+                match facts.blobs:
+                    case brenn_bus.BlobFacts(maximum, chunk, handles, held, reads, upload):
+                        self.assertEqual(maximum, MAX_BLOB)
+                        self.assertEqual(chunk, CHUNK)
+                        self.assertGreater(handles, 0)
+                        self.assertGreaterEqual(held, MAX_BLOB)
+                        self.assertEqual(chunk * reads, WINDOW)
+                        self.assertEqual(upload, slug not in SUBSCRIBE_ONLY)
+                    case door:
+                        self.fail(f"blobs is {door!r}")
+
+    def test_uploads_are_published_opened_and_read_back(self) -> None:
+        alice = self.attach("alice")
+        bob = self.attach("bob")
+        self.subscribe(bob, TEXT)
+        note = b"a short note"
+        data = os.urandom(WINDOW + WINDOW // 2)
+        source = self.dir / "data.bin"
+        source.write_bytes(data)
+        with (
+            alice.upload(note, content_type="text/plain", timeout=10.0) as small,
+            alice.upload_file(source, content_type="application/octet-stream", timeout=30.0) as large,
+        ):
+            self.assertEqual((small.size, small.content_type), (len(note), "text/plain"))
+            self.assertEqual(large.size, len(data))
+            delivery = self.published(alice, bob, {"note": small, "data": large})
+        self.assertEqual(
+            _named(delivery),
+            [
+                ("data", len(data), "application/octet-stream"),
+                ("note", len(note), "text/plain"),
+            ],
+        )
+        with bob.open_attachment(TEXT, delivery.message_id, "data", timeout=10.0) as opened:
+            self.assertEqual(opened.size, len(data))
+            self.assertEqual(opened.content_type, "application/octet-stream")
+            offset = WINDOW - 100
+            self.assertEqual(
+                bob.read_blob(opened, offset, 300, timeout=10.0), data[offset : offset + 300]
+            )
+            whole = self.dir / "data.copy"
+            bob.download_blob(opened, whole, timeout=30.0)
+            self.assertEqual(whole.read_bytes(), data)
+        with bob.open_attachment(TEXT, delivery.message_id, "note", timeout=10.0) as opened:
+            copy = self.dir / "note.copy"
+            bob.download_blob(opened, str(copy), timeout=10.0)
+            self.assertEqual(copy.read_bytes(), note)
+            with self.assertRaises(FileExistsError) as raised:
+                bob.download_blob(opened, copy, timeout=10.0)
+            self.assertEqual(raised.exception.filename, str(copy))
+            self.assertEqual(copy.read_bytes(), note)
+
+    def test_an_opened_attachment_is_forwarded_without_reading_it(self) -> None:
+        alice = self.attach("alice")
+        bob = self.attach("bob")
+        self.subscribe(bob, TEXT)
+        self.subscribe(alice, OTHER_TEXT)
+        with alice.upload(b"forward me", content_type="text/plain", timeout=10.0) as blob:
+            delivery = self.published(alice, bob, {"original": blob})
+        with bob.open_attachment(TEXT, delivery.message_id, "original", timeout=10.0) as opened:
+            outcome = bob.publish(
+                OTHER_TEXT,
+                brenn_bus.Body.text("forwarded"),
+                timeout=5.0,
+                attachments={"copy": opened},
+            )
+            self.assertIsInstance(outcome, brenn_bus.Ok)
+        forwarded = self.delivery_of(alice, "forwarded")
+        self.assertEqual(forwarded.channel, OTHER_TEXT)
+        self.assertEqual(_named(forwarded), [("copy", 10, "text/plain")])
+
+    def test_an_upload_over_the_cap_is_refused(self) -> None:
+        alice = self.attach("alice")
+        with self.assertRaises(brenn_bus.UploadRefused) as raised:
+            alice.upload(bytes(MAX_BLOB + 1), content_type="application/octet-stream", timeout=10.0)
+        refused = raised.exception
+        self.assertEqual(refused.reason, brenn_bus.UploadRefusal.BLOB_TOO_LARGE)
+        self.assertEqual((refused.size, refused.max), (MAX_BLOB + 1, MAX_BLOB))
+        self.assertIsNone(refused.offset)
+        self.assertIsNone(refused.len)
+
+    def test_a_subscribe_only_remote_may_not_upload(self) -> None:
+        carol = self.attach("carol")
+        with self.assertRaises(brenn_bus.UploadNotGranted):
+            carol.upload(b"x", content_type="text/plain", timeout=10.0)
+
+    def test_opens_of_what_is_not_there_are_refused(self) -> None:
+        alice = self.attach("alice")
+        bob = self.attach("bob")
+        self.subscribe(bob, TEXT)
+        with alice.upload(b"present", content_type="text/plain", timeout=10.0) as blob:
+            delivery = self.published(alice, bob, {"present": blob})
+        with self.assertRaises(brenn_bus.OpenRefused) as raised:
+            bob.open_attachment(TEXT, delivery.message_id, "absent", timeout=10.0)
+        self.assertEqual(raised.exception.reason, brenn_bus.OpenRefusal.NO_SUCH_ATTACHMENT)
+        self.assertIsNone(raised.exception.size)
+        with self.assertRaises(brenn_bus.OpenRefused) as raised:
+            bob.open_attachment(TEXT, str(uuid.uuid4()), "present", timeout=10.0)
+        self.assertEqual(raised.exception.reason, brenn_bus.OpenRefusal.NOT_RETAINED)
+
+    def test_a_closed_blob_is_gone(self) -> None:
+        alice = self.attach("alice")
+        blob = alice.upload(b"short-lived", content_type="text/plain", timeout=10.0)
+        blob.close()
+        blob.close()
+        with self.assertRaises(brenn_bus.BlobGone):
+            alice.read_blob(blob, 0, 1, timeout=10.0)
+        outcome = alice.publish(
+            TEXT, brenn_bus.Body.text("names a closed blob"), timeout=5.0, attachments={"gone": blob}
+        )
+        self.assertIsInstance(outcome, brenn_bus.AttachmentNotHeld)
+
+    def test_a_read_past_the_end_is_refused(self) -> None:
+        alice = self.attach("alice")
+        with alice.upload(b"0123456789", content_type="text/plain", timeout=10.0) as blob:
+            self.assertEqual(alice.read_blob(blob, 8, 2, timeout=10.0), b"89")
+            with self.assertRaises(brenn_bus.ReadRefused) as raised:
+                alice.read_blob(blob, 8, 3, timeout=10.0)
+            self.assertEqual(raised.exception.reason, brenn_bus.ReadRefusal.OUT_OF_RANGE)
+            self.assertEqual(raised.exception.size, 10)
+
+    def test_caller_errors_are_value_and_os_errors(self) -> None:
+        alice = self.attach("alice")
+        bob = self.attach("bob")
+        with alice.upload(b"mine", content_type="text/plain", timeout=10.0) as blob:
+            with self.assertRaisesRegex(ValueError, "another client"):
+                bob.read_blob(blob, 0, 1, timeout=10.0)
+            with self.assertRaisesRegex(ValueError, "another client"):
+                bob.publish(TEXT, brenn_bus.Body.text("x"), timeout=5.0, attachments={"a": blob})
+            with self.assertRaisesRegex(ValueError, "must not be negative"):
+                alice.read_blob(blob, -1, 1, timeout=10.0)
+            with self.assertRaisesRegex(ValueError, "attachment name"):
+                alice.publish(TEXT, brenn_bus.Body.text("x"), timeout=5.0, attachments={".x": blob})
+        with self.assertRaisesRegex(ValueError, "content type"):
+            alice.upload(b"x", content_type="not a media type", timeout=10.0)
+        with self.assertRaisesRegex(ValueError, "not a UUID"):
+            alice.open_attachment(TEXT, "not-a-uuid", "x", timeout=10.0)
+        with self.assertRaisesRegex(ValueError, "local"):
+            alice.open_attachment("local:x", str(uuid.uuid4()), "x", timeout=10.0)
+        missing = self.dir / "missing.bin"
+        with self.assertRaises(FileNotFoundError) as raised:
+            alice.upload_file(missing, content_type="text/plain", timeout=10.0)
+        self.assertEqual(raised.exception.filename, str(missing))
 
 
 class CredentialTest(ServerTestCase):

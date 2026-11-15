@@ -21,8 +21,10 @@ use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use super::*;
-use crate::Delivery;
 use crate::connector::set_failure;
+use crate::{BlobFacts, BlobHandle, Delivery};
+
+mod blobs;
 
 const URL: &str = "ws://127.0.0.1:1/attach";
 const CHANNEL: &str = "ephemeral:lab.events";
@@ -45,7 +47,20 @@ fn never() -> impl FnMut() -> bool {
 }
 
 fn codec() -> Codec {
-    Codec::negotiated(5)
+    Codec::negotiated(6)
+}
+
+/// A blob door of small bounds: a chunk of four bytes and a read window of
+/// eight, so a few bytes exercise chunking and windows.
+fn door() -> BlobFacts {
+    BlobFacts {
+        max_blob_bytes: 64,
+        max_chunk_bytes: 4,
+        max_handles: 4,
+        max_bytes_held: 128,
+        max_inflight_reads: 2,
+        upload: true,
+    }
 }
 
 fn depths() -> SubscriptionDepths {
@@ -195,18 +210,23 @@ impl Socket {
         self.send_raw(encode_server_hello(versions, "scripted-server"));
     }
 
-    /// Complete the handshake on v5, minting `session`.
+    /// Complete the handshake on v6 with [`door`], minting `session`.
     fn handshake(&self, session: &str) {
-        self.hello(VersionRange::exactly(5));
+        self.handshake_with(session, Some(door()));
+    }
+
+    /// Complete the handshake on v6 with the blob door `blobs`.
+    fn handshake_with(&self, session: &str, blobs: Option<BlobFacts>) {
+        self.hello(VersionRange::exactly(6));
         self.send(ServerFrame::Welcome {
-            version: 5,
+            version: 6,
             participant_id: "attacher:bob".to_string(),
             session_id: session.to_string(),
             heartbeat_secs: 60,
             max_body_bytes: 4096,
             max_frame_bytes: 16384,
             alert_granted: false,
-            blobs: None,
+            blobs,
         });
     }
 
@@ -216,7 +236,7 @@ impl Socket {
             .written
             .recv_timeout(PATIENCE)
             .expect("a frame from the client");
-        codec().decode_client(message).expect("a v5 client frame")
+        codec().decode_client(message).expect("a v6 client frame")
     }
 
     /// Assert the client writes nothing for [`QUIET`].
@@ -442,7 +462,7 @@ fn delivery(event: Option<Event>) -> Delivery {
 fn deliveries_arrive_in_wire_order_with_seq_and_dropped() {
     let controls = Controls::new();
     let (client, socket) = controls.attached();
-    assert_eq!(client.facts().version, 5);
+    assert_eq!(client.facts().version, 6);
     assert_eq!(client.facts().participant_id, "attacher:bob");
     hold(&client, &socket, CHANNEL);
 
@@ -930,7 +950,7 @@ fn a_drop_before_the_first_welcome_is_a_failed_attempt() {
     let first = controls.succeed();
     let second = controls.succeed();
     let client = controls.start(timings());
-    first.hello(VersionRange::exactly(5));
+    first.hello(VersionRange::exactly(6));
     first.drop_connection();
     wait_until("the second connect", || controls.connects() == 2);
     assert!(matches!(
@@ -955,7 +975,7 @@ fn an_attempt_that_opens_clears_the_earlier_dial_failure() {
     let opened = controls.succeed();
     let (_release, _stalled) = controls.stall();
     let client = controls.start(timings());
-    opened.hello(VersionRange::exactly(5));
+    opened.hello(VersionRange::exactly(6));
     opened.drop_connection();
     wait_until("the third connect", || controls.connects() == 3);
     assert_eq!(
@@ -1155,12 +1175,12 @@ fn no_version_in_common_ends_with_incompatible() {
     let controls = Controls::new();
     let socket = controls.succeed();
     let client = controls.start(timings());
-    socket.hello(VersionRange::exactly(4));
+    socket.hello(VersionRange::exactly(5));
     assert_eq!(
         client.await_attachment(PATIENCE, &mut never()),
         Err(AttachError::Ended(EndCause::Incompatible {
-            ours: VersionRange::exactly(5),
-            theirs: VersionRange::exactly(4),
+            ours: VersionRange::exactly(6),
+            theirs: VersionRange::exactly(5),
         }))
     );
 }
@@ -1187,41 +1207,13 @@ fn a_batch_result_is_fatal() {
 }
 
 #[test]
-fn a_blob_answer_is_fatal() {
+fn a_blob_answer_the_client_is_not_owed_is_fatal() {
     let controls = Controls::new();
     let (client, socket) = controls.attached();
-    // v5 has no blob frames, so only a v6 writer can produce one.
-    socket.send_raw(
-        Codec::negotiated(6).encode_server(&ServerFrame::BlobReadResult {
-            correlation: 1,
-            outcome: BlobReadOutcome::UnknownHandle,
-        }),
-    );
-    assert_fatal(&client);
-}
-
-#[test]
-fn attachment_not_held_is_fatal_and_ends_the_publish() {
-    let controls = Controls::new();
-    let (client, socket) = controls.attached();
-    let answer = thread::scope(|scope| {
-        let call = scope.spawn(|| client.publish(publish_request(OTHER), PATIENCE, &mut never()));
-        let ClientFrame::Publish { correlation, .. } = socket.next_frame() else {
-            panic!("expected a Publish");
-        };
-        // v5 cannot write this outcome, so only a v6 writer can produce it.
-        socket.send_raw(
-            Codec::negotiated(6).encode_server(&ServerFrame::PublishResult {
-                correlation,
-                outcome: WireOutcome::AttachmentNotHeld,
-            }),
-        );
-        call.join().unwrap()
+    socket.send(ServerFrame::BlobReadResult {
+        correlation: 1,
+        outcome: BlobReadOutcome::UnknownHandle,
     });
-    assert!(
-        matches!(answer, Err(CallError::Ended(EndCause::Fatal { .. }))),
-        "{answer:?}"
-    );
     assert_fatal(&client);
 }
 

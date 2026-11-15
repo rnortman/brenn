@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use brenn_attach_blocking::{
-    AttachParams, BlockingClient, PublishRequest, ResumePolicy, Status, SubscriptionDepths,
+    AttachParams, AttachmentName, Blob, BlockingClient, CallError, PublishRequest, ResumePolicy,
+    Status, SubscriptionDepths, Uuid,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyBytes, PyMapping, PyTuple};
 
 mod errors;
 mod types;
@@ -196,23 +197,136 @@ impl PyClient {
         }
     }
 
-    /// Publish one message and wait for the server's outcome.
-    #[pyo3(signature = (channel, body, *, timeout, urgency = PyUrgency::Normal))]
+    /// Publish one message and wait for the server's outcome. `attachments`
+    /// maps each attachment's name to a blob this client holds.
+    #[pyo3(signature = (channel, body, *, timeout, urgency = PyUrgency::Normal, attachments = None))]
     fn publish(
-        &self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         channel: String,
         body: PyRef<'_, PyBody>,
         timeout: f64,
         urgency: PyUrgency,
+        attachments: Option<&Bound<'_, PyMapping>>,
     ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
         let timeout = seconds(timeout)?;
-        let request = PublishRequest::new(channel, body.body.clone(), urgency.into());
+        let mut named = Vec::new();
+        let inner = &slf.get().inner;
+        if let Some(attachments) = attachments {
+            for item in attachments.items()?.iter() {
+                let (name, blob): (String, Bound<'_, PyBlob>) = item.extract()?;
+                let attachment = inner
+                    .attachment(&blob.get().blob, attachment_name(name)?)
+                    .map_err(|err| errors::call(py, err))?;
+                named.push(attachment);
+            }
+        }
+        let request =
+            PublishRequest::new(channel, body.body.clone(), urgency.into()).attachments(named);
         drop(body);
         match blocking(py, |interrupted| {
-            self.inner.publish(request, timeout, interrupted)
+            inner.publish(request, timeout, interrupted)
         })? {
             Ok(outcome) => types::publish_outcome(py, outcome),
+            Err(err) => Err(errors::call(py, err)),
+        }
+    }
+
+    /// Upload `data` as a blob of `content_type` and wait until it is sealed.
+    #[pyo3(signature = (data, *, content_type, timeout))]
+    fn upload(
+        slf: &Bound<'_, Self>,
+        data: &[u8],
+        content_type: &str,
+        timeout: f64,
+    ) -> PyResult<PyBlob> {
+        let timeout = seconds(timeout)?;
+        let inner = &slf.get().inner;
+        let made = blocking(slf.py(), |interrupted| {
+            inner.upload_bytes(content_type, data, timeout, interrupted)
+        })?;
+        slf.get().held(slf, made)
+    }
+
+    /// Upload the regular file at `path`, as long as it is when opened, and
+    /// wait until it is sealed.
+    #[pyo3(signature = (path, *, content_type, timeout))]
+    fn upload_file(
+        slf: &Bound<'_, Self>,
+        path: PathBuf,
+        content_type: &str,
+        timeout: f64,
+    ) -> PyResult<PyBlob> {
+        let timeout = seconds(timeout)?;
+        let inner = &slf.get().inner;
+        let made = blocking(slf.py(), |interrupted| {
+            inner.upload_file(content_type, &path, timeout, interrupted)
+        })?;
+        slf.get().held(slf, made)
+    }
+
+    /// Open the attachment `name` of the message `message_id` on `channel`
+    /// and wait until it is held.
+    #[pyo3(signature = (channel, message_id, name, *, timeout))]
+    fn open_attachment(
+        slf: &Bound<'_, Self>,
+        channel: &str,
+        message_id: &str,
+        name: String,
+        timeout: f64,
+    ) -> PyResult<PyBlob> {
+        let timeout = seconds(timeout)?;
+        let message_id = Uuid::parse_str(message_id).map_err(|err| {
+            PyValueError::new_err(format!("message_id {message_id:?} is not a UUID: {err}"))
+        })?;
+        let name = attachment_name(name)?;
+        let inner = &slf.get().inner;
+        let made = blocking(slf.py(), |interrupted| {
+            inner.open_blob(channel, message_id, name, timeout, interrupted)
+        })?;
+        slf.get().held(slf, made)
+    }
+
+    /// The bytes `[offset, offset + length)` of `blob`.
+    #[pyo3(signature = (blob, offset, length, *, timeout))]
+    fn read_blob<'py>(
+        &self,
+        py: Python<'py>,
+        blob: &Bound<'py, PyBlob>,
+        offset: i64,
+        length: i64,
+        timeout: f64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let timeout = seconds(timeout)?;
+        let offset = not_negative("offset", offset)?;
+        let length = not_negative("length", length)?;
+        let blob = &blob.get().blob;
+        match blocking(py, |interrupted| {
+            self.inner
+                .read_blob(blob, offset, length, timeout, interrupted)
+        })? {
+            Ok(bytes) => Ok(PyBytes::new(py, &bytes)),
+            Err(err) => Err(errors::call(py, err)),
+        }
+    }
+
+    /// Write the whole of `blob` to a new file at `path`; an existing file is
+    /// refused, and on any failure the file is removed.
+    #[pyo3(signature = (blob, path, *, timeout))]
+    fn download_blob(
+        &self,
+        py: Python<'_>,
+        blob: &Bound<'_, PyBlob>,
+        path: PathBuf,
+        timeout: f64,
+    ) -> PyResult<()> {
+        let timeout = seconds(timeout)?;
+        let blob = &blob.get().blob;
+        match blocking(py, |interrupted| {
+            self.inner
+                .read_blob_to_file(blob, &path, timeout, interrupted)
+        })? {
+            Ok(()) => Ok(()),
             Err(err) => Err(errors::call(py, err)),
         }
     }
@@ -287,6 +401,82 @@ impl PyClient {
     }
 }
 
+impl PyClient {
+    /// The Python face of a blob this client, `slf`, now holds.
+    fn held(&self, slf: &Bound<'_, Self>, made: Result<Blob, CallError>) -> PyResult<PyBlob> {
+        match made {
+            Ok(blob) => Ok(PyBlob {
+                client: slf.clone().unbind(),
+                blob,
+            }),
+            Err(err) => Err(errors::call(slf.py(), err)),
+        }
+    }
+}
+
+/// A blob held on a client's live attachment: an upload it sealed or an
+/// attachment it opened. It lasts until `close()`, the end of a `with` block,
+/// or the attachment's drop; collecting it releases nothing.
+#[pyclass(module = "brenn_bus", name = "Blob", frozen)]
+struct PyBlob {
+    client: Py<PyClient>,
+    blob: Blob,
+}
+
+#[pymethods]
+impl PyBlob {
+    #[getter]
+    fn size(&self) -> u64 {
+        self.blob.size()
+    }
+
+    #[getter]
+    fn content_type(&self) -> &str {
+        self.blob.content_type()
+    }
+
+    /// Give the blob up. Closing a blob already closed, or gone with its
+    /// attachment, succeeds.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let client = self.client.get();
+        match blocking(py, |interrupted| {
+            client.inner.close_blob(&self.blob, interrupted)
+        })? {
+            Ok(()) => Ok(()),
+            Err(err) => Err(errors::call(py, err)),
+        }
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyTuple>) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Blob(size={}, content_type={:?})",
+            self.blob.size(),
+            self.blob.content_type()
+        )
+    }
+}
+
+/// An attachment name, refused unless it follows the bus's grammar.
+fn attachment_name(name: String) -> PyResult<AttachmentName> {
+    AttachmentName::new(name).map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+/// A byte offset or length, refused if negative.
+fn not_negative(argument: &str, value: i64) -> PyResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| PyValueError::new_err(format!("{argument} must not be negative, not {value}")))
+}
+
 impl Drop for PyClient {
     /// Close with the GIL released: closing joins the supervisor thread, and a
     /// collected client must not hold every other Python thread for that long.
@@ -302,6 +492,7 @@ impl Drop for PyClient {
 fn brenn_bus(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(attach, m)?)?;
     m.add_class::<PyClient>()?;
+    m.add_class::<PyBlob>()?;
     types::register(m)?;
     errors::register(m)?;
     Ok(())
