@@ -441,6 +441,8 @@ pub struct Append<'s> {
 }
 
 impl Append<'_> {
+    // TODO(blob-append-write-copies-whole-argument): write full pieces
+    // straight from the argument and buffer only the tail.
     /// Append `bytes`, writing every full piece the buffer holds. After a
     /// refused write the bytes not yet written stay buffered.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
@@ -461,6 +463,8 @@ impl Append<'_> {
         flushed
     }
 
+    // TODO(blob-append-finish-erases-write-error): report a refused write or
+    // seal as a typed error.
     /// Write what the buffer holds and seal.
     pub fn finish(self) -> Result<Blob, Failure> {
         let mut offset = self.offset;

@@ -1,5 +1,25 @@
 # TODOs
 
+## `blob-append-finish-erases-write-error`
+
+`brenn-provider-kit`'s `Append::finish` writes the buffered tail and turns
+any `WriteError` into a `Failure` itself, while `Append::write` reports the
+same refusal typed. A blob shorter than `max_write_bytes` is written by
+`finish` alone, so for most blobs a guest cannot tell a full pool
+(`BudgetExhausted`) or a blob past the host's largest (`BlobTooLarge`) from
+any other failure without matching text, and cannot answer one in its own
+words. Done when `finish` reports a refused write or seal as a typed error
+and its callers convert.
+
+## `blob-append-write-copies-whole-argument`
+
+`brenn-provider-kit`'s `Append::write` extends its buffer with the whole
+argument before writing full pieces, so a caller that hands it a large
+in-memory value holds that value twice; a guest near its memory limit slices
+to `max_write_bytes` itself to avoid it. Done when `write` writes full
+pieces straight from the argument and buffers only the tail, and its doc
+says a caller may pass any length.
+
 ## `attach-blocking-second-loop-and-dial`
 
 `brenn-attach-blocking` holds a second copy of two things every embedder of
