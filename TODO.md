@@ -20,6 +20,102 @@ to `max_write_bytes` itself to avoid it. Done when `write` writes full
 pieces straight from the argument and buffers only the tail, and its doc
 says a caller may pass any length.
 
+## `gmail-body-forms-as-blobs`
+
+`GmailRead` answers a message's body only as converted text, cut at
+`max_chars` (at most 60,000) and at the result ceiling, and with no body at
+all when the message is over the provider's read limit or the bus cap
+(`text_omitted`). No tool answers the whole text, the HTML as sent or its
+rendering, and `GmailAttachment` refuses a body part carried inline. Blob
+answers remove the caps: `messages.get` taken with `response_attachment` and
+read in the guest, each form written as a blob of the result, as the
+out-of-tree Fastmail bundle's `FastmailBody` does under a measured bound.
+Gmail's answer is base64url inside JSON, so the bound and the fuel differ
+from Fastmail's and want their own measurement. Done when a tool answers a
+Gmail message's whole text, its HTML as sent and that HTML as text as
+attachments, above `GmailRead`'s caps, with a real-host test at its bound; or
+a recorded decision that `GmailRead`'s cut stays. The comment sits at
+`GmailRead`'s arm of `plan` in
+`brenn-wasm/components/google-gmail-read/src/logic.rs`.
+
+## `gmail-draft-attachments`
+
+`GmailDraft` writes a single-part `text/plain` message whose body is at most
+20,000 bytes, sent as base64 inside base64url inside the nested call's
+arguments under the 64 KiB cap; a draft carries no attachment. Gmail takes a
+draft with a file as a MIME message, which the component would build around
+the request's attachment and upload — a body built in the activation, which
+the kit cannot send (`kit-nested-call-body-built-in-activation`). Done when a
+draft tool attaches a file the agent holds and its body is no longer bounded
+by the arguments cap, or a recorded decision that neither is wanted. The
+comment sits at `draft_create_call` in
+`brenn-wasm/components/google-gmail-compose/src/logic.rs`.
+
+## `google-tool-text-names-attachments-uncovered`
+
+The tool descriptions of `config/specs/google-gmail-compose.brenn`,
+`google-gmail-organize.brenn`, `google-calendar-read.brenn` and
+`google-calendar-write.brenn` still list attachments among "Gmail endpoints
+these tools do not cover", and the header comment of
+`config/specs/google-gmail-read.brenn` names four tools where the component
+provides five. `GmailAttachment` covers attachments. Done when every
+description and that header say what the tools cover. The comment sits at
+that header.
+
+## `guest-memory-and-fuel-fixed-constants`
+
+A processor guest's linear memory (`PROCESSOR_MAX_MEMORY_BYTES`, 16 MiB) and
+its fuel (`PROCESSOR_FUEL_MINIMUM`, `PROCESSOR_FUEL_PER_ENVELOPE`,
+`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`) are constants; `docs/config-dsl.md`
+names the memory figure and no deployment setting moves either. A component
+that reads a blob inside the guest sets a bound of its own under them: the
+out-of-tree Fastmail bundle's body tool refuses an answer over 2 MiB, met
+fuel before memory for HTML-only mail, and had its HTML renderer rewritten to
+fit the fuel rate; the same bundle's file listing reads at most 192 KiB of
+multi-status, bound by fuel alone — parsing the XML cost about 200 fuel per
+byte on average at 1 MiB against the 128 granted, so the bound is what the
+50M floor covers, and memory holds more than five times as much. Decide
+whether either limit becomes a deployment or per-instance setting under a
+ceiling, with the window arithmetic of `wasm-window-byte-cap` and the
+security posture for untrusted guests redone against the larger figure, or
+stays fixed. Done when a setting has a test of a guest that completes under a
+raised limit and fails under the default, or the decision that both stay
+constants is recorded beside them and in `docs/config-dsl.md`. The comment
+sits at `PROCESSOR_MAX_MEMORY_BYTES` in `brenn-wasm/src/lib.rs`.
+
+## `mqtt-send-binary-base64`
+
+A conversation publishes bytes to MQTT only as
+`{ binary_base64, content_type? }` inside `MqttSend`'s JSON arguments, the
+one remaining place a conversation base64-encodes a payload; components
+publish bytes through the `mqtt` interface, and `BrennSend` takes bytes as an
+attachment. The form is in the tool's text and in no document. Decide
+whether `MqttSend` takes the payload as an attachment of the call, bounded by
+the broker's and the bus's limits rather than the arguments', and whether the
+base64 form then stays for small payloads; and document the outcome. Done
+when `MqttSend` publishes an attachment's bytes with a test, or
+`docs/message-bus.md` records the base64 form as the contract and why. The
+comment sits at `decode_outbound_body` in `brenn-mqtt/src/payload.rs`.
+
+## `nested-call-args-cap-fixed-at-64-kib`
+
+A nested tool call's arguments are capped at 64 KiB by a constant
+(`PROCESSOR_MAX_TOOL_ARGS_BYTES`, mirrored as `MAX_ARGS_BYTES` in
+`brenn-tool-registry`), and no deployment setting moves it. Every provider
+that writes a document it built pays for it with a bound of its own:
+`GmailDraft`'s 20,000-byte body, the Google calendar write's field caps, and
+in the out-of-tree Fastmail bundle a draft body of 20,000 characters, a
+calendar event refused above 60,000 bytes as carried, and the organize and
+contact bounds. A body by attachment lifts the cap only for a body the
+caller attached (`kit-nested-call-body-built-in-activation`). Decide between
+raising the constant, making it a `[messaging]` or per-instance setting with
+the request window's memory arithmetic redone (`wasm-window-byte-cap`), and
+leaving it with built bodies moved to blobs; `MAX_ASYNC_RESULT_BYTES`
+(512 KiB) on the answer side is the same question. Done when the decision is
+recorded, and under either of the first two a component sends a nested call
+over 64 KiB with a test. The comment sits at `PROCESSOR_MAX_TOOL_ARGS_BYTES`
+in `brenn-wasm/src/lib.rs`.
+
 ## `attach-blocking-second-loop-and-dial`
 
 `brenn-attach-blocking` holds a second copy of two things every embedder of

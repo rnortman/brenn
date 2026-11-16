@@ -250,6 +250,8 @@ fn draft_original_call(id: &str, account: Option<&str>, settings: &Settings) -> 
     )
 }
 
+// TODO(gmail-draft-attachments): a draft carrying a file from the request's
+// attachment, with a body not bounded by the nested call's arguments cap.
 /// drafts.create of the message the arguments describe under `subject`, as
 /// `raw`, filed in the original's thread for a reply. The `POST` creates a
 /// draft and sends nothing.

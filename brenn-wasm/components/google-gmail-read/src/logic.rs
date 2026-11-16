@@ -228,6 +228,9 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 api: search_list_call(&search, settings),
             })
         }
+        // TODO(gmail-body-forms-as-blobs): answer the whole text, the HTML as
+        // sent and its rendering as blobs, above `max_chars` and the result
+        // ceiling.
         Provided::GmailRead => {
             let read = ReadArgs::parse(args)?;
             Ok(Call {

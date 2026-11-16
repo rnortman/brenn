@@ -1120,6 +1120,8 @@ fn processor_fuel(total_envelopes: usize, new_attachment_bytes: Option<u64>) -> 
     });
     envelopes + attachments
 }
+// TODO(guest-memory-and-fuel-fixed-constants): this memory limit and the
+// fuel constants are fixed; decide whether a deployment may set them.
 /// Maximum memory a guest may grow to (bytes). 16 MiB per activation.
 ///
 /// Cap excess is a deterministic trap: `trap_on_grow_failure(true)` is set on
@@ -1179,6 +1181,8 @@ pub const PROCESSOR_MAX_ALERT_BODY_BYTES: usize = 4096;
 /// path and the cap may diverge from the interactive log/alert caps in the future.
 pub const PROCESSOR_MAX_DIAG_BYTES: usize = 4096;
 
+// TODO(nested-call-args-cap-fixed-at-64-kib): this cap is fixed; decide
+// whether to raise it, make it a setting, or move built bodies to blobs.
 /// Maximum bytes in a guest-supplied `tools` `args-json` (64 KiB, both classes).
 ///
 /// A guest-controlled argument blob; over-cap is a permanent `invalid-args` (never

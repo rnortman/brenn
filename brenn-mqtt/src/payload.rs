@@ -70,6 +70,8 @@ pub struct OutboundPayload {
     pub content_type: Option<String>,
 }
 
+// TODO(mqtt-send-binary-base64): take a binary payload as an attachment of
+// the call, or document `binary_base64` as the contract.
 /// Decode `MqttSend.body` into `OutboundPayload`.
 ///
 /// Accepted forms:

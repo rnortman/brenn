@@ -1,3 +1,6 @@
+// TODO(google-tool-text-names-attachments-uncovered): this header names four
+// tools where the component provides five, and other Google tool
+// descriptions still list attachments as uncovered.
 /// A user's Gmail read for an assistant, as the native tools `GmailLabels`,
 /// `GmailSearch`, `GmailRead` and `GmailThread`, each answered by
 /// `api-request` calls against the `oauth_provider` the instance names,
