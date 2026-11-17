@@ -2,7 +2,8 @@
 //!
 //! A component names a blob only by a resource handle: a [`BlobHandle`] it got
 //! from `open`, for an attachment of a message in one of its activation's
-//! input port windows, or from `writer.seal`, for a blob it made. Each handle
+//! input port windows, from `open-request`, for an attachment of a request
+//! pending for it, or from `writer.seal`, for a blob it made. Each handle
 //! is a [`BlobHold`], so a blob with an open handle is not deleted under it,
 //! and every handle lives in the activation's `ResourceTable`, which drops with
 //! the activation. Nothing here cleans up at the end of an activation: what a
@@ -11,13 +12,16 @@
 //! and everything else lets go when the store drops.
 //!
 //! `open` looks an attachment up by `(port, index, name)` in a table the host
-//! built from the envelopes it delivered; no function takes a blob id.
+//! built from the envelopes it delivered. `open-request` asks the
+//! [`ProvidesHost`](crate::ProvidesHost) for a clone of the hold the pending
+//! request keeps; it reads neither that table nor the [`BlobHost`]. No
+//! function takes a blob id.
 
 use std::sync::Arc;
 
 use brenn_envelope::{BlobId, BlobRef, check_attachment_list};
 use brenn_messaging_store::blob::{BlobError, BlobHold, BlobWriter, HeldAttachments};
-use tracing::error;
+use tracing::{debug, error};
 use wasmtime::component::Resource;
 
 use crate::processor_v0_2_bindings::brenn::processor0_2_0::bus as bus_v0_2;
@@ -26,7 +30,8 @@ use crate::{
     CompleteRefusal, CompleteWitError, PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION,
     PROCESSOR_MAX_BLOB_CALLS_PER_ACTIVATION, PROCESSOR_MAX_BLOB_HANDLES,
     PROCESSOR_MAX_BLOB_READ_BYTES, PROCESSOR_MAX_BLOB_WRITE_BYTES, ProcessorData, ProcessorUrgency,
-    ProvidesCallError, PublishRefusal, QueueRefusal, ToolCallError, ToolWitError,
+    ProvidesCallError, PublishRefusal, QueueRefusal, RequestAttachmentRefusal, ToolCallError,
+    ToolWitError, cap_guest_for_log,
 };
 
 /// The blob store as a component's activation reaches it.
@@ -94,7 +99,8 @@ pub(crate) struct ActivationBlobs {
     pub(crate) handed: HandedAttachments,
     /// Live `blob` and `writer` handles.
     handles: usize,
-    /// Calls of `open`, `read`, `create`, `write` and `seal`, refused or not.
+    /// Calls of `open`, `open-request`, `read`, `create`, `write` and `seal`,
+    /// refused or not.
     calls: usize,
     /// Bytes accepted by writes.
     bytes_written: u64,
@@ -191,8 +197,8 @@ impl ProcessorData {
             .expect("blobs host fn invoked without a blob_host (Blobs grant linked but seam unset)")
     }
 
-    /// Count one call of `open`, `read`, `create`, `write` or `seal` against
-    /// the activation's ceiling; `false` once it is passed.
+    /// Count one call of `open`, `open-request`, `read`, `create`, `write` or
+    /// `seal` against the activation's ceiling; `false` once it is passed.
     fn charge_blob_call(&mut self) -> bool {
         self.blob.calls += 1;
         if self.blob.calls > PROCESSOR_MAX_BLOB_CALLS_PER_ACTIVATION {
@@ -306,6 +312,39 @@ impl wit::Host for ProcessorData {
             reference,
             "host invariant: the store's record of a delivered blob differs from the message's"
         );
+        let handle = self.resource_table.push(BlobHandle(hold))?;
+        self.blob.handles += 1;
+        Ok(Ok(handle))
+    }
+
+    fn open_request(
+        &mut self,
+        id: String,
+        name: String,
+    ) -> wasmtime::Result<Result<Resource<BlobHandle>, wit::OpenRequestError>> {
+        if !self.charge_blob_call() {
+            return Ok(Err(wit::OpenRequestError::QuotaExceeded));
+        }
+        let Some(host) = self.provides_host.clone() else {
+            return Ok(Err(wit::OpenRequestError::NotPermitted));
+        };
+        if self.handles_full() {
+            return Ok(Err(wit::OpenRequestError::QuotaExceeded));
+        }
+        let hold = match host.request_attachment(&id, &name) {
+            Ok(hold) => hold,
+            Err(RequestAttachmentRefusal::NotPending) => {
+                debug!(
+                    slug = %self.slug,
+                    id = %cap_guest_for_log(&id),
+                    "wasm blobs: open-request named an id not pending for this component"
+                );
+                return Ok(Err(wit::OpenRequestError::NotPending));
+            }
+            Err(RequestAttachmentRefusal::NotAttached) => {
+                return Ok(Err(wit::OpenRequestError::NotAttached));
+            }
+        };
         let handle = self.resource_table.push(BlobHandle(hold))?;
         self.blob.handles += 1;
         Ok(Ok(handle))

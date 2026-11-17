@@ -2126,8 +2126,8 @@ fn a_page_capability_is_a_placed_instances_to_hold() {
     );
 }
 
-/// A surface serves `blobs` without its tool-call forms, so the word is a placed
-/// instance's to hold.
+/// A surface serves `blobs` without its tool-call forms and `open-request`, so
+/// the word is a placed instance's to hold.
 #[test]
 fn blobs_is_a_placed_instances_to_hold() {
     assert_eq!(

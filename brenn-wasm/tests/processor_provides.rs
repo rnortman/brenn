@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_wasm::{
     ComponentGrant, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome, ProcessorReceiveError,
-    ProvidesCallError, ProvidesHost, QueuedToolRequest, ToolCallError, ToolHost, ToolHostFn,
+    ProvidesCallError, ProvidesHost, QueuedToolRequest, RequestAttachmentRefusal, ToolCallError,
+    ToolHost, ToolHostFn,
 };
 use serde_json::{Value, json};
 
@@ -135,6 +136,17 @@ impl ProvidesHost for RecordingProvidesHost {
             })
             .to_string(),
         })
+    }
+
+    fn request_attachment(
+        &self,
+        id: &str,
+        _name: &str,
+    ) -> Result<brenn_wasm::BlobHold, RequestAttachmentRefusal> {
+        if !self.is_pending(id) {
+            return Err(RequestAttachmentRefusal::NotPending);
+        }
+        Err(RequestAttachmentRefusal::NotAttached)
     }
 }
 

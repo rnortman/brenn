@@ -53,7 +53,6 @@ pub fn serve_with_blobs<L: Logic>(
 ) -> Result<(), Error> {
     let results = activation.tool_results()?;
     let blobs = SdkBlobs {
-        activation,
         results: &results,
         table: RefCell::new(BTreeMap::new()),
         next: Cell::new(0),
@@ -312,7 +311,6 @@ enum Entry {
 /// the activation, so a handle kept past its step's [`Blobs::release`] finds
 /// no entry rather than another step's blob.
 struct SdkBlobs<'a> {
-    activation: &'a Activation,
     /// The results delivered new, for [`Blobs::open_result`].
     results: &'a [ToolResult],
     table: RefCell<BTreeMap<u32, Entry>>,
@@ -370,12 +368,15 @@ impl Blobs for SdkBlobs<'_> {
     }
 
     fn open_request(&self, id: &str, name: &str) -> Result<Blob, OpenError> {
-        match provides::open_request_attachment(self.activation, &pending(id), name) {
+        match provides::open_request_attachment(&pending(id), name) {
             Ok(raw) => Ok(self.hold(raw)),
-            Err(RequestAttachmentError::NotInWindow) => Err(OpenError::LeftWindow),
-            Err(RequestAttachmentError::Open(error)) => Err(open_error(error)),
-            Err(RequestAttachmentError::Malformed(detail)) => {
-                panic!("the host-built request window does not parse: {detail}")
+            Err(RequestAttachmentError::NotPending) => Err(OpenError::NotPending),
+            Err(RequestAttachmentError::NotAttached) => Err(OpenError::NotAttached),
+            Err(RequestAttachmentError::QuotaExceeded) => Err(OpenError::Quota),
+            // The kit completes through `provides`, so the component holds
+            // the grant; a host that says otherwise has broken that premise.
+            Err(RequestAttachmentError::NotPermitted) => {
+                panic!("the host refuses open-request for lack of `provides`")
             }
         }
     }

@@ -1,7 +1,8 @@
 //! The real `brenn_wasm::ProvidesHost` over the process's [`ProviderRuntime`].
 //!
 //! One host is built per WASM consumer granted `provides`. It answers that
-//! consumer's completions against the pending-call table, and resolves its
+//! consumer's completions against the pending-call table, gives it holds on
+//! the attachments of its pending requests from the same table, and resolves its
 //! `call-async-for` calls exactly as [`WasmToolHost`] resolves `call-async`,
 //! with the served id added to the request body as `serving`. The id is
 //! checked against the table *for this consumer* on every call; the acting
@@ -10,13 +11,15 @@
 
 use std::sync::Arc;
 
-use brenn_messaging_store::blob::HeldAttachments;
-use brenn_wasm::{ProvidesCallError, ProvidesHost, QueuedToolRequest, ToolCallError};
+use brenn_messaging_store::blob::{BlobHold, HeldAttachments};
+use brenn_wasm::{
+    ProvidesCallError, ProvidesHost, QueuedToolRequest, RequestAttachmentRefusal, ToolCallError,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::descriptor::{MAX_ASYNC_RESULT_BYTES, ToolError};
-use super::provided::{CompleteError, ProviderRuntime};
+use super::provided::{CompleteError, ProviderRuntime, RequestAttachmentError};
 use super::tool::ToolOutput;
 use super::wasm_host::WasmToolHost;
 
@@ -121,6 +124,19 @@ impl ProvidesHost for WasmProvidesHost {
         }
         self.tools
             .resolve_async(tool, args_json, call_id, Some(serving), with_attachments)
+    }
+
+    fn request_attachment(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> Result<BlobHold, RequestAttachmentRefusal> {
+        self.runtime
+            .request_attachment(&self.slug, id, name)
+            .map_err(|e| match e {
+                RequestAttachmentError::NotPending => RequestAttachmentRefusal::NotPending,
+                RequestAttachmentError::NotAttached => RequestAttachmentRefusal::NotAttached,
+            })
     }
 }
 
@@ -249,7 +265,12 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_carries_the_served_id_and_no_user() {
         let runtime = runtime();
-        let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let guard = runtime.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         let id = guard.id().as_str();
         let queued = host(&runtime, PROVIDER)
             .queue_async_for(id, "git-repo-pull", r#"{"repos":["r"]}"#, "c1", false)
@@ -275,7 +296,12 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_serving_an_id_not_pending_here_is_denied() {
         let runtime = runtime();
-        let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let guard = runtime.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         let id = guard.id().as_str().to_string();
         let args = r#"{"repos":["r"]}"#;
         let foreign =
@@ -295,7 +321,12 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_with_attachments_needs_an_accepting_tool() {
         let runtime = runtime();
-        let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let guard = runtime.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         let host = host(&runtime, PROVIDER);
         let id = guard.id().as_str();
         assert_eq!(
@@ -319,7 +350,12 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_is_admitted_by_the_providers_own_grants() {
         let runtime = runtime();
-        let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let guard = runtime.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         let id = guard.id().as_str();
         let host = host(&runtime, PROVIDER);
         assert_eq!(
@@ -343,7 +379,12 @@ mod tests {
     #[tokio::test]
     async fn a_provider_with_no_tool_grant_is_not_granted_a_nested_call() {
         let runtime = runtime();
-        let guard = runtime.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let guard = runtime.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         let (alert, _drain) = noop_alert_dispatcher();
         let tools = WasmToolHost::new(
             Arc::new(git_repo_pull_only()).into(),
@@ -416,6 +457,53 @@ mod tests {
                 .unwrap()
                 .id,
             made_id
+        );
+    }
+
+    /// A request's attachment opens for the instance it is pending for, under
+    /// the request's name, and is `not-pending` for another instance, for an
+    /// unknown id and once the call has ended.
+    #[tokio::test]
+    async fn a_pending_requests_attachment_opens_for_its_own_instance_only() {
+        use crate::provided::tests::blob_messenger;
+        use brenn_messaging_store::testutils::{held, seal_bytes};
+
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        let runtime = runtime();
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        let guard = runtime.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            held(&[("photo", &photo)]),
+        );
+        let id = guard.id().as_str().to_string();
+
+        let opened = host(&runtime, PROVIDER)
+            .request_attachment(&id, "photo")
+            .unwrap();
+        assert_eq!(opened.id(), photo.id());
+        assert_eq!(
+            host(&runtime, PROVIDER)
+                .request_attachment(&id, "other")
+                .unwrap_err(),
+            RequestAttachmentRefusal::NotAttached
+        );
+        for (slug, id) in [("other", id.as_str()), (PROVIDER, &"0".repeat(32))] {
+            assert_eq!(
+                host(&runtime, slug)
+                    .request_attachment(id, "photo")
+                    .unwrap_err(),
+                RequestAttachmentRefusal::NotPending
+            );
+        }
+        drop(guard);
+        assert_eq!(
+            host(&runtime, PROVIDER)
+                .request_attachment(&id, "photo")
+                .unwrap_err(),
+            RequestAttachmentRefusal::NotPending
         );
     }
 }

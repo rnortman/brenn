@@ -1452,14 +1452,22 @@ pub mod blobs {
     //! **Requires grant:** `"blobs"` in the component's grants. If the grant is
     //! absent the host does not link the `brenn:processor/blobs` interface and
     //! any import of it causes a load-time panic. The backend host serves the
-    //! whole module. A surface host serves [`limits`], [`open`] and [`Blob`]'s
-    //! reads, and refuses at boot a component that calls anything else here;
-    //! there a [`Blob::read`] answers [`ReadError::Unavailable`] for an
-    //! attachment whose bytes the page did not fetch.
+    //! whole interface. A surface host serves [`limits`], [`open`], [`Blob`],
+    //! [`create`], [`Writer`] and [`crate::publish_with_attachments`], and
+    //! refuses at boot a component that imports the interface's `open-request`,
+    //! `call-async`, `call-async-for` or `complete` — reached through
+    //! [`crate::provides::open_request_attachment`],
+    //! [`crate::tools::call_async_with_attachments`],
+    //! [`crate::provides::call_async_for_with_attachments`] and
+    //! [`crate::provides::complete_with_attachments`]; there a [`Blob::read`]
+    //! answers [`ReadError::Unavailable`] for an attachment whose bytes the
+    //! page did not fetch.
     //!
     //! A component names a blob only by a [`Blob`] handle, and gets one in
-    //! exactly two ways: [`open`], for an attachment of a message in this
-    //! activation's input port windows, and [`Writer::seal`], for a blob it
+    //! exactly three ways: [`open`], for an attachment of a message in this
+    //! activation's input port windows;
+    //! [`crate::provides::open_request_attachment`], for an attachment of a
+    //! request pending for this component; and [`Writer::seal`], for a blob it
     //! made in this activation. A handle is a hold: the blob is not deleted
     //! under it. Nothing outlives the activation: on `Ok` the messages it
     //! published hold their blobs, and every other handle and writer drops, so
@@ -1682,6 +1690,15 @@ pub mod blobs {
     /// delivered.
     pub(crate) fn open_at(port: &str, index: u32, name: &str) -> Result<Blob, OpenError> {
         contract::blob_open(port, index, name).map(|raw| Blob { raw })
+    }
+
+    /// A handle to attachment `name` of the request `id`, pending for this
+    /// component.
+    pub(crate) fn open_request(
+        id: &str,
+        name: &str,
+    ) -> Result<Blob, crate::provides::RequestAttachmentError> {
+        contract::blob_open_request(id, name).map(|raw| Blob { raw })
     }
 
     /// Each attachment's name and raw handle, as the contract takes them.
@@ -2581,8 +2598,11 @@ pub mod provides {
 
     impl ToolRequest {
         /// A handle to the request's attachment `name`, as
-        /// [`crate::blobs::open`] on the message the request was read from.
-        /// Valid only in the activation that delivered it.
+        /// [`crate::blobs::open`] on the message the request was read from: by
+        /// the message's place in this activation's window. Valid only in the
+        /// activation that delivered it, and imports nothing beyond `open`.
+        /// [`open_request_attachment`] opens by pending id instead, in any
+        /// activation while the request is pending.
         ///
         /// **Requires grant:** `"blobs"`.
         pub fn open(&self, name: &str) -> Result<crate::blobs::Blob, crate::blobs::OpenError> {
@@ -2661,53 +2681,45 @@ pub mod provides {
         }
     }
 
-    /// Why [`open_request_attachment`] gave no handle.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    /// Why [`open_request_attachment`] gave no handle: the cases of the
+    /// interface's `open-request-error`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum RequestAttachmentError {
-        /// No message of this activation's `tool-requests` window, new or
-        /// context, carries the request: newer requests displaced it.
-        NotInWindow,
-        /// The request's message is in the window and the host refused the
-        /// open.
-        Open(crate::blobs::OpenError),
-        /// The window holds a request body that [`Activation::tool_requests`]
-        /// would refuse, with the diagnostic. The body is host-built, so this
-        /// is a host fault.
-        ///
-        /// [`Activation::tool_requests`]: crate::Activation::tool_requests
-        Malformed(String),
+        /// The component lacks the `provides` grant.
+        NotPermitted,
+        /// `id` is not pending for this component: answered, failed,
+        /// expired, abandoned by its caller, from before a restart, or
+        /// another component's, told apart from nothing.
+        NotPending,
+        /// The request is pending and carries no attachment `name`.
+        NotAttached,
+        /// The activation's blob calls or live handles are at their bound.
+        QuotaExceeded,
     }
 
-    /// A handle to attachment `name` of the request `id`, wherever its message
-    /// sits in this activation's `tool-requests` window, new or context.
+    /// A handle to attachment `name` of the request `id`, pending for this
+    /// component, in any activation and wherever the request's message sits
+    /// or no longer sits in the `tool-requests` window.
     ///
-    /// [`ToolRequest::open`] reaches a request only in the activation that
-    /// delivers it new; this reaches it in any later activation for as long
-    /// as its message stays among the window's context. Once newer requests
-    /// displace it the answer is [`RequestAttachmentError::NotInWindow`],
-    /// whether or not the request is still pending.
+    /// The host holds a pending request's attachments until the request ends
+    /// — completed, failed, past its deadline, or its caller gone — so the
+    /// answer does not depend on the window. The handle is a hold and reads
+    /// no byte; given to [`call_async_for_with_attachments`], the nested
+    /// call holds the blob from that call, so the request may end afterwards.
+    /// [`ToolRequest::open`] opens by the message's place instead, only in
+    /// the activation that delivers it.
     ///
-    /// **Requires grant:** `"blobs"`.
+    /// Counts as one blob call and its handle as one live handle. Not served
+    /// on a surface.
+    ///
+    /// **Requires grants:** `provides`, checked at the call: without it every
+    /// call is [`RequestAttachmentError::NotPermitted`]; and `"blobs"` for the
+    /// interface this calls.
     pub fn open_request_attachment(
-        activation: &crate::Activation,
         id: &PendingId,
         name: &str,
     ) -> Result<crate::blobs::Blob, RequestAttachmentError> {
-        let window = activation
-            .reserved_window(brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT)
-            .map_err(|e| RequestAttachmentError::Malformed(e.to_string()))?;
-        for message in window
-            .context_messages()
-            .iter()
-            .chain(window.new_messages())
-        {
-            let request = parse_request(message)
-                .map_err(|e| RequestAttachmentError::Malformed(e.to_string()))?;
-            if request.id == *id {
-                return request.open(name).map_err(RequestAttachmentError::Open);
-            }
-        }
-        Err(RequestAttachmentError::NotInWindow)
+        crate::blobs::open_request(&id.0, name)
     }
 
     fn complete_raw(id: &PendingId, outcome_json: &str) -> Result<(), Error> {

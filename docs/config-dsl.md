@@ -2161,9 +2161,10 @@ out of the vocabulary.
 attachments of the messages an activation is handed, creating blobs, and
 publishing messages that name them. On a top-level instance the whole
 interface is served. On a placed instance everything but the tool-call forms
-is — reading, creating and publishing, on the page's wire and page-local
-channels alike — and a kind that imports `call-async`, `call-async-for` or
-`complete` is refused when its artifact is checked at boot. It pairs with no
+and `open-request` is — reading, creating and publishing, on the page's wire
+and page-local channels alike — and a kind that imports `open-request`,
+`call-async`, `call-async-for` or `complete` is refused when its artifact is
+checked at boot. It pairs with no
 wiring, like `log`: a component that only reads blobs binds no output. A
 component that publishes with attachments also needs `ports`.
 

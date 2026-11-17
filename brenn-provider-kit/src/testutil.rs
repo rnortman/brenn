@@ -216,7 +216,7 @@ struct BlobStore {
     write_budget: u64,
     calls: u32,
     written: u64,
-    left_window: bool,
+    not_pending: bool,
     requests: BTreeMap<(String, String), Sealed>,
     results: BTreeMap<(String, String), Sealed>,
     slots: Vec<Slot>,
@@ -238,7 +238,7 @@ impl Default for BlobStore {
             write_budget: 64 << 20,
             calls: 0,
             written: 0,
-            left_window: false,
+            not_pending: false,
             requests: BTreeMap::new(),
             results: BTreeMap::new(),
             slots: Vec::new(),
@@ -423,9 +423,13 @@ impl MemoryHost {
         self.blobs.borrow_mut().call_budget = calls;
     }
 
-    /// Whether every request's attachment answers `LeftWindow`.
-    pub fn request_attachments_left_window(&self, left: bool) {
-        self.blobs.borrow_mut().left_window = left;
+    /// Whether every request's attachment answers `NotPending`, as the host
+    /// answers once a request has ended. Only the open is refused: a call
+    /// is still accepted and a completion still recorded, so a test sees
+    /// the failure the kit gives, which on the host is refused `not-pending`
+    /// and dropped by the glue, reaching no caller.
+    pub fn requests_not_pending(&self, not_pending: bool) {
+        self.blobs.borrow_mut().not_pending = not_pending;
     }
 
     /// Refuse the next blob create with `error`.
@@ -528,8 +532,8 @@ impl Blobs for MemoryHost {
     fn open_request(&self, id: &str, name: &str) -> Result<Blob, OpenError> {
         self.limits()?;
         let mut blobs = self.blobs.borrow_mut();
-        if blobs.left_window {
-            return Err(OpenError::LeftWindow);
+        if blobs.not_pending {
+            return Err(OpenError::NotPending);
         }
         let sealed = blobs
             .requests

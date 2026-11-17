@@ -133,6 +133,9 @@ pub(crate) async fn ingress_cleanup_loop(db: brenn_db::Db, retention_days: u64) 
     }
 }
 
+// TODO(blob-budget-rule-sized-by-window): the blob-pool sizing rule assumes a
+// row's blobs go when the row leaves its channel's window; a durable row and
+// its blobs go at this loop's next pass.
 /// Background task: GC bus (channel-associated) messages past the channel reap
 /// frontier.
 ///

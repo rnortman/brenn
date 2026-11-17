@@ -4,6 +4,39 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **A provider's request attachments stay reachable while the request is
+  pending.** A WASM provider component (a tool implemented as a WebAssembly
+  component) can now open a request's attachments at any point while the host
+  still holds that request pending. Before, it could reach them only while the
+  request was among the newest in its `tool-requests` window, so under load a
+  tool that uploaded attachments after an earlier step (a session call, a
+  previous upload) failed `internal` through no fault of its caller.
+  - **For operators:** each pending provided-tool call now holds its
+    request's attachment blobs until the call ends (completed, failed, timed
+    out or abandoned). The hold is not charged against `blob_budget_bytes`;
+    at worst the attachments of Σ `max_concurrency` requests (up to 32 blobs
+    each) outlive their request by one bus GC interval. No setting changes.
+  - **For WASM component authors:** `brenn:processor/blobs@0.3.0` gains
+    `open-request(id, name)` with its own `open-request-error`
+    (`not-permitted`, `not-pending`, `not-attached`, `quota-exceeded`). It is
+    an addition: artifacts built before it load unchanged. It needs the
+    `provides` grant and is not served on a surface, where a component that
+    imports it is refused at boot. See `docs/component-packages.md`,
+    "Contract evolution".
+  - **BREAKING for authors using `brenn-guest`, `brenn-provider-kit` or
+    `brenn-provider-kit-guest`:** `provides::open_request_attachment` drops
+    its `activation` argument and calls `blobs.open-request`;
+    `RequestAttachmentError` is now `NotPermitted` / `NotPending` /
+    `NotAttached` / `QuotaExceeded`; the kit's `OpenError::LeftWindow` is
+    `OpenError::NotPending`; `MemoryHost::request_attachments_left_window` is
+    `MemoryHost::requests_not_pending`. A component served by
+    `serve_with_blobs` imports `open-request` whether or not its tools take
+    attachments, so release brenn before any bundle built on this kit.
+  - **BREAKING for code implementing `brenn_wasm::ProvidesHost`** (e.g. a
+    test harness hosting a provider): the trait gains a required method,
+    `request_attachment(id, name)`, which must hold the request's attachment
+    while the request is pending.
+
 ## [0.36.0] — 2026-11-15
 
 A huge release; the headline is binary messages and blob attachments on the

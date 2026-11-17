@@ -1,9 +1,10 @@
-//! The three `blobs` tool-call forms against recording seams over a real
-//! blob store: their grants, their check order, and who holds each blob.
+//! The three `blobs` tool-call forms and `open-request` against recording
+//! seams over a real blob store: their grants, their check order, and who
+//! holds each blob.
 
 use std::sync::{Arc, Mutex};
 
-use brenn_envelope::BlobId;
+use brenn_envelope::{AttachmentName, BlobId};
 use brenn_messaging_store::blob::{
     BlobError, BlobHold, BlobLimits, BlobStore, BlobWriter, HeldAttachments, Retain,
 };
@@ -84,19 +85,38 @@ impl ToolHost for QueueSeam {
     }
 }
 
-/// A `ProvidesHost` with one pending id that keeps every completion it
-/// accepts, holds included, and resolves nested calls as [`QueueSeam`].
+/// A `ProvidesHost` with one pending id, `"pending"`, whose request holds
+/// the attachments it is given, that keeps every completion it accepts, holds
+/// included, counts the attachment lookups that reach it, and resolves nested
+/// calls as [`QueueSeam`].
 struct ProvidesSeam {
     queue: Arc<QueueSeam>,
     completed: Mutex<Vec<(String, HeldAttachments)>>,
+    request: Mutex<HeldAttachments>,
+    lookups: Mutex<usize>,
 }
 
 impl ProvidesSeam {
     fn new() -> Arc<Self> {
+        Self::holding(HeldAttachments::none())
+    }
+
+    fn holding(request: HeldAttachments) -> Arc<Self> {
         Arc::new(Self {
             queue: QueueSeam::new(true),
             completed: Mutex::new(Vec::new()),
+            request: Mutex::new(request),
+            lookups: Mutex::new(0),
         })
+    }
+
+    /// The request ends: its holds go.
+    fn end_request(&self) {
+        *self.request.lock().unwrap() = HeldAttachments::none();
+    }
+
+    fn lookups(&self) -> usize {
+        *self.lookups.lock().unwrap()
     }
 }
 
@@ -126,6 +146,24 @@ impl ProvidesHost for ProvidesSeam {
         with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
         self.queue.resolve(tool, with_attachments)
+    }
+
+    fn request_attachment(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> Result<BlobHold, RequestAttachmentRefusal> {
+        *self.lookups.lock().unwrap() += 1;
+        if id != "pending" {
+            return Err(RequestAttachmentRefusal::NotPending);
+        }
+        let name = AttachmentName::new(name).map_err(|_| RequestAttachmentRefusal::NotAttached)?;
+        self.request
+            .lock()
+            .unwrap()
+            .hold(&name)
+            .cloned()
+            .ok_or(RequestAttachmentRefusal::NotAttached)
     }
 }
 
@@ -180,6 +218,29 @@ impl Rig {
     fn sealed_count(&self) -> usize {
         self.store.usage().sealed
     }
+}
+
+/// A request's attachments as the host holds them: `bytes` in one blob of
+/// type `text/plain`, under each of `names`, made in `store` and held only by
+/// the value returned.
+fn request_holding(store: &Arc<BlobStore>, bytes: &[u8], names: &[&str]) -> HeldAttachments {
+    let mut writer = store.create("text/plain").expect("created");
+    writer.write(0, bytes).expect("written");
+    let hold = writer.seal().expect("sealed");
+    HeldAttachments::new(
+        names
+            .iter()
+            .map(|n| (AttachmentName::new(*n).expect("a name"), hold.clone())),
+    )
+    .expect("within bounds")
+}
+
+fn open_request(
+    data: &mut ProcessorData,
+    id: &str,
+    name: &str,
+) -> Result<Resource<BlobHandle>, wit::OpenRequestError> {
+    BlobsHost::open_request(data, id.to_string(), name.to_string()).expect("no trap")
 }
 
 fn borrow(handle: &Resource<BlobHandle>) -> Resource<BlobHandle> {
@@ -450,4 +511,169 @@ fn complete_refusals_and_its_cap() {
         trap.to_string()
             .contains("provides.complete calls in one activation")
     );
+}
+
+/// Without `provides` every `open-request` is `not-permitted` and charged as
+/// a blob call; once the blob-call budget is spent the answer is
+/// `quota-exceeded`, ahead of the grant.
+#[test]
+fn open_request_without_provides_is_not_permitted_and_charged() {
+    let mut rig = rig(None, None);
+    for _ in 0..PROCESSOR_MAX_BLOB_CALLS_PER_ACTIVATION {
+        assert!(matches!(
+            open_request(&mut rig.data, "pending", "a"),
+            Err(wit::OpenRequestError::NotPermitted)
+        ));
+    }
+    assert!(matches!(
+        open_request(&mut rig.data, "pending", "a"),
+        Err(wit::OpenRequestError::QuotaExceeded)
+    ));
+}
+
+/// With `provides`: the blob-call budget is judged first, then the handle
+/// bound, which a full table meets without asking the seam; then the id, then
+/// the name.
+#[test]
+fn open_request_checks_run_in_the_stated_order() {
+    let dir = tempfile::tempdir().expect("blob directory");
+    let store = BlobStore::for_tests(
+        dir.path(),
+        BlobLimits {
+            max_blob_bytes: 1024,
+            budget_bytes: 1024 * 1024,
+        },
+    );
+    let provides = ProvidesSeam::holding(request_holding(&store, b"x", &["a"]));
+    let mut rig = rig(None, Some(provides.clone()));
+
+    assert!(matches!(
+        open_request(&mut rig.data, "gone", "a"),
+        Err(wit::OpenRequestError::NotPending)
+    ));
+    assert!(matches!(
+        open_request(&mut rig.data, "pending", "b"),
+        Err(wit::OpenRequestError::NotAttached)
+    ));
+    assert!(matches!(
+        open_request(&mut rig.data, "pending", "not a name"),
+        Err(wit::OpenRequestError::NotAttached)
+    ));
+    assert!(matches!(
+        open_request(&mut rig.data, "gone", "b"),
+        Err(wit::OpenRequestError::NotPending)
+    ));
+    assert_eq!(provides.lookups(), 4);
+
+    let mut handles = Vec::new();
+    for _ in 0..PROCESSOR_MAX_BLOB_HANDLES {
+        handles.push(open_request(&mut rig.data, "pending", "a").expect("opened"));
+    }
+    assert_eq!(provides.lookups(), 4 + PROCESSOR_MAX_BLOB_HANDLES);
+    assert!(matches!(
+        open_request(&mut rig.data, "gone", "a"),
+        Err(wit::OpenRequestError::QuotaExceeded)
+    ));
+    assert_eq!(
+        provides.lookups(),
+        4 + PROCESSOR_MAX_BLOB_HANDLES,
+        "a full handle table refuses before the seam is asked"
+    );
+    HostBlob::drop(&mut rig.data, handles.pop().expect("a handle")).expect("dropped");
+    handles.push(open_request(&mut rig.data, "pending", "a").expect("a freed slot opens"));
+    for handle in handles {
+        HostBlob::drop(&mut rig.data, handle).expect("dropped");
+    }
+
+    // Spend what is left of the blob-call budget: with the handle table empty,
+    // the next call is refused before the seam is asked.
+    let spent = 4 + PROCESSOR_MAX_BLOB_HANDLES + 2;
+    for _ in spent..PROCESSOR_MAX_BLOB_CALLS_PER_ACTIVATION {
+        let _ = open_request(&mut rig.data, "gone", "a");
+    }
+    let asked = provides.lookups();
+    assert!(matches!(
+        open_request(&mut rig.data, "pending", "a"),
+        Err(wit::OpenRequestError::QuotaExceeded)
+    ));
+    assert_eq!(provides.lookups(), asked);
+}
+
+/// A handle from `open-request` reads the request's blob under either of its
+/// names, holds it after the request ends, and lets it go when dropped.
+#[test]
+fn an_open_request_handle_reads_and_holds_the_requests_blob() {
+    let dir = tempfile::tempdir().expect("blob directory");
+    let store = BlobStore::for_tests(
+        dir.path(),
+        BlobLimits {
+            max_blob_bytes: 1024,
+            budget_bytes: 1024 * 1024,
+        },
+    );
+    let provides = ProvidesSeam::holding(request_holding(&store, b"hello", &["a", "b"]));
+    let mut rig = rig(None, Some(provides.clone()));
+
+    let blob = open_request(&mut rig.data, "pending", "b").expect("opened");
+    assert_eq!(
+        HostBlob::size(&mut rig.data, borrow(&blob)).expect("no trap"),
+        5
+    );
+    assert_eq!(
+        HostBlob::content_type(&mut rig.data, borrow(&blob)).expect("no trap"),
+        "text/plain"
+    );
+    let bytes = HostBlob::read(&mut rig.data, borrow(&blob), 0, 5)
+        .expect("no trap")
+        .expect("read");
+    assert_eq!(bytes, b"hello");
+
+    provides.end_request();
+    assert_eq!(store.usage().sealed, 1, "the handle holds the blob");
+    assert!(matches!(
+        open_request(&mut rig.data, "pending", "a"),
+        Err(wit::OpenRequestError::NotAttached)
+    ));
+    HostBlob::drop(&mut rig.data, blob).expect("dropped");
+    assert_eq!(store.usage().sealed, 0);
+}
+
+/// A request's attachment forwarded through `call-async-for`: the queued
+/// nested request holds the blob after the handle is dropped and the request
+/// has ended, and lets it go when the buffer drops.
+#[test]
+fn a_forwarded_request_attachment_outlives_the_request() {
+    let dir = tempfile::tempdir().expect("blob directory");
+    let store = BlobStore::for_tests(
+        dir.path(),
+        BlobLimits {
+            max_blob_bytes: 1024,
+            budget_bytes: 1024 * 1024,
+        },
+    );
+    let provides = ProvidesSeam::holding(request_holding(&store, b"body", &["file"]));
+    let mut rig = rig(None, Some(provides.clone()));
+
+    let blob = open_request(&mut rig.data, "pending", "file").expect("opened");
+    BlobsHost::call_async_for(
+        &mut rig.data,
+        "pending".to_string(),
+        "echo".to_string(),
+        "{}".to_string(),
+        "c1".to_string(),
+        named(&[("body", &blob)]),
+    )
+    .expect("no trap")
+    .expect("queued");
+    HostBlob::drop(&mut rig.data, blob).expect("dropped");
+    provides.end_request();
+    assert_eq!(store.usage().sealed, 1, "the queued request holds the blob");
+
+    let publishes = rig.data.take_ok_publishes();
+    assert_eq!(publishes.len(), 1);
+    let refs = publishes[0].attachments.refs();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs.iter().next().expect("one").1.size, 4);
+    drop(publishes);
+    assert_eq!(store.usage().sealed, 0);
 }

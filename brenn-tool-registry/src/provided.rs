@@ -16,17 +16,26 @@
 //! it: the [`PendingGuard`] owns the record and removes it on drop, whether the
 //! call completed, failed, reached its deadline, or was cancelled by its
 //! caller. No id outlives its waiter.
+//!
+//! The record holds the request's attachments for its life, from before the
+//! request is published until the call ends, so the providing instance opens
+//! one by pending id ([`ProviderRuntime::request_attachment`]) wherever the
+//! request's message sits in its inbox, or after the bus GC has deleted that
+//! row. The hold charges nothing: a blob is charged once, when written. A
+//! record leaves the table under the table's lock and is dropped after it, so
+//! a last hold's file work never runs under that lock.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
+use brenn_envelope::AttachmentName;
 use brenn_lib::mcp_tool_names::MCP_BRENN_PREFIX;
 use brenn_lib::messaging::config::ProvidedToolDecl;
 use brenn_lib::messaging::{ParticipantId, Urgency, canonical_address};
 use brenn_lib::tools::AclClause;
 use brenn_messaging::{Messenger, PublishResult};
-use brenn_messaging_store::blob::HeldAttachments;
+use brenn_messaging_store::blob::{BlobHold, HeldAttachments};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -107,6 +116,17 @@ pub enum CompleteError {
     InvalidOutcome(String),
 }
 
+/// Why [`ProviderRuntime::request_attachment`] gave no hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAttachmentError {
+    /// The id is not pending for this instance: answered, failed, expired,
+    /// abandoned by its caller, from before a restart, or another instance's.
+    /// Indistinguishable on purpose.
+    NotPending,
+    /// The request is pending and carries no attachment of that name.
+    NotAttached,
+}
+
 struct PendingCall {
     /// The providing instance's consumer slug.
     instance: String,
@@ -116,6 +136,9 @@ struct PendingCall {
     /// The call's deadline; the waiter answers for it then at the latest.
     deadline: Instant,
     completion: oneshot::Sender<Result<ToolOutput, ToolError>>,
+    /// The request's attachments: one hold per distinct blob it names, for
+    /// the record's life.
+    attachments: HeldAttachments,
 }
 
 /// What a nested call serving a pending call inherits from it: the acting
@@ -161,9 +184,9 @@ impl ProviderRuntime {
             .expect("provider runtime pending table lock poisoned")
     }
 
-    /// Record a call to `tool` provided by `instance` under a fresh id. The
-    /// record is removed when the returned guard drops, if nothing removed it
-    /// first.
+    /// Record a call to `tool` provided by `instance` under a fresh id,
+    /// holding the request's `attachments`. The record, with its holds, is
+    /// removed when the returned guard drops, if nothing removed it first.
     ///
     /// # Panics
     ///
@@ -174,6 +197,7 @@ impl ProviderRuntime {
         instance: &str,
         tool: &'static str,
         ctx: &ToolCtx,
+        attachments: HeldAttachments,
     ) -> PendingGuard {
         let deadline = ctx.deadline.unwrap_or_else(|| {
             panic!("BUG: a call to provided tool {tool:?} began without a deadline")
@@ -189,6 +213,7 @@ impl ProviderRuntime {
                 acting_user: ctx.acting_user.clone(),
                 deadline,
                 completion,
+                attachments,
             },
         );
         assert!(previous.is_none(), "BUG: a minted pending id {id} collided");
@@ -241,6 +266,28 @@ impl ProviderRuntime {
                 acting_user: record.acting_user.clone(),
                 deadline: record.deadline,
             })
+    }
+
+    /// A hold on the blob attachment `name` of the request `id` gives, iff
+    /// `id` is pending for `instance`. A name outside the attachment grammar
+    /// is one the request does not carry.
+    pub fn request_attachment(
+        &self,
+        instance: &str,
+        id: &str,
+        name: &str,
+    ) -> Result<BlobHold, RequestAttachmentError> {
+        let pending = self.lock();
+        let record = pending
+            .get(id)
+            .filter(|record| record.instance == instance)
+            .ok_or(RequestAttachmentError::NotPending)?;
+        let name = AttachmentName::new(name).map_err(|_| RequestAttachmentError::NotAttached)?;
+        record
+            .attachments
+            .hold(&name)
+            .cloned()
+            .ok_or(RequestAttachmentError::NotAttached)
     }
 
     /// Fail every listed id still pending for `instance` with
@@ -344,7 +391,10 @@ impl PendingGuard {
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        self.runtime.lock().remove(self.id.as_str());
+        // The table's lock is released at the end of this statement, before
+        // the record and its holds drop.
+        let removed = self.runtime.lock().remove(self.id.as_str());
+        drop(removed);
     }
 }
 
@@ -429,7 +479,9 @@ impl AsyncTool for ProvidedTool {
             .deadline
             .unwrap_or_else(|| panic!("BUG: provided tool {name:?} admitted without a deadline"));
         let started = Instant::now();
-        let mut guard = self.runtime.begin(&self.instance, name, ctx);
+        let mut guard = self
+            .runtime
+            .begin(&self.instance, name, ctx, attachments.clone());
 
         let address = canonical_address(&request_inbox_name(&self.instance));
         let body = serde_json::to_string(&ProvidedRequest {
@@ -701,7 +753,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_record_answers_only_its_own_instance_once() {
         let rt = runtime();
-        let mut guard = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(Some(alice())));
+        let mut guard = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(Some(alice())),
+            HeldAttachments::none(),
+        );
         let id = guard.id().as_str().to_string();
         assert_eq!(id.len(), 32);
         assert!(id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
@@ -737,8 +794,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn ids_are_distinct_and_a_userless_record_is_pending() {
         let rt = runtime();
-        let a = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
-        let b = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let a = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
+        let b = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         assert_ne!(a.id(), b.id());
         assert_eq!(rt.acting_user_for(PROVIDER, a.id().as_str()), Some(None));
     }
@@ -747,7 +814,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dropping_the_guard_removes_the_record() {
         let rt = runtime();
-        let guard = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(Some(alice())));
+        let guard = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(Some(alice())),
+            HeldAttachments::none(),
+        );
         let id = guard.id().as_str().to_string();
         drop(guard);
         assert_eq!(rt.acting_user_for(PROVIDER, &id), None);
@@ -762,7 +834,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_inadmissible_outcome_leaves_the_record_pending() {
         let rt = runtime();
-        let mut guard = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let mut guard = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         let id = guard.id().as_str().to_string();
 
         for refused in [
@@ -827,7 +904,12 @@ pub(crate) mod tests {
             ToolError::InvalidArgs("bad".to_string()),
             ToolError::Internal("broke".to_string()),
         ] {
-            let mut guard = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+            let mut guard = rt.begin(
+                PROVIDER,
+                "echo-for-user",
+                &pending_ctx(None),
+                HeldAttachments::none(),
+            );
             let id = guard.id().as_str().to_string();
             assert_eq!(rt.complete(PROVIDER, &id, Err(answer.clone())), Ok(()));
             assert_eq!((&mut guard.rx).await.unwrap().map(|o| o.value), Err(answer));
@@ -840,9 +922,24 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn fail_delivered_answers_only_this_instances_pending_ids() {
         let rt = runtime();
-        let mut live = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
-        let mut done = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
-        let foreign = rt.begin("other", "echo-for-user", &pending_ctx(None));
+        let mut live = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
+        let mut done = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
+        let foreign = rt.begin(
+            "other",
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         let done_id = done.id().as_str().to_string();
         rt.complete(PROVIDER, &done_id, Ok(json!("answered").into()))
             .unwrap();
@@ -1104,7 +1201,6 @@ pub(crate) mod tests {
 
     // --- attachments ---
 
-    use brenn_envelope::AttachmentName;
     use brenn_messaging_store::testutils::{held, seal_bytes};
 
     fn attachment(name: &str) -> AttachmentName {
@@ -1181,7 +1277,12 @@ pub(crate) mod tests {
         let (messenger, _blob_dir) = blob_messenger().await;
         let store = messenger.blob_store().unwrap().clone();
         let rt = runtime();
-        let guard = rt.begin(PROVIDER, "echo-for-user", &pending_ctx(None));
+        let guard = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            HeldAttachments::none(),
+        );
         let id = guard.id().as_str().to_string();
         let outcome = |value: Value| {
             let made = seal_bytes(&store, "text/plain", b"made");
@@ -1209,5 +1310,233 @@ pub(crate) mod tests {
             Err(CompleteError::NotPending)
         );
         assert_eq!(store.usage().sealed, 0, "nobody waits: the blob is gone");
+    }
+
+    // --- the record's hold on the request's attachments ---
+
+    /// Evict every row of the provider's inbox, as a bus GC pass does once
+    /// the rows have left its window, and reap; how many blobs the reap
+    /// deleted.
+    async fn evict_and_reap(messenger: &Messenger) -> usize {
+        use brenn_messaging_store::db::bus_gc_evict_channel;
+        let mut evicted = 0;
+        {
+            let conn = messenger.db().lock().await;
+            for entry in messenger.directory().list_durable() {
+                evicted += bus_gc_evict_channel(
+                    &conn,
+                    entry.uuid,
+                    &entry.address,
+                    entry.transport_type,
+                    0,
+                    entry.resolved_channel.sink,
+                    None,
+                )
+                .messages_evicted;
+            }
+        }
+        assert_eq!(evicted, 1, "the one request row is evicted");
+        messenger.reap_blobs().await.blobs
+    }
+
+    /// A record holds one count on each distinct blob its request names, so
+    /// it is the blob's only holder once the caller's hold is gone, and either
+    /// name the blob is given under opens it.
+    #[tokio::test]
+    async fn a_record_holds_its_requests_attachments_under_each_name() {
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        let rt = runtime();
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        let photo_id = photo.id().clone();
+        let guard = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            held(&[("photo", &photo), ("copy", &photo)]),
+        );
+        drop(photo);
+        assert_eq!(store.usage().sealed, 1, "the record holds the blob");
+
+        let id = guard.id().as_str();
+        for name in ["photo", "copy"] {
+            let hold = rt
+                .request_attachment(PROVIDER, id, name)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(hold.id(), &photo_id, "{name}");
+            assert_eq!(hold.read(0, 9).unwrap(), b"png bytes", "{name}");
+        }
+        assert_eq!(store.usage().sealed, 1, "an opened hold dropped is no loss");
+        drop(guard);
+        assert_eq!(store.usage().sealed, 0, "the record held it last");
+    }
+
+    /// The hold ends wherever the record ends: an accepted completion, a
+    /// failed delivery, the guard dropping. A refused completion ends neither.
+    #[tokio::test]
+    async fn the_records_hold_ends_with_the_record() {
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        let rt = runtime();
+        let begin = || {
+            let doc = seal_bytes(&store, "text/plain", b"doc");
+            rt.begin(
+                PROVIDER,
+                "echo-for-user",
+                &pending_ctx(None),
+                held(&[("doc", &doc)]),
+            )
+        };
+
+        let completed = begin();
+        let over = "x".repeat(PROVIDED_RESULT_BUDGET);
+        let id = completed.id().as_str();
+        assert!(matches!(
+            rt.complete(PROVIDER, id, Ok(json!(over).into())),
+            Err(CompleteError::InvalidOutcome(_))
+        ));
+        assert!(rt.request_attachment(PROVIDER, id, "doc").is_ok());
+        assert_eq!(store.usage().sealed, 1, "a refused completion keeps it");
+        rt.complete(PROVIDER, id, Ok(json!(1).into())).unwrap();
+        assert_eq!(store.usage().sealed, 0, "completed: the blob is gone");
+        drop(completed);
+
+        let failed = begin();
+        rt.fail_delivered(PROVIDER, &[failed.id().as_str().to_string()], "trap");
+        assert_eq!(store.usage().sealed, 0, "failed: the blob is gone");
+        drop(failed);
+
+        drop(begin());
+        assert_eq!(store.usage().sealed, 0, "guard dropped: the blob is gone");
+    }
+
+    /// An id not pending for the instance — another instance's, unknown, or
+    /// ended in any way — opens nothing, and says no more than that; a pending
+    /// request opens no name it does not carry.
+    #[tokio::test]
+    async fn a_request_attachment_needs_a_pending_id_and_a_name_it_carries() {
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        let rt = runtime();
+        let begin = || {
+            let doc = seal_bytes(&store, "text/plain", b"doc");
+            rt.begin(
+                PROVIDER,
+                "echo-for-user",
+                &pending_ctx(None),
+                held(&[("doc", &doc)]),
+            )
+        };
+
+        let live = begin();
+        let live_id = live.id().as_str();
+        for name in ["other", "", "not/a name"] {
+            assert_eq!(
+                rt.request_attachment(PROVIDER, live_id, name).unwrap_err(),
+                RequestAttachmentError::NotAttached,
+                "{name:?}"
+            );
+        }
+
+        let completed = begin();
+        let completed_id = completed.id().as_str().to_string();
+        rt.complete(PROVIDER, &completed_id, Ok(json!(1).into()))
+            .unwrap();
+        let failed = begin();
+        let failed_id = failed.id().as_str().to_string();
+        rt.fail_delivered(PROVIDER, std::slice::from_ref(&failed_id), "trap");
+        let dropped_id = begin().id().as_str().to_string();
+        let unknown = "0".repeat(32);
+        for (instance, id) in [
+            ("other", live_id),
+            (PROVIDER, completed_id.as_str()),
+            (PROVIDER, failed_id.as_str()),
+            (PROVIDER, dropped_id.as_str()),
+            (PROVIDER, unknown.as_str()),
+        ] {
+            assert_eq!(
+                rt.request_attachment(instance, id, "doc").unwrap_err(),
+                RequestAttachmentError::NotPending,
+                "{instance} {id}"
+            );
+        }
+        assert!(rt.request_attachment(PROVIDER, live_id, "doc").is_ok());
+    }
+
+    /// A call waiting through `execute` keeps its attachment through a GC
+    /// pass that evicts its request row and reaps, so the attachment still
+    /// opens; once the call ends at its deadline, the next reap deletes it.
+    #[tokio::test]
+    async fn a_pending_calls_attachment_outlives_its_row_and_goes_after_the_deadline() {
+        let (alert, _drain) = noop_alert_dispatcher();
+        let rt = ProviderRuntime::new(alert);
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        rt.attach(messenger.clone());
+        let tool = Arc::new(ProvidedTool::new(PROVIDER, &decl(1), rt.clone()));
+        let doc = seal_bytes(&store, "text/plain", b"doc");
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let call = tokio::spawn({
+            let tool = tool.clone();
+            let handed = held(&[("doc", &doc)]);
+            async move {
+                tool.execute(&ctx(None, Some(deadline)), json!({}), handed)
+                    .await
+            }
+        });
+        let id = published_id(&messenger).await;
+        drop(doc);
+
+        assert_eq!(evict_and_reap(&messenger).await, 0, "the record holds it");
+        let hold = rt.request_attachment(PROVIDER, &id, "doc").unwrap();
+        assert_eq!(hold.read(0, 3).unwrap(), b"doc");
+        drop(hold);
+
+        assert!(matches!(call.await.unwrap(), Err(ToolError::Internal(_))));
+        assert_eq!(
+            rt.request_attachment(PROVIDER, &id, "doc").unwrap_err(),
+            RequestAttachmentError::NotPending
+        );
+        assert_eq!(
+            messenger.reap_blobs().await.blobs,
+            1,
+            "the record held it last"
+        );
+        assert_eq!(store.usage().sealed, 0);
+    }
+
+    /// As above, for a caller that goes away: the aborted call's record ends
+    /// and the next reap deletes the attachment its evicted row named.
+    #[tokio::test]
+    async fn an_abandoned_calls_attachment_goes_at_the_next_reap() {
+        let rt = runtime();
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        rt.attach(messenger.clone());
+        let tool = Arc::new(ProvidedTool::new(PROVIDER, &decl(1), rt.clone()));
+        let doc = seal_bytes(&store, "text/plain", b"doc");
+        let call = tokio::spawn({
+            let tool = tool.clone();
+            let handed = held(&[("doc", &doc)]);
+            async move { tool.execute(&pending_ctx(None), json!({}), handed).await }
+        });
+        let id = published_id(&messenger).await;
+        drop(doc);
+
+        assert_eq!(evict_and_reap(&messenger).await, 0, "the record holds it");
+        assert!(rt.request_attachment(PROVIDER, &id, "doc").is_ok());
+
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            rt.request_attachment(PROVIDER, &id, "doc").unwrap_err(),
+            RequestAttachmentError::NotPending
+        );
+        assert_eq!(
+            messenger.reap_blobs().await.blobs,
+            1,
+            "the record held it last"
+        );
+        assert_eq!(store.usage().sealed, 0);
     }
 }

@@ -76,8 +76,9 @@ pub enum ComponentGrant {
     /// `brenn:processor/blobs` — read the blobs the activation's messages
     /// carry by byte range, create blobs, and publish messages that carry
     /// them. The backend host serves the whole interface; a surface host
-    /// serves every member but the tool-call forms, the members
-    /// [`SURFACE_BLOBS_MEMBERS`] lists (see [`ComponentGrant::served_members`]).
+    /// serves every member but the tool-call forms and `open-request`, the
+    /// members [`SURFACE_BLOBS_MEMBERS`] lists (see
+    /// [`ComponentGrant::served_members`]).
     Blobs,
     /// Fullscreen takeover of the page the component is placed on. Names no WIT
     /// interface: the capability is a binding to a takeover-plane channel, and
@@ -216,8 +217,8 @@ pub enum ServedMembers {
 
 /// The members of `brenn:processor/blobs@0.3.0` a surface host serves: the
 /// read side, `create`, the `writer` resource and `publish`. The tool-call
-/// forms `call-async`, `call-async-for` and `complete` are not served on a
-/// page.
+/// forms `call-async`, `call-async-for` and `complete`, and the provider's
+/// `open-request`, are not served on a page.
 pub const SURFACE_BLOBS_MEMBERS: &[&str] = &[
     "limits",
     "open",
@@ -337,7 +338,7 @@ impl ComponentGrant {
     ///
     /// A legal grant may still be served only in part on a host: that is
     /// [`ComponentGrant::served_members`]. `blobs` is legal on a surface and
-    /// served there without its tool-call forms.
+    /// served there without its tool-call forms and `open-request`.
     pub fn illegal_on(self, host: ComponentHost) -> Option<&'static str> {
         match (host, self) {
             (ComponentHost::Surface, Self::Store) => Some(
@@ -367,8 +368,9 @@ impl ComponentGrant {
 
     /// Which members of this grant's interface `host` serves, for a grant
     /// legal there. Every pair serves its whole interface but `blobs` on a
-    /// surface, which serves everything but the tool-call forms; a surface
-    /// refuses at boot a kind that imports any other member of it.
+    /// surface, which serves everything but the tool-call forms and
+    /// `open-request`; a surface refuses at boot a kind that imports any other
+    /// member of it.
     pub fn served_members(self, host: ComponentHost) -> ServedMembers {
         match (self, host) {
             (Self::Blobs, ComponentHost::Surface) => ServedMembers::Only(SURFACE_BLOBS_MEMBERS),
@@ -1298,7 +1300,7 @@ mod tests {
     }
 
     /// `blobs` is legal on both hosts; the surface serves reading, making and
-    /// publishing, and not the tool-call forms.
+    /// publishing, and not the tool-call forms or `open-request`.
     #[test]
     fn blobs_is_legal_on_both_hosts_and_served_without_tool_calls_on_a_surface() {
         for host in [ComponentHost::Surface, ComponentHost::TopLevel] {
@@ -1327,11 +1329,8 @@ mod tests {
                 "{producing} is not served on a page"
             );
         }
-        for tool_call in ["call-async", "call-async-for", "complete"] {
-            assert!(
-                !members.contains(&tool_call),
-                "{tool_call} is served on a page"
-            );
+        for refused in ["open-request", "call-async", "call-async-for", "complete"] {
+            assert!(!members.contains(&refused), "{refused} is served on a page");
         }
     }
 

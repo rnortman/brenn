@@ -48,7 +48,7 @@ use brenn_envelope::addressing::PROVIDER_CONCURRENCY_CEILING;
 use brenn_envelope::{GuestBody, MessageBody, MessageEnvelope};
 /// The blobs a completion or a published message carries, named in the
 /// [`ProvidesHost`] and [`ProcessorPublish`] seams.
-pub use brenn_messaging_store::blob::HeldAttachments;
+pub use brenn_messaging_store::blob::{BlobHold, HeldAttachments};
 
 /// The grant vocabulary, re-exported: what a load spec grants, what this host
 /// links and what an operator writes are one set of words, and a caller
@@ -967,6 +967,17 @@ pub enum ProvidesCallError {
     InvalidOutcome(String),
 }
 
+/// Why [`ProvidesHost::request_attachment`] gave no hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAttachmentRefusal {
+    /// The id is not pending for this component — answered, failed, expired,
+    /// abandoned by its caller, from before a restart, or never this
+    /// component's. Indistinguishable.
+    NotPending,
+    /// The request is pending and carries no attachment of that name.
+    NotAttached,
+}
+
 /// Host seam for the `provides` WIT interface — the pending-call table and the
 /// native tool substrate as seen from `brenn-wasm`.
 ///
@@ -976,7 +987,7 @@ pub enum ProvidesCallError {
 /// consumer's tool grants; checking that an id is pending for *this* component
 /// lives behind this seam.
 ///
-/// Contract: neither method may panic on guest-supplied input — an unknown id,
+/// Contract: no method may panic on guest-supplied input — an unknown id,
 /// malformed outcome or bad tool/args maps to a typed error. A host-side wiring
 /// invariant may panic per the project posture.
 pub trait ProvidesHost: Send + Sync {
@@ -1003,6 +1014,14 @@ pub trait ProvidesHost: Send + Sync {
         call_id: &str,
         with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError>;
+
+    /// A hold on attachment `name` of the request `id`, when `id` is pending
+    /// for this component.
+    fn request_attachment(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> Result<BlobHold, RequestAttachmentRefusal>;
 }
 
 /// Host callback for the `provides` interface. `Some` iff the `Provides`
@@ -6792,6 +6811,13 @@ mod processor_store_host_tests {
             _with_attachments: bool,
         ) -> Result<QueuedToolRequest, ToolCallError> {
             Err(ToolCallError::Denied("not pending".to_string()))
+        }
+        fn request_attachment(
+            &self,
+            _id: &str,
+            _name: &str,
+        ) -> Result<BlobHold, RequestAttachmentRefusal> {
+            Err(RequestAttachmentRefusal::NotPending)
         }
     }
 

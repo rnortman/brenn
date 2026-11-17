@@ -7,11 +7,15 @@
 //! OAuth provider and one host, which is all that rig assumes.
 
 use brenn_envelope::AttachmentName;
+use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
+use brenn_messaging::MountDebt;
+use brenn_messaging::testutils::owed_everywhere;
 use brenn_messaging_store::blob::BlobUsage;
 use brenn_messaging_store::testutils::seal_bytes;
 use brenn_oauth::testutil::ApiSeen;
-use brenn_tool_registry::HeldAttachments;
+use brenn_tool_registry::{HeldAttachments, ToolError, ToolOutput};
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 
 use super::google_workspace_rig::{self as workspace, Clauses, GoogleClass};
 use super::stub_rig::{StubRig, file_bytes};
@@ -47,14 +51,7 @@ async fn rig() -> StubRig {
 /// Put a 3 MiB PDF with `args`, running `steps` nested calls; every request
 /// the stub saw, and the answer.
 async fn put(r: &StubRig, args: Value, steps: usize) -> (Vec<ApiSeen>, Value, Vec<u8>) {
-    let bytes = file_bytes(SIZE);
-    let hold = seal_bytes(
-        r.messenger.blob_store().expect("a blob store"),
-        "application/pdf",
-        &bytes,
-    );
-    let attachments = brenn_messaging::testutils::held(&[(FILE, &hold)]);
-    drop(hold);
+    let (attachments, bytes) = a_file(r);
     let output = r
         .call_running("KitFilePut", args, attachments, steps)
         .await
@@ -93,10 +90,10 @@ async fn a_callers_file_is_the_put_body() {
 }
 
 /// The two-step put: the `PUT` is issued by the activation that receives the
-/// `HEAD`'s answer, so the body is opened from the request's window context
-/// rather than from the activation that delivered it.
+/// `HEAD`'s answer, so the body is opened by the request's pending id in a
+/// later activation than the one that delivered it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_put_after_a_head_opens_the_body_from_window_context() {
+async fn a_put_after_a_head_opens_the_body_in_a_later_activation() {
     let r = rig().await;
     let (seen, value, bytes) = put(&r, json!({ "path": FILES, "head": true }), 2).await;
     assert_eq!(seen.len(), 2, "a HEAD, then a PUT: {seen:?}");
@@ -161,4 +158,133 @@ async fn an_answer_is_the_callers_attachment() {
         },
         "the answer's blob is the caller's, not a copy"
     );
+}
+
+/// A 3 MiB PDF handed to a `KitFilePut` call as `file`.
+fn a_file(r: &StubRig) -> (HeldAttachments, Vec<u8>) {
+    let bytes = file_bytes(SIZE);
+    let hold = seal_bytes(
+        r.messenger.blob_store().expect("a blob store"),
+        "application/pdf",
+        &bytes,
+    );
+    (brenn_messaging::testutils::held(&[(FILE, &hold)]), bytes)
+}
+
+/// Call `KitFilePut` with `head: true`, serve it and run its `HEAD`, so the
+/// `HEAD`'s answer is owed to the provider and the `PUT` is the next step.
+/// The call's task and the request's id.
+async fn put_past_its_head(
+    r: &StubRig,
+    attachments: HeldAttachments,
+) -> (JoinHandle<Result<ToolOutput, ToolError>>, String) {
+    let call = r.call_for_alice_with(
+        "KitFilePut",
+        json!({ "path": FILES, "head": true }),
+        attachments,
+    );
+    let id = r.requested_id().await;
+    r.serve().await;
+    r.run_nested().await;
+    (call, id)
+}
+
+/// Abort a call's task, as a caller that stops waiting does, and wait until
+/// the call is gone.
+async fn drop_caller(call: JoinHandle<Result<ToolOutput, ToolError>>) {
+    call.abort();
+    assert!(
+        call.await.expect_err("the call was aborted").is_cancelled(),
+        "the call ended before it was dropped"
+    );
+}
+
+/// The ids of every request the provider's next activation is handed on its
+/// `tool-requests` port, context and new.
+async fn handed_requests(r: &StubRig) -> Vec<String> {
+    let (_, ports) = r
+        .messenger
+        .load_activation_snapshot(&r.provider_sub, &r.provider.inputs, MountDebt::Settled)
+        .await
+        .expect("the provider is owed an activation");
+    let requests = ports
+        .iter()
+        .find(|port| port.port == TOOL_REQUEST_INPUT_PORT)
+        .expect("the provider has a tool-requests port");
+    requests
+        .entries
+        .iter()
+        .map(|(_, envelope)| {
+            let body: Value =
+                serde_json::from_str(envelope.body.as_text().expect("a text request body"))
+                    .expect("a JSON request body");
+            body["id"].as_str().expect("a request id").to_string()
+        })
+        .collect()
+}
+
+/// A put whose request leaves the provider's request window while it waits
+/// on its `HEAD` still sends the caller's file: four newer requests, each
+/// abandoned by its caller once it is on the inbox, push the put's message
+/// out of the window its next activation is handed, and the body is opened
+/// by the pending id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_whose_request_left_the_window_still_sends_the_file() {
+    let r = rig().await;
+    let (attachments, bytes) = a_file(&r);
+    let (call, id) = put_past_its_head(&r, attachments).await;
+
+    let depth = 4;
+    for n in 0..depth {
+        let get = r.call_for_alice_with(
+            "KitFileGet",
+            json!({ "path": FILES }),
+            HeldAttachments::none(),
+        );
+        // The `HEAD`'s answer, and each request so far.
+        r.owed(&r.provider_sub, n + 2).await;
+        drop_caller(get).await;
+    }
+    let handed = handed_requests(&r).await;
+    assert_eq!(handed.len(), depth, "{handed:?}");
+    assert!(
+        !handed.contains(&id),
+        "the put's request is still in the window: {handed:?}"
+    );
+
+    r.serve().await;
+    r.run_nested().await;
+    r.serve().await;
+    let output = call.await.unwrap().expect("KitFilePut answered");
+    assert!(output.attachments.is_empty());
+    assert_eq!(output.value, json!({ "status": 200, "bytes": SIZE }));
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), 2, "a HEAD, then a PUT: {seen:?}");
+    assert_eq!(seen[0].method, "HEAD");
+    assert_put_carries(&seen[1], &bytes);
+    r.assert_finished(&id);
+}
+
+/// A put whose caller is gone before its `PUT` step sends nothing: the step
+/// finds the request no longer pending, no nested call is issued and no row
+/// is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_whose_caller_left_sends_no_file() {
+    let r = rig().await;
+    let (attachments, _) = a_file(&r);
+    let (call, id) = put_past_its_head(&r, attachments).await;
+    drop_caller(call).await;
+    assert!(r.runtime.serving(&r.provider.slug, &id).is_none());
+
+    r.serve().await;
+    assert!(
+        owed_everywhere(&r.messenger, &r.executor_sub())
+            .await
+            .is_empty(),
+        "a nested call was issued for a request nobody waits on"
+    );
+    let seen = r.seen();
+    assert_eq!(seen.len(), 1, "the HEAD alone: {seen:?}");
+    assert_eq!(seen[0].0, "HEAD");
+    assert!(r.inflight_keys().is_empty(), "the component kept a row");
 }

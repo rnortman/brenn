@@ -313,6 +313,7 @@ fn the_blob_caller_imports_tools_and_ports_for_their_types_alone() {
 
 /// The provider fixture completes through `blobs.complete` and nests through
 /// `blobs.call-async-for`, and imports `tools` and `provides` for their types.
+/// It never opens by pending id, so it does not import `open-request`.
 #[test]
 fn the_blob_provider_imports_tools_and_provides() {
     let engine = engine();
@@ -334,4 +335,25 @@ fn the_blob_provider_imports_tools_and_provides() {
     for function in ["complete", "call-async-for"] {
         assert!(blobs.iter().any(|m| m == function), "{blobs:?}");
     }
+    assert!(
+        !blobs.iter().any(|m| m == "open-request"),
+        "a provider that does not open by pending id imports open-request: {blobs:?}"
+    );
+}
+
+/// A component served by the kit's `serve_with_blobs` opens a request's
+/// attachments by pending id, so the kit suites run `open-request`.
+#[test]
+fn the_kit_file_fixture_imports_open_request() {
+    let engine = engine();
+    let blobs = instance_members(
+        &engine,
+        "processor-kit-file-test",
+        "brenn:processor/blobs@0.3.0",
+    )
+    .expect("processor-kit-file-test imports blobs");
+    assert!(
+        blobs.iter().any(|m| m == "open-request"),
+        "processor-kit-file-test does not import open-request: {blobs:?}"
+    );
 }

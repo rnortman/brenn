@@ -419,6 +419,9 @@ impl ToolRegistry {
         }
     }
 
+    // TODO(tool-provide-attachment-count): a provided tool's per-provide
+    // attachment count would be refused here, before `execute` publishes the
+    // request.
     /// The guard every call site that reaches `execute` runs first: a call
     /// carrying attachments to a tool that does not accept them is
     /// `InvalidArgs`.

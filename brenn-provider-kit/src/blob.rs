@@ -98,8 +98,8 @@ const QUOTA: &str = "the activation's bound on live blob handles or blob calls i
 pub enum OpenError {
     /// The request or answer carries no attachment of that name.
     NotAttached,
-    /// The request's message is no longer in the provider's request window.
-    LeftWindow,
+    /// The host no longer holds the request pending.
+    NotPending,
     /// The message names the blob and nothing holds it any longer.
     NotFound,
     Quota,
@@ -180,9 +180,7 @@ impl From<OpenError> for Failure {
     fn from(error: OpenError) -> Failure {
         internal(match error {
             OpenError::NotAttached => "blob open: no attachment of that name".to_string(),
-            OpenError::LeftWindow => {
-                "blob open: the request is no longer in this provider's request window".to_string()
-            }
+            OpenError::NotPending => "blob open: the request is no longer pending".to_string(),
             OpenError::NotFound => "blob open: the attachment's blob is no longer held".to_string(),
             OpenError::Quota => format!("blob open: {QUOTA}"),
             OpenError::Unavailable => UNAVAILABLE.to_string(),
@@ -263,11 +261,9 @@ impl From<SealError> for Failure {
 pub trait Blobs {
     fn limits(&self) -> Result<BlobLimits, Unavailable>;
 
-    // TODO(kit-request-attachment-outlives-window): open a pending request's
-    // attachment in any activation while the request is pending.
-    /// A handle to attachment `name` of pending request `id`, found by its
-    /// message's place in this activation's request window.
-    /// [`OpenError::LeftWindow`] when the message has left the window.
+    /// A handle to attachment `name` of pending request `id`, in any
+    /// activation while the host holds the request pending;
+    /// [`OpenError::NotPending`] once it does not.
     fn open_request(&self, id: &str, name: &str) -> Result<Blob, OpenError>;
 
     /// A handle to attachment `name` of the result correlated by `call_id`,

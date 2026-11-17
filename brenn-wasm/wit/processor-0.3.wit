@@ -12,8 +12,8 @@ package brenn:processor@0.3.0;
 ///
 /// Served by the backend host in full. A surface host serves `limits`,
 /// `open`, the `blob` resource, `create`, the `writer` resource and
-/// `publish`, and refuses a component that imports `call-async`,
-/// `call-async-for` or `complete`.
+/// `publish`, and refuses a component that imports `open-request`,
+/// `call-async`, `call-async-for` or `complete`.
 ///
 /// STABLE. No type or function of `blobs@0.3.0` is changed or removed, no
 /// case is added to a variant or an enum and no field to a record, and each
@@ -31,10 +31,13 @@ package brenn:processor@0.3.0;
 /// promise.
 ///
 /// Who may name a blob. A component names a blob only by a `blob` handle,
-/// and gets one in exactly two ways: `open`, for an attachment of a message
-/// in one of this activation's input port windows, and `writer.seal`, for a
-/// blob it made in this activation. No function takes a blob id. An id in a
-/// header, a body or a component's own store opens nothing.
+/// and gets one in exactly three ways: `open`, for an attachment of a message
+/// in one of this activation's input port windows; `open-request`, for an
+/// attachment of a request pending for this component; and `writer.seal`,
+/// for a blob it made in this activation. No function takes a blob id. A
+/// pending request's id is not a blob id, and one not pending for the caller
+/// opens nothing. An id in a header, a body or a component's own store opens
+/// nothing.
 ///
 /// Lifetime. A handle is a hold: a blob with an open handle is not deleted
 /// under it. Nothing a component holds outlives the activation. On `ok` the
@@ -42,7 +45,8 @@ package brenn:processor@0.3.0;
 /// every other handle and writer is dropped, so a sealed blob no published
 /// message names and an unsealed writer's bytes are deleted. On `err` or a
 /// trap nothing is published, and every blob the activation made is deleted.
-/// A blob it only opened lives on by the messages that name it. The one
+/// A blob it only opened lives on by the messages that name it, and one
+/// opened by `open-request` also by the pending request that holds it. The one
 /// exception is `complete`: a completion holds the blobs it names from the
 /// call, so a blob the activation made and completed with survives the
 /// activation's `err` or trap, as the completion does.
@@ -83,7 +87,9 @@ package brenn:processor@0.3.0;
 /// carry no attachments; `call-async`, `call-async-for` and `complete` of
 /// this interface are the forms that do. A request on `tool-requests` carries
 /// the attachments its caller gave, and a result on `tool-results` those the
-/// tool answered with; their bodies are those of the plain forms.
+/// tool answered with; their bodies are those of the plain forms. A request's
+/// attachments are also reachable through `open-request` for as long as the
+/// request is pending, wherever its message sits in the window.
 /// A `receive` reply, `calls.call` and `tools.call-fast` carry no
 /// attachments. TODO(blobs-on-sync-calls)
 ///
@@ -224,6 +230,44 @@ interface blobs {
     /// page forwarded there; `not-found` there means the message left the
     /// page's window after the activation's windows were read.
     open: func(port: string, index: u32, name: string) -> result<blob, open-error>;
+
+    variant open-request-error {
+        /// The component lacks the `provides` grant.
+        not-permitted,
+        /// `id` is not pending for this component: answered, failed, expired,
+        /// abandoned by its caller, from before a restart, or another
+        /// component's. Indistinguishable on purpose.
+        not-pending,
+        /// The request is pending and carries no attachment `name`.
+        not-attached,
+        /// As `open-error.quota-exceeded`.
+        quota-exceeded,
+    }
+
+    /// A handle to attachment `name` of the request `id`, pending for this
+    /// component, in any activation and wherever the request's message sits
+    /// or no longer sits in the `tool-requests` window. Takes a hold and
+    /// reads no byte.
+    ///
+    /// The host holds a pending request's attachments from the moment the
+    /// request is published until the request ends: by its completion, by a
+    /// failed activation, by its deadline, by its caller leaving. So the
+    /// answer does not depend on the window. The handle is a hold like any
+    /// other and may be forwarded: given to `call-async-for`, the nested
+    /// call's message holds the blob from that call, so the request may end
+    /// afterwards without the nested call losing its body.
+    ///
+    /// Needs the `provides` grant, checked at the call: the error type wraps
+    /// nothing, so an artifact that calls it imports no interface but `blobs`
+    /// for it. Without the grant every call is `not-permitted`. It counts as
+    /// one blob call and its handle as one handle, as `open`'s do.
+    ///
+    /// The checks run in a fixed order: the blob-call budget
+    /// (`quota-exceeded`); the `provides` grant; the handle bound
+    /// (`quota-exceeded`); the id (`not-pending`); the name (`not-attached`).
+    ///
+    /// Not served on a surface: a component that imports it is refused there.
+    open-request: func(id: string, name: string) -> result<blob, open-request-error>;
 
     /// A blob being written. Dropped unsealed, its bytes are deleted.
     resource writer {

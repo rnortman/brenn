@@ -883,8 +883,8 @@ pub fn brenn_processor_config_get(instance: &str, key: &str) -> Option<String> {
 // ── the blobs seam ──────────────────────────────────────────────────────────
 //
 // `brenn:processor/blobs@0.3.0` as a page serves it: everything but the
-// tool-call forms. Every export takes the instance from the loader's own
-// closure, and every decision is the innermost in-flight frame's
+// tool-call forms and `open-request`. Every export takes the instance from the
+// loader's own closure, and every decision is the innermost in-flight frame's
 // [`crate::blob_scope::BlobScope`]'s, answered from the page's attachment
 // cache, its blob table, its ledger of page-made bytes and the blob door the
 // last attachment advertised. A refusal is thrown as `{ payload: variant }`,

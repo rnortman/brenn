@@ -2364,6 +2364,7 @@ mod tests {
             CALLER_SLUG,
             "echo-for-user",
             &crate::provided::tests::pending_ctx(Some(alice())),
+            brenn_messaging_store::blob::HeldAttachments::none(),
         );
         insert_request(
             &h,
@@ -2413,6 +2414,7 @@ mod tests {
             "other",
             "echo-for-user",
             &crate::provided::tests::pending_ctx(Some(alice())),
+            brenn_messaging_store::blob::HeldAttachments::none(),
         );
         insert_request(
             &h,
@@ -2452,6 +2454,7 @@ mod tests {
             CALLER_SLUG,
             "echo-for-user",
             &crate::provided::tests::pending_ctx(Some(alice())),
+            brenn_messaging_store::blob::HeldAttachments::none(),
         );
         insert_request(&h, &request_body("busy", "brenn"), Some(h.results_uuid)).await;
         insert_request(
@@ -2549,6 +2552,7 @@ mod tests {
                 Some(alice()),
                 Some(tokio::time::Instant::now() + Duration::from_secs(10)),
             ),
+            brenn_messaging_store::blob::HeldAttachments::none(),
         );
         let mut body: Value = serde_json::from_str(&provided_body("nested")).unwrap();
         body["serving"] = json!(served.id().as_str());

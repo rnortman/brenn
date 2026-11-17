@@ -17,7 +17,7 @@ use crate::{
     Processor, PublishAttachmentsError, PublishOptions, Urgency,
     blobs::{BlobLimits, CreateError, Gap, OpenError, ReadError, SealError, WriteError},
     calls::CallError,
-    provides::CompleteAttachmentsError,
+    provides::{CompleteAttachmentsError, RequestAttachmentError},
     tools::CallAttachmentsError,
 };
 
@@ -292,6 +292,15 @@ pub(crate) fn blob_open(port: &str, index: u32, name: &str) -> Result<RawBlob, O
         raw_blobs::OpenError::NotPermitted => OpenError::NotPermitted,
         raw_blobs::OpenError::NotFound => OpenError::NotFound,
         raw_blobs::OpenError::QuotaExceeded => OpenError::QuotaExceeded,
+    })
+}
+
+pub(crate) fn blob_open_request(id: &str, name: &str) -> Result<RawBlob, RequestAttachmentError> {
+    raw_blobs::open_request(id, name).map_err(|e| match e {
+        raw_blobs::OpenRequestError::NotPermitted => RequestAttachmentError::NotPermitted,
+        raw_blobs::OpenRequestError::NotPending => RequestAttachmentError::NotPending,
+        raw_blobs::OpenRequestError::NotAttached => RequestAttachmentError::NotAttached,
+        raw_blobs::OpenRequestError::QuotaExceeded => RequestAttachmentError::QuotaExceeded,
     })
 }
 

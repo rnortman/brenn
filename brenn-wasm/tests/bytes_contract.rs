@@ -873,9 +873,9 @@ fn the_surface_check_passes_a_read_only_blobs_importer_under_an_alias() {
 /// name, under the served name and under an alias an exact-name check would let
 /// through to a type stage that links them.
 #[test]
-fn the_surface_check_refuses_each_blobs_tool_call_form_by_member() {
+fn the_surface_check_refuses_each_blobs_member_a_page_does_not_serve() {
     for name in ["brenn:processor/blobs@0.3.0", "brenn:processor/blobs@0.3.1"] {
-        for member in ["call-async", "call-async-for", "complete"] {
+        for member in ["open-request", "call-async", "call-async-for", "complete"] {
             let bytes = surface_fixture(&blobs_import(
                 name,
                 READ_ERROR,

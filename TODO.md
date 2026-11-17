@@ -20,6 +20,25 @@ to `max_write_bytes` itself to avoid it. Done when `write` writes full
 pieces straight from the argument and buffers only the tail, and its doc
 says a caller may pass any length.
 
+## `blob-budget-rule-sized-by-window`
+
+A durable channel's row is deleted by the bus GC pass, not when newer rows
+push it out of the channel's window, so between two passes a channel holds
+every row published since the last one, and each row holds its blobs in the
+blob pool. The documents size the pool by the window all the same:
+`docs/config-dsl.md` ("The OAuth tools") gives `blob_budget_bytes` as the sum,
+over the inboxes that receive attachment answers, of depth × `max_blob_bytes`,
+and `docs/security-posture.md` and `blob-budget-per-component` say a tool
+call's blobs rest on its rows "for that channel's window". A caller that takes
+more attachment answers between two passes than its result inbox is deep holds
+more than the rule counts, and a pool sized by the rule can fill. Decide
+whether a row that names blobs is evicted when it is displaced, or the pool is
+reaped when a write is refused for budget, or the rule is restated with the GC
+interval as a term. Done = the sizing rule in `docs/config-dsl.md` is a bound
+the host keeps, with a test that publishes attachment answers past an inbox's
+depth between two passes; or the documents state the interval term and no
+passage says "for that channel's window" of a durable row's blobs.
+
 ## `gmail-body-forms-as-blobs`
 
 `GmailRead` answers a message's body only as converted text, cut at
@@ -115,6 +134,25 @@ leaving it with built bodies moved to blobs; `MAX_ASYNC_RESULT_BYTES`
 recorded, and under either of the first two a component sends a nested call
 over 64 KiB with a test. The comment sits at `PROCESSOR_MAX_TOOL_ARGS_BYTES`
 in `brenn-wasm/src/lib.rs`.
+
+## `tool-provide-attachment-count`
+
+A tool declaring `accepts_attachments` is sent up to
+`MAX_ATTACHMENTS_PER_MESSAGE` (32) attachments on a request, whatever number
+it takes, and the host publishes a provided tool's request into the provider's
+durable request inbox before the provider can refuse a count it does not take.
+The refused request's blobs stay charged to the blob pool until the bus GC
+pass that follows its row leaving that inbox's window, so a provider cannot
+state a blob-pool term tighter than 32 × `max_blob_bytes` for every request
+its inbox holds between two passes (the interval term is
+`blob-budget-rule-sized-by-window`'s). Build: a per-provide attachment count (for
+example `max_attachments` beside `accepts_attachments`), enforced by the host
+before the request is published. It is a new key of the `provide` vocabulary
+and a new refusal, not a change to the 32. Done = a request carrying more than
+a provide's count is refused with nothing published to the provider's request
+inbox, with a test on each path that reaches a provided tool; or
+`docs/component-packages.md` records 32 a request as what a provider's
+blob-pool term is sized for, and why.
 
 ## `attach-blocking-second-loop-and-dial`
 
@@ -999,23 +1037,6 @@ Done = for (a), a component reads a 304 and its headers through the kit, with
 a test; for (b), this entry and its comment removed, the limit staying in the
 reader's documentation. The `TODO(kit-payload-reader-cannot-read-304)` comment
 sits at `read_api_payload` in `brenn-provider-kit/src/answer.rs`.
-
-## `kit-request-attachment-outlives-window`
-
-A provider's request carries the attachments its caller gave, and a component
-reaches one only by its message's place in the `tool-requests` window. The
-window holds the last Σ `max_concurrency` requests, the pending table holds no
-attachments (`PendingCall` in `brenn-tool-registry/src/provided.rs`), and a
-request still pending is displaced when that many newer requests arrive. The
-kit therefore answers `internal` when a queued first step or a later step
-needs a request's attachment that has left the window
-(`OpenError::LeftWindow`). Build: the host holds a pending request's
-attachments for as long as the request is pending, and a function of the
-`blobs` interface opens one by pending id — a WIT addition under the
-interface's version rule. Done = a kit request's attachment opens in any
-activation while the request is pending, with a test that displaces its
-message from the window first; or `docs/component-packages.md` records the
-window as the contract and why.
 
 ## `kit-nested-call-body-built-in-activation`
 

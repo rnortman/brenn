@@ -126,11 +126,11 @@ the 0.2.0 world with `blobs` imported. A kind that does not name `blobs` in
 `requires` does not import it, and its artifact, its record and its spec are
 what they were. A kind that does needs a brenn new enough to link it, by the
 same ordering rule as `calls`. The backend serves the whole interface. A
-surface serves everything but the tool-call forms — `limits`, `open`, a blob's
-`size`, `content-type` and `read`, `create`, the `writer` resource and
-`publish` — and a kind that imports `call-async`, `call-async-for` or
-`complete` is refused when its artifact is checked at boot, naming the
-function. A kind placed on a surface with the `blobs` grant reads, makes and
+surface serves everything but the tool-call forms and `open-request` —
+`limits`, `open`, a blob's `size`, `content-type` and `read`, `create`, the
+`writer` resource and `publish` — and a kind that imports `open-request`,
+`call-async`, `call-async-for` or `complete` is refused when its artifact is
+checked at boot, naming the function. A kind placed on a surface with the `blobs` grant reads, makes and
 forwards blobs there. On a page `open` succeeds for any attachment of a message
 in the activation's windows, and `read` answers `unavailable` when the page
 does not hold that attachment's bytes (`docs/message-bus.md` §2.1.2a, "A
@@ -167,6 +167,16 @@ longer links and is rebuilt against the current `brenn-guest`; one that matches
 `brenn_guest::blobs::ReadError` exhaustively gains an arm for
 `ReadError::Unavailable`.
 
+An addition to `blobs@0.3.0` in force: **`open-request`**, a function that
+opens an attachment of a request pending for the calling component by the
+request's pending id and the attachment's name, with an error variant of its
+own, `open-request-error`. It was added under the interface's rule above, as
+`mqtt-publish-expiring` was to `mqtt`: no package version bump and no new
+grant word, and no existing type or function changed. A component that does
+not call it imports nothing new, so a bundle built before it links as it did.
+One that calls it needs a brenn that serves it, by the same ordering rule as
+`calls`. `brenn-guest` reaches it through `provides::open_request_attachment`.
+
 **Blobs and tool calls.** An asynchronous tool call carries named
 attachments by reference in both directions. Three functions of `blobs` are
 the forms that do, each taking a list of `(name, blob)` pairs as
@@ -198,7 +208,12 @@ read, so:
 - a provider that makes nested calls, plain or with attachments, requires
   `tools` as well, because a nested call is admitted by the provider's own
   tool grants and its result arrives on `tool-results`;
-- a class that publishes with attachments requires `ports` and `blobs`.
+- a class that publishes with attachments requires `ports` and `blobs`;
+- a provider that opens its requests' attachments by pending id
+  (`open-request`) requires `provides` and `blobs`. Its error type wraps
+  nothing, so the artifact imports no interface but `blobs` for it, and the
+  host checks `provides` at the call: without it every call is
+  `not-permitted`.
 
 A component that calls none of the three imports none of them, and nothing
 through them: an artifact already built is unaffected by their addition.
@@ -209,13 +224,16 @@ names the caller or the tool gave; their bodies are unchanged. `blobs.open`
 reaches them by `(port, index, name)`, as on any input port. A result carries
 attachments only when its outcome is `ok`. `brenn-guest`'s
 `tools::ToolResult` and `provides::ToolRequest` list them in `attachments` and
-open one with `open(name)`. `ToolRequest::open` reaches a request only in the
-activation that delivers it new; `provides::open_request_attachment(activation,
-id, name)` opens an attachment of the request `id` wherever its message sits in
-the activation's `tool-requests` window, new or context, and answers
-`NotInWindow` once newer requests have displaced it. The window holds the last
-Σ `max_concurrency` requests of the provider's tools, so a request that waits
-behind that many newer ones can no longer reach its attachments.
+open one with `open(name)`. `ToolRequest::open` opens by the message's place,
+through `blobs.open`, and only in the activation that delivers the request.
+`provides::open_request_attachment(id, name)` opens through `blobs.open-request`
+by the request's pending id, in any activation while the request is pending,
+wherever its message sits or no longer sits in the `tool-requests` window. It
+answers `NotPermitted` without the `provides` grant, `NotPending` when `id` is
+not pending for the component — answered, failed, expired, abandoned by its
+caller, from before a restart, or another component's, told apart from
+nothing — `NotAttached` when the request carries no attachment of that name,
+and `QuotaExceeded` past the activation's blob-call or handle bound.
 
 *A host tool that takes and answers attachments.* `api-request` is one: its
 `body_attachment` argument names the call's attachment to send as the request
@@ -229,8 +247,18 @@ an answer, and `api-request` refuses its `response_attachment` `denied`.
 *Who holds a blob.* A call is buffered and flushed as the plain form is: the
 request reaches the bus iff the activation returns `ok`, and the buffered
 request holds its blobs until then; an `Err` or a trap drops them. On the bus,
-the request row holds them for its channel's window, whatever becomes of the
-call. A completion is immediate, as `provides.complete` is, and it is the one
+the request row holds them, whatever becomes of the call, until the bus GC pass
+that follows the row leaving its channel's window. A provided tool's request is
+also held by its pending record, from before the request is published until
+the call ends — completed, failed, past its deadline or its caller gone: one
+count on each distinct blob the request names, charging nothing, for at most
+Σ `max_concurrency` records an instance at once, each for at most the 240
+seconds a provided call is given. The record's hold outlasts the row only when
+a GC pass evicts the row of a request still pending, and the blob then goes at
+the first reap after the call ends, so the provider's side keeps alive at
+most the attachments of that many requests for at most one GC interval past
+each one's end. The record is in memory: after a restart none exists, and the
+rows hold what they held. A completion is immediate, as `provides.complete` is, and it is the one
 exception to "nothing a component holds outlives the activation": the
 completion holds the blobs it names from the call, so a blob the activation
 made and completed with survives the activation's later `Err` or trap, as the
@@ -544,6 +572,28 @@ before, so a row written before the cut parses after it. A component that uses
 no attachment changes signatures and literals and nothing else, keeps calling
 `serve`, and keeps its grants. `brenn-guest` gained
 `provides::open_request_attachment` (an addition; no WIT changed).
+
+Another cut of this kind in force now: **a request's attachment opens by
+pending id.** In `brenn-guest`, `provides::open_request_attachment(activation,
+id, name)` is `open_request_attachment(id, name)`: it takes no activation and
+calls `blobs.open-request`, so a component that calls it imports that function
+and needs a brenn that serves it. `provides::RequestAttachmentError`'s cases
+are the interface's — `NotPermitted`, `NotPending`, `NotAttached`,
+`QuotaExceeded` — so `RequestAttachmentError::NotInWindow`,
+`RequestAttachmentError::Open` and `RequestAttachmentError::Malformed` are
+gone. In `brenn-provider-kit`, `OpenError::LeftWindow` is gone and
+`OpenError::NotPending` added, so an exhaustive match changes an arm, and a
+step that needs an ended request's attachment fails with "the request is no
+longer pending; its attachment `<name>` was not sent" where it named the
+window, a completion the host drops.
+`MemoryHost::request_attachments_left_window` is
+`MemoryHost::requests_not_pending`, under which a request's attachment
+answers `NotPending` and the kit's failure is recorded as its completion.
+`brenn_wasm::ProvidesHost` has a new required method, `request_attachment`,
+which a harness that delivers requests with attachments answers from them
+while the request is pending. A component served by
+`brenn-provider-kit-guest`'s `serve_with_blobs` imports `open-request`, whether
+or not its tools take attachments, so it needs a brenn that serves it.
 
 Another cut of this kind in force now: **`MessageEnvelope.body` is a
 `MessageBody`**, bytes with an optional content type, re-exported from
@@ -1029,13 +1079,13 @@ one that reads an answer by range and builds the blob it completes with.
 
 Three limits are the component's to design for:
 
-- **A request's attachments reach as far as its window.** A request's
-  attachment opens in the activation that delivers it, and afterwards only
-  while its message is among the last Σ `max_concurrency` messages of the
-  provider's request inbox. A queued first step or a later step whose request
-  has been displaced answers the request `internal` ("the request's
-  attachment `<name>` is no longer in this provider's request window; newer
-  requests displaced it while this one waited"), without spending the call
+- **A request's attachments last as long as the request.** A request's
+  attachment opens at any step — a first step, a queued first step, a later
+  step — while the host holds the request pending, wherever its message sits
+  in the provider's request inbox. A step that needs one after the request
+  has ended — its deadline passed, its caller gone, a restart — answers the
+  request `internal` ("the request is no longer pending; its attachment
+  `<name>` was not sent"), which the host drops, without spending the call
   budget.
 - **An activation's blob bounds are shared** by every step it runs: the 64 MiB
   it may write, its 4,096 blob calls and the fuel attachments add. A refused
@@ -1062,9 +1112,12 @@ Three limits are the component's to design for:
 
 `MemoryHost` serves `Blobs` in memory for a host test: `seed_request` and
 `seed_result` give a request or a result an attachment's bytes; the limits,
-an activation's write and call budgets, a window-displacement switch and
-scripted `create` and `write` refusals stand in for the host's; and each nested
-call's body and each completion's attachments are recorded with their bytes.
+an activation's write and call budgets, a switch under which every
+request's attachment answers `NotPending` (`requests_not_pending`; calls and
+completions are still recorded, so a test sees the failure the kit gives,
+which the host drops) and scripted `create` and `write` refusals
+stand in for the host's; and each nested call's body and each completion's
+attachments are recorded with their bytes.
 
 ### The gate set
 

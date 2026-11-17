@@ -15,8 +15,8 @@ use brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT;
 use brenn_wasm::{
     GuestAlertSeverity, HostActivation, KvStore, MqttPublishFn, MqttPublishOutcome, OutputAclFn,
     OutputPortSpec, ProcessorAlerter, ProcessorLoadSpec, ProcessorUrgency, ProvidesCallError,
-    ProvidesHost, ProvidesHostFn, QueuedToolRequest, ReplayComponent, SinkBudget, ToolCallError,
-    ToolHost, ToolHostFn,
+    ProvidesHost, ProvidesHostFn, QueuedToolRequest, ReplayComponent, RequestAttachmentRefusal,
+    SinkBudget, ToolCallError, ToolHost, ToolHostFn,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -258,8 +258,9 @@ pub fn noop_tool_host() -> ToolHostFn {
     Arc::new(NotGrantedToolHost)
 }
 
-/// `ProvidesHost` that holds no pending request: every completion is
-/// `not-pending` and every on-behalf-of call is `denied`.
+/// `ProvidesHost` that holds no pending request: every completion and every
+/// request attachment is `not-pending`, and every on-behalf-of call is
+/// `denied`.
 ///
 /// For tests that grant `Provides` but do not serve a request — the `load`
 /// invariant requires a `Some` provides_host whenever the grant is present.
@@ -283,6 +284,13 @@ impl ProvidesHost for NothingPendingProvidesHost {
         _with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
         Err(ToolCallError::Denied("not pending".to_string()))
+    }
+    fn request_attachment(
+        &self,
+        _id: &str,
+        _name: &str,
+    ) -> Result<brenn_wasm::BlobHold, RequestAttachmentRefusal> {
+        Err(RequestAttachmentRefusal::NotPending)
     }
 }
 

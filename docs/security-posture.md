@@ -899,9 +899,11 @@ by reference (`docs/message-bus.md` §2.1.2a).
   attachments only if its declaration says so, checked before it runs; a
   provider's completion holds the blobs it names past its activation's
   `Err` or trap, and they drop with the call if its waiter is gone. A blob
-  handed to a provided tool stays on the provider's request inbox for that
-  inbox's window, whatever becomes of the call: handing a provider a blob is
-  giving it that blob.
+  handed to a provided tool stays on the provider's request inbox until the
+  bus GC pass that follows its row leaving that inbox's window, whatever
+  becomes of the call, and is held beside that by the request's pending
+  record until the call ends: handing a provider a blob is giving it that
+  blob.
 - **What an app's result inbox exposes: nothing to any policy.** A tool
   result that carries attachments to a conversation is published on
   `brenn:app-tool-results/<app-slug>` and written into the calling
@@ -1055,8 +1057,9 @@ by reference (`docs/message-bus.md` §2.1.2a).
   component's budget refusals. A conversation's rate is limited by its send
   budget and rate. A tool call's blobs rest on the rows of the call — the
   request on `brenn:tools/<tool>` and on a provider's request inbox, and the
-  result on the caller's inbox, a component's or an app's — each for that
-  channel's window, so a caller fills the pool through the channels of the
+  result on the caller's inbox, a component's or an app's — each until the bus
+  GC pass that follows the row leaving that channel's window, and a provided
+  call's request also on its pending record until the call ends, so a caller fills the pool through the channels of the
   tools it calls, and a provider through its callers' inboxes; after a
   restart an app's result inbox holds blobs no conversation can name until its
   window turns over. A per-producer share of the budget is
@@ -1381,9 +1384,10 @@ body field.
 
 - **An id acts only while its caller waits.** A pending record lives exactly as
   long as its caller's wait, and no longer: completion, failure, expiry and a
-  dropped waiter all remove it. `complete` and `call-async-for` on an id not
-  pending for this component are refused (`not-pending`, `denied`), and an id
-  pending for another component is indistinguishable from an unknown one.
+  dropped waiter all remove it. `complete`, `call-async-for` and
+  `open-request` on an id not pending for this component are refused
+  (`not-pending`, `denied`, `not-pending`), and an id pending for another
+  component is indistinguishable from an unknown one.
 - **The acting user is read after admission.** The executor reads the user of a
   nested call from the pending record once, after the nested call's permit is
   acquired and immediately before it runs. A nested call whose record went away
@@ -1413,13 +1417,13 @@ Limits, stated beside the guarantees:
   reads, as the component's own calls do (§9f).
 - A request delivered after its record is gone (restart, expiry) is served to a
   provider that then cannot act on it or complete it.
-- A provider's reach to its requests' attachments is its request window. It
-  opens one by the request message's place in the `tool-requests` window, which
-  holds the last Σ `max_concurrency` requests; the pending record holds no
-  attachments. A request still pending whose message newer requests displaced
-  can no longer reach its attachments, and the provider kit answers it
-  `internal` (`kit-request-attachment-outlives-window` in `TODO.md`). Nothing
-  wider is reachable: a request's attachments are what its caller handed it.
+- A provider's reach to its requests' attachments is its pending requests. It
+  opens one by pending id and attachment name (`blobs.open-request`); the id is
+  checked against the pending table for the calling instance on every call,
+  and the pending record holds the request's attachments until the call ends.
+  Nothing wider is reachable: a request's attachments are what its caller
+  handed it, and a provider that could already open them in the activation
+  that delivered the request gains time, not blobs.
 - A live request can be pushed out of a provider's request inbox unseen, when a
   later request expires or its caller abandons it before the provider runs. It
   is answered `internal` at its deadline and nothing runs for it. A drop on the

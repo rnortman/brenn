@@ -537,19 +537,19 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
         }
         Ok(match self.host.open_request(&entry.id, name) {
             Ok(blob) => Ok(blob),
-            Err(OpenError::LeftWindow | OpenError::NotFound) => {
+            Err(OpenError::NotPending) => {
                 self.host.log(
-                    Level::Warn,
+                    Level::Info,
                     format!(
-                        "{} step {} for {}: attachment `{name}` has left the request window",
+                        "{} step {} for {}: the request is no longer pending; attachment \
+                         `{name}` not sent",
                         entry.tool.name(),
                         entry.call.step,
                         entry.id
                     ),
                 );
                 Err(crate::call::internal(format!(
-                    "the request's attachment `{name}` is no longer in this provider's request \
-                     window; newer requests displaced it while this one waited"
+                    "the request is no longer pending; its attachment `{name}` was not sent"
                 )))
             }
             Err(OpenError::NotAttached) => {
@@ -1427,20 +1427,22 @@ mod tests {
         let row = InFlight::<Fixture>::decode(&host.rows(INFLIGHT_NS)[0].1).unwrap();
         assert_eq!(row.attachments, [file]);
 
-        host.request_attachments_left_window(true);
+        host.requests_not_pending(true);
         let late = Request { id: id(1), ..put };
         host.activate::<Files>(&(), input(1, vec![late], vec![]))
             .unwrap();
         assert!(host.take_calls().is_empty());
-        assert_eq!(
-            errors(&host.take_completions()),
-            [(
-                id(1).as_str(),
-                ErrorKind::Internal,
-                "the request's attachment `file` is no longer in this provider's request window; \
-                 newer requests displaced it while this one waited"
-            )]
+        assert_eq!(host.take_completions(), [not_sent(1)]);
+        assert_eq!(host.rows(INFLIGHT_NS).len(), 1);
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        assert!(
+            host.take_log()
+                .iter()
+                .any(|(level, line)| *level == Level::Info
+                    && line
+                        .contains("the request is no longer pending; attachment `file` not sent"))
         );
+        host.requests_not_pending(false);
 
         host.set_blob_limits(Some(crate::blob::BlobLimits {
             max_read_bytes: 1024,
@@ -1468,6 +1470,19 @@ mod tests {
         assert_eq!(completion.attachments[0].name, "copy");
         assert_eq!(completion.attachments[0].bytes, bytes);
         assert_eq!(host.peak_handles(), 2);
+    }
+
+    /// The kit's failure for request `n`, whose attachment `file` it could
+    /// not open because the request is no longer pending.
+    fn not_sent(n: usize) -> Completion {
+        Completion {
+            id: id(n),
+            answer: Answered::Error(
+                ErrorKind::Internal,
+                "the request is no longer pending; its attachment `file` was not sent".to_string(),
+            ),
+            attachments: Vec::new(),
+        }
     }
 
     fn put(n: usize, file: &crate::blob::Attached) -> Request {
@@ -1521,10 +1536,10 @@ mod tests {
     }
 
     #[test]
-    fn a_body_attachment_that_left_the_window_spends_no_budget() {
+    fn a_body_attachment_of_a_request_no_longer_pending_spends_no_budget() {
         let host = MemoryHost::new();
         let file = host.seed_request(&id(0), "file", "text/plain", b"x".to_vec());
-        host.request_attachments_left_window(true);
+        host.requests_not_pending(true);
         let mut new = vec![put(0, &file)];
         new.extend(requests(1..CALL_BUDGET + 1));
         host.activate::<Files>(&(), input(0, new, vec![])).unwrap();
@@ -1533,14 +1548,18 @@ mod tests {
             (1..=CALL_BUDGET).map(id).collect::<Vec<_>>()
         );
         assert!(host.rows(BACKLOG_NS).is_empty());
-        let completions = host.take_completions();
-        assert_eq!(errors(&completions).len(), 1);
-        assert_eq!(completions[0].id, id(0));
+        assert_eq!(host.take_completions(), [not_sent(0)]);
+        assert!(
+            host.rows(INFLIGHT_NS)
+                .iter()
+                .all(|(_, bytes)| InFlight::<Fixture>::decode(bytes).unwrap().id != id(0))
+        );
         assert!(
             host.take_log()
                 .iter()
-                .any(|(level, line)| *level == Level::Warn
-                    && line.contains("attachment `file` has left the request window"))
+                .any(|(level, line)| *level == Level::Info
+                    && line
+                        .contains("the request is no longer pending; attachment `file` not sent"))
         );
     }
 
