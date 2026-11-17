@@ -36,9 +36,9 @@ pub mod testutil;
 pub use brenn_messaging_store::blob::HeldAttachments;
 pub use cell::ToolRegistryCell;
 pub use descriptor::{
-    AclDenied, DEFAULT_FAST_BUDGET, ENVELOPE_MARGIN, Idempotency, MAX_ARGS_BYTES,
-    MAX_ASYNC_RESULT_BYTES, MAX_FAST_BUDGET, MAX_FAST_CALLS_PER_ACTIVATION, MAX_FAST_RESULT_BYTES,
-    PROVIDED_TOOL_CEILING, ToolClass, ToolDescriptor, ToolError, UserBinding,
+    AclDenied, DEFAULT_FAST_BUDGET, ENVELOPE_MARGIN, Idempotency, MAX_ASYNC_RESULT_BYTES,
+    MAX_FAST_BUDGET, MAX_FAST_CALLS_PER_ACTIVATION, MAX_FAST_RESULT_BYTES, PROVIDED_TOOL_CEILING,
+    ToolClass, ToolDescriptor, ToolError, UserBinding,
 };
 pub use executor::{
     CallerGrantTable, CallerGrants, TOOL_EXECUTOR_COMPONENT, ToolCallerGrants, ToolExecutor,

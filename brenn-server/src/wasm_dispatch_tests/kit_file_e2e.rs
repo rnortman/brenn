@@ -1,8 +1,9 @@
 //! Files through a provider-kit component, end to end: the compiled
 //! `processor-kit-file-test` fixture, served by the kit's `serve_with_blobs`,
 //! forwards a caller's attachment as a nested `api-request`'s body and an
-//! `api-request` answer's blob as its own completion's attachment, through
-//! the real guest adapter. The fixture's instance is lowered from its
+//! `api-request` answer's blob as its own completion's attachment, and builds
+//! a nested call's body when the call is issued, through the real guest
+//! adapter. The fixture's instance is lowered from its
 //! specification onto the rig the Google suites share: its `config` names an
 //! OAuth provider and one host, which is all that rig assumes.
 
@@ -10,7 +11,7 @@ use brenn_envelope::AttachmentName;
 use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
 use brenn_messaging::MountDebt;
 use brenn_messaging::testutils::owed_everywhere;
-use brenn_messaging_store::blob::BlobUsage;
+use brenn_messaging_store::blob::{BlobHold, BlobUsage};
 use brenn_messaging_store::testutils::seal_bytes;
 use brenn_oauth::testutil::ApiSeen;
 use brenn_tool_registry::{HeldAttachments, ToolError, ToolOutput};
@@ -43,6 +44,15 @@ const FILE: &str = "file";
 const SIZE: usize = 3 << 20;
 
 const CLAUSES: Clauses<'static> = &[("PUT", FILES), ("HEAD", FILES), ("GET", FILES)];
+/// The fixture's Σ `max_concurrency`, its request window's depth.
+const WINDOW: usize = 12;
+/// The most bodies the provider kit builds in one activation.
+const BUILD_BUDGET: usize = 4;
+/// How many times `KitBodyPut` repeats its text: the built body is over the
+/// 64 KiB a component's call arguments are capped at.
+const TIMES: usize = 80;
+/// The size of the file a built body ends with.
+const BUILT_FILE_SIZE: usize = 1 << 20;
 
 async fn rig() -> StubRig {
     workspace::rig(&KIT_FILE, CLAUSES).await
@@ -76,6 +86,164 @@ fn assert_put_carries(seen: &ApiSeen, bytes: &[u8]) {
         &SIZE.to_string()
     );
     assert_eq!(seen.headers.get("content-type").unwrap(), "application/pdf");
+}
+
+/// The 1,000-character text `KitBodyPut` repeats.
+fn body_text() -> String {
+    (0..1000u32)
+        .map(|n| char::from(b'a' + (n % 26) as u8))
+        .collect()
+}
+
+/// `KitBodyPut`'s arguments: `text` repeated `times` times.
+fn body_args(text: &str, times: usize) -> Value {
+    json!({ "path": FILES, "text": text, "times": times })
+}
+
+/// A built `PUT` in `seen`: `body` exactly, with its length and the built
+/// blob's type.
+fn assert_built_put(seen: &ApiSeen, body: &[u8]) {
+    assert_eq!(seen.method, "PUT");
+    assert_eq!(seen.path_and_query, FILES);
+    assert!(
+        seen.body == body,
+        "the stub received the built body exactly"
+    );
+    assert_eq!(
+        seen.headers.get("content-length").unwrap(),
+        &body.len().to_string()
+    );
+    assert_eq!(
+        seen.headers.get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+}
+
+/// A file of `size` bytes, sealed once and handed to each call that asks.
+struct File {
+    hold: BlobHold,
+    bytes: Vec<u8>,
+}
+
+impl File {
+    fn sealed(r: &StubRig, size: usize) -> File {
+        let bytes = file_bytes(size);
+        let hold = seal_bytes(
+            r.messenger.blob_store().expect("a blob store"),
+            "application/pdf",
+            &bytes,
+        );
+        File { hold, bytes }
+    }
+
+    fn attachments(&self) -> HeldAttachments {
+        brenn_messaging::testutils::held(&[(FILE, &self.hold)])
+    }
+}
+
+/// A body built of the caller's arguments alone, larger than a component's
+/// call arguments may be, is the nested `PUT`'s body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_built_from_arguments_is_the_put_body() {
+    let r = rig().await;
+    let text = body_text();
+    let output = r
+        .call_running(
+            "KitBodyPut",
+            body_args(&text, TIMES),
+            HeldAttachments::none(),
+            1,
+        )
+        .await
+        .expect("KitBodyPut answered");
+    let body = text.repeat(TIMES).into_bytes();
+    assert!(body.len() > 64 * 1024);
+    assert_eq!(output.value, json!({ "status": 200, "bytes": body.len() }));
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), 1, "one PUT: {seen:?}");
+    assert_built_put(&seen[0], &body);
+}
+
+/// A body built from a request's attachment: a prefix the component writes,
+/// then the caller's 1 MiB file read in pieces.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_built_around_an_attachment_is_the_put_body() {
+    let r = rig().await;
+    let file = File::sealed(&r, BUILT_FILE_SIZE);
+    let output = r
+        .call_running(
+            "KitBodyPut",
+            body_args("prefix\n", 1),
+            file.attachments(),
+            1,
+        )
+        .await
+        .expect("KitBodyPut answered");
+    let mut body = b"prefix\n".to_vec();
+    body.extend_from_slice(&file.bytes);
+    assert_eq!(output.value, json!({ "status": 200, "bytes": body.len() }));
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), 1, "one PUT: {seen:?}");
+    assert_built_put(&seen[0], &body);
+}
+
+/// Five built requests delivered in one activation: four are built and
+/// issued, the fifth waits in the backlog with no body, and the activation
+/// that settles the first four builds and issues it. Every body arrives
+/// whole.
+async fn five_built_in_one_activation(
+    args: Value,
+    attachments: impl Fn() -> HeldAttachments,
+    body: &[u8],
+    r: &StubRig,
+) {
+    let calls: Vec<_> = (0..BUILD_BUDGET + 1)
+        .map(|_| r.call_for_alice_with("KitBodyPut", args.clone(), attachments()))
+        .collect();
+    r.owed(&r.provider_sub, BUILD_BUDGET + 1).await;
+
+    r.serve().await;
+    assert_eq!(r.inflight_keys().len(), BUILD_BUDGET);
+    assert_eq!(r.backlog_keys().len(), 1, "the fifth is queued");
+    assert_eq!(r.stub.lock().unwrap().api_seen.len(), 0);
+
+    r.run_nested_calls(BUILD_BUDGET).await;
+    r.serve().await;
+    assert!(r.backlog_keys().is_empty(), "the backlog was drained");
+    assert_eq!(r.inflight_keys().len(), 1, "the fifth was issued");
+
+    r.run_nested().await;
+    r.serve().await;
+    for call in calls {
+        let output = call.await.unwrap().expect("KitBodyPut answered");
+        assert_eq!(output.value, json!({ "status": 200, "bytes": body.len() }));
+    }
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), BUILD_BUDGET + 1, "five PUTs");
+    for put in &seen {
+        assert_built_put(put, body);
+    }
+    assert!(
+        r.inflight_keys().is_empty(),
+        "the answered requests left rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn five_bodies_built_from_arguments_in_one_activation_all_arrive() {
+    let r = rig().await;
+    let text = body_text();
+    let body = text.repeat(TIMES).into_bytes();
+    five_built_in_one_activation(body_args(&text, TIMES), HeldAttachments::none, &body, &r).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn five_bodies_built_around_attachments_in_one_activation_all_arrive() {
+    let r = rig().await;
+    let file = File::sealed(&r, BUILT_FILE_SIZE);
+    let mut body = b"prefix\n".to_vec();
+    body.extend_from_slice(&file.bytes);
+    five_built_in_one_activation(body_args("prefix\n", 1), || file.attachments(), &body, &r).await;
 }
 
 /// 3 MiB up: the caller's attachment is the nested `PUT`'s body, forwarded
@@ -224,7 +392,7 @@ async fn handed_requests(r: &StubRig) -> Vec<String> {
 }
 
 /// A put whose request leaves the provider's request window while it waits
-/// on its `HEAD` still sends the caller's file: four newer requests, each
+/// on its `HEAD` still sends the caller's file: a window of newer requests, each
 /// abandoned by its caller once it is on the inbox, push the put's message
 /// out of the window its next activation is handed, and the body is opened
 /// by the pending id.
@@ -234,7 +402,7 @@ async fn a_put_whose_request_left_the_window_still_sends_the_file() {
     let (attachments, bytes) = a_file(&r);
     let (call, id) = put_past_its_head(&r, attachments).await;
 
-    let depth = 4;
+    let depth = WINDOW;
     for n in 0..depth {
         let get = r.call_for_alice_with(
             "KitFileGet",

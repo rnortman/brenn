@@ -172,6 +172,26 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_row_with_a_built_body_holds_no_body_and_round_trips() {
+        let mut row = queued(1_000, "a");
+        row.call.api.method = "PUT".to_string();
+        row.call.api.body = Some(Body::Built);
+        let wire: Value = serde_json::from_slice(&row.encode()).unwrap();
+        assert_eq!(
+            wire["call"]["api"],
+            json!({
+                "provider": "example",
+                "method": "PUT",
+                "host": "api.example.com",
+                "path": "/v1/items",
+                "body_built": true,
+            })
+        );
+        assert_eq!(Queued::decode(&row.encode()), Ok(row.clone()));
+        assert_eq!(row.in_flight(2_000).target, row.call.api.target());
+    }
+
+    #[test]
     fn a_queued_row_with_an_unknown_field_does_not_parse() {
         let base: Value = serde_json::from_slice(&queued(1, "a").encode()).unwrap();
         let mut top = base.clone();

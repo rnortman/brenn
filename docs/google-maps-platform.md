@@ -156,7 +156,8 @@ permitted growth of a fragment channel between reaps, which
 reap gap, is six times the 64 KiB figure. A full result inbox weighs up to
 `retain_depth` × `max_body_bytes` before the component parses it — 64 ×
 384 KiB is 24 MiB — against a guest memory of 16 MiB, and the request window
-up to Σ × 64 KiB of arguments, about 1 MiB for this class; an activation
+up to Σ × `max_body_bytes`, since the cap bounds each whole request: 18 × 384 KiB
+is 6.75 MiB for this class; an activation
 handed more than the guest can hold traps, and the host fails its new
 requests and alerts. That weight is the operator's to size
 (`docs/config-dsl.md`, the `provide` statement); nothing at load refuses it.

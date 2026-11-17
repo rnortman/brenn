@@ -629,8 +629,14 @@ tool api-request {
 three arguments, and at most one may be given: `body`, text sent as written;
 `body_base64`, bytes in standard base64; or `body_attachment`, the name of an
 attachment the call carries, whose bytes are sent as they are. Text and base64
-ride in the call's arguments and are bounded by them (64 KiB, about 48 KiB of
-bytes in base64). An attachment is bounded only by the deployment's largest
+ride in the call's arguments. A component's arguments are capped at 64 KiB
+(about 48 KiB of bytes in base64), a fixed limit and not a setting: a larger
+cap would still carry the body as text inside JSON, and a component cannot
+learn a deployment's limit at run time. A conversation's arguments are not
+held to that cap; `[messaging] max_body_bytes` bounds a request to a tool a
+component provides, not a call to `api-request`. A body too large to carry
+in the caller's arguments goes as `body_attachment`. An
+attachment is bounded only by the deployment's largest
 blob (`max_blob_bytes`) and is streamed, never held whole. A component hands
 the attachment through `blobs.call-async`; a conversation through the
 reserved `attachments` argument (`{"<name>": {"message_id", "name"}}`). A
@@ -664,8 +670,13 @@ and holds its bytes in the blob pool for that long, after the caller has
 read it. Size `blob_budget_bytes` at or above the sum, over the inboxes that
 receive attachment answers, of the inbox's depth × `max_blob_bytes`, or lower
 `max_blob_bytes`. An `api-request` attachment answer and a provided tool's
-attachment (`GmailAttachment`'s file, for one) both count. When the pool is
-full every producer in the deployment is refused until a window turns over.
+attachment (`GmailAttachment`'s file, for one) both count. A
+`body_attachment`'s blob rests the same way, on the request's row on
+`brenn:tools/api-request`; the rule counts each row for its window, and a
+row is deleted at the bus GC pass after it leaves the window, a term the rule
+does not yet carry (`blob-budget-rule-sized-by-window` in `TODO.md`). When
+the pool is full every producer in the deployment is refused until a window
+turns over.
 
 #### The device-location tool
 
@@ -1408,9 +1419,11 @@ component GmailTools {
   set `noise = alarm`, as the guides set theirs, reports the drop.
 
   The ceiling is a count; what a full window weighs is the operator's to
-  size, as for every input window. A request's args are up to 64 KiB
-  (`MAX_ARGS_BYTES`), so the request window holds up to Σ × 64 KiB — 64 MiB at
-  Σ = 1000 — and the `tool-results` inbox up to `retain_depth` ×
+  size, as for every input window. A request on a provider's inbox is bounded
+  by `[messaging] max_body_bytes` on the whole request body, so the request
+  window holds up to Σ × `max_body_bytes` — 64 MiB at Σ = 1000 and the default
+  cap of 64 KiB — and a component caller's arguments are capped at 64 KiB
+  besides. The `tool-results` inbox holds up to `retain_depth` ×
   `[messaging] max_body_bytes`, both before the guest parses them, against a
   guest memory of 16 MiB (`PROCESSOR_MAX_MEMORY_BYTES`). An activation handed
   more than the guest can hold traps; the host fails that activation's new

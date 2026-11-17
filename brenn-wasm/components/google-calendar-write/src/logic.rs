@@ -29,6 +29,8 @@ use serde_json::{Value, json};
 
 use crate::spec::Provided;
 
+// TODO(google-write-bodies-in-call-arguments): send the event as a blob the
+// component builds, once a request's bytes bring fuel.
 /// The most characters an event write's `summary` or `location` may hold. A
 /// write's arguments travel as one JSON body inside the nested call's args,
 /// which the host caps at 64 KiB: with every argument at its cap, each at its

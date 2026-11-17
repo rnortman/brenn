@@ -17,8 +17,10 @@ the `google` OAuth provider. The operator's setup is in
 Every example below is the argument object of one `api-request` call. Brenn
 attaches the calling user's bearer token; never send an `Authorization`
 header. Query values are strings, or an array of strings for a key Google
-takes more than once. A JSON body is passed as a string in `body`, and Brenn
-sets `Content-Type: application/json` for it.
+takes more than once. A JSON body is passed as a string in `body`, within the
+caller's arguments, and Brenn sets `Content-Type: application/json` for it; a
+body too large to carry in the arguments (a component's are capped at
+64 KiB) goes as `body_attachment`.
 
 `account` names one of the user's connected Google accounts. Leave it out
 when the user has one; when the user has several and it is left out, the call

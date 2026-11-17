@@ -60,22 +60,30 @@ pub fn query<const N: usize>(pairs: [(&str, String); N]) -> Query {
 }
 
 /// A request body: text, sent as `body`; bytes, sent as `body_base64`
-/// (standard padded base64, as `api-request` reads it); or the request's own
+/// (standard padded base64, as `api-request` reads it); the request's own
 /// attachment of that name, forwarded as the call's attachment and named in
-/// `body_attachment` — no byte copied. One by construction; `api-request`
-/// refuses a call carrying two.
+/// `body_attachment` — no byte copied; or a body the component builds when
+/// the call is issued (`Logic::body`), sent as the call's attachment
+/// [`BUILT_BODY_ATTACHMENT`]. One by construction; `api-request` refuses a
+/// call carrying two.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Body {
     Text(String),
     Bytes(Vec<u8>),
-    // TODO(kit-nested-call-body-built-in-activation): a body the component
-    // builds in the activation, beside the request's own attachment.
     Attachment(String),
+    /// Built by the component in the activation that issues the call, and
+    /// held by the call's message alone. A stored call records it as
+    /// `body_built`, which `api-request` never receives: the loop sends the
+    /// call with `body_attachment` naming [`BUILT_BODY_ATTACHMENT`].
+    Built,
 }
 
 /// The attachment name [`ApiCall::answer_as_attachment`] asks the answer's
 /// body under.
 pub const ANSWER_ATTACHMENT: &str = "body";
+
+/// The attachment name a built body ([`Body::Built`]) is sent under.
+pub const BUILT_BODY_ATTACHMENT: &str = "body";
 
 /// One `api-request` call's arguments. Every optional field is left off the
 /// wire when unset, so a component sends only what it uses: `account` only
@@ -103,7 +111,8 @@ pub struct ApiCall {
 }
 
 /// [`ApiCall`] as `api-request` reads it: the body is `body` when text and
-/// `body_base64` when bytes.
+/// `body_base64` when bytes. `body_built` is the stored form of
+/// [`Body::Built`], written only when true.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApiCallWire {
@@ -123,14 +132,17 @@ struct ApiCallWire {
     body_base64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_attachment: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    body_built: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     response_attachment: Option<String>,
 }
 
 impl From<ApiCall> for ApiCallWire {
     fn from(call: ApiCall) -> Self {
+        let body_built = call.body == Some(Body::Built);
         let (body, body_base64, body_attachment) = match call.body {
-            None => (None, None, None),
+            None | Some(Body::Built) => (None, None, None),
             Some(Body::Text(text)) => (Some(text), None, None),
             Some(Body::Bytes(bytes)) => (None, Some(Base64::encode_string(&bytes)), None),
             Some(Body::Attachment(name)) => (None, None, Some(name)),
@@ -146,6 +158,7 @@ impl From<ApiCall> for ApiCallWire {
             body,
             body_base64,
             body_attachment,
+            body_built,
             response_attachment: call.response_attachment,
         }
     }
@@ -155,15 +168,24 @@ impl TryFrom<ApiCallWire> for ApiCall {
     type Error = String;
 
     fn try_from(wire: ApiCallWire) -> Result<Self, String> {
-        let body = match (wire.body, wire.body_base64, wire.body_attachment) {
-            (None, None, None) => None,
-            (Some(text), None, None) => Some(Body::Text(text)),
-            (None, Some(encoded), None) => Some(Body::Bytes(
+        let body = match (
+            wire.body,
+            wire.body_base64,
+            wire.body_attachment,
+            wire.body_built,
+        ) {
+            (None, None, None, false) => None,
+            (Some(text), None, None, false) => Some(Body::Text(text)),
+            (None, Some(encoded), None, false) => Some(Body::Bytes(
                 Base64::decode_vec(&encoded).map_err(|_| "`body_base64` is not base64")?,
             )),
-            (None, None, Some(name)) => Some(Body::Attachment(name)),
+            (None, None, Some(name), false) => Some(Body::Attachment(name)),
+            (None, None, None, true) => Some(Body::Built),
             _ => {
-                return Err("`body`, `body_base64` and `body_attachment` are exclusive".to_string());
+                return Err(
+                    "`body`, `body_base64`, `body_attachment` and `body_built` are exclusive"
+                        .to_string(),
+                );
             }
         };
         Ok(ApiCall {
@@ -380,6 +402,45 @@ mod tests {
         let mut api = serde_json::to_value(bare()).unwrap();
         api["port"] = json!(443);
         assert!(serde_json::from_value::<ApiCall>(api).is_err());
+    }
+
+    #[test]
+    fn a_built_body_is_stored_as_body_built_and_exclusive_with_every_other_body() {
+        let mut built = bare();
+        built.method = "PUT".to_string();
+        built.body = Some(Body::Built);
+        let wire = serde_json::to_value(&built).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "provider": "maps",
+                "method": "PUT",
+                "host": "maps.example.com",
+                "path": "/v1/places",
+                "body_built": true,
+            })
+        );
+        let call = Call {
+            step: 3,
+            api: built,
+        };
+        let stored = serde_json::to_vec(&call).unwrap();
+        assert_eq!(serde_json::from_slice::<Call>(&stored).unwrap(), call);
+        for other in [
+            json!({ "body": "{}" }),
+            json!({ "body_base64": "AAEC" }),
+            json!({ "body_attachment": "file" }),
+        ] {
+            let mut both = wire.clone();
+            both.as_object_mut()
+                .unwrap()
+                .extend(other.as_object().unwrap().clone());
+            let refused = serde_json::from_value::<ApiCall>(both).unwrap_err();
+            assert!(refused.to_string().contains("exclusive"), "{refused}");
+        }
+        let mut unbuilt = serde_json::to_value(bare()).unwrap();
+        unbuilt["body_built"] = json!(false);
+        assert_eq!(serde_json::from_value::<ApiCall>(unbuilt).unwrap(), bare());
     }
 
     #[test]

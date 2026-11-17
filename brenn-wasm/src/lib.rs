@@ -1200,15 +1200,17 @@ pub const PROCESSOR_MAX_ALERT_BODY_BYTES: usize = 4096;
 /// path and the cap may diverge from the interactive log/alert caps in the future.
 pub const PROCESSOR_MAX_DIAG_BYTES: usize = 4096;
 
-// TODO(nested-call-args-cap-fixed-at-64-kib): this cap is fixed; decide
-// whether to raise it, make it a setting, or move built bodies to blobs.
 /// Maximum bytes in a guest-supplied `tools` `args-json` (64 KiB, both classes).
 ///
 /// A guest-controlled argument blob; over-cap is a permanent `invalid-args` (never
-/// forwarded to a tool). Mirrors the host-side registry cap (the native
-/// `ToolRegistry` fixes the same value); the constant is duplicated across the
-/// crate boundary because `brenn-wasm` cannot depend on `brenn-server`, exactly
-/// like the `MqttPublishOutcome` WIT-variant mirror.
+/// forwarded to a tool). The cap is fixed, not a setting, and is checked here
+/// only, at the guest import, on a component's own `args-json`. A body larger
+/// than it travels as an attachment of the call, the form the provider kit
+/// builds (`Body::Built`). A larger cap would still carry a body as text inside
+/// JSON, and a guest cannot learn a deployment's limit at run time, so a setting
+/// would lift nothing until every component also learned it. It does not size a
+/// provider's request window: a request to a provided tool is bounded by
+/// `[messaging] max_body_bytes` on the whole request body.
 pub const PROCESSOR_MAX_TOOL_ARGS_BYTES: usize = 64 * 1024;
 /// Maximum bytes in a fast-tool result JSON returned to the guest (256 KiB).
 ///
@@ -1248,8 +1250,8 @@ pub const PROCESSOR_MAX_COMPLETE_CALLS_PER_ACTIVATION: usize =
 ///
 /// Bounds the text before any host parses it: over-cap is `invalid-outcome`
 /// and never reaches the provides host, so the id stays pending. Duplicated
-/// across the crate boundary like [`PROCESSOR_MAX_TOOL_ARGS_BYTES`]; the
-/// registry asserts the two agree.
+/// across the crate boundary because `brenn-wasm` cannot depend on the
+/// registry; the registry asserts the two agree.
 pub const PROCESSOR_MAX_COMPLETE_OUTCOME_BYTES: usize = 512 * 1024;
 
 /// The largest single `blobs` read, in bytes. A guest has 16 MiB of memory, so

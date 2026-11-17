@@ -156,9 +156,10 @@ The cap also sizes what each result inbox can weigh: a full window is up to
 `retain_depth` × `max_body_bytes` before the component parses it — 32 ×
 384 KiB is 12 MiB for `gmail-read` and `calendar-read`, 16 × 384 KiB is
 6 MiB for the other three — against a guest memory of 16 MiB, and the request
-window is up to Σ × 64 KiB of arguments: 896 KiB for `gmail-read`, 768 KiB
-for `calendar-read`, 128 KiB for `gmail-compose` and `gmail-organize`, 192 KiB for
-`calendar-write`. An activation handed more than the guest can hold traps,
+window is up to Σ × `max_body_bytes`, since the cap bounds each whole request:
+5.25 MiB for `gmail-read` (Σ = 14), 4.5 MiB for `calendar-read` (Σ = 12),
+768 KiB for `gmail-compose` and `gmail-organize` (Σ = 2), 1.125 MiB for
+`calendar-write` (Σ = 3). An activation handed more than the guest can hold traps,
 and the host fails its new requests and alerts. That weight is the operator's to size (`docs/config-dsl.md`, the
 `provide` statement); nothing at load refuses it.
 `GmailBody` holds a message's answer and its forms in the guest while it

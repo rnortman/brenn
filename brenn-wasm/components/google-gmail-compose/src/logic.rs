@@ -55,6 +55,8 @@ const HEADER_VALUE_MAX_BYTES: usize = 980;
 const SUBJECT_MAX_CHARS: usize = 500;
 /// The most characters a draft's `body` may hold, as its schema states it.
 const BODY_MAX_CHARS: usize = 20_000;
+// TODO(google-write-bodies-in-call-arguments): send the draft as a blob the
+// component builds, once a request's bytes bring fuel.
 /// The most bytes a draft's body may hold in its CRLF form, a lone line break
 /// counting as the two bytes it becomes. The body travels as base64 of that
 /// form inside `raw`, itself base64url of the message, inside the nested
@@ -251,7 +253,7 @@ fn draft_original_call(id: &str, account: Option<&str>, settings: &Settings) -> 
 }
 
 // TODO(gmail-draft-attachments): a draft carrying a file from the request's
-// attachment, with a body not bounded by the nested call's arguments cap.
+// attachment, in a MIME message the component builds as the call's body.
 /// drafts.create of the message the arguments describe under `subject`, as
 /// `raw`, filed in the original's thread for a reply. The `POST` creates a
 /// draft and sends nothing.

@@ -1,7 +1,8 @@
 //! A provider's activation loop: serving `provide`d tools by nested
-//! `api-request` calls, at most [`CALL_BUDGET`] of them per activation, with
-//! the requests past the budget kept in a backlog that later activations
-//! drain as results free capacity.
+//! `api-request` calls, at most [`CALL_BUDGET`] of them per activation and at
+//! most [`BUILD_BUDGET`] with a body the component builds, with the requests
+//! past either budget kept in a backlog that later activations drain as
+//! results free capacity.
 //!
 //! The loop names the host through [`Host`] and the component through
 //! [`Logic`], so it runs on the host under test against an in-memory store.
@@ -14,8 +15,10 @@
 //!    advances it: the request completes, fails, or issues or queues its next
 //!    step. A request more than [`HOST_DEADLINE_MS`] older than the activation
 //!    that delivered it is answered `internal` instead and not advanced.
-//! 3. **Backlog.** Entries are issued oldest first until the budget is spent.
-//! 4. **New requests.** Each is planned, then issued or queued.
+//! 3. **Backlog.** Entries are issued oldest first; the drain stops at the
+//!    first entry a budget leaves it unable to issue.
+//! 4. **New requests.** Each is planned, then issued or queued; once the
+//!    drain has left an entry behind, every one is queued.
 //! 5. **Guard.** A backlog with no call issued this activation and no live
 //!    in-flight row has nothing to wake the instance and drain it: every entry
 //!    is answered `internal` now.
@@ -24,18 +27,21 @@
 //! implies an in-flight row issued within [`NESTED_WORST_CASE_MS`], whose
 //! result activates the instance again.
 //!
-//! Each step — planning a request, advancing it on an answer, issuing a
-//! backlog entry — runs with a [`Step`] over the host's [`Blobs`], and the
+//! Each step — planning a request, advancing it on an answer, building a
+//! call's body, issuing a backlog entry — runs with a [`Step`] over the host's
+//! [`Blobs`], and the
 //! loop calls [`Blobs::release`] once the step's outcome is carried out. A
 //! completion carries what the step attached; a failure carries nothing; a
 //! step that attaches and then issues a call is the component's fault.
+
+use std::borrow::Cow;
 
 use serde_json::{Map, Value};
 
 use crate::answer::{NestedError, not_issued, result_summary};
 use crate::backlog::{Queued, parse_key};
 use crate::blob::{Attached, Blob, Blobs, OpenError, Step};
-use crate::call::{ApiCall, Body, Call, ErrorKind, Failure, Next};
+use crate::call::{ApiCall, BUILT_BODY_ATTACHMENT, Body, Call, ErrorKind, Failure, Next};
 use crate::row::{InFlight, Tool, claim, issued_at_ms, row_expired};
 
 /// The host's ceiling on a provided-tool call (`PROVIDED_TOOL_CEILING`). The
@@ -76,6 +82,18 @@ pub const BACKLOG_MAX_WAIT_MS: u64 = HOST_DEADLINE_MS - NESTED_WORST_CASE_MS;
 /// its call cap to half its per-activation publish budget, which nested calls
 /// share with port publishes, so the budget is within both.
 pub const CALL_BUDGET: usize = 32;
+
+/// The most bodies the loop builds ([`Logic::body`]) in one activation, a
+/// failed build included: a build can fail having spent its whole cost. A
+/// call whose body is built past it is queued, as a call past
+/// [`CALL_BUDGET`] is. An activation's least fuel is the host's floor
+/// (`PROCESSOR_FUEL_MINIMUM`, 50M), which covers its first five envelopes;
+/// every further envelope adds its own 10M. With at most four builds in an
+/// activation, a component whose other steps cost S and whose build costs B
+/// is safe where S + 4B fits the floor. The drain builds out of the backlog
+/// in activations that carry no envelope for it, so the floor is what such
+/// a build runs on.
+pub const BUILD_BUDGET: usize = 4;
 
 /// The store namespace of in-flight rows, keyed by call id.
 pub const INFLIGHT_NS: &str = "inflight";
@@ -144,8 +162,8 @@ pub enum Level {
     Warn,
 }
 
-/// What the loop needs of the component: its tool enum, its settings, and
-/// the two step functions.
+/// What the loop needs of the component: its tool enum, its settings, the
+/// two step functions, and the builder of a body the component builds.
 pub trait Logic {
     type Tool: Tool;
     type Settings;
@@ -168,6 +186,44 @@ pub trait Logic {
         step: &mut Step<'_>,
         settings: &Self::Settings,
     ) -> Next;
+
+    /// The body of `call`, whose call returned [`Body::Built`], built when
+    /// the call is issued: in the activation that planned or advanced it, or
+    /// in a later one that drains it from the backlog. `call` is the call as
+    /// a backlog row holds it — the tool, the caller's arguments, `derived`,
+    /// the call with its step, and the request's attachment headers. `step`
+    /// reaches the request's attachments and builds blobs; it carries no
+    /// answer and cannot attach. A value an earlier answer taught reaches the
+    /// body through `derived`. The returned blob's content type is what
+    /// `api-request` sends when the call sets no `Content-Type` header.
+    ///
+    /// At most [`BUILD_BUDGET`] bodies are built per activation, a failed
+    /// build included, so `plan` refuses everything this could refuse on the
+    /// arguments, and a build fails only on what it meets at issue time: the
+    /// blob pool, the activation's bound on bytes written, which every build
+    /// and blob write of the activation shares, a request no longer pending.
+    /// A failure answers the request and no call is attempted, so a body the
+    /// write bound refuses fails its request even where a later activation
+    /// would have built it.
+    ///
+    /// # Panics
+    /// By default, naming the fault: a `Logic` that returns `Body::Built`
+    /// defines this.
+    // TODO(built-body-from-attachment-unfueled-after-arrival): fuel a body
+    // built from a request's attachment outside the activation the request
+    // arrived in, or refuse one over a declared bound when it is planned.
+    fn body(
+        call: &Queued<Self::Tool>,
+        _step: &Step<'_>,
+        _settings: &Self::Settings,
+    ) -> Result<Blob, Failure> {
+        panic!(
+            "{} step {} for {} returns `Body::Built`, and its `Logic` defines no `body`",
+            call.tool.name(),
+            call.call.step,
+            call.id
+        )
+    }
 }
 
 /// A new request on the instance's request inbox.
@@ -211,19 +267,22 @@ pub fn serve<H: Host, L: Logic>(
         settings,
         now_ms: input.now_ms,
         attempted: 0,
+        built: 0,
         issued: 0,
         queued: false,
+        left_behind: false,
         last_refusal: None,
+        last_build_failure: None,
     };
     run.sweep()?;
     for result in input.results {
         run.answer(result)?;
     }
-    let left_behind = run.drain()?;
+    run.drain()?;
     for request in input.requests {
         run.serve(request)?;
     }
-    if (run.queued || left_behind) && run.issued == 0 && !run.live_row()? {
+    if (run.queued || run.left_behind) && run.issued == 0 && !run.live_row()? {
         run.refuse_backlog()?;
     }
     Ok(())
@@ -237,12 +296,18 @@ struct Run<'a, H: Host, L: Logic> {
     /// Calls attempted this activation, refused ones included: the host's
     /// per-activation counter counts both.
     attempted: usize,
+    /// Bodies built this activation, failed builds included.
+    built: usize,
     /// Calls the host accepted this activation.
     issued: usize,
     /// Whether this activation wrote a backlog entry.
     queued: bool,
+    /// Whether the drain stopped at an entry it could not issue.
+    left_behind: bool,
     /// The host's text for the latest refused call.
     last_refusal: Option<String>,
+    /// The detail of the latest failed build.
+    last_build_failure: Option<String>,
 }
 
 impl<H: Host, L: Logic> Run<'_, H, L> {
@@ -254,6 +319,9 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
     /// whose request arrived within the wait. An entry before that point that
     /// does not parse — another build wrote it — is answered and deleted on its
     /// key alone, as an in-flight row expires on its age alone.
+    // TODO(kit-sweep-decodes-expired-backlog-rows-unbudgeted): read a row's
+    // times without decoding the whole row, and bound the entries answered
+    // per activation.
     fn sweep(&mut self) -> Result<(), H::Error> {
         for (key, bytes) in self.host.scan(INFLIGHT_NS)? {
             if row_expired(&bytes, self.now_ms).map_err(H::fault)? {
@@ -401,20 +469,59 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
         carried
     }
 
-    /// Issue backlog entries oldest first until the budget is spent. Whether
-    /// entries are left behind.
-    fn drain(&mut self) -> Result<bool, H::Error> {
+    /// Issue backlog entries oldest first, stopping at the first a budget
+    /// leaves this activation unable to issue: an entry is never skipped to
+    /// reach a later one. Once the call budget is spent the drain stops
+    /// without decoding the next row; until then each entry is decoded before
+    /// deciding, since whether the build budget holds it depends on its body.
+    fn drain(&mut self) -> Result<(), H::Error> {
         for (key, bytes) in self.host.scan(BACKLOG_NS)? {
             if self.attempted >= CALL_BUDGET {
-                return Ok(true);
+                self.host.log(
+                    Level::Debug,
+                    format!(
+                        "left the backlog from {} on: {CALL_BUDGET} calls attempted this \
+                         activation",
+                        String::from_utf8_lossy(&key)
+                    ),
+                );
+                self.left_behind = true;
+                return Ok(());
             }
             let entry = self.queued_row(&key, &bytes)?;
+            if let Some(reason) = self.held(&entry) {
+                self.host.log(
+                    Level::Debug,
+                    format!(
+                        "left {} step {} for {} in the backlog: {reason}",
+                        entry.tool.name(),
+                        entry.call.step,
+                        entry.id
+                    ),
+                );
+                self.left_behind = true;
+                return Ok(());
+            }
             self.host.delete(BACKLOG_NS, &key)?;
             let issued = self.issue(entry);
             self.host.release();
             issued?;
         }
-        Ok(false)
+        Ok(())
+    }
+
+    /// Why `entry`'s call cannot be issued this activation, or `None` when it
+    /// can.
+    fn held(&self, entry: &Queued<L::Tool>) -> Option<String> {
+        if self.left_behind {
+            Some("the backlog holds an older entry this activation cannot issue".to_string())
+        } else if self.attempted >= CALL_BUDGET {
+            Some(format!("{CALL_BUDGET} calls attempted this activation"))
+        } else if entry.call.api.body == Some(Body::Built) && self.built >= BUILD_BUDGET {
+            Some(format!("{BUILD_BUDGET} bodies built this activation"))
+        } else {
+            None
+        }
     }
 
     /// Serve one new request: plan its first call and issue or queue it.
@@ -447,18 +554,18 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
         carried
     }
 
-    /// Issue `entry`'s call if the budget allows, or keep it in the backlog.
+    /// Issue `entry`'s call if the budgets allow, or keep it in the backlog.
     fn issue_or_queue(&mut self, entry: Queued<L::Tool>) -> Result<(), H::Error> {
-        if self.attempted < CALL_BUDGET {
+        let Some(reason) = self.held(&entry) else {
             return self.issue(entry);
-        }
+        };
         self.host
             .put(BACKLOG_NS, entry.key().as_bytes(), &entry.encode())?;
         self.queued = true;
         self.host.log(
             Level::Debug,
             format!(
-                "queued {} step {} for {}: {CALL_BUDGET} calls attempted this activation",
+                "queued {} step {} for {}: {reason}",
                 entry.tool.name(),
                 entry.call.step,
                 entry.id
@@ -469,24 +576,40 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
 
     /// Issue `entry`'s call and record its in-flight row, or answer the
     /// request with the host's refusal when the call cannot be queued. A
-    /// refused attempt counts against the budget; a body attachment that
-    /// cannot be opened answers the request without an attempt.
+    /// refused attempt counts against the call budget; a body attachment that
+    /// cannot be opened, or a body that cannot be built, answers the request
+    /// without an attempt. A built body goes as the call's attachment
+    /// [`BUILT_BODY_ATTACHMENT`], named in its `body_attachment`.
     fn issue(&mut self, entry: Queued<L::Tool>) -> Result<(), H::Error> {
-        let body = match &entry.call.api.body {
+        let (api, body) = match &entry.call.api.body {
             Some(Body::Attachment(name)) => match self.open_body(&entry, name)? {
-                Ok(blob) => Some((name.as_str(), blob)),
+                Ok(blob) => (Cow::Borrowed(&entry.call.api), Some((name.as_str(), blob))),
                 Err(failure) => {
                     return self
                         .host
                         .complete_err(&entry.id, failure.kind, &failure.detail);
                 }
             },
-            _ => None,
+            Some(Body::Built) => match self.build(&entry) {
+                Ok(blob) => (
+                    Cow::Owned(ApiCall {
+                        body: Some(Body::Attachment(BUILT_BODY_ATTACHMENT.to_string())),
+                        ..entry.call.api.clone()
+                    }),
+                    Some((BUILT_BODY_ATTACHMENT, blob)),
+                ),
+                Err(failure) => {
+                    return self
+                        .host
+                        .complete_err(&entry.id, failure.kind, &failure.detail);
+                }
+            },
+            _ => (Cow::Borrowed(&entry.call.api), None),
         };
         self.attempted += 1;
         let state = entry.in_flight(self.now_ms);
         let call_id = state.call_id();
-        let api = &entry.call.api;
+        let api = api.as_ref();
         let body = body.as_ref().map(|(name, blob)| (*name, blob));
         match self.host.call(&entry.id, api, &call_id, body) {
             Ok(()) => {
@@ -512,6 +635,32 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
                     .complete_err(&entry.id, ErrorKind::Internal, &detail)
             }
         }
+    }
+
+    /// `entry`'s body, built by the component; a failed build counts against
+    /// [`BUILD_BUDGET`] as a built one does.
+    // TODO(correctness-built-bodies-share-activation-write-cap-and-fail-instead-of-queue):
+    // queue a build the activation's remaining write bound cannot hold
+    // instead of answering it, without requeueing a body no activation holds.
+    fn build(&mut self, entry: &Queued<L::Tool>) -> Result<Blob, Failure> {
+        self.built += 1;
+        let step = Step::planning(self.host, &entry.id, entry.attachments.clone());
+        let built = L::body(entry, &step, self.settings);
+        drop(step);
+        if let Err(failure) = &built {
+            self.host.log(
+                Level::Info,
+                format!(
+                    "{} step {} for {}: body not built: {}",
+                    entry.tool.name(),
+                    entry.call.step,
+                    entry.id,
+                    failure.detail
+                ),
+            );
+            self.last_build_failure = Some(failure.detail.clone());
+        }
+        built
     }
 
     /// The request's attachment `name`, which `entry`'s call forwards as its
@@ -577,24 +726,31 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
     }
 
     /// Answer every backlog entry now: nothing outstanding will wake the
-    /// instance to drain it.
+    /// instance to drain it. The detail names the host's refusal when a call
+    /// was refused, and otherwise the failed builds.
     fn refuse_backlog(&mut self) -> Result<(), H::Error> {
-        let refusal = self
-            .last_refusal
-            .as_deref()
-            .expect("a backlog is left only once the budget is spent, and none was issued");
-        let detail = format!(
-            "api-request refused every call this activation could issue and none is \
-             outstanding; this request was not attempted. {}",
-            not_issued(refusal)
-        );
+        let detail = match (&self.last_refusal, &self.last_build_failure) {
+            (Some(refusal), _) => format!(
+                "api-request refused every call this activation could issue and none is \
+                 outstanding; this request was not attempted. {}",
+                not_issued(refusal)
+            ),
+            (None, Some(failure)) => format!(
+                "this provider could not build the body of any call this activation could \
+                 issue and none is outstanding; this request was not attempted. The last \
+                 build failed: {failure}"
+            ),
+            (None, None) => panic!(
+                "a backlog is left with no call issued only after a refused call or a failed build"
+            ),
+        };
         for (key, bytes) in self.host.scan(BACKLOG_NS)? {
             let entry = self.queued_row(&key, &bytes)?;
             self.host.delete(BACKLOG_NS, &key)?;
             self.host.log(
                 Level::Warn,
                 format!(
-                    "{} step {} for {} answered: every call refused and none outstanding",
+                    "{} step {} for {} answered: no call issued and none outstanding",
                     entry.tool.name(),
                     entry.call.step,
                     entry.id
@@ -1760,6 +1916,491 @@ mod tests {
         answer_attacher(&host, attacher(1, json!({ "size": 1_000 }))).unwrap();
         let completion = host.take_completions().remove(0);
         assert_eq!(completion.attachments[0].bytes.len(), 1_000);
+    }
+
+    /// A provider whose calls carry a body it builds: `"build"` plans a
+    /// built `PUT`; `"two_step"` plans a plain first step whose answer's
+    /// `learned` goes into `derived` and whose second step is built. The
+    /// body is `derived`'s `learned`, then `text` (default `x`) `times` times
+    /// (default 1), then the request's attachment `file` when it carries
+    /// one; `"fail"` refuses to build it. Any other request is a plain `GET`.
+    struct Builder;
+
+    const BUILT_TYPE: &str = "application/x-built";
+
+    fn built_put(step: u8, tool: Fixture) -> Call {
+        let mut call = call(step, tool, "built");
+        call.api.method = "PUT".to_string();
+        call.api.body = Some(Body::Built);
+        call
+    }
+
+    impl Logic for Builder {
+        type Tool = Fixture;
+        type Settings = ();
+
+        fn plan(tool: Fixture, args: &Value, _: &Step<'_>, _: &()) -> Result<Call, String> {
+            Ok(if args.get("build").is_some() {
+                built_put(1, tool)
+            } else {
+                call(1, tool, "plain")
+            })
+        }
+
+        fn advance(
+            state: &InFlight<Fixture>,
+            outcome: Result<Value, NestedError>,
+            _: &mut Step<'_>,
+            _: &(),
+        ) -> Next {
+            match outcome {
+                Ok(value) if state.step == 1 && state.args.get("two_step").is_some() => {
+                    Next::Call {
+                        call: built_put(2, state.tool),
+                        derived: Map::from_iter([(
+                            "learned".to_string(),
+                            value["learned"].clone(),
+                        )]),
+                    }
+                }
+                Ok(_) => Next::Complete(json!({ "step": state.step })),
+                Err(error) => Next::Fail(internal(error.detail)),
+            }
+        }
+
+        fn body(call: &Queued<Fixture>, step: &Step<'_>, _: &()) -> Result<Blob, Failure> {
+            if call.args.get("fail").is_some() {
+                return Err(internal("refused to build"));
+            }
+            let mut blob = step.append(BUILT_TYPE)?;
+            if let Some(learned) = call.derived.get("learned").and_then(Value::as_str) {
+                blob.write(learned.as_bytes())?;
+            }
+            let text = call.args.get("text").and_then(Value::as_str).unwrap_or("x");
+            let times = call.args.get("times").and_then(Value::as_u64).unwrap_or(1);
+            for _ in 0..times {
+                blob.write(text.as_bytes())?;
+            }
+            if step.request_attachments().iter().any(|a| a.name == "file") {
+                let file = step.open_request("file")?;
+                for piece in step.pieces(&file) {
+                    blob.write(&piece?)?;
+                }
+            }
+            blob.finish()
+        }
+    }
+
+    /// Request `n` for a built body, with `args` beside `"build"`.
+    fn built(n: usize, args: Value) -> Request {
+        let mut args = args;
+        args["build"] = json!(true);
+        Request {
+            id: id(n),
+            tool: "fixture-lookup".to_string(),
+            args,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn run_builder(host: &MemoryHost, input: Input) -> Result<(), String> {
+        host.activate::<Builder>(&(), input)
+    }
+
+    fn built_body(bytes: &str) -> Option<(String, Vec<u8>)> {
+        Some((BUILT_BODY_ATTACHMENT.to_string(), bytes.as_bytes().to_vec()))
+    }
+
+    fn logged(host: &MemoryHost, level: Level, line: &str) -> bool {
+        host.take_log()
+            .iter()
+            .any(|(at, text)| *at == level && text == line)
+    }
+
+    #[test]
+    fn a_built_body_goes_out_as_the_calls_attachment() {
+        let host = MemoryHost::new();
+        let request = built(0, json!({ "text": "ab", "times": 3 }));
+        run_builder(&host, input(0, vec![request], vec![])).unwrap();
+        let call = host.take_calls().remove(0);
+        assert_eq!(call.body, built_body("ababab"));
+        assert_eq!(call.body_content_type.as_deref(), Some(BUILT_TYPE));
+        assert_eq!(
+            call.call.body,
+            Some(Body::Attachment(BUILT_BODY_ATTACHMENT.to_string()))
+        );
+        let sent = serde_json::to_value(&call.call).unwrap();
+        assert_eq!(sent["body_attachment"], json!(BUILT_BODY_ATTACHMENT));
+        assert!(sent.get("body_built").is_none(), "{sent}");
+        let row = InFlight::<Fixture>::decode(&host.rows(INFLIGHT_NS)[0].1).unwrap();
+        assert_eq!(row.target, built_put(1, Fixture::Lookup).api.target());
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        assert_eq!(host.peak_handles(), 1);
+    }
+
+    #[test]
+    fn a_body_built_after_an_earlier_step_sees_its_derived() {
+        let host = MemoryHost::new();
+        let request = Request {
+            id: id(0),
+            tool: "fixture-lookup".to_string(),
+            args: json!({ "two_step": true }),
+            attachments: Vec::new(),
+        };
+        run_builder(&host, input(0, vec![request], vec![])).unwrap();
+        let first = host.take_calls().remove(0);
+        assert_eq!(first.body, None);
+        let answered = Delivered {
+            outcome: Ok(json!({ "status": 200, "learned": "learned-" })),
+            ..result(&first, false)
+        };
+        run_builder(&host, input(1, vec![], vec![answered])).unwrap();
+        let second = host.take_calls().remove(0);
+        assert_eq!(second.call_id, format!("{}/2", id(0)));
+        assert_eq!(second.body, built_body("learned-x"));
+    }
+
+    #[test]
+    fn built_bodies_past_the_build_budget_queue_and_are_built_next_activation() {
+        let host = MemoryHost::new();
+        let mut new: Vec<Request> = (0..=BUILD_BUDGET)
+            .map(|n| built(n, json!({ "text": id(n) })))
+            .collect();
+        new.extend(requests(BUILD_BUDGET + 1..BUILD_BUDGET + 2));
+        run_builder(&host, input(0, new, vec![])).unwrap();
+        let first = host.take_calls();
+        let mut expected: Vec<String> = (0..BUILD_BUDGET).map(id).collect();
+        expected.push(id(BUILD_BUDGET + 1));
+        assert_eq!(ids(&first), expected);
+        for (n, call) in first[..BUILD_BUDGET].iter().enumerate() {
+            assert_eq!(call.body, built_body(&id(n)));
+        }
+        assert_eq!(first[BUILD_BUDGET].body, None);
+        assert_eq!(backlog_ids(&host), [id(BUILD_BUDGET)]);
+        let row = &host.rows(BACKLOG_NS)[0].1;
+        let wire: Value = serde_json::from_slice(row).unwrap();
+        assert_eq!(wire["call"]["api"]["body_built"], json!(true));
+        for field in ["body", "body_base64", "body_attachment"] {
+            assert!(wire["call"]["api"].get(field).is_none(), "{wire}");
+        }
+        assert!(logged(
+            &host,
+            Level::Debug,
+            &format!(
+                "queued fixture-lookup step 1 for {}: {BUILD_BUDGET} bodies built this activation",
+                id(BUILD_BUDGET)
+            )
+        ));
+        assert!(holds_invariant(&host, 0));
+
+        run_builder(&host, input(1, vec![], vec![])).unwrap();
+        let second = host.take_calls();
+        assert_eq!(ids(&second), [id(BUILD_BUDGET)]);
+        assert_eq!(second[0].body, built_body(&id(BUILD_BUDGET)));
+        assert!(host.rows(BACKLOG_NS).is_empty());
+    }
+
+    #[test]
+    fn a_built_call_past_the_call_budget_is_built_and_issued_next_activation() {
+        let host = MemoryHost::new();
+        let mut new = requests(0..CALL_BUDGET);
+        new.push(built(CALL_BUDGET, json!({ "text": "late" })));
+        run_builder(&host, input(0, new, vec![])).unwrap();
+        let first = host.take_calls();
+        assert_eq!(first.len(), CALL_BUDGET);
+        assert!(first.iter().all(|call| call.body.is_none()));
+        assert_eq!(backlog_ids(&host), [id(CALL_BUDGET)]);
+
+        run_builder(&host, input(1, vec![], vec![])).unwrap();
+        let second = host.take_calls();
+        assert_eq!(ids(&second), [id(CALL_BUDGET)]);
+        assert_eq!(second[0].body, built_body("late"));
+        assert!(host.rows(BACKLOG_NS).is_empty());
+    }
+
+    /// Requests `0..=BUILD_BUDGET`, each building `pre-` and its seeded
+    /// attachment `file`, `file <n>`.
+    fn built_with_files(host: &MemoryHost) -> Vec<Request> {
+        (0..=BUILD_BUDGET)
+            .map(|n| {
+                let file = host.seed_request(
+                    &id(n),
+                    "file",
+                    "text/plain",
+                    format!("file {n}").into_bytes(),
+                );
+                Request {
+                    attachments: vec![file],
+                    ..built(n, json!({ "text": "pre-" }))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_body_built_from_a_requests_attachment_is_built_when_its_call_is_issued() {
+        let host = MemoryHost::new();
+        run_builder(&host, input(0, built_with_files(&host), vec![])).unwrap();
+        let first = host.take_calls();
+        for (n, call) in first.iter().enumerate() {
+            assert_eq!(call.body, built_body(&format!("pre-file {n}")));
+        }
+        assert_eq!(first.len(), BUILD_BUDGET);
+        let queued = Queued::<Fixture>::decode(&host.rows(BACKLOG_NS)[0].1).unwrap();
+        assert_eq!(queued.attachments[0].name, "file");
+
+        run_builder(&host, input(1, vec![], vec![])).unwrap();
+        let second = host.take_calls();
+        assert_eq!(ids(&second), [id(BUILD_BUDGET)]);
+        assert_eq!(
+            second[0].body,
+            built_body(&format!("pre-file {BUILD_BUDGET}"))
+        );
+    }
+
+    #[test]
+    fn a_built_body_of_a_request_no_longer_pending_spends_no_call() {
+        let host = MemoryHost::new();
+        run_builder(&host, input(0, built_with_files(&host), vec![])).unwrap();
+        host.take_calls();
+        host.requests_not_pending(true);
+        let after = BUILD_BUDGET + 1;
+        run_builder(
+            &host,
+            input(1, requests(after..after + CALL_BUDGET), vec![]),
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&host.take_calls()),
+            (after..after + CALL_BUDGET).map(id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            errors(&host.take_completions()),
+            [(
+                id(BUILD_BUDGET).as_str(),
+                ErrorKind::Internal,
+                "blob open: the request is no longer pending"
+            )]
+        );
+        assert!(host.rows(BACKLOG_NS).is_empty());
+    }
+
+    #[test]
+    fn the_drain_past_the_call_budget_decodes_no_row() {
+        let host = MemoryHost::new();
+        run(&host, input(1_000, requests(0..CALL_BUDGET), vec![])).unwrap();
+        let first = host.take_calls();
+        // Not a backlog row: decoding it would fail the activation.
+        let key = format!("{:020}/{}", 500, id(99));
+        host.insert(BACKLOG_NS, key.as_bytes(), b"not a backlog row");
+        host.take_log();
+
+        let results = first.iter().map(|call| result(call, true)).collect();
+        run(&host, input(2_000, vec![], results)).unwrap();
+        assert_eq!(host.take_calls().len(), CALL_BUDGET);
+        let line = format!(
+            "left the backlog from {key} on: {CALL_BUDGET} calls attempted this activation"
+        );
+        let log = host.take_log();
+        assert!(log.contains(&(Level::Debug, line)), "{log:?}");
+        assert_eq!(host.rows(BACKLOG_NS).len(), 1);
+    }
+
+    #[test]
+    fn the_drain_stops_at_a_built_entry_the_build_budget_holds() {
+        let host = MemoryHost::new();
+        let two_step = (0..BUILD_BUDGET)
+            .map(|n| Request {
+                id: id(n),
+                tool: "fixture-lookup".to_string(),
+                args: json!({ "two_step": true }),
+                attachments: Vec::new(),
+            })
+            .collect();
+        run_builder(&host, input(0, two_step, vec![])).unwrap();
+        let outstanding = host.take_calls();
+        let mut held = entry(10, 1, 0, 0);
+        held.args = json!({ "build": true });
+        held.call = built_put(1, Fixture::Lookup);
+        insert_entry(&host, &held);
+        insert_entry(&host, &entry(11, 1, 0, 0));
+
+        let results = outstanding.iter().map(|c| result(c, false)).collect();
+        run_builder(&host, input(1, requests(12..13), results)).unwrap();
+        let second = host.take_calls();
+        assert_eq!(ids(&second), (0..BUILD_BUDGET).map(id).collect::<Vec<_>>());
+        assert!(second.iter().all(|call| call.body == built_body("x")));
+        assert_eq!(backlog_ids(&host), [id(10), id(11), id(12)]);
+        let log = host.take_log();
+        for line in [
+            format!(
+                "left fixture-lookup step 1 for {} in the backlog: {BUILD_BUDGET} bodies built \
+                 this activation",
+                id(10)
+            ),
+            format!(
+                "queued fixture-lookup step 1 for {}: the backlog holds an older entry this \
+                 activation cannot issue",
+                id(12)
+            ),
+        ] {
+            assert!(log.contains(&(Level::Debug, line)), "{log:?}");
+        }
+        assert!(holds_invariant(&host, 1));
+
+        run_builder(&host, input(2, vec![], vec![])).unwrap();
+        let third = host.take_calls();
+        assert_eq!(ids(&third), [id(10), id(11), id(12)]);
+        assert_eq!(third[0].body, built_body("x"));
+        assert!(host.rows(BACKLOG_NS).is_empty());
+    }
+
+    #[test]
+    fn a_failed_build_answers_its_request_and_spends_the_build_budget() {
+        let host = MemoryHost::new();
+        let mut new = vec![built(0, json!({ "fail": true }))];
+        new.extend((1..=BUILD_BUDGET).map(|n| built(n, json!({}))));
+        run_builder(&host, input(0, new, vec![])).unwrap();
+        assert_eq!(
+            ids(&host.take_calls()),
+            (1..BUILD_BUDGET).map(id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            errors(&host.take_completions()),
+            [(id(0).as_str(), ErrorKind::Internal, "refused to build")]
+        );
+        assert_eq!(backlog_ids(&host), [id(BUILD_BUDGET)]);
+        assert!(logged(
+            &host,
+            Level::Info,
+            &format!(
+                "fixture-lookup step 1 for {}: body not built: refused to build",
+                id(0)
+            )
+        ));
+        assert!(
+            host.rows(INFLIGHT_NS)
+                .iter()
+                .all(|(_, bytes)| InFlight::<Fixture>::decode(bytes).unwrap().id != id(0))
+        );
+    }
+
+    const NOT_BUILT: &str = "this provider could not build the body of any call this activation \
+                             could issue and none is outstanding; this request was not attempted. \
+                             The last build failed: refused to build";
+
+    #[test]
+    fn with_every_build_failed_and_nothing_outstanding_the_guard_answers_the_backlog() {
+        let failing = |range: std::ops::Range<usize>| -> Vec<Request> {
+            range.map(|n| built(n, json!({ "fail": true }))).collect()
+        };
+        let host = MemoryHost::new();
+        run_builder(&host, input(0, failing(0..BUILD_BUDGET + 2), vec![])).unwrap();
+        assert!(host.take_calls().is_empty());
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        let completions = host.take_completions();
+        let answered = errors(&completions);
+        let mut expected: Vec<(String, &str)> = (0..BUILD_BUDGET)
+            .map(|n| (id(n), "refused to build"))
+            .collect();
+        expected.extend((BUILD_BUDGET..BUILD_BUDGET + 2).map(|n| (id(n), NOT_BUILT)));
+        assert_eq!(
+            answered
+                .iter()
+                .map(|(answered_id, kind, detail)| {
+                    assert_eq!(*kind, ErrorKind::Internal);
+                    (answered_id.to_string(), *detail)
+                })
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        let host = MemoryHost::new();
+        run_builder(&host, input(0, requests(0..1), vec![])).unwrap();
+        host.take_calls();
+        run_builder(&host, input(1, failing(1..BUILD_BUDGET + 3), vec![])).unwrap();
+        assert!(host.take_calls().is_empty());
+        assert_eq!(errors(&host.take_completions()).len(), BUILD_BUDGET);
+        assert_eq!(
+            backlog_ids(&host),
+            [id(BUILD_BUDGET + 1), id(BUILD_BUDGET + 2)]
+        );
+        assert!(holds_invariant(&host, 1));
+    }
+
+    #[test]
+    fn a_refused_built_call_releases_its_body_and_the_guard_names_the_refusal() {
+        let host = MemoryHost::new();
+        host.refuse_all(REFUSAL);
+        let mut new = vec![built(0, json!({ "fail": true }))];
+        new.extend((1..=BUILD_BUDGET).map(|n| built(n, json!({}))));
+        run_builder(&host, input(0, new, vec![])).unwrap();
+        assert!(host.take_calls().is_empty());
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        assert!(host.rows(INFLIGHT_NS).is_empty());
+        assert_eq!(host.peak_handles(), 1);
+        let refused = not_issued(REFUSAL);
+        let guard = format!(
+            "api-request refused every call this activation could issue and none is \
+             outstanding; this request was not attempted. {refused}"
+        );
+        let mut expected = vec![(id(0), "refused to build".to_string())];
+        expected.extend((1..BUILD_BUDGET).map(|n| (id(n), refused.clone())));
+        expected.push((id(BUILD_BUDGET), guard));
+        assert_eq!(
+            errors(&host.take_completions())
+                .iter()
+                .map(|(answered_id, kind, detail)| {
+                    assert_eq!(*kind, ErrorKind::Internal);
+                    (answered_id.to_string(), detail.to_string())
+                })
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_built_body_served_no_blobs_fails_naming_the_entry_point() {
+        let host = MemoryHost::new();
+        host.set_blob_limits(None);
+        run_builder(&host, input(0, vec![built(0, json!({}))], vec![])).unwrap();
+        assert!(host.take_calls().is_empty());
+        let completion = host.take_completions().remove(0);
+        let Answered::Error(ErrorKind::Internal, detail) = completion.answer else {
+            panic!("completed with {:?}", completion.answer);
+        };
+        assert!(detail.contains("`serve_with_blobs`"), "{detail}");
+    }
+
+    /// A provider that returns a built body and defines no `body`.
+    struct NoBody;
+
+    impl Logic for NoBody {
+        type Tool = Fixture;
+        type Settings = ();
+
+        fn plan(tool: Fixture, _: &Value, _: &Step<'_>, _: &()) -> Result<Call, String> {
+            Ok(built_put(1, tool))
+        }
+
+        fn advance(
+            _: &InFlight<Fixture>,
+            _: Result<Value, NestedError>,
+            _: &mut Step<'_>,
+            _: &(),
+        ) -> Next {
+            Next::Fail(internal("never answered"))
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "fixture-lookup step 1 for r000 returns `Body::Built`, and its `Logic` defines no `body`"
+    )]
+    fn a_built_body_with_no_body_defined_panics_naming_the_fault() {
+        let host = MemoryHost::new();
+        host.activate::<NoBody>(&(), input(0, requests(0..1), vec![]))
+            .unwrap();
     }
 
     #[test]

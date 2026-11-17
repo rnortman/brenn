@@ -4,12 +4,13 @@
 //! by the display name the component passes.
 //!
 //! - [`activation`]: an activation loop over a [`Host`] trait, issuing at
-//!   most [`CALL_BUDGET`] nested calls per activation and keeping the rest in
-//!   a backlog that later activations drain.
+//!   most [`CALL_BUDGET`] nested calls per activation, building at most
+//!   [`BUILD_BUDGET`] of their bodies, and keeping the rest in a backlog that
+//!   later activations drain.
 //! - [`backlog`]: the backlog row a queued request keeps.
 //! - [`blob`]: a request's and an answer's attachments, the [`Blobs`]
-//!   interface a host serves, and the [`Step`] through which `plan` and
-//!   `advance` open, read, build and attach blobs.
+//!   interface a host serves, and the [`Step`] through which `plan`,
+//!   `advance` and `body` open, read, build and attach blobs.
 //! - [`row`]: the in-flight row a request keeps in the component's store
 //!   between the activation that issues a nested call and the one that
 //!   receives its answer, generic over the component's [`Tool`] enum.
@@ -59,8 +60,8 @@ pub mod settings;
 pub mod testutil;
 
 pub use activation::{
-    BACKLOG_MAX_WAIT_MS, CALL_BUDGET, Delivered, HOST_DEADLINE_MS, Host, INFLIGHT_TTL_MS, Input,
-    Level, Logic, NESTED_WORST_CASE_MS, Request, Rows, serve,
+    BACKLOG_MAX_WAIT_MS, BUILD_BUDGET, CALL_BUDGET, Delivered, HOST_DEADLINE_MS, Host,
+    INFLIGHT_TTL_MS, Input, Level, Logic, NESTED_WORST_CASE_MS, Request, Rows, serve,
 };
 pub use answer::{
     Answer, BlobAnswer, COMPACT_RESULT_CEILING, NestedError, Payload, PayloadAnswer, Unreadable,
@@ -73,8 +74,8 @@ pub use blob::{
     Unavailable, WriteError, Writer,
 };
 pub use call::{
-    ANSWER_ATTACHMENT, ApiCall, Body, Call, ErrorKind, Failure, Next, Query, QueryValue, Target,
-    internal, query,
+    ANSWER_ATTACHMENT, ApiCall, BUILT_BODY_ATTACHMENT, Body, Call, ErrorKind, Failure, Next, Query,
+    QueryValue, Target, internal, query,
 };
 pub use row::{InFlight, Tool, no_such_step, stored};
 #[cfg(feature = "testutils")]

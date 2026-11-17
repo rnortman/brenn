@@ -23,9 +23,6 @@ pub const MAX_FAST_BUDGET: Duration = Duration::from_millis(50);
 /// Enforced by the WASM host; declared here as the shared constant.
 pub const MAX_FAST_CALLS_PER_ACTIVATION: usize = 64;
 
-/// Maximum `args-json` size accepted for any tool call (both classes).
-pub const MAX_ARGS_BYTES: usize = 64 * 1024;
-
 /// Maximum serialized result size for a fast-class call.
 pub const MAX_FAST_RESULT_BYTES: usize = 256 * 1024;
 
@@ -54,7 +51,6 @@ pub const ENVELOPE_MARGIN: usize = 4 * 1024;
 // about the same numbers. brenn-server *does* see both crates, so pin the two
 // copies together — a silent divergence (raising one, shipping a no-op) fails the
 // build instead.
-const _: () = assert!(MAX_ARGS_BYTES == brenn_wasm::PROCESSOR_MAX_TOOL_ARGS_BYTES);
 const _: () = assert!(MAX_FAST_RESULT_BYTES == brenn_wasm::PROCESSOR_MAX_FAST_TOOL_RESULT_BYTES);
 const _: () = assert!(
     MAX_FAST_CALLS_PER_ACTIVATION == brenn_wasm::PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION

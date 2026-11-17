@@ -11,6 +11,11 @@
 //! - `kit-file-get` — `GET <path>` asking for the body as an attachment, and
 //!   completes with `{"status", "bytes", "attachment": "file"}`, the answer's
 //!   blob forwarded as the completion's attachment `file`.
+//! - `kit-body-put` — `PUT <path>` with a body the component builds when the
+//!   call is issued (`Body::Built`): `text` repeated `times` times, then the
+//!   request's attachment `file`, read in pieces, when it carries one.
+//!   Completes with `{"status", "bytes"}`, the status of the `PUT` and the
+//!   body's length, computed from the arguments and the attachment's header.
 //!
 //! The instance's `config` names `provider` and `host`; every call names the
 //! caller's user and no account.
@@ -19,9 +24,9 @@ mod spec;
 
 use brenn_guest::{Activation, Body as GuestBody, Error, Processor};
 use brenn_provider_kit::{
-    ApiCall, BlobAnswer, Body, Call, Failure, InFlight, Logic, NestedError, Next, PayloadAnswer,
-    Step, Tool, host, internal, no_such_step, object, read_api_blob, read_api_payload, required,
-    stored,
+    ApiCall, Attached, Blob, BlobAnswer, Body, Call, Failure, InFlight, Logic, NestedError, Next,
+    PayloadAnswer, Queued, Step, Tool, capped, host, integer, internal, no_such_step, object,
+    read_api_blob, read_api_payload, required, stored,
 };
 use serde_json::{Value, json};
 
@@ -36,6 +41,12 @@ const API: &str = "the stub";
 const FIRST_STEP: u8 = 0;
 /// `kit-file-put`'s `PUT` after its `HEAD`.
 const PUT_AFTER_HEAD_STEP: u8 = 1;
+/// The content type of the body `kit-body-put` builds.
+const BUILT_TYPE: &str = "application/octet-stream";
+/// The longest `text` `kit-body-put` takes, in characters.
+const TEXT_MAX_CHARS: usize = 1024;
+/// The most times `kit-body-put` repeats its `text`.
+const TIMES_MAX: u64 = 4096;
 
 impl Tool for Provided {
     fn name(self) -> &'static str {
@@ -72,12 +83,46 @@ struct Args {
 impl Args {
     fn parse(args: &Value) -> Result<Args, String> {
         let map = object(args, &["path", "head"])?;
-        let path = match map.get("path") {
-            Some(Value::String(path)) if path.starts_with('/') => path.clone(),
-            _ => return Err("`path` must be a string starting with `/`".to_string()),
-        };
+        let path = path(map)?;
         let head = brenn_provider_kit::flag(map, "head")?;
         Ok(Args { path, head })
+    }
+}
+
+/// The arguments' `path`: a string starting with `/`.
+fn path(map: &serde_json::Map<String, Value>) -> Result<String, String> {
+    match map.get("path") {
+        Some(Value::String(path)) if path.starts_with('/') => Ok(path.clone()),
+        _ => Err("`path` must be a string starting with `/`".to_string()),
+    }
+}
+
+/// `kit-body-put`'s arguments: the path, and the text its body repeats.
+struct BodyArgs {
+    path: String,
+    text: String,
+    times: u64,
+}
+
+impl BodyArgs {
+    fn parse(args: &Value) -> Result<BodyArgs, String> {
+        let map = object(args, &["path", "text", "times"])?;
+        let path = path(map)?;
+        let text = capped(map, "text", TEXT_MAX_CHARS)?
+            .ok_or("`text` is required")?
+            .to_string();
+        let times = integer(map, "times", 1, TIMES_MAX)?.ok_or("`times` is required")?;
+        Ok(BodyArgs { path, text, times })
+    }
+
+    /// The length of the body built from these arguments and the request's
+    /// `attachments`.
+    fn body_len(&self, attachments: &[Attached]) -> u64 {
+        let file = attachments
+            .iter()
+            .find(|attached| attached.name == FILE)
+            .map_or(0, |attached| attached.size);
+        self.text.len() as u64 * self.times + file
     }
 }
 
@@ -119,9 +164,9 @@ impl Logic for KitFiles {
         step: &Step<'_>,
         settings: &Settings,
     ) -> Result<Call, String> {
-        let args = Args::parse(args)?;
         match tool {
             Provided::KitFilePut => {
+                let args = Args::parse(args)?;
                 if !step
                     .request_attachments()
                     .iter()
@@ -138,7 +183,15 @@ impl Logic for KitFiles {
                     Ok(put(settings, &args.path, FIRST_STEP))
                 }
             }
+            Provided::KitBodyPut => {
+                let args = BodyArgs::parse(args)?;
+                Ok(Call {
+                    step: FIRST_STEP,
+                    api: api_call(settings, "PUT", &args.path, Some(Body::Built)),
+                })
+            }
             Provided::KitFileGet => {
+                let args = Args::parse(args)?;
                 if args.head {
                     return Err("`head` is an argument of KitFilePut".to_string());
                 }
@@ -160,9 +213,62 @@ impl Logic for KitFiles {
             Provided::KitFilePut => put_answered(state, outcome, settings),
             Provided::KitFileGet if state.step == FIRST_STEP => got(state, outcome, step),
             Provided::KitFileGet => Err(no_such_step(state.tool, state.step)),
+            Provided::KitBodyPut if state.step == FIRST_STEP => body_put(state, outcome),
+            Provided::KitBodyPut => Err(no_such_step(state.tool, state.step)),
         };
         next.unwrap_or_else(Next::Fail)
     }
+
+    fn body(
+        call: &Queued<Provided>,
+        step: &Step<'_>,
+        _settings: &Settings,
+    ) -> Result<Blob, Failure> {
+        if !matches!(call.tool, Provided::KitBodyPut) || call.call.step != FIRST_STEP {
+            return Err(no_such_step(call.tool, call.call.step));
+        }
+        let args = BodyArgs::parse(&call.args).map_err(|reason| {
+            internal(format!(
+                "stored {} arguments no longer parse: {reason}",
+                call.tool.name()
+            ))
+        })?;
+        let mut body = step.append(BUILT_TYPE)?;
+        for _ in 0..args.times {
+            body.write(args.text.as_bytes())?;
+        }
+        if call
+            .attachments
+            .iter()
+            .any(|attached| attached.name == FILE)
+        {
+            let file = step.open_request(FILE)?;
+            for piece in step.pieces(&file) {
+                body.write(&piece?)?;
+            }
+        }
+        body.finish()
+    }
+}
+
+/// `kit-body-put`'s `PUT` answered: the request completes.
+fn body_put(
+    state: &InFlight<Provided>,
+    outcome: Result<Value, NestedError>,
+) -> Result<Next, Failure> {
+    let args = stored(state, BodyArgs::parse)?;
+    let status = match read_api_payload(outcome, &state.target, API)? {
+        PayloadAnswer::Payload(payload) => payload.status,
+        PayloadAnswer::Relay(value) => return Ok(Next::Complete(value)),
+        PayloadAnswer::Unreadable(why) => return Err(why.failure(API, None)),
+        PayloadAnswer::Error { status, .. } => {
+            return Err(internal(format!("{API} answered HTTP {status}")));
+        }
+    };
+    Ok(Next::Complete(json!({
+        "status": status,
+        "bytes": args.body_len(&state.attachments),
+    })))
 }
 
 /// `kit-file-put`'s `HEAD` answered: the `PUT` follows. Its `PUT` answered:

@@ -1677,6 +1677,9 @@ impl Messenger {
     /// are neither synced nor adopted: the ring keeps the holds. A panic
     /// mid-flush leaves the blobs adopted in the rolled-back transaction to the
     /// next reap.
+    // TODO(tool-request-body-not-held-to-max-body-bytes): a tool request's
+    // body is held only to the guest import's arguments cap, not to
+    // `max_body_bytes`.
     pub async fn publish_from_wasm(&self, consumer_slug: &str, publishes: &[WasmPublish<'_>]) {
         if publishes.is_empty() {
             return;

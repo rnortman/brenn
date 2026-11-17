@@ -26,6 +26,8 @@ use crate::active_bridge::ActiveBridge;
 
 /// The store namespace a provider component keeps its in-flight rows in.
 const INFLIGHT_NS: &str = "inflight";
+/// The store namespace a provider component keeps its queued calls in.
+const BACKLOG_NS: &str = "backlog";
 
 /// The stub, started before the rig so the suite can build its provider over
 /// the stub's URL.
@@ -240,9 +242,15 @@ impl StubRig {
     /// Run the one nested call the provider issued, and wait for its result
     /// on the provider's inbox; returns that result.
     pub async fn run_nested(&self) -> Value {
-        self.owed(&self.executor_sub(), 1).await;
+        self.run_nested_calls(1).await.remove(0)
+    }
+
+    /// Run the `n` nested calls the provider issued, and wait for their
+    /// results on the provider's inbox; returns those results.
+    pub async fn run_nested_calls(&self, n: usize) -> Vec<Value> {
+        self.owed(&self.executor_sub(), n).await;
         self.executor.drain_step().await;
-        self.owed(&self.provider_sub, 1).await.remove(0)
+        self.owed(&self.provider_sub, n).await
     }
 
     /// Serve the request, then run each of its `steps` nested calls and hand
@@ -357,10 +365,20 @@ impl StubRig {
 
     /// The keys of the component's in-flight rows, read from its store.
     pub fn inflight_keys(&self) -> Vec<String> {
+        self.keys(INFLIGHT_NS)
+    }
+
+    /// The keys of the component's backlog rows, read from its store.
+    pub fn backlog_keys(&self) -> Vec<String> {
+        self.keys(BACKLOG_NS)
+    }
+
+    /// The keys of the component's rows in namespace `ns`.
+    fn keys(&self, ns: &str) -> Vec<String> {
         self.provider
             .component
             .kv_store_for_testing()
-            .scan_for_testing(INFLIGHT_NS)
+            .scan_for_testing(ns)
             .into_iter()
             .map(|(key, _)| String::from_utf8(key).expect("a UTF-8 key"))
             .collect()

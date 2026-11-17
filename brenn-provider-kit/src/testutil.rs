@@ -156,6 +156,8 @@ pub struct NestedCall {
     pub call_id: String,
     /// The attachment the call carried as its body: its name and bytes.
     pub body: Option<(String, Vec<u8>)>,
+    /// The content type of the body's blob.
+    pub body_content_type: Option<String>,
 }
 
 /// One attachment of a completion: its name, content type and bytes.
@@ -706,12 +708,13 @@ impl Host for MemoryHost {
             return Err(text);
         }
         drop(refuse);
-        let body = body.map(|(name, blob)| (name.to_string(), self.sealed_at(blob).bytes.to_vec()));
+        let body = body.map(|(name, blob)| (name.to_string(), self.sealed_at(blob)));
         self.calls.borrow_mut().push(NestedCall {
             id: id.to_string(),
             call: call.clone(),
             call_id: call_id.to_string(),
-            body,
+            body_content_type: body.as_ref().map(|(_, sealed)| sealed.content_type.clone()),
+            body: body.map(|(name, sealed)| (name, sealed.bytes.to_vec())),
         });
         Ok(())
     }

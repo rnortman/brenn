@@ -16,9 +16,11 @@
 //! The entry point is the choice of grant. [`serve`] serves the loop no
 //! blobs: its [`Blobs`] answers `Unavailable` from every method and it
 //! reaches no function of the SDK's `blobs` module, so a component served by
-//! it imports no `blobs` interface and needs no `blobs` grant.
-//! [`serve_with_blobs`] serves the SDK's `blobs` interface, so a component
-//! served by it imports `blobs` and its class requires the grant.
+//! it imports no `blobs` interface and needs no `blobs` grant; a call whose
+//! body the component builds fails its request `internal`, naming
+//! [`serve_with_blobs`]. [`serve_with_blobs`] serves the SDK's `blobs`
+//! interface, so a component served by it imports `blobs` and its class
+//! requires the grant.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -45,8 +47,9 @@ pub fn serve<L: Logic>(activation: &Activation, settings: &L::Settings) -> Resul
 
 /// [`serve`], with the SDK's `blobs` interface behind the loop's [`Blobs`]:
 /// a step opens its request's and its answer's attachments, reads and builds
-/// blobs, forwards a request attachment as a nested call's body and completes
-/// with attachments. The component's class requires `blobs`.
+/// blobs, forwards a request attachment as a nested call's body, builds a
+/// nested call's body (`Logic::body`) and completes with attachments. The
+/// component's class requires `blobs`.
 pub fn serve_with_blobs<L: Logic>(
     activation: &Activation,
     settings: &L::Settings,

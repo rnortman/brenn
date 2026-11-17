@@ -980,7 +980,8 @@ instance, so its `Value`s are the ones `brenn-guest` hands over.
 `brenn-provider-kit` names no guest SDK: it holds the loop (behind a `Host`
 trait), the rows a request keeps, the backlog, the call and answer types, and
 the argument and settings readers, and its loop issues at most `CALL_BUDGET`
-nested calls per activation, queueing the rest for later activations.
+nested calls per activation and builds at most `BUILD_BUDGET` bodies,
+queueing the rest for later activations.
 `brenn-provider-kit-guest` is the SDK glue: one `serve::<L: Logic>(&activation,
 &settings)` per activation, where `L` is the component's `plan` and `advance`.
 
@@ -1044,6 +1045,21 @@ stays inside the host's 64 live handles as long as one step does.
   the request's attachment of that name as the body, no byte copied; on the
   wire it is `api-request`'s `body_attachment`. A name the request does not
   carry is the component's fault and fails the activation.
+- **Building a nested call's body.** `Body::Built` has the component build
+  the call's body when the call is issued, in `Logic::body`, which a
+  component that returns it defines (the default panics). `body` is handed
+  the call as a backlog row holds it — `Queued`: the tool, the caller's
+  arguments, `derived`, the call with its step, and the request's attachment
+  headers — and a `Step` that reaches the request's attachments and builds
+  blobs, and returns the sealed blob from `append`. It runs in whichever
+  activation issues the call: the one that planned or advanced it, or a
+  later one that drains it from the backlog, so a value an earlier answer
+  taught reaches it through `derived`. The blob goes as the call's
+  attachment `BUILT_BODY_ATTACHMENT` (`"body"`), and its content type is
+  what `api-request` sends when the call sets no `Content-Type`. Nothing is
+  built for a queued call; the call's message alone holds the blob once it
+  is sent. A failed build answers the request with its failure and attempts
+  no call.
 - **Asking for a blob answer.** `ApiCall::answer_as_attachment()` sets
   `response_attachment` to `ANSWER_ATTACHMENT` (`"body"`). `read_api_blob`
   reads the answer as a `BlobAnswer`: `Blob { status, headers, bytes,
@@ -1074,12 +1090,12 @@ class keeps `requires` without `blobs` and grant parity proves it.
 `blobs`. A component served by `serve` that asks for an attachment answer has
 its nested call answered `denied` by `api-request`, which `read_api_blob`
 reads as every reader reads a denied call. `processor-kit-file-test` is the
-worked example of both directions; `google-gmail-read`'s `GmailAttachment` is
+worked example of both directions and of a built body (`KitBodyPut`); `google-gmail-read`'s `GmailAttachment` is
 one that reads an answer by range and builds the blob it completes with, and
 its `GmailBody` one that holds an answer whole, under a bound it checks on
 the blob's size before reading, and builds the blobs it completes with.
 
-Three limits are the component's to design for:
+Four limits are the component's to design for:
 
 - **A request's attachments last as long as the request.** A request's
   attachment opens at any step — a first step, a queued first step, a later
@@ -1111,6 +1127,39 @@ Three limits are the component's to design for:
   attachment on its caller's inbox. Size `blob_budget_bytes` at or above the
   sum, over the inboxes that receive attachment answers, of the inbox's depth
   × `max_blob_bytes` (`docs/config-dsl.md`, "The OAuth tools").
+- **A body is built on the fuel of the activation that issues its call.**
+  At most `BUILD_BUDGET` (4) bodies are built per activation, a failed build
+  included, so a component sizes its bound for S + nB on the host's 50M
+  floor, where S is a step's cost, B a build's, and n the most bodies one of
+  its activations can build — late answers counted, since the kit advances
+  an answer the host has given up on — and never more than `BUILD_BUDGET`;
+  a component that has not worked n out takes 4. `max_concurrency` bounds
+  neither the answers nor the ended requests' messages an activation is
+  handed, so a component whose late answers build can reach `BUILD_BUDGET`
+  and queue whatever its Σ. Through the fifth envelope every step shares the
+  50M, so the count is every step the floor activation runs, not the builds
+  alone: the builds; the steps that plan or advance and then queue; the
+  answers that settle, each of which decodes an in-flight row holding the
+  request's arguments; and, when the build budget stops the drain, the one
+  decode at which it stops. A settle is not the cheap step: the row it
+  decodes holds the caller's arguments whole, and decoding them costs by
+  their size, far more for a character JSON escapes than for a plain one, so
+  where the arguments are large a component's bound is set as much by the
+  answers one activation settles as by the bodies it builds. `plan` refuses
+  everything `body` could refuse on the arguments, so that `body` fails only
+  on what it meets at issue time (the blob pool, the activation's bound on
+  bytes written, a request no longer pending), because a failed build spends
+  the budget like any other. Every build and every other blob write of an
+  activation share its bound on bytes written (64 MiB), and a build that
+  bound refuses answers its request rather than waiting for a later
+  activation: where bodies together pass it, the build that crosses it and
+  every build after it in that activation fail, though each alone would
+  have been built.
+  A request's attachment adds fuel only in the activation the request
+  arrived in, so a body built from one is bounded by what the floor covers,
+  not by the attachment rate. A trap while draining rolls the store back,
+  so it repeats on each later activation until the entries have waited
+  `BACKLOG_MAX_WAIT_MS` and the sweep answers them unbuilt.
 
 `MemoryHost` serves `Blobs` in memory for a host test: `seed_request` and
 `seed_result` give a request or a result an attachment's bytes; the limits,

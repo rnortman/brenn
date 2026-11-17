@@ -324,6 +324,7 @@ async fn evict_everything_and_reap(booted: &Booted) {
 /// Evict and reap, then assert no blob is left in the store or on disk.
 async fn assert_nothing_outlives(booted: &Booted, rig: &Rig) {
     evict_everything_and_reap(booted).await;
+    // TODO(blob-restart-test-flaky-under-load): once failed here under full `make check`, usage not zero.
     assert_eq!(store_usage(booted), usage(0, 0));
     assert_eq!(rig.files(), Vec::<std::path::PathBuf>::new());
 }

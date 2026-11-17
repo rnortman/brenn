@@ -3,7 +3,9 @@
 /// `PUT`'s body, after a `HEAD` of the same path when `head` is true, so the
 /// body is then opened from window context in a later activation.
 /// `kit-file-get` asks for a `GET`'s body as an attachment and forwards it as
-/// its own attachment `file`.
+/// its own attachment `file`. `kit-body-put` builds a `PUT`'s body when the
+/// call is issued: `text` repeated `times` times, then the attachment `file`
+/// when the request carries one.
 ///
 /// The instance's `config` names `provider`, the OAuth provider every call
 /// names, and `host`, the `host[:port]` every call reaches.
@@ -24,5 +26,12 @@ component ProcessorKitFileTest {
     description = "Test fixture: GET `path` and answer its body as the attachment `file`.";
     input_schema = """{ "type": "object", "properties": { "path": { "type": "string", "pattern": "^/[A-Za-z0-9/_.-]{0,255}$" } }, "required": ["path"], "additionalProperties": false }""";
     max_concurrency = 2;
+  }
+  provide kit-body-put {
+    mcp_name = "KitBodyPut";
+    description = "Test fixture: PUT to `path` a body built of `text` repeated `times` times, followed by the attachment `file` when one is attached.";
+    input_schema = """{ "type": "object", "properties": { "path": { "type": "string", "pattern": "^/[A-Za-z0-9/_.-]{0,255}$" }, "text": { "type": "string", "minLength": 1, "maxLength": 1024 }, "times": { "type": "integer", "minimum": 1, "maximum": 4096 } }, "required": ["path", "text", "times"], "additionalProperties": false }""";
+    accepts_attachments = true;
+    max_concurrency = 8;
   }
 }

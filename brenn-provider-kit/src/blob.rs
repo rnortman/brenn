@@ -1,6 +1,6 @@
 //! Attachments: what a request or an answer carries, the handles a step holds
 //! on blobs, the [`Blobs`] interface a host serves a step, and the [`Step`] a
-//! component's `plan` and `advance` receive.
+//! component's `plan`, `advance` and `body` receive.
 //!
 //! A [`Blob`] or [`Writer`] is a slot in a table the host adapter keeps for
 //! one step, not a blob id: a component names a blob only by a handle it was
@@ -296,7 +296,8 @@ pub struct Step<'a> {
 }
 
 impl<'a> Step<'a> {
-    /// The step that plans request `id`'s first call.
+    /// The step that plans request `id`'s first call, or builds the body of
+    /// one of its calls: it reaches the request's attachments and no answer.
     pub fn planning(blobs: &'a dyn Blobs, id: &str, request: Vec<Attached>) -> Step<'a> {
         Step {
             blobs,

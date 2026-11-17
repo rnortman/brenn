@@ -4,6 +4,34 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **A provider component can build a nested call's body.** A provider built on
+  `brenn-provider-kit` can now send a body it builds — a document, a MIME
+  message around a request's attachment — as an attachment of its nested
+  `api-request` call, instead of as text inside the call's arguments, which
+  are capped at 64 KiB.
+  - **BREAKING for authors using `brenn-provider-kit`:** `Body` gains
+    `Body::Built`, so an exhaustive match on it no longer compiles. A call
+    with `Body::Built` has its body built by the new `Logic::body`, when the
+    call is issued, in whichever activation issues it; a value an earlier
+    answer taught reaches it through `derived`. It is sent as the call's
+    attachment `BUILT_BODY_ATTACHMENT`, so the component is served by
+    `serve_with_blobs` and its class requires `blobs`. At most `BUILD_BUDGET`
+    (4) bodies are built per activation, a failed build included; a call past
+    it is queued as a call past `CALL_BUDGET` is, and the backlog drains
+    oldest first without skipping an entry. A backlog row holding a built
+    call is not read by an older kit. `MemoryHost`'s `NestedCall` gains
+    `body_content_type`.
+- **What bounds a request to a provided tool, stated correctly.** The
+  documents said a request's arguments are up to 64 KiB, so a provider's
+  request window holds up to Σ (its request limit) × 64 KiB. The 64 KiB cap
+  binds only the arguments a component passes to a nested call, and stays; a
+  conversation's call is bounded by `[messaging] max_body_bytes` on the whole
+  request, so the window holds up to Σ × `max_body_bytes` — at the Google
+  guides' 393,216 bytes, six times the old figure. `docs/config-dsl.md` and the
+  Google Workspace and Maps guides now say so. Nothing a deployment runs
+  changes.
+  - **For Rust callers of `brenn-tool-registry`:** `MAX_ARGS_BYTES`, which
+    nothing compared against, is removed.
 - **A provider's request attachments stay reachable while the request is
   pending.** A WASM provider component (a tool implemented as a WebAssembly
   component) can now open a request's attachments at any point while the host
