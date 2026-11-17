@@ -128,7 +128,13 @@ fn attachment_path(id: &str, attachment_id: &str) -> String {
 
 /// Serve message `id`, its PDF of `bytes` at `depth` as part `part_id`, and
 /// the fetch of that PDF.
-fn serve_message(r: &StubRig, id: &str, depth: usize, part_id: &str, bytes: &[u8]) -> Vec<u8> {
+pub(super) fn serve_message(
+    r: &StubRig,
+    id: &str,
+    depth: usize,
+    part_id: &str,
+    bytes: &[u8],
+) -> Vec<u8> {
     let attachment_id = format!("ATT-{id}");
     r.answer(
         &format!("{MESSAGES}/{id}"),
@@ -167,7 +173,7 @@ async fn fetch(
 }
 
 /// The completion's attachment: its content type and every byte.
-fn file_of(output: &ToolOutput) -> (String, Vec<u8>) {
+pub(super) fn file_of(output: &ToolOutput) -> (String, Vec<u8>) {
     let name = AttachmentName::new(FILE).unwrap();
     assert_eq!(
         output.attachments.refs().iter().count(),
@@ -428,7 +434,7 @@ async fn a_full_store_refuses_the_decode_and_leaves_only_the_answer() {
 
 /// The blob `answer` hands a conversation as `name`, read whole from the
 /// app's result inbox message the answer names.
-async fn handed(r: &StubRig, answer: &Value, name: &str) -> (String, Vec<u8>) {
+pub(super) async fn handed(r: &StubRig, answer: &Value, name: &str) -> (String, Vec<u8>) {
     let message: Uuid = answer["message_id"]
         .as_str()
         .unwrap_or_else(|| panic!("a handed result: {answer}"))

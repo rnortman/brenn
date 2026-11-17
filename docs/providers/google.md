@@ -1,8 +1,9 @@
 # Gmail and Google Calendar endpoints through `api-request`
 
-The Google Workspace components answer Gmail's labels, searches, messages
-and threads as the tools `GmailLabels`, `GmailSearch`, `GmailRead` and
-`GmailThread` (`google-gmail-read`), create drafts as `GmailDraft`
+The Google Workspace components answer Gmail's labels, searches, messages,
+threads, attachments and message bodies as the tools `GmailLabels`,
+`GmailSearch`, `GmailRead`, `GmailThread`, `GmailAttachment` and `GmailBody`
+(`google-gmail-read`), create drafts as `GmailDraft`
 (`google-gmail-compose`) and change labels as `GmailModifyLabels`
 (`google-gmail-organize`), and answer Google Calendar's calendar list, events,
 single events and free/busy as `CalendarList`, `CalendarEvents`,
@@ -78,7 +79,9 @@ id and the `part_id` `GmailRead` lists for the attachment, and answers the
 decoded file as an attachment of its result, which can be forwarded with
 `BrennSend`, saved with `brenn-tool save` or handed to another tool. A part
 `GmailRead` lists without a `part_id` is carried inside the message, or nested
-deeper than `GmailAttachment` reads, and is not fetched.
+deeper than `GmailAttachment` reads, and is not fetched: `GmailAttachment`
+refuses a part carried inside the message, naming `GmailRead`, or `GmailBody`
+when the part is body text.
 
 The raw route is messages.attachments.get through `api-request`. The
 attachment id is the `attachmentId` of the part, which `GmailRead` does not
@@ -114,8 +117,11 @@ The clause that admits the call names the path's two ids as `*`:
 
 ### A message in another form
 
-`GmailRead` answers a message's headers, its text decoded and its
-attachments listed. For the message as Google stores it, ask for
+`GmailRead` answers a message's headers, its text decoded and cut, and its
+attachments listed. `GmailBody` is the route for the whole text, the HTML as
+sent and the HTML as text: it answers each as an attachment of its result,
+for a message whose answer from Gmail is at most 786,432 bytes. For the
+message as Google stores it, and for a message over that bound, ask for
 `format=raw` (the whole RFC 2822 message, base64url, in `raw`),
 `format=full` (the part tree, each part's `data` included unless the mask
 leaves it out) or `format=minimal` (ids, labels, snippet and sizes, no headers or body), with a

@@ -8,7 +8,14 @@
 # first sees it, preferably by moving the pin to a fixed release. An `ignore`
 # entry is the owner's call, never an implementer's shortcut.
 version = 2
-ignore = []
+# TODO(chrono-unmaintained): both crates are unmaintained with no fixed
+# release. Ignored by id, so a vulnerability filed against either still
+# fails this check. One file serves three units, so the units that lack a
+# crate warn that its advisory was not encountered (TODO(xtask-deny-warnings)).
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; no fixed release. See TODO(chrono-unmaintained)." },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained; no fixed release. See TODO(chrono-unmaintained)." },
+]
 
 [bans]
 # Permissive to start; add banned crates here as needed.

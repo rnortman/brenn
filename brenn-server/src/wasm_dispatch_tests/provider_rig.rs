@@ -57,6 +57,9 @@ pub(super) struct ProviderSetup<'a> {
     /// The blob store's limits, on a rig that installs one;
     /// [`TEST_BLOB_LIMITS`] when `None`.
     pub blob_limits: Option<BlobLimits>,
+    /// The limits every provider activation runs under in place of the
+    /// production ones; the production limits when `None`.
+    pub limits: Option<ActivationLimits>,
 }
 
 /// The apps of a rig whose conversations call the registry. The rig gives the
@@ -103,6 +106,7 @@ pub(super) struct ProviderRig {
     /// provider granted `blobs`.
     pub blobs: Option<TempBlobDir>,
     caller: Option<Caller>,
+    limits: Option<ActivationLimits>,
 }
 
 pub(super) fn alice() -> ActingUser {
@@ -125,6 +129,7 @@ impl ProviderRig {
             caller,
             conversations,
             blob_limits,
+            limits,
         } = setup;
         let (alert, _alerts) = noop_alert_dispatcher();
         let runtime = ProviderRuntime::new(alert.clone());
@@ -388,6 +393,7 @@ impl ProviderRig {
             provider_results,
             blobs,
             caller,
+            limits,
         }
     }
 
@@ -479,8 +485,19 @@ impl ProviderRig {
         ParticipantId::for_system(TOOL_EXECUTOR_COMPONENT)
     }
 
-    /// Activate the provider on whatever it is owed.
+    /// Activate the provider on whatever it is owed, under the rig's limits.
     pub async fn serve(&self) {
-        drain_step(&self.provider, &self.provider_sub, MountDebt::Settled).await;
+        match self.limits {
+            None => drain_step(&self.provider, &self.provider_sub, MountDebt::Settled).await,
+            Some(limits) => {
+                drain_step_with_limits(
+                    &self.provider,
+                    &self.provider_sub,
+                    MountDebt::Settled,
+                    limits,
+                )
+                .await;
+            }
+        }
     }
 }

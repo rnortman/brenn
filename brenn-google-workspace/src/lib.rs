@@ -7,6 +7,7 @@
 //! under test and links into each component's guest build alike.
 
 pub mod args;
+pub mod bytes;
 pub mod calendar;
 pub mod call;
 pub mod gmail;

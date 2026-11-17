@@ -179,6 +179,9 @@ pub(super) struct RigOptions<'a> {
     /// and are granted every tool the class provides and `api-request` under
     /// the rig's clauses.
     pub conversations: bool,
+    /// The limits every provider activation runs under in place of the
+    /// production ones; the production limits when `None`.
+    pub limits: Option<ActivationLimits>,
 }
 
 impl Default for RigOptions<'_> {
@@ -189,6 +192,7 @@ impl Default for RigOptions<'_> {
             max_response_bytes: None,
             blob_limits: None,
             conversations: false,
+            limits: None,
         }
     }
 }
@@ -303,6 +307,7 @@ pub(super) async fn rig_built(
         max_response_bytes,
         blob_limits,
         conversations: with_conversations,
+        limits,
     } = options;
     let started = stub_rig::start().await;
     let host = started.host.clone();
@@ -357,6 +362,7 @@ pub(super) async fn rig_built(
             ]),
             caller,
             conversations,
+            limits,
             vault,
         },
     )

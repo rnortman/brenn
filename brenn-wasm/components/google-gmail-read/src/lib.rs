@@ -1,12 +1,13 @@
 //! Gmail read (brenn:processor world): `GmailLabels`, `GmailSearch`,
-//! `GmailRead`, `GmailThread` and `GmailAttachment`.
+//! `GmailRead`, `GmailThread`, `GmailAttachment` and `GmailBody`.
 //!
 //! Each activation reads the instance's `config` and hands the activation to
 //! `brenn-provider-kit`'s loop, which runs it in one store transaction: it
 //! sweeps rows no result can still arrive for, answers every new result,
 //! issues queued requests, serves every new request, and commits. The loop
-//! is served with the SDK's `blobs`: `GmailAttachment` reads Gmail's answer
-//! from a blob and completes with the decoded file as one. At most
+//! is served with the SDK's `blobs`: `GmailAttachment` and `GmailBody` each
+//! read Gmail's answer from a blob and complete with files, the decoded
+//! attachment or the message's body forms. At most
 //! `CALL_BUDGET` nested calls go out per activation; requests past it wait in
 //! the store's backlog for a later activation.
 //!

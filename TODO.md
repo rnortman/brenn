@@ -39,22 +39,49 @@ the host keeps, with a test that publishes attachment answers past an inbox's
 depth between two passes; or the documents state the interval term and no
 passage says "for that channel's window" of a durable row's blobs.
 
-## `gmail-body-forms-as-blobs`
+## `chrono-unmaintained`
 
-`GmailRead` answers a message's body only as converted text, cut at
-`max_chars` (at most 60,000) and at the result ceiling, and with no body at
-all when the message is over the provider's read limit or the bus cap
-(`text_omitted`). No tool answers the whole text, the HTML as sent or its
-rendering, and `GmailAttachment` refuses a body part carried inline. Blob
-answers remove the caps: `messages.get` taken with `response_attachment` and
-read in the guest, each form written as a blob of the result, as the
-out-of-tree Fastmail bundle's `FastmailBody` does under a measured bound.
-Gmail's answer is base64url inside JSON, so the bound and the fuel differ
-from Fastmail's and want their own measurement. Done when a tool answers a
-Gmail message's whole text, its HTML as sent and that HTML as text as
-attachments, above `GmailRead`'s caps, with a real-host test at its bound; or
-a recorded decision that `GmailRead`'s cut stays. The comment sits at
-`GmailRead`'s arm of `plan` in
+RustSec lists `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555)
+as unmaintained, with no fixed release; `deny.toml` ignores both advisories by
+id so the gate stays green. `chrono` is a direct dependency of most first-party
+crates: it is in the envelope's field types, the stored timestamp format and
+the automation schedule's time zones. Choose a replacement (the advisory names
+`jiff` and `time`), and move every crate and both lockfiles to it, keeping the
+stored and wire timestamp formats. Done = neither crate is in `Cargo.lock` or
+`brenn-wasm/components/Cargo.lock`, and both `ignore` entries are gone from
+`deny.toml`.
+
+## `gmail-body-forms-above-bound`
+
+The Gmail body tool reads `messages.get`'s answer inside the guest and
+refuses a message whose answer is over its bound (786432 bytes), which fuel
+sets under the host's fixed guest limits for the costliest message a sender
+can write: a message of minimal HTML parts naming 2,400 distinct unknown
+charsets in turn spends about 127 fuel per answer byte against the 136.8
+that 1/1.4 of the activation's fuel floor grants at that size, and the bound
+is set where at least five percent of that grant is left unspent, while its
+peak memory is at most 8.2 MiB of the 12 MiB margin. A larger message is
+reachable only as `format=raw` through `api-request` by a caller granted it.
+Lifting the bound waits on a read that holds neither the answer nor a form
+whole — a streaming reader of the part tree and an HTML-to-text conversion
+that works by piece — or on `guest-memory-and-fuel-fixed-constants`. Done = the tool answers the forms of
+any message whose answer fits `max_blob_bytes`, with a real-host test, or a
+recorded decision that the bound stays. The comment sits at `BODY_ANSWER_MAX`
+in `brenn-wasm/components/google-gmail-read/src/logic.rs`.
+
+## `gmail-body-part-by-reference-unread`
+
+`GmailBody` makes its forms from the text parts `messages.get` carries
+inline. A `text/plain` or `text/html` part Gmail answers by `attachmentId` is
+left out of every form and reported in `decoding_notes`; it is fetched whole,
+as sent, with `GmailAttachment` when `GmailRead` lists it with a `part_id`.
+Folding it into the forms needs two nested answers in one result, and a step
+can open only the answer delivered to it and carries no blob to a later
+step. Whether Gmail serves a message's body text this way has not been
+observed. Done = the forms include such a part, fetched through
+`messages.attachments.get`, with a test; or a recorded observation that Gmail
+does not answer body text by reference, and the note removed. The comment
+sits in `GmailBody`'s body reader in
 `brenn-wasm/components/google-gmail-read/src/logic.rs`.
 
 ## `gmail-draft-attachments`
@@ -70,17 +97,6 @@ by the arguments cap, or a recorded decision that neither is wanted. The
 comment sits at `draft_create_call` in
 `brenn-wasm/components/google-gmail-compose/src/logic.rs`.
 
-## `google-tool-text-names-attachments-uncovered`
-
-The tool descriptions of `config/specs/google-gmail-compose.brenn`,
-`google-gmail-organize.brenn`, `google-calendar-read.brenn` and
-`google-calendar-write.brenn` still list attachments among "Gmail endpoints
-these tools do not cover", and the header comment of
-`config/specs/google-gmail-read.brenn` names four tools where the component
-provides five. `GmailAttachment` covers attachments. Done when every
-description and that header say what the tools cover. The comment sits at
-that header.
-
 ## `guest-memory-and-fuel-fixed-constants`
 
 A processor guest's linear memory (`PROCESSOR_MAX_MEMORY_BYTES`, 16 MiB) and
@@ -93,7 +109,11 @@ fuel before memory for HTML-only mail, and had its HTML renderer rewritten to
 fit the fuel rate; the same bundle's file listing reads at most 192 KiB of
 multi-status, bound by fuel alone — parsing the XML cost about 200 fuel per
 byte on average at 1 MiB against the 128 granted, so the bound is what the
-50M floor covers, and memory holds more than five times as much. Decide
+50M floor covers, and memory holds more than five times as much; and
+`GmailBody`'s Gmail read refuses an answer over 768 KiB, set by fuel under a
+1.4 test margin with five percent of it spare, its costliest message
+spending about 127 fuel per answer byte where memory peaks under 8.2 MiB.
+Decide
 whether either limit becomes a deployment or per-instance setting under a
 ceiling, with the window arithmetic of `wasm-window-byte-cap` and the
 security posture for untrusted guests redone against the larger figure, or
@@ -134,6 +154,21 @@ leaving it with built bodies moved to blobs; `MAX_ASYNC_RESULT_BYTES`
 recorded, and under either of the first two a component sends a nested call
 over 64 KiB with a test. The comment sits at `PROCESSOR_MAX_TOOL_ARGS_BYTES`
 in `brenn-wasm/src/lib.rs`.
+
+## `provider-result-activation-trap-strands-request`
+
+A provider activation that traps while answering a nested call's result
+fails no request: the dispatcher fails only the requests new in the trapped
+activation, the provider kit's store writes are rolled back, and the result,
+no longer new, is never read again. The request it belonged to is answered
+only when the host's ceiling for it runs out. A provider that reads an answer
+inside the guest (`GmailAttachment`, `GmailBody`) reaches this when the
+answer and the activation's input windows together outgrow the guest's
+memory. Decide whether the dispatcher fails the requests whose results were
+new in a trapped activation, or the kit reads a result again on the next
+one. Done = a real-host test in which an activation traps on a result and
+its caller is answered an error without waiting for the ceiling. The comment
+sits at `fail_delivered_requests` in `brenn-wasm-dispatch/src/lib.rs`.
 
 ## `tool-provide-attachment-count`
 
@@ -1125,7 +1160,7 @@ consumer's tool grants, validated at the component-load site.
 
 ## `xtask-deny-warnings`
 
-`make check`'s `xtask-deny` step prints two warnings that are not failures.
+`make check`'s `xtask-deny` step prints three kinds of warning that are not failures.
 (1) `chacha20 0.10.0` in the root `Cargo.lock` is yanked; it arrives through
 `rand 0.10.1`, and the index has 0.10.1 and 0.10.2. Repin it with
 `CARGO_BAZEL_REPIN=chacha20 CARGO_BAZEL_REPIN_ONLY=crates bazel mod deps` (the
@@ -1135,10 +1170,14 @@ the `graf.git` line of `deny.toml`'s `allow-git`: one `deny.toml` is applied to
 all three workspace units, `brenn-graf` in the root unit uses that source, and
 the `brenn-wasm/components` and `tools/scrub` units do not, so cargo-deny warns
 in those two. Deleting the line breaks the root unit (`unknown-git = "deny"`).
+(3) `advisory-not-detected` on the two `ignore` entries of `deny.toml`, for
+the same reason: `chrono-tz` is absent from the `brenn-wasm/components` unit
+and both crates from `tools/scrub`; these go when `chrono-unmaintained` is
+done.
 Decide between a per-unit config passed by `xtask deny` and keeping one shared
 file with the warning documented beside the line. Done is `xtask-deny`
-printing neither warning, or (2) resolved as "documented, kept" with the
-comment at the line saying so.
+printing none of these warnings, or (2) resolved as "documented, kept" with
+the comment at the line saying so and (3) gone with its `ignore` entries.
 
 ## `brenn-tool-requires-approval-dead-gate`
 

@@ -881,6 +881,8 @@ mod fanout;
 #[cfg(test)]
 mod git_forge_parser;
 #[cfg(test)]
+mod limits;
+#[cfg(test)]
 mod mount;
 #[cfg(test)]
 mod multiport;

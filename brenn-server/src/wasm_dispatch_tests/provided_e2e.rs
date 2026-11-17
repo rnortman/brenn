@@ -121,6 +121,7 @@ async fn rig(provider_acl: Vec<&[(&str, &str)]>, caller_args: Value) -> Rig {
         }),
         conversations: None,
         blob_limits: None,
+        limits: None,
     })
     .await;
 

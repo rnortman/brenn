@@ -1,9 +1,10 @@
 //! The wrapper's decisions, in `std` plus `serde_json`: validating
-//! `GmailLabels`', `GmailSearch`'s, `GmailRead`'s, `GmailThread`'s and
-//! `GmailAttachment`'s arguments, building their Gmail calls as `api-request`
-//! arguments, reading `api-request`'s answer, compacting Google's JSON into
-//! the tool's result, and decoding a fetched attachment from one blob into
-//! another through the kit's [`Step`]. Nothing here names the guest SDK, so
+//! `GmailLabels`', `GmailSearch`'s, `GmailRead`'s, `GmailThread`'s,
+//! `GmailAttachment`'s and `GmailBody`'s arguments, building their Gmail calls
+//! as `api-request` arguments, reading `api-request`'s answer, compacting
+//! Google's JSON into the tool's result, decoding a fetched attachment from
+//! one blob into another, and writing a message's body forms as blobs from
+//! the blob Gmail's answer arrived in, through the kit's [`Step`]. Nothing here names the guest SDK, so
 //! the whole module runs on the host under test. Tools are the generated `Provided` enum, whose SDK-facing
 //! parts are wasm32-only.
 
@@ -12,9 +13,13 @@
 #[cfg(test)]
 mod spec;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hasher};
 
-use brenn_google_workspace::args::{QUERY_MAX_CHARS, account, id_arg, is_token, max_chars};
+use brenn_google_workspace::args::{
+    QUERY_MAX_CHARS, account, id_arg, id_list, is_token, max_chars,
+};
+use brenn_google_workspace::bytes;
 use brenn_google_workspace::call::get_call;
 use brenn_google_workspace::gmail::attachment::{DecodeError, Decoder, part_tree_fields};
 use brenn_google_workspace::gmail::{
@@ -24,13 +29,14 @@ use brenn_google_workspace::gmail::{
 use brenn_google_workspace::scope::{Scope, google_error, no_body_refused};
 use brenn_google_workspace::settings::Settings;
 use brenn_google_workspace::text::{
-    PAGE_MAX_CHARS, bounded_quote, fit_text, next_page, plain, put_cut_text, shape,
+    PAGE_MAX_CHARS, bounded_quote, fit_text, next_page, plain, plain_byte, plain_changes,
+    put_cut_text, shape,
 };
 use brenn_provider_kit::{
-    Answer, ApiCall, Args, BlobAnswer, COMPACT_RESULT_CEILING, Call, CreateError, ErrorKind,
-    Failure, Logic, NestedError, Next, Query, QueryValue, Step, Tool, Unreadable, bounded, capped,
-    copy, cut, flag, google, integer, internal, no_such_step, object, query, read_api_blob,
-    read_api_result, serialized_len, stored,
+    Answer, ApiCall, Append, Args, Blob, BlobAnswer, COMPACT_RESULT_CEILING, Call, CreateError,
+    ErrorKind, Failure, Logic, NestedError, Next, Query, QueryValue, Step, Tool, Unreadable,
+    bounded, capped, copy, cut, flag, google, integer, internal, no_such_step, object, query,
+    read_api_blob, read_api_result, serialized_len, stored,
 };
 use serde_json::{Value, json};
 
@@ -93,6 +99,10 @@ const READ_HEADERS: &[&str] = &[
 /// `GmailRead`'s second step: the message's structure, read when the full
 /// message's read was cut at the provider's read limit or refused by the host.
 const STRUCTURE_STEP: u8 = 2;
+/// Where `GmailRead` sends a caller whose message it answered without a body:
+/// `GmailBody`'s answer is a blob, which neither `max_response_bytes` nor the
+/// bus cap bounds.
+const TO_GMAIL_BODY: &str = "GmailBody answers the body as files";
 /// What the structure mask lists of the message itself.
 const STRUCTURE_MESSAGE_FIELDS: &str = "id,threadId,labelIds,snippet,internalDate,sizeEstimate";
 /// What the structure mask lists of each part: everything but `data`.
@@ -156,6 +166,24 @@ const FILE_ATTACHMENT: &str = "attachment";
 /// The content type of a file whose part names none the host accepts.
 const OCTET_STREAM: &str = "application/octet-stream";
 
+/// The largest answer from Gmail `GmailBody` reads, in bytes of the JSON as
+/// it arrives: the whole answer is held in the guest, parsed, and turned
+/// into its forms there, so the bound is what fits the guest's fuel and
+/// memory. Checked on the answer's blob before a byte of it is read. Fuel
+/// sets it: it is set so that the costliest message a sender can write
+/// leaves at least five percent of 1/1.4 of the activation's fuel floor
+/// unspent.
+// TODO(gmail-body-forms-above-bound): answer the forms of a message whose
+// answer is over this bound.
+pub const BODY_ANSWER_MAX: u64 = 768 * 1024;
+/// The routes a message over `GmailBody`'s bound still has.
+const BODY_ROUTES: &str = "GmailRead answers its text cut, and a caller granted api-request \
+                           reads the whole message with `format=raw` and `response_attachment` \
+                           (docs/providers/google.md)";
+/// The content types of the forms.
+const TEXT_PLAIN_UTF8: &str = "text/plain; charset=utf-8";
+const TEXT_HTML_UTF8: &str = "text/html; charset=utf-8";
+
 /// The scope `tool`'s step `step` needs. A step the tool does not have is
 /// never asked for: `advance` maps an error only for a step it issued.
 fn scope(tool: Provided, step: u8) -> Scope {
@@ -165,7 +193,8 @@ fn scope(tool: Provided, step: u8) -> Scope {
             | Provided::GmailSearch
             | Provided::GmailRead
             | Provided::GmailThread
-            | Provided::GmailAttachment,
+            | Provided::GmailAttachment
+            | Provided::GmailBody,
             _,
         ) => Scope::GmailRead,
     }
@@ -228,9 +257,6 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
                 api: search_list_call(&search, settings),
             })
         }
-        // TODO(gmail-body-forms-as-blobs): answer the whole text, the HTML as
-        // sent and its rendering as blobs, above `max_chars` and the result
-        // ceiling.
         Provided::GmailRead => {
             let read = ReadArgs::parse(args)?;
             Ok(Call {
@@ -250,6 +276,13 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
             Ok(Call {
                 step: 1,
                 api: part_tree_call(&attachment, settings),
+            })
+        }
+        Provided::GmailBody => {
+            let body = BodyArgs::parse(args)?;
+            Ok(Call {
+                step: 1,
+                api: body_call(&body, settings),
             })
         }
     }
@@ -469,6 +502,87 @@ fn attachment_call(args: &AttachmentArgs, attachment_id: &str, settings: &Settin
     .answer_as_attachment()
 }
 
+/// A form of a message's body `GmailBody` answers, in the order the forms are
+/// written and attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Form {
+    /// The text `GmailRead` answers, uncut.
+    Text,
+    /// The HTML view's parts, decoded.
+    Html,
+    /// The HTML view's parts read as text.
+    Rendered,
+}
+
+impl Form {
+    const ALL: [Form; 3] = [Form::Text, Form::Html, Form::Rendered];
+
+    /// The form's name, as `forms` takes it and as its attachment is named.
+    fn name(self) -> &'static str {
+        match self {
+            Form::Text => "text",
+            Form::Html => "html",
+            Form::Rendered => "rendered",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Form> {
+        Form::ALL.into_iter().find(|form| form.name() == name)
+    }
+}
+
+/// `GmailBody`'s arguments: the message, and its forms in [`Form::ALL`]
+/// order.
+struct BodyArgs {
+    id: String,
+    forms: Vec<Form>,
+    account: Option<String>,
+}
+
+impl BodyArgs {
+    /// Every argument the tool takes.
+    const KEYS: &[&str] = &["id", "forms", "account"];
+
+    fn parse(args: &Value) -> Result<BodyArgs, String> {
+        let map = object(args, Self::KEYS)?;
+        let id = gmail_id(map, "id")?.ok_or("`id` is required")?;
+        let names = id_list(
+            map,
+            "forms",
+            (1, Form::ALL.len()),
+            "form names",
+            |name| Form::from_name(name).is_some(),
+            || "one of `text`, `html` and `rendered`".to_string(),
+        )?
+        .ok_or("`forms` is required")?;
+        let mut forms: Vec<Form> = names
+            .iter()
+            .map(|name| Form::from_name(name).expect("id_list admitted only form names"))
+            .collect();
+        forms.sort_unstable();
+        Ok(BodyArgs {
+            id,
+            forms,
+            account: account(map)?,
+        })
+    }
+
+    fn wants(&self, form: Form) -> bool {
+        self.forms.contains(&form)
+    }
+}
+
+/// messages.get of the whole message, its answer asked for as an attachment.
+fn body_call(args: &BodyArgs, settings: &Settings) -> ApiCall {
+    get_call(
+        settings,
+        args.account.as_deref(),
+        format!("{MESSAGES_PATH}/{}", args.id),
+        query([("format", "full".to_string())]),
+    )
+    .answer_as_attachment()
+}
+
 /// labels.list for the names of the user labels an answer carries.
 fn label_names_call(account: Option<&str>, settings: &Settings) -> ApiCall {
     get_call(
@@ -624,8 +738,12 @@ pub fn advance(
     step: &mut Step<'_>,
     settings: &Settings,
 ) -> Next {
-    if (state.tool, state.step) == (Provided::GmailAttachment, FETCH_STEP) {
-        return attachment_fetched(state, outcome, step);
+    match (state.tool, state.step) {
+        (Provided::GmailAttachment, FETCH_STEP) => {
+            return attachment_fetched(state, outcome, step);
+        }
+        (Provided::GmailBody, 1) => return body_read(state, outcome, step),
+        _ => {}
     }
     let body = match read_api_result(outcome, &state.target, google::API_NAME) {
         Ok(Answer::Body(body)) => body,
@@ -681,7 +799,8 @@ pub fn advance(
 /// A nested read that was cut or refused, decided by the step's shape: a
 /// per-message read of a search page is listed unavailable and the page goes
 /// on; a message's or a thread's first read is asked for again narrower,
-/// carrying why; every other step fails with why.
+/// carrying why; a message's narrower read fails with why and the route to
+/// its body; every other step fails with why.
 fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
     settle(
         state.tool,
@@ -703,10 +822,12 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
                 },
                 derived: why.to_derived(),
             }),
+            (Provided::GmailRead, STRUCTURE_STEP) => {
+                Err(why.failure(google::API_NAME, Some(TO_GMAIL_BODY)))
+            }
             (Provided::GmailLabels, 1)
             | (Provided::GmailSearch, 1)
             | (Provided::GmailAttachment, 1)
-            | (Provided::GmailRead, STRUCTURE_STEP)
             | (Provided::GmailThread, THREAD_NARROW_STEP)
             | (Provided::GmailSearch | Provided::GmailRead | Provided::GmailThread, LABELS_STEP) => {
                 Err(why.failure(google::API_NAME, None))
@@ -747,7 +868,10 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
             let value = match tool {
                 Provided::GmailRead => fit_text(value, "text", COMPACT_RESULT_CEILING),
                 Provided::GmailThread => fit_thread(value, COMPACT_RESULT_CEILING),
-                Provided::GmailLabels | Provided::GmailSearch | Provided::GmailAttachment => value,
+                Provided::GmailLabels
+                | Provided::GmailSearch
+                | Provided::GmailAttachment
+                | Provided::GmailBody => value,
             };
             bounded(value, COMPACT_RESULT_CEILING, None)
         }
@@ -789,7 +913,7 @@ fn part_located(state: &InFlight, body: &Value, settings: &Settings) -> Result<N
         None => {
             return Err(invalid_args(format!(
                 "part `{}` is carried inside the message, not as an attachment Gmail serves; \
-                 read it with GmailRead",
+                 read it with GmailRead, or whole with GmailBody when it is body text",
                 args.part_id
             )));
         }
@@ -982,6 +1106,484 @@ fn decode_attachment(state: &InFlight, answer: &str, step: &mut Step<'_>) -> Res
     })))
 }
 
+/// `GmailBody`'s read answered: Gmail's JSON, an attachment of the answer,
+/// turned into the forms asked for; a typed refusal of `api-request`'s,
+/// Google's error or an unreadable answer fails the request.
+fn body_read(state: &InFlight, outcome: Result<Value, NestedError>, step: &mut Step<'_>) -> Next {
+    let answer = match read_api_blob(outcome, &state.target, google::API_NAME) {
+        Ok(BlobAnswer::Blob { attachment, .. }) => attachment,
+        Ok(BlobAnswer::Relay(value)) => return Next::Complete(value),
+        Ok(BlobAnswer::Unreadable(why)) => {
+            return Next::Fail(why.failure(google::API_NAME, None));
+        }
+        Ok(BlobAnswer::Error { status, body }) => {
+            return Next::Fail(google_error(status, &body, scope(state.tool, state.step)));
+        }
+        Ok(BlobAnswer::TooLarge { limit, .. }) => {
+            return Next::Fail(invalid_args(format!(
+                "the message's answer from Gmail exceeds the host's largest blob \
+                 (max_blob_bytes, {limit} bytes); GmailRead answers its text cut"
+            )));
+        }
+        Ok(BlobAnswer::StoreFull) => {
+            return Next::Fail(internal(
+                "the host's blob store is full (blob_budget_bytes)",
+            ));
+        }
+        Err(failure) => return Next::Fail(failure),
+    };
+    settle(state.tool, body_forms(state, &answer, step))
+}
+
+/// Gmail's answer, the step's answer attachment `answer`, read whole when it
+/// is at most [`BODY_ANSWER_MAX`] bytes and parsed into the message's part
+/// tree, which borrows from it; the walk's leaves and the notes' sentences
+/// made, the buffer is dropped, and then each form asked for
+/// written to a blob of its own, in [`Form::ALL`] order, each leaf's text
+/// dropped once no form left to write reads it. Every form is sealed before
+/// the first is attached, so a failure attaches nothing.
+fn body_forms(state: &InFlight, answer: &str, step: &mut Step<'_>) -> Result<Next, Failure> {
+    let args = stored(state, BodyArgs::parse)?;
+    let api = "messages.get";
+    let blob = step.open_answer(answer)?;
+    if blob.size() > BODY_ANSWER_MAX {
+        return Err(invalid_args(format!(
+            "the message's answer from Gmail is {} bytes, over the {BODY_ANSWER_MAX} bytes \
+             GmailBody reads; {BODY_ROUTES}",
+            blob.size()
+        )));
+    }
+    let size = usize::try_from(blob.size()).expect("BODY_ANSWER_MAX fits the target's usize");
+    let mut bytes = Vec::with_capacity(size);
+    for piece in step.pieces(&blob) {
+        bytes.extend_from_slice(&piece?);
+    }
+    // The tree and the notes borrow their strings from the answer, which is
+    // held until the walk and the notes have read them.
+    let message = decode::Message::from_slice(&bytes).map_err(|error| walk_failure(error, api))?;
+    if message.id != args.id {
+        return Err(shape(api));
+    }
+    let wanted = decode::Wanted {
+        text: args.wants(Form::Text),
+        html: args.wants(Form::Html),
+        rendered: args.wants(Form::Rendered),
+    };
+    let (mut bodies, notes) =
+        decode::bodies(&message.payload, wanted).map_err(|error| walk_failure(error, api))?;
+    let answered = body_notes(&notes, bodies.by_reference)?;
+    drop(notes);
+    drop(message);
+    drop(bytes);
+    let max_write = usize::try_from(step.limits()?.max_write_bytes.max(1))
+        .expect("a u32 fits the target's usize");
+
+    let mut out = Args::new();
+    out.insert("id".to_string(), json!(args.id));
+    let mut made = Vec::with_capacity(args.forms.len());
+    for (at, &form) in args.forms.iter().enumerate() {
+        let (value, blob) = body_form(step, &bodies, form, max_write)?;
+        out.insert(form.name().to_string(), value);
+        if let Some(blob) = blob {
+            made.push((form, blob));
+        }
+        release(&mut bodies, &args.forms[at + 1..]);
+    }
+    if !answered.is_empty() {
+        out.insert(
+            "decoding_notes".to_string(),
+            Value::Array(answered.into_iter().map(Value::String).collect()),
+        );
+    }
+    for (form, blob) in made {
+        step.attach(form.name(), blob);
+    }
+    Ok(Next::Complete(Value::Object(out)))
+}
+
+/// `bodies`' decoding notes as answered: each sentence once, in the order
+/// first said, then the sentence counting the parts that came by reference.
+/// A message can make many distinct sentences; once their bytes alone are
+/// over the result ceiling the answer would be too, so it is refused there.
+/// The distinct notes are counted first at the length of their sentence
+/// with nothing quoted, which no sentence is shorter than, so a message
+/// whose notes are over the ceiling by that count is refused before any
+/// sentence is made.
+fn body_notes(notes: &[decode::Note<'_>], by_reference: usize) -> Result<Vec<String>, Failure> {
+    let over = || {
+        internal(format!(
+            "the message's decoding notes alone are over the {COMPACT_RESULT_CEILING}-byte \
+             result ceiling"
+        ))
+    };
+    let charset_floor = note(&decode::Note::UnknownCharset("".into()), false).len();
+    let utf8_floor = note(&decode::Note::InvalidUtf8, false).len();
+    let children_floor = note(
+        &decode::Note::UnlistedChildren {
+            mime_type: "".into(),
+            depth: 0,
+        },
+        false,
+    )
+    .len();
+    let mut seen = Distinct::new(notes, note_hash, same_note);
+    let mut distinct = Vec::new();
+    let mut len = 0;
+    for (at, one) in notes.iter().enumerate() {
+        if !seen.first(at) {
+            continue;
+        }
+        len += match one {
+            decode::Note::UnknownCharset(_) => charset_floor,
+            decode::Note::InvalidUtf8 => utf8_floor,
+            decode::Note::UnlistedChildren { .. } => children_floor,
+        };
+        if len > COMPACT_RESULT_CEILING {
+            return Err(over());
+        }
+        distinct.push(one);
+    }
+
+    // Distinct notes say one sentence only where quoting made their names
+    // alike: a name cut, or a control character in it made a space.
+    let quoted_alike = distinct.iter().any(|one| match one {
+        decode::Note::UnknownCharset(name)
+        | decode::Note::UnlistedChildren {
+            mime_type: name, ..
+        } => name.len() > HEADER_MAX_BYTES || plain_changes(name.as_bytes()),
+        decode::Note::InvalidUtf8 => false,
+    });
+    let mut sentences: Vec<String> = distinct.into_iter().map(|one| note(one, false)).collect();
+    let kept: Vec<usize> = if quoted_alike {
+        let mut seen = Distinct::new(
+            &sentences,
+            |sentence| sip(sentence.as_bytes()),
+            |a, b| bytes::same(a.as_bytes(), b.as_bytes()),
+        );
+        (0..sentences.len()).filter(|&at| seen.first(at)).collect()
+    } else {
+        (0..sentences.len()).collect()
+    };
+    let mut answered = Vec::with_capacity(kept.len() + 1);
+    let mut len = 0;
+    for at in kept {
+        let sentence = std::mem::take(&mut sentences[at]);
+        len += sentence.len();
+        if len > COMPACT_RESULT_CEILING {
+            return Err(over());
+        }
+        answered.push(sentence);
+    }
+    // TODO(gmail-body-part-by-reference-unread): fetch a text part Gmail
+    // carries by reference and read it into the forms.
+    match by_reference {
+        0 => {}
+        1 => answered.push(
+            "1 text part came as an attachment reference and is in no form; GmailRead lists \
+             it under attachments, and one listed with a `part_id` is fetched with \
+             GmailAttachment"
+                .to_string(),
+        ),
+        n => answered.push(format!(
+            "{n} text parts came as attachment references and are in no form; GmailRead lists \
+             them under attachments, and one listed with a `part_id` is fetched with \
+             GmailAttachment"
+        )),
+    }
+    Ok(answered)
+}
+
+/// Which items of a list are the first of their kind, asked in order.
+///
+/// Items are told apart by a 64-bit hash and compared only with an item
+/// that hashes alike, so the work is each item hashed once, a search of
+/// integers, and a comparison with its earlier equal; an item is never
+/// searched against other items' text. The items here are notes and
+/// sentences whose text is the sender's, which it can make long and alike;
+/// the hash is SipHash, so making many items hash alike is out of its
+/// reach.
+struct Distinct<'a, T> {
+    items: &'a [T],
+    hash: fn(&T) -> u64,
+    same: fn(&T, &T) -> bool,
+    /// Each hash seen, with the first item that has it.
+    firsts: BTreeMap<u64, usize>,
+    /// Each later distinct item whose hash an earlier one has, by hash.
+    collided: BTreeSet<(u64, usize)>,
+}
+
+impl<'a, T> Distinct<'a, T> {
+    fn new(items: &'a [T], hash: fn(&T) -> u64, same: fn(&T, &T) -> bool) -> Self {
+        Distinct {
+            items,
+            hash,
+            same,
+            firsts: BTreeMap::new(),
+            collided: BTreeSet::new(),
+        }
+    }
+
+    /// Whether `items[at]` is the first of its kind, every item before it
+    /// having been asked.
+    fn first(&mut self, at: usize) -> bool {
+        let item = &self.items[at];
+        let key = (self.hash)(item);
+        let earlier = *self.firsts.entry(key).or_insert(at);
+        if earlier == at {
+            return true;
+        }
+        if (self.same)(&self.items[earlier], item)
+            || self
+                .collided
+                .range((key, 0)..=(key, usize::MAX))
+                .any(|&(_, seen)| (self.same)(&self.items[seen], item))
+        {
+            return false;
+        }
+        self.collided.insert((key, at));
+        true
+    }
+}
+
+/// SipHash of `bytes`, in one write.
+fn sip(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+/// Whether two notes are the same note.
+fn same_note(a: &decode::Note<'_>, b: &decode::Note<'_>) -> bool {
+    use decode::Note::{InvalidUtf8, UnknownCharset, UnlistedChildren};
+    match (a, b) {
+        (UnknownCharset(a), UnknownCharset(b)) => bytes::same(a.as_bytes(), b.as_bytes()),
+        (InvalidUtf8, InvalidUtf8) => true,
+        (
+            UnlistedChildren {
+                mime_type: a,
+                depth: a_depth,
+            },
+            UnlistedChildren {
+                mime_type: b,
+                depth: b_depth,
+            },
+        ) => a_depth == b_depth && bytes::same(a.as_bytes(), b.as_bytes()),
+        _ => false,
+    }
+}
+
+/// A note's hash for [`Distinct`]: its quoted string's, with its kind and
+/// depth mixed in.
+fn note_hash(note: &decode::Note<'_>) -> u64 {
+    // An odd multiplier keeps distinct depths distinct.
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+    match note {
+        decode::Note::UnknownCharset(name) => sip(name.as_bytes()),
+        decode::Note::InvalidUtf8 => 0,
+        decode::Note::UnlistedChildren { mime_type, depth } => {
+            sip(mime_type.as_bytes()) ^ (*depth as u64 + 1).wrapping_mul(MIX)
+        }
+    }
+}
+
+/// `form` of `bodies`: its answer and the blob holding it, or its answer
+/// alone when the form is absent.
+fn body_form(
+    step: &Step<'_>,
+    bodies: &decode::Bodies,
+    form: Form,
+    max_write: usize,
+) -> Result<(Value, Option<Blob>), Failure> {
+    let leaves = |view: &[usize]| {
+        view.iter()
+            .map(|&leaf| &bodies.leaves[leaf])
+            .collect::<Vec<_>>()
+    };
+    let (view, absent) = match form {
+        Form::Text => (&bodies.text, "no text part"),
+        Form::Html | Form::Rendered => (&bodies.html, "no HTML part"),
+    };
+    if view.is_empty() {
+        return Ok((json!({ "absent": absent }), None));
+    }
+    let leaves = leaves(view);
+    let (segments, separator, through_plain, content_type, mut value) = match form {
+        Form::Text => {
+            let source = |source| leaves.iter().all(|leaf| leaf.source == source);
+            let source = if source(decode::Source::Plain) {
+                "text/plain"
+            } else if source(decode::Source::Html) {
+                "text/html"
+            } else {
+                "mixed"
+            };
+            let mut segments = Vec::with_capacity(leaves.len());
+            for leaf in &leaves {
+                segments.push(kept(leaf.text())?);
+            }
+            (
+                segments,
+                "\n\n",
+                true,
+                TEXT_PLAIN_UTF8,
+                json!({ "source": source }),
+            )
+        }
+        Form::Html => {
+            let mut segments = Vec::with_capacity(leaves.len());
+            for leaf in &leaves {
+                segments.push(kept(leaf.decoded.as_deref())?);
+            }
+            (
+                segments,
+                "\n",
+                false,
+                TEXT_HTML_UTF8,
+                json!({ "parts": leaves.len() }),
+            )
+        }
+        Form::Rendered => {
+            let mut segments = Vec::with_capacity(leaves.len());
+            for leaf in &leaves {
+                segments.push(kept(leaf.rendering.as_deref())?);
+            }
+            (
+                segments,
+                "\n\n",
+                true,
+                TEXT_PLAIN_UTF8,
+                json!({ "parts": leaves.len() }),
+            )
+        }
+    };
+    let segments: Vec<&str> = if through_plain {
+        segments
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect()
+    } else {
+        segments
+    };
+    let size = segments.iter().map(|text| text.len()).sum::<usize>()
+        + separator.len() * segments.len().saturating_sub(1);
+    if size == 0 {
+        return Ok((json!({ "absent": "empty" }), None));
+    }
+    let blob = write_form(
+        step,
+        content_type,
+        &segments,
+        separator,
+        through_plain,
+        max_write,
+    )?;
+    value["attachment"] = json!(form.name());
+    value["size"] = json!(blob.size());
+    Ok((value, Some(blob)))
+}
+
+/// A leaf's text a form reads, which the walk keeps for every form asked for.
+fn kept(text: Option<&str>) -> Result<&str, Failure> {
+    text.ok_or_else(|| internal("a part a form reads was not kept by the walk"))
+}
+
+/// A blob of `content_type` holding `segments` joined by `separator`, through
+/// [`plain`] when `through_plain`, written in slices of at most `max_write`
+/// bytes so no write holds a whole segment.
+fn write_form(
+    step: &Step<'_>,
+    content_type: &str,
+    segments: &[&str],
+    separator: &str,
+    through_plain: bool,
+    max_write: usize,
+) -> Result<Blob, Failure> {
+    let mut blob = step.append(content_type)?;
+    let mut gathered = Vec::new();
+    for (at, segment) in segments.iter().enumerate() {
+        if at > 0 {
+            // `plain` leaves a separator as it is.
+            gather(
+                &mut blob,
+                &mut gathered,
+                separator.as_bytes(),
+                false,
+                max_write,
+            )?;
+        }
+        gather(
+            &mut blob,
+            &mut gathered,
+            segment.as_bytes(),
+            through_plain,
+            max_write,
+        )?;
+    }
+    if !gathered.is_empty() {
+        blob.write(&gathered)?;
+    }
+    blob.finish()
+}
+
+/// The length under which [`gather`] gathers a piece with others.
+const GATHERED_UNDER: usize = 4096;
+
+/// `bytes`, through [`plain`] when `through_plain`, written to `blob` after
+/// what `gathered` holds. A piece shorter than [`GATHERED_UNDER`] is gathered
+/// with others into one write of at most `max_write` bytes, since each write
+/// costs more than a short piece's bytes; a longer one is written in slices
+/// of at most `max_write`.
+fn gather(
+    blob: &mut Append<'_>,
+    gathered: &mut Vec<u8>,
+    bytes: &[u8],
+    through_plain: bool,
+    max_write: usize,
+) -> Result<(), Failure> {
+    if bytes.len() < GATHERED_UNDER && gathered.len() + bytes.len() <= max_write {
+        if through_plain && plain_changes(bytes) {
+            gathered.extend(bytes.iter().copied().map(plain_byte));
+        } else {
+            gathered.extend_from_slice(bytes);
+        }
+        return Ok(());
+    }
+    if !gathered.is_empty() {
+        blob.write(gathered)?;
+        gathered.clear();
+    }
+    // TODO(blob-append-write-copies-whole-argument): pass each segment whole
+    // once the kit's `Append::write` stops copying its argument.
+    for slice in bytes.chunks(max_write) {
+        if through_plain && plain_changes(slice) {
+            gathered.extend(slice.iter().copied().map(plain_byte));
+            blob.write(gathered)?;
+            gathered.clear();
+        } else {
+            blob.write(slice)?;
+        }
+    }
+    Ok(())
+}
+
+/// `bodies` with every leaf's text that none of the forms `later` reads
+/// dropped. `text` is written first, so no later form reads a plain leaf.
+fn release(bodies: &mut decode::Bodies, later: &[Form]) {
+    let (html, rendered) = (later.contains(&Form::Html), later.contains(&Form::Rendered));
+    let mut in_html = vec![false; bodies.leaves.len()];
+    for &leaf in &bodies.html {
+        in_html[leaf] = true;
+    }
+    for (leaf, in_html) in bodies.leaves.iter_mut().zip(in_html) {
+        if !(html && in_html && leaf.source == decode::Source::Html) {
+            leaf.decoded = None;
+        }
+        if !(rendered && in_html) {
+            leaf.rendering = None;
+        }
+    }
+}
+
 /// messages.list read: an empty page completes at once; otherwise the first
 /// listed message is read next, the ids and the page's token and estimate
 /// riding in `derived`.
@@ -1103,7 +1705,7 @@ fn read_full(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next
     } else {
         "mixed"
     };
-    let mut notes = notes(&extracted, false);
+    let mut notes = notes(&extracted.notes, false);
     if text.is_empty() && extracted.text_by_reference {
         notes.push(
             "the body is an attachment reference, not fetched; it is listed under attachments"
@@ -1135,12 +1737,12 @@ fn read_structure(state: &InFlight, body: &Value, settings: &Settings) -> Result
         out.insert("snippet".to_string(), json!(snippet));
     }
     let extracted = extract(body, api)?;
-    let notes = notes(&extracted, true);
+    let notes = notes(&extracted.notes, true);
     out.insert("text".to_string(), Value::Null);
     out.insert(
         "text_omitted".to_string(),
         json!(format!(
-            "{}; headers and attachments are listed, the body is not",
+            "{}; headers and attachments are listed, the body is not; {TO_GMAIL_BODY}",
             quoted(&why, estimate)
         )),
     );
@@ -1154,51 +1756,68 @@ fn read_structure(state: &InFlight, body: &Value, settings: &Settings) -> Result
 /// A message's `payload` read by `decode::extract`. A message without one, a
 /// tree not of Gmail's shape, or a part whose data is not base64url is
 /// Google's fault.
-fn extract(body: &Value, api: &str) -> Result<decode::Extracted, Failure> {
+fn extract<'a>(body: &'a Value, api: &str) -> Result<decode::Extracted<'a>, Failure> {
     let payload = body.get("payload").ok_or_else(|| shape(api))?;
-    decode::extract(payload).map_err(|error| match error {
+    decode::Part::from_value(payload)
+        .and_then(|payload| decode::extract(&payload))
+        .map_err(|error| walk_failure(error, api))
+}
+
+/// Why a message's tree could not be read, as Google's fault.
+fn walk_failure(error: decode::WalkError, api: &str) -> Failure {
+    match error {
         decode::WalkError::Shape => shape(api),
         decode::WalkError::Base64(part) => internal(format!(
             "Gmail {api} part {} carries body data that is not base64url",
             bounded_quote(&part)
         )),
-    })
+    }
 }
 
 /// The decoding notes as answered. `structure` says the tree came through
 /// the structure mask, whose depth is why a part's children go unlisted.
-fn notes(extracted: &decode::Extracted, structure: bool) -> Vec<String> {
-    extracted
-        .notes
-        .iter()
-        .map(|note| match note {
-            decode::Note::UnknownCharset(name) => format!(
-                "charset \"{}\" is not supported; decoded as UTF-8, non-ASCII characters may \
-                 be wrong",
-                bounded_quote(name)
-            ),
-            decode::Note::InvalidUtf8 => {
-                "a text part is not valid UTF-8; its invalid bytes are shown as \u{fffd}"
-                    .to_string()
-            }
-            decode::Note::UnlistedChildren { mime_type, depth } if structure => format!(
-                "a {} part at depth {depth} has children the structure mask does not list; \
-                 attachments below it are not listed",
-                bounded_quote(mime_type)
-            ),
-            decode::Note::UnlistedChildren { mime_type, depth } => format!(
-                "a {} part at depth {depth} has no children in Google's answer; nothing below \
-                 it is shown",
-                bounded_quote(mime_type)
-            ),
-        })
-        .collect()
+fn notes(notes: &[decode::Note<'_>], structure: bool) -> Vec<String> {
+    notes.iter().map(|one| note(one, structure)).collect()
+}
+
+/// One note as [`notes`] answers it.
+fn note(note: &decode::Note<'_>, structure: bool) -> String {
+    // Pieces joined, not formatted: a message can make thousands of notes.
+    let joined = |pieces: &[&str]| {
+        let mut sentence = String::with_capacity(pieces.iter().map(|piece| piece.len()).sum());
+        for piece in pieces {
+            sentence.push_str(piece);
+        }
+        sentence
+    };
+    match note {
+        decode::Note::UnknownCharset(name) => joined(&[
+            "charset \"",
+            &bounded_quote(name),
+            "\" is not supported; decoded as UTF-8, non-ASCII characters may be wrong",
+        ]),
+        decode::Note::InvalidUtf8 => {
+            "a text part is not valid UTF-8; its invalid bytes are shown as \u{fffd}".to_string()
+        }
+        decode::Note::UnlistedChildren { mime_type, depth } => joined(&[
+            "a ",
+            &bounded_quote(mime_type),
+            " part at depth ",
+            &depth.to_string(),
+            if structure {
+                " has children the structure mask does not list; attachments below it are \
+                 not listed"
+            } else {
+                " has no children in Google's answer; nothing below it is shown"
+            },
+        ]),
+    }
 }
 
 /// The attachments as answered: `filename` and `mime_type` through `plain`
 /// and cut to `HEADER_MAX_BYTES`, `size` when Google gave it, `inline`, and
 /// `part_id` when the part has one the attachment fetch takes.
-fn attachments(extracted: &decode::Extracted) -> Value {
+fn attachments(extracted: &decode::Extracted<'_>) -> Value {
     Value::Array(
         extracted
             .attachments
@@ -3136,7 +3755,7 @@ mod tests {
                     "text_omitted": "Google's answer (300000 bytes; sizeEstimate 4096) exceeds \
                                      api-request's read limit for this provider \
                                      (max_response_bytes); headers and attachments are listed, \
-                                     the body is not",
+                                     the body is not; GmailBody answers the body as files",
                     "attachments": [{ "filename": "Q3 report.pdf",
                                       "mime_type": "application/pdf", "size": 48213,
                                       "inline": false, "part_id": "1" }],
@@ -3154,7 +3773,11 @@ mod tests {
         );
         assert_eq!(
             answered(&row, cut_read(json!(900000))),
-            Next::Fail(Unreadable::Cut("900000 bytes".to_string()).failure(google::API_NAME, None))
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "Google's answer (900000 bytes) exceeds api-request's read limit for this \
+                 provider (max_response_bytes); GmailBody answers the body as files"
+            ))
         );
     }
 
@@ -3175,16 +3798,17 @@ mod tests {
             json!(
                 "the host did not deliver api-request's answer: result exceeds [messaging] \
                  max_body_bytes; sizeEstimate 4096; headers and attachments are listed, the \
-                 body is not"
+                 body is not; GmailBody answers the body as files"
             )
         );
-        // The narrower read refused too is the request's failure, no hint.
+        // The narrower read refused too is the request's failure, naming the
+        // tool that reads the body.
         assert_eq!(
             answered(&row, nested("internal", refusal)),
             Next::Fail(failure(
                 ErrorKind::Internal,
                 "the host did not deliver api-request's answer: result exceeds [messaging] \
-                 max_body_bytes"
+                 max_body_bytes; GmailBody answers the body as files"
             ))
         );
         // A structure row that lost its reason is refused, not guessed at.
@@ -3769,7 +4393,7 @@ mod tests {
             Next::Fail(failure(
                 ErrorKind::InvalidArgs,
                 "part `0` is carried inside the message, not as an attachment Gmail serves; \
-                 read it with GmailRead"
+                 read it with GmailRead, or whole with GmailBody when it is body text"
             ))
         );
         assert_eq!(
@@ -4105,6 +4729,738 @@ mod tests {
         assert!(detail.contains("inline"), "{detail}");
     }
 
+    /// A `GmailBody` row at its one step, as `plan` issues it.
+    fn body_state(args: Value) -> InFlight {
+        let call = plan(Provided::GmailBody, &args, &settings()).unwrap();
+        InFlight::new(
+            &"b".repeat(32),
+            Provided::GmailBody,
+            &args,
+            &call,
+            Map::new(),
+            1_000,
+            1_000,
+        )
+    }
+
+    /// A text leaf of `mime_type` holding `bytes`, its charset declared when
+    /// `charset` names one.
+    fn text_leaf(mime_type: &str, charset: Option<&str>, bytes: &[u8]) -> Value {
+        let mut leaf = json!({
+            "partId": "", "mimeType": mime_type, "filename": "",
+            "body": { "size": bytes.len(), "data": base64url(bytes) },
+        });
+        if let Some(charset) = charset {
+            leaf["headers"] = json!([
+                { "name": "Content-Type", "value": format!("{mime_type}; charset={charset}") }
+            ]);
+        }
+        leaf
+    }
+
+    fn plain_leaf(text: &str) -> Value {
+        text_leaf("text/plain", Some("UTF-8"), text.as_bytes())
+    }
+
+    fn html_leaf(html: &str) -> Value {
+        text_leaf("text/html", Some("UTF-8"), html.as_bytes())
+    }
+
+    /// A `multipart/*` part of `subtype` holding `parts`.
+    fn multipart(subtype: &str, parts: Vec<Value>) -> Value {
+        json!({
+            "partId": "", "mimeType": format!("multipart/{subtype}"), "filename": "",
+            "body": { "size": 0 }, "parts": parts,
+        })
+    }
+
+    /// messages.get's answer for message `m1` with `payload`.
+    fn gmail_message(payload: Value) -> Vec<u8> {
+        json!({ "id": "m1", "threadId": "t1", "snippet": "Lunch?", "payload": payload })
+            .to_string()
+            .into_bytes()
+    }
+
+    /// One `GmailBody` request with `args` run through the kit's loop on
+    /// `host`, its read answered with `encoded` as its attachment. The
+    /// request's completion.
+    fn body_through_the_loop(host: &MemoryHost, args: Value, encoded: Vec<u8>) -> Completion {
+        let id = "r000".to_string();
+        let request = Request {
+            id: id.clone(),
+            tool: Provided::GmailBody.name().to_string(),
+            args,
+            attachments: Vec::new(),
+        };
+        host.activate::<GmailReads>(
+            &settings(),
+            Input {
+                now_ms: 0,
+                requests: vec![request],
+                results: Vec::new(),
+            },
+        )
+        .unwrap();
+        let read = host.take_calls().remove(0);
+        assert_eq!(read.call.response_attachment.as_deref(), Some("body"));
+        let size = encoded.len() as u64;
+        let answer = host.seed_result(&read.call_id, "body", "application/json", encoded);
+        host.activate::<GmailReads>(
+            &settings(),
+            Input {
+                now_ms: 1,
+                requests: Vec::new(),
+                results: vec![Delivered {
+                    call_id: read.call_id,
+                    serving: Some(id),
+                    outcome: blob_answer("body", size),
+                    attachments: vec![answer],
+                }],
+            },
+        )
+        .unwrap();
+        let mut completions = host.take_completions();
+        assert_eq!(completions.len(), 1);
+        completions.remove(0)
+    }
+
+    /// `GmailBody` of message `m1` in `forms`, answered with `payload`: the
+    /// answer and each blob's name, content type and text.
+    fn body_forms_of(forms: Value, payload: Value) -> (Value, Vec<(String, String, String)>) {
+        let completion = body_through_the_loop(
+            &MemoryHost::new(),
+            json!({ "id": "m1", "forms": forms }),
+            gmail_message(payload),
+        );
+        let Answered::Value(value) = completion.answer else {
+            panic!("{completion:?}");
+        };
+        let blobs = completion
+            .attachments
+            .into_iter()
+            .map(|blob| {
+                (
+                    blob.name,
+                    blob.content_type,
+                    String::from_utf8(blob.bytes).unwrap(),
+                )
+            })
+            .collect();
+        (value, blobs)
+    }
+
+    const ALL_FORMS: [&str; 3] = ["text", "html", "rendered"];
+
+    #[test]
+    fn body_plans_one_full_read_answered_as_an_attachment() {
+        let call = plan(
+            Provided::GmailBody,
+            &json!({ "id": "m1", "forms": ["html"], "account": "alice@example.com" }),
+            &settings(),
+        )
+        .unwrap();
+        assert_eq!(call.step, 1);
+        assert_eq!(call.api.method, "GET");
+        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m1");
+        assert_eq!(
+            call.api.query,
+            query([
+                ("format", "full".to_string()),
+                ("prettyPrint", "false".to_string()),
+            ])
+        );
+        assert_eq!(call.api.body, None);
+        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(call.api.response_attachment.as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn body_refuses_bad_arguments() {
+        let forms = "`forms` must be an array of 1 to 3 form names";
+        let form = "each of `forms` must be one of `text`, `html` and `rendered`";
+        for (args, error) in [
+            (json!({ "forms": ["text"] }), "`id` is required"),
+            (
+                json!({ "id": "m/1", "forms": ["text"] }),
+                "`id` must be 1 to 128 letters, digits, `_` or `-`",
+            ),
+            (json!({ "id": "m1" }), "`forms` is required"),
+            (json!({ "id": "m1", "forms": [] }), forms),
+            (
+                json!({ "id": "m1", "forms": ["text", "html", "rendered", "text"] }),
+                forms,
+            ),
+            (json!({ "id": "m1", "forms": "text" }), forms),
+            (json!({ "id": "m1", "forms": ["Text"] }), form),
+            (json!({ "id": "m1", "forms": ["txt"] }), form),
+            (json!({ "id": "m1", "forms": [1] }), form),
+            (
+                json!({ "id": "m1", "forms": ["html", "html"] }),
+                "`forms` names \"html\" twice",
+            ),
+            (
+                json!({ "id": "m1", "forms": ["text"], "max_chars": 10 }),
+                "unknown argument `max_chars`; this tool takes `id`, `forms`, `account`",
+            ),
+            (
+                json!({ "id": "m1", "forms": ["text"], "account": "" }),
+                "`account` is empty",
+            ),
+            (
+                json!({ "id": "m1", "forms": ["text"], "account": 1 }),
+                "`account` must be a string",
+            ),
+        ] {
+            assert_eq!(
+                plan(Provided::GmailBody, &args, &settings()).unwrap_err(),
+                error,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_forms_are_taken_in_any_order_and_kept_in_form_order() {
+        for (names, expected) in [
+            (
+                json!(["rendered", "text"]),
+                vec![Form::Text, Form::Rendered],
+            ),
+            (json!(["rendered", "html", "text"]), Form::ALL.to_vec()),
+            (json!(["html"]), vec![Form::Html]),
+        ] {
+            let args = BodyArgs::parse(&json!({ "id": "m1", "forms": names })).unwrap();
+            assert_eq!(args.forms, expected, "{names}");
+        }
+    }
+
+    #[test]
+    fn an_alternative_answers_its_plain_text_its_html_and_the_html_rendered() {
+        let payload = multipart(
+            "alternative",
+            vec![
+                plain_leaf("Lunch at noon?"),
+                html_leaf("<p>Lunch at <b>noon</b>?</p>"),
+            ],
+        );
+        let (value, blobs) = body_forms_of(json!(["rendered", "text", "html"]), payload);
+        let rendered = decode::html_to_text("<p>Lunch at <b>noon</b>?</p>");
+        assert_eq!(
+            value,
+            json!({
+                "id": "m1",
+                "text": { "attachment": "text", "size": 14, "source": "text/plain" },
+                "html": { "attachment": "html", "size": 28, "parts": 1 },
+                "rendered": { "attachment": "rendered", "size": rendered.len(), "parts": 1 },
+            })
+        );
+        let utf8_plain = "text/plain; charset=utf-8".to_string();
+        assert_eq!(
+            blobs,
+            vec![
+                (
+                    "text".to_string(),
+                    utf8_plain.clone(),
+                    "Lunch at noon?".to_string()
+                ),
+                (
+                    "html".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                    "<p>Lunch at <b>noon</b>?</p>".to_string()
+                ),
+                ("rendered".to_string(), utf8_plain, rendered),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_forms_asked_for_are_answered_and_attached() {
+        let payload = multipart(
+            "alternative",
+            vec![plain_leaf("Lunch?"), html_leaf("<p>Lunch?</p>")],
+        );
+        for forms in [
+            vec!["text"],
+            vec!["html"],
+            vec!["rendered"],
+            vec!["html", "text"],
+            vec!["rendered", "html"],
+        ] {
+            let (value, blobs) = body_forms_of(json!(forms), payload.clone());
+            let mut expected: Vec<&str> = ALL_FORMS
+                .into_iter()
+                .filter(|form| forms.contains(form))
+                .collect();
+            let names: Vec<&str> = blobs.iter().map(|(name, ..)| name.as_str()).collect();
+            assert_eq!(names, expected, "{forms:?}");
+            expected.push("id");
+            expected.sort_unstable();
+            let keys: Vec<&str> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, expected, "{forms:?}");
+        }
+    }
+
+    /// `GmailRead`'s `text` of message `m1` answered with `payload`, under a
+    /// `max_chars` that does not cut it.
+    fn read_text(payload: &Value) -> String {
+        let body = String::from_utf8(gmail_message(payload.clone())).unwrap();
+        let answer = completed(answered(
+            &read_state(json!({ "id": "m1", "max_chars": MAX_CHARS_MAX })),
+            http(200, &body),
+        ));
+        assert_eq!(answer.get("text_truncated"), None);
+        answer["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_text_form_is_gmail_reads_text_uncut() {
+        let controls = "tab\there\u{1}bell\u{7}\r\nend";
+        for payload in [
+            plain_leaf("Lunch at noon?"),
+            html_leaf("<div>Lunch &amp; <i>talk</i></div><p>at noon</p>"),
+            multipart(
+                "alternative",
+                vec![plain_leaf(" \n "), html_leaf("<p>Hi</p>")],
+            ),
+            multipart(
+                "mixed",
+                vec![
+                    plain_leaf(controls),
+                    plain_leaf(""),
+                    html_leaf("<p>Second\u{2}</p>"),
+                    text_leaf("text/plain", Some("windows-1252"), b"caf\xe9 \x93q\x94"),
+                ],
+            ),
+            multipart(
+                "alternative",
+                vec![
+                    plain_leaf("é".repeat(40_000).as_str()),
+                    html_leaf("<p>long</p>"),
+                ],
+            ),
+        ] {
+            let (value, blobs) = body_forms_of(json!(["text"]), payload.clone());
+            let text = read_text(&payload);
+            assert_eq!(blobs.len(), 1, "{value}");
+            assert_eq!(blobs[0].2, text);
+            assert_eq!(value["text"]["size"], json!(text.len()));
+        }
+        let (value, _) = body_forms_of(
+            json!(["text"]),
+            multipart("mixed", vec![plain_leaf("a"), html_leaf("<p>b</p>")]),
+        );
+        assert_eq!(value["text"]["source"], json!("mixed"));
+        let (value, blobs) = body_forms_of(json!(ALL_FORMS), html_leaf("<p>Only</p>"));
+        assert_eq!(value["text"]["source"], json!("text/html"));
+        assert_eq!(blobs[0].2, blobs[2].2, "an HTML-only text is its rendering");
+    }
+
+    #[test]
+    fn html_is_decoded_and_unchanged_and_several_parts_join_by_a_newline() {
+        let payload = multipart(
+            "mixed",
+            vec![
+                text_leaf("text/html", Some("windows-1252"), b"<p>caf\xe9\x01</p>"),
+                plain_leaf("between"),
+                html_leaf("<p>\u{2}second</p>"),
+            ],
+        );
+        let (value, blobs) = body_forms_of(json!(["html", "rendered"]), payload);
+        assert_eq!(value["html"]["parts"], json!(2));
+        assert_eq!(value["rendered"]["parts"], json!(2));
+        assert_eq!(blobs[0].2, "<p>café\u{1}</p>\n<p>\u{2}second</p>");
+        let rendered = [
+            decode::html_to_text("<p>café\u{1}</p>"),
+            decode::html_to_text("<p>\u{2}second</p>"),
+        ];
+        assert_eq!(
+            blobs[1].2,
+            plain(&rendered.join("\n\n")),
+            "rendered through plain"
+        );
+        assert!(!blobs[1].2.contains(['\u{1}', '\u{2}']));
+    }
+
+    #[test]
+    fn a_form_the_message_lacks_is_absent_saying_why() {
+        let (value, blobs) = body_forms_of(json!(ALL_FORMS), plain_leaf("Lunch?"));
+        assert_eq!(value["html"], json!({ "absent": "no HTML part" }));
+        assert_eq!(value["rendered"], json!({ "absent": "no HTML part" }));
+        assert_eq!(blobs.len(), 1);
+
+        let pdf = json!({
+            "partId": "1", "mimeType": "application/pdf", "filename": "a.pdf",
+            "body": { "size": 3, "attachmentId": "ANGjdJ8" },
+        });
+        let (value, blobs) = body_forms_of(json!(ALL_FORMS), multipart("mixed", vec![pdf]));
+        assert_eq!(
+            value,
+            json!({
+                "id": "m1",
+                "text": { "absent": "no text part" },
+                "html": { "absent": "no HTML part" },
+                "rendered": { "absent": "no HTML part" },
+            })
+        );
+        assert!(blobs.is_empty());
+
+        let (value, blobs) = body_forms_of(json!(ALL_FORMS), html_leaf(""));
+        for form in ALL_FORMS {
+            assert_eq!(value[form], json!({ "absent": "empty" }), "{form}");
+        }
+        assert!(blobs.is_empty());
+        let (value, _) =
+            body_forms_of(json!(["text", "rendered"]), html_leaf("<style>p{}</style>"));
+        assert_eq!(value["text"], json!({ "absent": "empty" }));
+        assert_eq!(value["rendered"], json!({ "absent": "empty" }));
+    }
+
+    #[test]
+    fn decoding_notes_are_said_once_and_count_parts_by_reference() {
+        let by_reference = |mime_type: &str| {
+            json!({
+                "partId": "2", "mimeType": mime_type, "filename": "",
+                "body": { "size": 9, "attachmentId": "ANGjdJ8" },
+            })
+        };
+        let payload = multipart(
+            "mixed",
+            vec![
+                text_leaf("text/plain", Some("koi8-r"), b"one"),
+                text_leaf("text/html", Some("koi8-r"), b"<p>two</p>"),
+                text_leaf("text/plain", Some("UTF-8"), b"\xff"),
+                by_reference("text/plain"),
+                by_reference("text/html"),
+            ],
+        );
+        let (value, _) = body_forms_of(json!(ALL_FORMS), payload);
+        assert_eq!(
+            value["decoding_notes"],
+            json!([
+                "charset \"koi8-r\" is not supported; decoded as UTF-8, non-ASCII characters may \
+                 be wrong",
+                "a text part is not valid UTF-8; its invalid bytes are shown as \u{fffd}",
+                "2 text parts came as attachment references and are in no form; GmailRead lists \
+                 them under attachments, and one listed with a `part_id` is fetched with \
+                 GmailAttachment",
+            ])
+        );
+        let (value, _) = body_forms_of(
+            json!(["html"]),
+            multipart("mixed", vec![plain_leaf("one"), by_reference("text/plain")]),
+        );
+        assert_eq!(
+            value["decoding_notes"],
+            json!([
+                "1 text part came as an attachment reference and is in no form; GmailRead lists \
+                 it under attachments, and one listed with a `part_id` is fetched with \
+                 GmailAttachment"
+            ])
+        );
+        // A note about a part no form asked for reads is not said.
+        let (value, _) = body_forms_of(
+            json!(["html"]),
+            multipart(
+                "mixed",
+                vec![
+                    text_leaf("text/plain", Some("koi8-r"), b"one"),
+                    html_leaf("<p>two</p>"),
+                ],
+            ),
+        );
+        assert_eq!(value.get("decoding_notes"), None);
+    }
+
+    /// messages.get's answer for a plain message `m1`, padded to exactly
+    /// `size` bytes.
+    fn answer_of(size: u64) -> Vec<u8> {
+        let base = gmail_message(plain_leaf("Lunch?")).len();
+        let mut answer: Value =
+            serde_json::from_slice(&gmail_message(plain_leaf("Lunch?"))).unwrap();
+        answer["snippet"] = json!("x".repeat(size as usize - base + "Lunch?".len()));
+        let answer = answer.to_string().into_bytes();
+        assert_eq!(answer.len() as u64, size);
+        answer
+    }
+
+    #[test]
+    fn an_answer_at_the_bound_is_read_and_one_over_is_refused_unread() {
+        let completion = body_through_the_loop(
+            &MemoryHost::new(),
+            json!({ "id": "m1", "forms": ["text"] }),
+            answer_of(BODY_ANSWER_MAX),
+        );
+        assert_eq!(completion.attachments.len(), 1, "{completion:?}");
+        assert_eq!(completion.attachments[0].bytes, b"Lunch?");
+        // The open is the step's one blob call: a read would be refused.
+        let host = MemoryHost::new();
+        host.set_blob_call_budget(1);
+        let completion = body_through_the_loop(
+            &host,
+            json!({ "id": "m1", "forms": ["text"] }),
+            answer_of(BODY_ANSWER_MAX + 1),
+        );
+        assert_eq!(
+            error(&completion),
+            (
+                ErrorKind::InvalidArgs,
+                format!(
+                    "the message's answer from Gmail is {} bytes, over the {BODY_ANSWER_MAX} \
+                     bytes GmailBody reads; GmailRead answers its text cut, and a caller \
+                     granted api-request reads the whole message with `format=raw` and \
+                     `response_attachment` (docs/providers/google.md)",
+                    BODY_ANSWER_MAX + 1
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn the_reads_refusals_and_errors_are_mapped() {
+        let state = body_state(json!({ "id": "m1", "forms": ["text"] }));
+        assert_eq!(
+            answered(&state, too_large(67_108_864, Some(70_000_000))),
+            Next::Fail(failure(
+                ErrorKind::InvalidArgs,
+                "the message's answer from Gmail exceeds the host's largest blob \
+                 (max_blob_bytes, 67108864 bytes); GmailRead answers its text cut"
+            ))
+        );
+        assert_eq!(
+            answered(&state, store_full()),
+            Next::Fail(failure(
+                ErrorKind::Internal,
+                "the host's blob store is full (blob_budget_bytes)"
+            ))
+        );
+        let not_found = google(404, "NOT_FOUND", "Requested entity was not found.");
+        assert_eq!(
+            answered(&state, http(404, &not_found)),
+            Next::Fail(google_error(404, &not_found, Scope::GmailRead))
+        );
+        let relayed = credential_invalid(json!("alice@example.com"));
+        assert_eq!(
+            answered(&state, Ok(relayed.clone())),
+            Next::Complete(relayed)
+        );
+        assert_eq!(
+            answered(&state, cut_read(json!(300000))),
+            Next::Fail(Unreadable::Cut("300000 bytes".to_string()).failure(google::API_NAME, None))
+        );
+        let Next::Fail(Failure { kind, detail }) = answered(&state, http(200, "{}")) else {
+            panic!("an inline answer was accepted");
+        };
+        assert_eq!(kind, ErrorKind::Internal);
+        assert!(detail.contains("inline"), "{detail}");
+    }
+
+    #[test]
+    fn an_answer_not_of_gmails_shape_completes_nothing() {
+        let shape = "unexpected Google messages.get response shape";
+        let mut other = serde_json::from_slice::<Value>(&gmail_message(plain_leaf("a"))).unwrap();
+        other["id"] = json!("m2");
+        let mut bad_data = plain_leaf("a");
+        bad_data["partId"] = json!("1.2");
+        bad_data["body"]["data"] = json!("ab*d");
+        for (what, encoded, detail) in [
+            ("not JSON", b"<html>".to_vec(), shape),
+            (
+                "cut short",
+                gmail_message(plain_leaf("a"))[..20].to_vec(),
+                shape,
+            ),
+            ("another message", other.to_string().into_bytes(), shape),
+            (
+                "a part not of Gmail's shape",
+                gmail_message(json!({ "mimeType": 7 })),
+                shape,
+            ),
+            (
+                "data not base64url",
+                gmail_message(bad_data),
+                "Gmail messages.get part 1.2 carries body data that is not base64url",
+            ),
+        ] {
+            let completion = body_through_the_loop(
+                &MemoryHost::new(),
+                json!({ "id": "m1", "forms": ALL_FORMS }),
+                encoded,
+            );
+            assert_eq!(error(&completion), (ErrorKind::Internal, detail), "{what}");
+        }
+    }
+
+    #[test]
+    fn notes_over_the_result_ceiling_alone_complete_nothing() {
+        let leaves = |count: usize| {
+            (0..count)
+                .map(|at| text_leaf("text/plain", Some(&format!("x-{at}")), b"a"))
+                .collect()
+        };
+        let sentence = |at: usize| {
+            format!(
+                "charset \"x-{at}\" is not supported; decoded as UTF-8, non-ASCII characters \
+                 may be wrong"
+            )
+        };
+        // The most distinct sentences whose bytes fit the ceiling.
+        let (mut fit, mut len) = (0, 0);
+        while len + sentence(fit).len() <= COMPACT_RESULT_CEILING {
+            len += sentence(fit).len();
+            fit += 1;
+        }
+        // Nine tenths of them are answered, quotes and commas included.
+        let most = fit * 9 / 10;
+        let (value, _) = body_forms_of(json!(["text"]), multipart("mixed", leaves(most)));
+        assert_eq!(value["decoding_notes"].as_array().unwrap().len(), most);
+        // One more is over by the sentences made; as many as the ceiling
+        // holds sentences with nothing quoted, and one, are over before any
+        // is made.
+        let floor = note(&decode::Note::UnknownCharset("".into()), false).len();
+        for count in [fit + 1, COMPACT_RESULT_CEILING / floor + 1] {
+            let completion = body_through_the_loop(
+                &MemoryHost::new(),
+                json!({ "id": "m1", "forms": ["text"] }),
+                gmail_message(multipart("mixed", leaves(count))),
+            );
+            assert_eq!(
+                error(&completion),
+                (
+                    ErrorKind::Internal,
+                    "the message's decoding notes alone are over the 262144-byte result ceiling"
+                ),
+                "{count} distinct notes"
+            );
+            assert!(completion.attachments.is_empty());
+        }
+        // Said once each, repeats cost nothing toward the ceiling.
+        let mut repeated = leaves(64);
+        repeated.extend(leaves(64));
+        let (value, _) = body_forms_of(json!(["text"]), multipart("mixed", repeated));
+        let notes = value["decoding_notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 64);
+        assert_eq!(notes[63], json!(sentence(63)));
+    }
+
+    #[test]
+    fn the_first_of_each_distinct_item_is_told_in_order() {
+        let items = ["b", "a", "b", "c", "a", "b"];
+        let mut seen = Distinct::new(&items, |item| sip(item.as_bytes()), |a, b| a == b);
+        let firsts: Vec<bool> = (0..items.len()).map(|at| seen.first(at)).collect();
+        assert_eq!(firsts, [true, true, false, true, false, false]);
+
+        // Items that all hash alike are still told apart.
+        let items = [1, 2, 1, 3, 2];
+        let mut seen = Distinct::new(&items, |_| 7, |a, b| a == b);
+        let firsts: Vec<bool> = (0..items.len()).map(|at| seen.first(at)).collect();
+        assert_eq!(firsts, [true, true, false, true, false]);
+    }
+
+    #[test]
+    fn notes_are_the_same_exactly_when_equal() {
+        let notes = [
+            decode::Note::InvalidUtf8,
+            decode::Note::UnknownCharset("x".into()),
+            decode::Note::UnknownCharset("y".into()),
+            decode::Note::UnlistedChildren {
+                mime_type: "x".into(),
+                depth: 1,
+            },
+            decode::Note::UnlistedChildren {
+                mime_type: "x".into(),
+                depth: 2,
+            },
+            decode::Note::UnlistedChildren {
+                mime_type: "y".into(),
+                depth: 1,
+            },
+        ];
+        for a in &notes {
+            for b in &notes {
+                assert_eq!(same_note(a, b), a == b, "{a:?} {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn charsets_quoted_alike_are_one_sentence() {
+        // Names alike in every byte the sentence quotes: cut alike, or
+        // alike once a control character is a space.
+        let long = "x".repeat(HEADER_MAX_BYTES);
+        let quoted_alike = [
+            [format!("{long}1"), format!("{long}2")],
+            ["x\u{1}".to_string(), "x\u{2}".to_string()],
+        ];
+        for names in quoted_alike {
+            let leaves = names
+                .iter()
+                .map(|name| text_leaf("text/plain", Some(name), b"a"))
+                .collect();
+            let (value, _) = body_forms_of(json!(["text"]), multipart("mixed", leaves));
+            assert_eq!(value["decoding_notes"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    /// An alternative of 3 000 bytes of plain text and of HTML.
+    fn wide_alternative() -> Vec<u8> {
+        gmail_message(multipart(
+            "alternative",
+            vec![
+                plain_leaf(&"p".repeat(3_000)),
+                html_leaf(&format!("<p>{}</p>", "h".repeat(2_993))),
+            ],
+        ))
+    }
+
+    #[test]
+    fn a_refused_create_or_write_fails_with_nothing_attached() {
+        let args = || json!({ "id": "m1", "forms": ALL_FORMS });
+        let host = small_pieces();
+        host.refuse_next_create(CreateError::BudgetExhausted);
+        assert_eq!(
+            error(&body_through_the_loop(&host, args(), wide_alternative())),
+            (
+                ErrorKind::Internal,
+                "blob create: the host's blob store is full (blob_budget_bytes)"
+            )
+        );
+        // The text form is written whole; the HTML form passes the budget.
+        let host = small_pieces();
+        host.set_write_budget(4_096);
+        assert_eq!(
+            error(&body_through_the_loop(&host, args(), wide_alternative())),
+            (
+                ErrorKind::Internal,
+                "blob write: the activation's bound on blob calls or on bytes written is reached"
+            )
+        );
+        let host = small_pieces();
+        host.refuse_next_write(WriteError::BudgetExhausted);
+        assert_eq!(
+            error(&body_through_the_loop(&host, args(), wide_alternative())),
+            (
+                ErrorKind::Internal,
+                "blob write: the host's blob store is full (blob_budget_bytes)"
+            )
+        );
+    }
+
+    #[test]
+    fn small_read_and_write_pieces_give_the_same_forms() {
+        let args = json!({ "id": "m1", "forms": ALL_FORMS });
+        let whole = body_through_the_loop(&MemoryHost::new(), args.clone(), wide_alternative());
+        let pieces = body_through_the_loop(&small_pieces(), args, wide_alternative());
+        assert_eq!(whole.attachments.len(), 3);
+        assert_eq!(whole, pieces);
+        assert_eq!(whole.attachments[0].bytes, "p".repeat(3_000).as_bytes());
+    }
+
     /// Every step `tool` issues a call at.
     fn steps(tool: Provided) -> Vec<u8> {
         match tool {
@@ -4118,17 +5474,20 @@ mod tests {
             // The fetch step's answer is an attachment, not JSON; its tests
             // are its own.
             Provided::GmailAttachment => vec![1],
+            // Its one step's answer is an attachment, not JSON.
+            Provided::GmailBody => vec![],
         }
     }
 
     /// A row of each tool at its first step, as `plan` issues it.
-    fn first_reads() -> [InFlight; 5] {
+    fn first_reads() -> [InFlight; 6] {
         let reads = [
             labels_state(json!({})),
             search_state(json!({ "q": "lunch" })),
             read_state(json!({ "id": "m1" })),
             thread_state(json!({ "id": "t1" })),
             attachment_state(json!({ "id": "m1", "part_id": "1" })),
+            body_state(json!({ "id": "m1", "forms": ["text"] })),
         ];
         for tool in Provided::ALL {
             assert!(
@@ -4156,6 +5515,7 @@ mod tests {
             scope(Provided::GmailAttachment, FETCH_STEP),
             Scope::GmailRead
         );
+        assert_eq!(scope(Provided::GmailBody, 1), Scope::GmailRead);
     }
 
     #[test]
@@ -4176,6 +5536,7 @@ mod tests {
             Provided::GmailRead => (ReadArgs::KEYS, &["id"]),
             Provided::GmailThread => (ThreadArgs::KEYS, &["id"]),
             Provided::GmailAttachment => (AttachmentArgs::KEYS, &["id", "part_id"]),
+            Provided::GmailBody => (BodyArgs::KEYS, &["id", "forms"]),
         };
         let text = |max_chars| Bound::Text {
             max_chars,
@@ -4197,6 +5558,12 @@ mod tests {
                 (Provided::GmailAttachment, "part_id") => {
                     Bound::Pattern(format!("^[A-Za-z0-9.]{{1,{PART_ID_MAX_CHARS}}}$"))
                 }
+                (Provided::GmailBody, "forms") => Bound::Array {
+                    min: 1,
+                    max: Form::ALL.len(),
+                    unique: true,
+                    item: Box::new(Bound::Enum(Form::ALL.map(Form::name).to_vec())),
+                },
                 _ => panic!("{tool:?} takes `{key}`, which no bound here states"),
             };
             (key, bound)
@@ -4215,11 +5582,12 @@ mod tests {
             Provided::GmailSearch => json!({ "q": "from:alice" }),
             Provided::GmailRead | Provided::GmailThread => json!({ "id": "m1" }),
             Provided::GmailAttachment => json!({ "id": "m1", "part_id": "1" }),
+            Provided::GmailBody => json!({ "id": "m1", "forms": ["text"] }),
         }
     }
 
     /// The probes of an argument whose bound is a pattern of this component's
-    /// own, which the kit has none for.
+    /// own, or an array, which the kit has none for.
     fn pattern_probes(key: &str) -> Probes {
         let strings = |ids: &[&str]| ids.iter().map(|id| json!(id)).collect::<Vec<_>>();
         match key {
@@ -4237,6 +5605,22 @@ mod tests {
                 .into_iter()
                 .chain([json!(1)])
                 .collect(),
+            },
+            "forms" => Probes {
+                admitted: vec![
+                    json!(["text"]),
+                    json!(["rendered"]),
+                    json!(["rendered", "html", "text"]),
+                ],
+                refused: vec![
+                    json!([]),
+                    json!(["text", "html", "rendered", "text"]),
+                    json!(["text", "text"]),
+                    json!(["raw"]),
+                    json!(["Text"]),
+                    json!([1]),
+                    json!("text"),
+                ],
             },
             other => panic!("no pattern probes for `{other}`"),
         }
@@ -4275,6 +5659,27 @@ mod tests {
         }
     }
 
+    /// `GmailBody`'s description states the bound the tool refuses above,
+    /// so the model is told the figure the tool enforces.
+    #[test]
+    fn gmail_bodys_description_states_its_bound() {
+        let spec = spec_text();
+        let (_, block) = spec
+            .split_once("provide gmail-body {")
+            .expect("the spec has a `provide gmail-body` block");
+        let description = block
+            .lines()
+            .map(str::trim)
+            .take_while(|line| *line != "}")
+            .find_map(|line| line.strip_prefix("description = "))
+            .expect("`provide gmail-body` has a description");
+        let stated = format!("over {BODY_ANSWER_MAX} bytes is refused");
+        assert!(
+            description.contains(&stated),
+            "`gmail-body`'s description must say \"{stated}\""
+        );
+    }
+
     #[test]
     fn every_step_answers_an_unreadable_read_by_its_shape() {
         let refusal = "result exceeds [messaging] max_body_bytes";
@@ -4300,7 +5705,6 @@ mod tests {
         for state in [
             labels_state(json!({})),
             search_state(json!({ "q": "lunch" })),
-            at(read_state(json!({ "id": "m1" })), STRUCTURE_STEP),
             at(thread_state(json!({ "id": "t1" })), THREAD_NARROW_STEP),
             at(search_state(json!({ "q": "lunch" })), LABELS_STEP),
             at(read_state(json!({ "id": "m1" })), LABELS_STEP),
@@ -4314,6 +5718,17 @@ mod tests {
                     name(&state)
                 );
             }
+        }
+
+        // A message's narrower read: the rendering and the route to its body.
+        let state = at(read_state(json!({ "id": "m1" })), STRUCTURE_STEP);
+        for (outcome, why) in outcomes() {
+            assert_eq!(
+                answered(&state, outcome),
+                Next::Fail(why.failure(google::API_NAME, Some(TO_GMAIL_BODY))),
+                "{}",
+                name(&state)
+            );
         }
 
         // A narrower form: one re-read, carrying why.
@@ -4413,6 +5828,7 @@ mod tests {
             read_state(json!({ "id": "m1" })),
             thread_state(json!({ "id": "t1" })),
             attachment_state(json!({ "id": "m1", "part_id": "1" })),
+            body_state(json!({ "id": "m1", "forms": ["text"] })),
         ];
         for tool in Provided::ALL {
             assert!(

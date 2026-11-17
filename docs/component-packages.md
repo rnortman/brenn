@@ -1075,7 +1075,9 @@ class keeps `requires` without `blobs` and grant parity proves it.
 its nested call answered `denied` by `api-request`, which `read_api_blob`
 reads as every reader reads a denied call. `processor-kit-file-test` is the
 worked example of both directions; `google-gmail-read`'s `GmailAttachment` is
-one that reads an answer by range and builds the blob it completes with.
+one that reads an answer by range and builds the blob it completes with, and
+its `GmailBody` one that holds an answer whole, under a bound it checks on
+the blob's size before reading, and builds the blobs it completes with.
 
 Three limits are the component's to design for:
 
@@ -1102,7 +1104,7 @@ Three limits are the component's to design for:
   host's deadline and the kit's cutoff is still advanced, so
   `max_concurrency` with the cutoff does not guarantee one blob-building
   step per activation; a late answer can still share an activation's bounds
-  with a live one. `GmailAttachment` declares 1.
+  with a live one. `GmailAttachment` and `GmailBody` each declare 1.
 - **An answer rests after it is read.** An answer asked for as an attachment
   rests on the component's `brenn:tool-results/<slug>` for that inbox's
   window after the component has read it, and so does a completion's

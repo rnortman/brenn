@@ -69,6 +69,9 @@ pub(super) struct StubProvider<'a> {
     pub caller: Option<CallerSetup<'a>>,
     /// Apps whose conversations call the registry, if the suite has any.
     pub conversations: Option<ConversationSetup>,
+    /// The limits every provider activation runs under in place of the
+    /// production ones; the production limits when `None`.
+    pub limits: Option<ActivationLimits>,
     /// The OAuth service's vault, held for the rig's life.
     pub vault: tempfile::TempDir,
 }
@@ -201,6 +204,7 @@ impl StubRig {
             caller: setup.caller,
             conversations: setup.conversations,
             blob_limits: Some(setup.blob_limits.unwrap_or_else(production_blob_limits)),
+            limits: setup.limits,
         })
         .await;
         base.provider.component.open_store();

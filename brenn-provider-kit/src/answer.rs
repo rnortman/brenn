@@ -482,11 +482,22 @@ fn read_headers(value: &Value) -> Result<BTreeMap<String, String>, Failure> {
         .collect()
 }
 
-/// `value`'s length as serialized JSON.
+/// `value`'s length as serialized JSON, counted as it is written rather
+/// than held.
 pub fn serialized_len(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .expect("a JSON value serializes")
-        .len()
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).expect("a JSON value serializes");
+    count.0
 }
 
 /// `value` as the request's answer, unless it serializes larger than

@@ -28,18 +28,50 @@ pub fn chars_prefix(text: &str, max_chars: usize) -> (&str, bool) {
 /// bytes (`\u00XX`) and has no use in a header, a snippet or a body.
 pub fn plain(text: &str) -> String {
     text.chars()
-        .map(|c| match c {
-            '\t' | '\n' | '\r' => c,
-            '\u{0}'..='\u{1f}' => ' ',
-            _ => c,
+        .map(|c| {
+            if c.is_ascii() {
+                char::from(plain_byte(c as u8))
+            } else {
+                c
+            }
         })
         .collect()
 }
 
+/// One byte of UTF-8 text as [`plain`] maps it; `plain` applies this rule to
+/// each ASCII character. A C0 control character is one byte and every byte
+/// of a longer character is above 0x7F, so mapping a text's bytes one by one
+/// is `plain` of the text, piece by piece.
+pub fn plain_byte(byte: u8) -> u8 {
+    match byte {
+        b'\t' | b'\n' | b'\r' => byte,
+        0x00..=0x1f => b' ',
+        _ => byte,
+    }
+}
+
+/// Whether [`plain_byte`] changes any of `bytes`. The mask marks the bytes
+/// of a word that `plain_byte` changes, so it states the same rule.
+pub fn plain_changes(bytes: &[u8]) -> bool {
+    use crate::bytes::{below, equal};
+    let mask = |word| match below(word, 0x20) {
+        0 => 0,
+        controls => controls & !equal(word, b'\t') & !equal(word, b'\n') & !equal(word, b'\r'),
+    };
+    crate::bytes::find(bytes, 0, mask, |b| plain_byte(b) != b) < bytes.len()
+}
+
 /// A sender-written string quoted in a fixed sentence: through `plain`, cut
-/// to `HEADER_MAX_BYTES`.
+/// to `HEADER_MAX_BYTES`. `plain` changes no character's length, so the cut
+/// is made first, where it falls on the plain text too, and only what is
+/// kept is mapped.
 pub fn bounded_quote(text: &str) -> String {
-    cut(&plain(text), HEADER_MAX_BYTES).0
+    let (quoted, _) = cut(text, HEADER_MAX_BYTES);
+    if plain_changes(quoted.as_bytes()) {
+        plain(&quoted)
+    } else {
+        quoted
+    }
 }
 
 /// The serialized width of `c` in a JSON string, as `serde_json` writes it.
@@ -112,6 +144,55 @@ pub fn shape(api: &str) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_byte_maps_every_byte_as_plain_maps_its_text() {
+        let text = "a\u{0}b\tc\u{1b}é\u{7f}😀\r\n\u{1f}";
+        let bytes: Vec<u8> = text.bytes().map(plain_byte).collect();
+        assert_eq!(String::from_utf8(bytes).unwrap(), plain(text));
+        for byte in 0x80..=0xff {
+            assert_eq!(plain_byte(byte), byte);
+        }
+    }
+
+    #[test]
+    fn a_quote_is_the_plain_text_cut() {
+        let wide = "é".repeat(HEADER_MAX_BYTES);
+        let cases = [
+            String::new(),
+            "a\u{1}b\tc".to_string(),
+            "x".repeat(HEADER_MAX_BYTES),
+            "x".repeat(HEADER_MAX_BYTES + 1),
+            format!("{}\u{1}", "x".repeat(HEADER_MAX_BYTES)),
+            format!("\u{1f}{}", "x".repeat(2 * HEADER_MAX_BYTES)),
+            format!("x{wide}"),
+        ];
+        for text in cases {
+            assert_eq!(
+                bounded_quote(&text),
+                cut(&plain(&text), HEADER_MAX_BYTES).0,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_changes_whatever_plain_byte_changes_wherever_it_stands() {
+        for byte in 0..=0xff {
+            for len in [1, 7, 8, 9, 23] {
+                for at in 0..len {
+                    let mut bytes = vec![b'a'; len];
+                    bytes[at] = byte;
+                    assert_eq!(
+                        plain_changes(&bytes),
+                        plain_byte(byte) != byte,
+                        "{byte:#x} at {at} of {len}"
+                    );
+                }
+            }
+        }
+        assert!(!plain_changes(b""));
+    }
 
     #[test]
     fn plain_replaces_c0_controls_other_than_tab_newline_and_return() {

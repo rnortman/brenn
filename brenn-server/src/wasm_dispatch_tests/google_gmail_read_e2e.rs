@@ -765,7 +765,7 @@ async fn a_read_past_the_limit_falls_back_to_the_structure() {
                 "text_omitted": format!(
                     "Google's answer ({} bytes; sizeEstimate 9000) exceeds api-request's read \
                      limit for this provider (max_response_bytes); headers and attachments are \
-                     listed, the body is not",
+                     listed, the body is not; GmailBody answers the body as files",
                     full.len()
                 ),
             })
@@ -1118,7 +1118,10 @@ async fn a_read_refused_by_the_bus_cap_falls_back_to_the_structure() {
     assert_eq!(answer["snippet"], "Hi Bob, The numbers are in & attached");
     let omitted = answer["text_omitted"].as_str().unwrap();
     let why = omitted
-        .strip_suffix("; sizeEstimate 9000; headers and attachments are listed, the body is not")
+        .strip_suffix(
+            "; sizeEstimate 9000; headers and attachments are listed, the body is not; \
+             GmailBody answers the body as files",
+        )
         .unwrap_or_else(|| panic!("{omitted}"));
     assert_unreadable(Unreadable::Refused, why, full_len);
     assert_eq!(r.seen().len(), 2);

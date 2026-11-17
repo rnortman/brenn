@@ -69,6 +69,7 @@ const GMAIL_READ: Class = Class {
         ("gmail-read", "GmailRead"),
         ("gmail-thread", "GmailThread"),
         ("gmail-attachment", "GmailAttachment"),
+        ("gmail-body", "GmailBody"),
     ],
     clauses: &[
         ("GET", "/gmail/v1/users/me/labels"),

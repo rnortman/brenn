@@ -36,6 +36,40 @@ All notable changes to Brenn are documented here.
     test harness hosting a provider): the trait gains a required method,
     `request_attachment(id, name)`, which must hold the request's attachment
     while the request is pending.
+- **`GmailBody`: a Gmail message's body whole, as files.** The
+  `google-gmail-read` class gains a sixth tool. `GmailBody` takes a message
+  `id` and `forms`, one to three of `text` (`GmailRead`'s text, uncut),
+  `html` (the message's HTML as sent, decoded to UTF-8) and `rendered` (that
+  HTML read as text), and answers each as an attachment of its result. It
+  reads messages up to 786,432 bytes of Gmail's answer, about ten times
+  `GmailRead`'s 60,000 characters, and refuses a larger one naming that
+  bound and the `format=raw` route.
+  - **For operators:** grant it with `tool gmail-body {}`. The class needs no
+    new capability or clause (`blobs` and `messages.get` are already
+    granted). Its Σ `max_concurrency` is 14, so the `retain_depth = 32` the
+    guide sets on `brenn:tool-results/gmail-read` still holds it. Each call
+    leaves Gmail's answer on that inbox for its window: at most 786,432
+    bytes when the tool answers, and up to `max_blob_bytes` when it refuses
+    a message over its bound, since the answer is fetched before it is
+    checked. A success also leaves up to three forms of at most 1,769,472
+    bytes each, together at most 5,308,416 bytes, on one row of the
+    caller's inbox; `docs/google-workspace.md` says how that fits the blob
+    pool and the guest's memory (the tool peaks at about 8.2 MiB).
+  - `GmailRead`'s `text_omitted`, and its `internal` when even the message's
+    structure cannot be read, now end "…; GmailBody answers the body as
+    files", and `GmailAttachment`'s refusal of a part carried inside the
+    message names `GmailBody` for body text.
+  - `GmailRead` now checks the type of every field of every part of Gmail's
+    answer. An answer malformed below a part listed as an attachment, which
+    it used to ignore, is now answered `shape`. Gmail's own answers are not
+    affected.
+  - The tool descriptions of the four other Google classes no longer list
+    attachments among the Gmail endpoints the tools do not cover.
+- `chrono` and `chrono-tz` are listed by RustSec as unmaintained
+  (RUSTSEC-2026-0543, RUSTSEC-2026-0555), with no fixed release. The
+  dependency gate ignores those two advisories by id; a vulnerability filed
+  against either crate still fails it. Moving off both crates is tracked as
+  `chrono-unmaintained`.
 
 ## [0.36.0] — 2026-11-15
 

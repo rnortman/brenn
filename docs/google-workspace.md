@@ -8,8 +8,9 @@ agent's container: Brenn attaches the credential to each request itself.
 The assistant reaches Google in one of two ways:
 
 - **The Google Workspace components** (section 5), five of them, one per
-  Google scope set, give it native tools — `GmailLabels`, `GmailSearch`, `GmailRead` and `GmailThread`
-  for reading mail, `GmailDraft` and `GmailModifyLabels` for drafting replies
+  Google scope set, give it native tools — `GmailLabels`, `GmailSearch`,
+  `GmailRead`, `GmailThread`, `GmailAttachment` and `GmailBody` for reading
+  mail, `GmailDraft` and `GmailModifyLabels` for drafting replies
   and filing mail, `CalendarList`, `CalendarEvents`, `CalendarEvent` and
   `CalendarFreeBusy` for reading the calendar, and `CalendarCreate`,
   `CalendarUpdate` and `CalendarDelete` for changing it — that build
@@ -143,19 +144,29 @@ whichever of these tools reads it. A search page that lists it is answered
 with its other messages and names that one in `unavailable`, with the reason;
 a thread that holds it is read again without `To` and `Cc`, which answers
 when those were the oversized headers; any other read of it is answered
-`internal` naming `max_body_bytes`. No cap setting closes that, and that
-message is simply not readable through these tools; it is the sender's
-doing, not the operator's configuration, and mail is untrusted input.
+`internal` naming `max_body_bytes`, and `GmailRead`'s ends by naming
+`GmailBody`. No cap setting closes that: that message's headers are not
+readable through these tools. Its body is: `GmailBody` asks for the message's
+answer as a blob, which the bus cap does not bound, and answers the body's
+forms whenever that answer is within its bound of 786,432 bytes. It is the
+sender's doing, not the operator's configuration, and mail is untrusted
+input.
 
 The cap also sizes what each result inbox can weigh: a full window is up to
 `retain_depth` × `max_body_bytes` before the component parses it — 32 ×
 384 KiB is 12 MiB for `gmail-read` and `calendar-read`, 16 × 384 KiB is
 6 MiB for the other three — against a guest memory of 16 MiB, and the request
-window is up to Σ × 64 KiB of arguments: 832 KiB for `gmail-read`, 768 KiB
+window is up to Σ × 64 KiB of arguments: 896 KiB for `gmail-read`, 768 KiB
 for `calendar-read`, 128 KiB for `gmail-compose` and `gmail-organize`, 192 KiB for
 `calendar-write`. An activation handed more than the guest can hold traps,
 and the host fails its new requests and alerts. That weight is the operator's to size (`docs/config-dsl.md`, the
 `provide` statement); nothing at load refuses it.
+`GmailBody` holds a message's answer and its forms in the guest while it
+works, up to 8.19 MiB for an answer at its bound of 786,432 bytes, and that
+peak and the windows' weight share the 16 MiB: a `gmail-read` result window
+sized near the guest's memory traps a body answer the tool would otherwise
+take. A trap on that answer fails no request, so the caller waits out the
+request's ceiling (240 s) before it is answered.
 
 Operators who already have the Maps guide's `messaging` block need nothing
 more: the cap is bus-wide, and the value is the same.
@@ -215,7 +226,7 @@ Five components answer the assistant's Gmail and Calendar tools with stamped
 
 | Package | Class | Tools |
 |---|---|---|
-| `google-gmail-read` | `GoogleGmailRead` | `GmailLabels`, `GmailSearch`, `GmailRead`, `GmailThread`, `GmailAttachment` |
+| `google-gmail-read` | `GoogleGmailRead` | `GmailLabels`, `GmailSearch`, `GmailRead`, `GmailThread`, `GmailAttachment`, `GmailBody` |
 | `google-gmail-compose` | `GoogleGmailCompose` | `GmailDraft` |
 | `google-gmail-organize` | `GoogleGmailOrganize` | `GmailModifyLabels` |
 | `google-calendar-read` | `GoogleCalendarRead` | `CalendarList`, `CalendarEvents`, `CalendarEvent`, `CalendarFreeBusy` |
@@ -245,7 +256,7 @@ Then the inbox tuning and the instances:
 ```
 // Each live request has one nested call outstanding: Σ max_concurrency
 // results can arrive between two activations, twice over if one is
-// re-delivered: retain_depth ≥ 2 × Σ. gmail-read's Σ is 13, so 32 holds it.
+// re-delivered: retain_depth ≥ 2 × Σ. gmail-read's Σ is 14, so 32 holds it.
 channel at "brenn:tool-results/gmail-read" {
   push_depth = 1;
   retain_depth = 32;
@@ -360,6 +371,7 @@ agent PersonalAssistant {
   tool gmail-read {}
   tool gmail-thread {}
   tool gmail-attachment {}
+  tool gmail-body {}
   tool gmail-draft {}
   tool gmail-modify-labels {}
   tool calendar-list {}
@@ -382,7 +394,7 @@ sizes the inbox one instance's nested answers arrive on (the slug after the
 Google call outstanding, so at most Σ `max_concurrency` answers are
 outstanding at once, and an answer may be delivered twice: the window must
 hold 2 × Σ, `retain_depth ≥ 2 × Σ` for each class, rounded up to a power of
-two. `gmail-read`'s Σ is 13 and `calendar-read`'s 12, so their blocks' 32
+two. `gmail-read`'s Σ is 14 and `calendar-read`'s 12, so their blocks' 32
 holds it; a tool joining either class that takes its Σ past 16 needs its block
 raised. `gmail-compose`'s and `gmail-organize`'s Σ is 2 and
 `calendar-write`'s 3, which the family default of 16 holds; their blocks
@@ -392,13 +404,14 @@ answered `internal` after the 240-second ceiling. Every block sets
 `push_depth = 1`, the inert channel rung, and `noise = alarm`, which makes a
 drop on that inbox an alert: without a block an inbox's overflow is silent.
 
-**What `GmailAttachment` leaves in the blob pool.** An attachment answer
+**What `GmailAttachment` and `GmailBody` leave in the blob pool.** An attachment answer
 rests on the result's row in the inbox that received it until that inbox's
 window turns over, and holds its bytes in the blob pool (`[messaging]
 blob_budget_bytes`, 1 GiB by default) for that long. The rule for every
 deployment: size `blob_budget_bytes` at or above the sum, over the inboxes
-that receive attachment answers, of the inbox's depth × `max_blob_bytes`, or
-lower `max_blob_bytes`. The cases under it here:
+that receive attachment answers, of the inbox's depth × what one of its rows
+can hold — `max_blob_bytes` for each attachment the row carries — or lower
+`max_blob_bytes`. The cases under it here:
 
 - *An `api-request` attachment answer.* Each fetch leaves Gmail's encoded
   answer — the attachment's JSON, a third larger than the file — on
@@ -408,20 +421,33 @@ lower `max_blob_bytes`. The cases under it here:
   32 × about 66.7 MB, about 2.1 GB: twice the default pool. About 15 fetches
   of the largest attachment in a row fill the default pool, and every other
   producer in the deployment is then refused until the window turns over.
+  `GmailBody` leaves its message's encoded answer there the same way. The
+  answer is fetched whole before the tool checks it against its bound, so a
+  message it answers leaves at most 786,432 bytes, and a message it refuses
+  as over that bound leaves its whole answer, up to `max_blob_bytes`, as an
+  attachment answer does.
 - *A provided tool's attachment.* The decoded file rests on its caller's
   inbox for that inbox's window: an app's `brenn:app-tool-results/<app-slug>`,
   or a calling component's `brenn:tool-results/<slug>`. Every success of
-  `GmailAttachment` is such an attachment, so a component granted the tool
+  `GmailAttachment` is such an attachment, and so is each of the up to three
+  forms a `GmailBody` success answers, each at most 1,769,472 bytes (2.25 ×
+  its bound: a part's bytes are three quarters of its encoded size, and a byte
+  can decode to three), on one row: together at most 5,308,416 bytes. A
+  component granted either tool
   needs `blobs` to open what it is answered. Granted to a component without
   `blobs`, the tool leaves up to that component's result-inbox depth × the
   attachment size of blobs nobody can open, and they count in the sum
   (`TODO.md`, `tool-result-attachments-to-caller-without-blobs`).
 
 For a `gmail-read` instance, set `blob_budget_bytes` for 32 × 4/3 × the
-largest attachment you mean to serve, plus what its callers' inboxes hold;
-or lower `max_blob_bytes`, which lowers the largest attachment the tool
-returns with it — a larger one is answered `invalid_args` naming
-`max_blob_bytes`. The inbox's depth cannot go below 2 × Σ = 26, so it is not
+largest attachment you mean to serve, plus what its callers' inboxes hold:
+each inbox's depth × the larger of the largest attachment and, when the
+caller is granted `GmailBody`, a success's 5,308,416 bytes of forms.
+`GmailBody` adds nothing to the first term: every answer it leaves, a refused
+one included, is at most `max_blob_bytes`, as an attachment answer is. The
+alternative is to lower `max_blob_bytes`, which lowers the largest attachment the tool returns
+with it — a larger one is answered `invalid_args` naming `max_blob_bytes`.
+The inbox's depth cannot go below 2 × Σ = 28, so it is not
 the lever.
 
 **The clauses.** Each instance holds one clause per endpoint its own tools
@@ -431,7 +457,9 @@ call, and nothing wider:
   message, one thread and one message's attachment, all `GET`s. The class
   also requires `blobs`, which the instance grants: `GmailAttachment` asks
   for the attachment's answer as a blob, decodes it by range and answers the
-  file as an attachment.
+  file as an attachment, and `GmailBody` asks for the message's answer as a
+  blob and answers its body forms as attachments. `GmailBody` calls
+  `messages.get`, which the one-message clause already admits.
 - `gmail-compose` — the `GET` of one message, for a reply's original, and the
   `POST` for `drafts`, which creates a draft in the user's Drafts and sends
   nothing.
@@ -470,7 +498,7 @@ instance across every user it serves, keyed by the instance:
   two such searches without stalling. `GmailRead` and `GmailThread` are at
   most three: the read, one narrower read when the first is too large, and
   label names. `GmailAttachment` is two: the message's part tree, then the
-  attachment.
+  attachment. `GmailBody` is one, the message's full read.
 - `gmail-compose` — `GmailDraft` is one call, two for a reply (the
   original's headers, then the draft), so a burst of 10 admits five replies.
 - `gmail-organize` — `GmailModifyLabels` is one call whatever the number of
@@ -503,8 +531,8 @@ host containing `/` fails every activation with the key named.
 `calendar_events` scope sets (section 7, step 1). Each tool needs one:
 
 - `gmail_readonly` — `GmailLabels`, `GmailSearch`, `GmailRead`,
-  `GmailThread` and `GmailAttachment`, and the read of the original that a reply draft makes
-  first.
+  `GmailThread`, `GmailAttachment` and `GmailBody`, and the read of the
+  original that a reply draft makes first.
 - `gmail_compose` — `GmailDraft`.
 - `gmail_organize` — `GmailModifyLabels`.
 - `calendar_readonly` — the four Calendar read tools.
@@ -567,7 +595,14 @@ inside the message, or nested deeper than eight levels (mail forwarded as an
 attachment several times over), and cannot be fetched with the tool. A message too large to read whole —
 over the read limit (`max_response_bytes`), or refused on the bus cap
 (`max_body_bytes`) — is answered with its headers, its attachments and
-Gmail's preview, `text` null and `text_omitted` saying why. Header values,
+Gmail's preview, `text` null and `text_omitted` saying why.
+`GmailBody` answers a message's body whole, above those cuts, as up to three
+attachments of its result named by the `forms` asked: `text` (`GmailRead`'s
+text uncut), `html` (the message's HTML as sent, decoded to UTF-8) and
+`rendered` (that HTML as text), each with its `size`, or `absent` saying why
+there is none. A message whose answer from Gmail is over 786,432 bytes is
+refused naming that bound; a caller granted `api-request` reads it with
+`format=raw` (`docs/providers/google.md`). Header values,
 attachment names and MIME types are bounded in bytes and a cut header is
 flagged; a long text is cut to the wrapper's result ceiling and says so; a
 long thread is trimmed to its newest messages and `messages_omitted` says
@@ -646,7 +681,7 @@ instructions (its system prompt or the `CLAUDE.md` it reads):
 
 ```
 You have Gmail tools: GmailLabels, GmailSearch, GmailRead, GmailThread,
-GmailAttachment, GmailDraft and GmailModifyLabels.
+GmailAttachment, GmailBody, GmailDraft and GmailModifyLabels.
 You have Google Calendar tools: CalendarList, CalendarEvents, CalendarEvent,
 CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
 - Pass `account` only when the user has several Google accounts connected;
@@ -660,6 +695,8 @@ CalendarFreeBusy, CalendarCreate, CalendarUpdate and CalendarDelete.
 - GmailAttachment fetches an attachment GmailRead listed with a `part_id` and
   hands you the file as an attachment: forward it with BrennSend, save it
   with `brenn-tool save`, or hand it to another tool.
+- GmailBody hands you a message's whole text, its HTML or the HTML as text as
+  files when GmailRead's text is cut or omitted.
 - GmailDraft creates a draft the user sends from Gmail and never sends; a
   reply draft's answer says `in_thread: false` when Gmail filed it as a new
   conversation instead of in the original's — the draft is in Drafts and is
@@ -860,10 +897,12 @@ sections 3 and 5 in place.
       [messaging] max_body_bytes", on ordinary mail, is the bus cap at its
       default: the `messaging` block of section 3 was not applied, and it
       takes a restart. Under the recommended pair it is a message whose
-      sender-written headers are oversized; that message is not readable
-      through these tools, and neither is a message that carries the same
-      headers (a reply, whose subject is copied from it); there is nothing to
-      raise and nothing to fix. The same detail appears without failing the
+      sender-written headers are oversized; that message's headers are not
+      readable through these tools, and neither are those of a message that
+      carries the same headers (a reply, whose subject is copied from it);
+      there is nothing to raise and nothing to fix. Its body is readable:
+      `GmailRead`'s `internal` ends by naming `GmailBody`, which answers the
+      body as files up to its bound (section 3). The same detail appears without failing the
       request where the tools have somewhere to put it: a search page names
       such a message in `unavailable` and answers the rest, a thread is read
       again without `to` and `cc` (`recipients_omitted` quotes it), and a
@@ -887,7 +926,9 @@ sections 3 and 5 in place.
       recommended pair it is rare, and there is nothing to narrow.
     - A `GmailRead` answer with `text_omitted` on an ordinary message means
       `max_response_bytes` was lowered (section 3), or, when it quotes
-      `max_body_bytes`, that the `messaging` block was not applied.
+      `max_body_bytes`, that the `messaging` block was not applied. The
+      string ends by naming `GmailBody`, which reads the body whole whatever
+      either setting is, up to its own bound.
     - A `GmailThread` answer with `recipients_omitted` naming
       `max_response_bytes` or `max_body_bytes` is a thread whose headers were
       too large to read whole; it was read again without `to` and `cc`, and
@@ -938,7 +979,7 @@ message in another form, history, thread listings and draft listings; Calendar's
 events in a window for a caller without a user, as the automation below is.
 For the assistant, the calendar list, events, one event and free/busy,
 creating, changing and deleting events, draft creation, label changes and
-fetching an attachment GmailRead lists are the components' tools (section 5). Each host it names must be in the provider's `api_hosts`
+fetching an attachment GmailRead lists or a message's whole body are the components' tools (section 5). Each host it names must be in the provider's `api_hosts`
 (section 3) and admitted by a clause of the agent's grant.
 
 The assistant, reading only, beside its other grants:

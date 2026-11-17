@@ -75,6 +75,7 @@ mod git_sync_consumer;
 mod google_calendar_read_e2e;
 mod google_calendar_write_e2e;
 mod google_gmail_attachment_e2e;
+mod google_gmail_body_e2e;
 mod google_gmail_compose_e2e;
 mod google_gmail_organize_e2e;
 mod google_gmail_read_e2e;

@@ -577,7 +577,7 @@ async fn run_consumer(
     // the backlog a reload primed both arrive in it — and it is what a
     // component with nothing but a self-tick chain arms from.
     pacer.admit().await;
-    drain(&cfg, &subscriber, Cause::Gate(MountDebt::Owed)).await;
+    drain(&cfg, &subscriber, Cause::Gate(MountDebt::Owed), NO_OVERRIDE).await;
 
     // Serialized drain loop, woken by external eager wakes (`spawn_eager_wake`).
     // A wake sets a one-permit flag; any wakes that arrive during a drain step
@@ -606,7 +606,7 @@ async fn run_consumer(
             }
         };
         pacer.admit().await;
-        drain(&cfg, &subscriber, cause).await;
+        drain(&cfg, &subscriber, cause, NO_OVERRIDE).await;
     }
 }
 
@@ -654,7 +654,77 @@ fn refuse_pending_sync_requests(
 /// Single-scan design: `load_activation_snapshot` performs one subscriber-scoped
 /// pending-push scan under one DB lock hold covering all K input ports (AC 7).
 pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mount: MountDebt) {
-    drain(cfg, subscriber, Cause::Gate(mount)).await;
+    drain(cfg, subscriber, Cause::Gate(mount), NO_OVERRIDE).await;
+}
+
+/// Limits one test activation runs under in place of the production ones.
+///
+/// One or the other: the component offers no entry that overrides both.
+#[cfg(any(test, feature = "testutils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationLimits {
+    /// The fuel grant, and the epoch deadline in ticks of the processor's
+    /// epoch clock.
+    Fuel { fuel: u64, epoch_ticks: u64 },
+    /// The guest's memory limit in bytes.
+    Memory(usize),
+}
+
+/// [`drain_step`] with the activation run under `limits` — test use only.
+///
+/// Every other step of the drain is the production one; only the guest's
+/// fuel and epoch deadline, or its memory limit, are replaced.
+#[cfg(any(test, feature = "testutils"))]
+pub async fn drain_step_with_limits(
+    cfg: &WasmConsumerConfig,
+    subscriber: &ParticipantId,
+    mount: MountDebt,
+    limits: ActivationLimits,
+) {
+    drain(cfg, subscriber, Cause::Gate(mount), Some(limits)).await;
+}
+
+/// The limits override a drain step carries: always none outside test builds.
+#[cfg(any(test, feature = "testutils"))]
+type LimitsOverride = Option<ActivationLimits>;
+#[cfg(not(any(test, feature = "testutils")))]
+type LimitsOverride = ();
+
+#[cfg(any(test, feature = "testutils"))]
+const NO_OVERRIDE: LimitsOverride = None;
+#[cfg(not(any(test, feature = "testutils")))]
+const NO_OVERRIDE: LimitsOverride = ();
+
+/// Run one activation on the component, under the override when there is one.
+///
+/// An override drops `inbound_chain`: only the async gate takes one, and an
+/// async activation starts a chain of its own.
+#[cfg(any(test, feature = "testutils"))]
+fn run_activation(
+    component: &ProcessorComponent,
+    activation: HostActivation,
+    inbound_chain: Vec<String>,
+    limits: LimitsOverride,
+) -> ProcessorOutcome {
+    match limits {
+        None => component.handle_in_chain(activation, inbound_chain),
+        Some(ActivationLimits::Fuel { fuel, epoch_ticks }) => {
+            component.handle_with_limits(activation, epoch_ticks, fuel)
+        }
+        Some(ActivationLimits::Memory(bytes)) => {
+            component.handle_with_memory_limit(activation, bytes)
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "testutils")))]
+fn run_activation(
+    component: &ProcessorComponent,
+    activation: HostActivation,
+    inbound_chain: Vec<String>,
+    (): LimitsOverride,
+) -> ProcessorOutcome {
+    component.handle_in_chain(activation, inbound_chain)
 }
 
 /// One sync-call drain step: assemble the same activation with the request
@@ -667,10 +737,15 @@ pub async fn drain_step_sync(
     subscriber: &ParticipantId,
     request: SyncRequest,
 ) {
-    drain(cfg, subscriber, Cause::Sync(request)).await;
+    drain(cfg, subscriber, Cause::Sync(request), NO_OVERRIDE).await;
 }
 
-async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Cause) {
+async fn drain(
+    cfg: &WasmConsumerConfig,
+    subscriber: &ParticipantId,
+    cause: Cause,
+    limits: LimitsOverride,
+) {
     // Step 1: assemble the multi-port snapshot. It is fixed before the guest
     // runs, but the ports are windowed one after another, not at one instant:
     // a publish landing between two port reads can be in the later port's
@@ -907,9 +982,10 @@ async fn drain(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, cause: Caus
     // starts a chain of its own.
     let inbound_chain = sync.as_ref().map_or_else(Vec::new, |req| req.chain.clone());
     let component = cfg.component.clone();
-    let join_result =
-        tokio::task::spawn_blocking(move || component.handle_in_chain(activation, inbound_chain))
-            .await;
+    let join_result = tokio::task::spawn_blocking(move || {
+        run_activation(&component, activation, inbound_chain, limits)
+    })
+    .await;
     let outcome = match join_result {
         Ok(outcome) => outcome,
         Err(join_err) => {
@@ -1132,6 +1208,8 @@ async fn record_activation_failure(
         .await;
 }
 
+// TODO(provider-result-activation-trap-strands-request): a result handed new
+// to a failed activation fails no request; its caller waits out the ceiling.
 /// Answer `internal` every provided-tool call whose request a failed activation
 /// was handed as new.
 ///

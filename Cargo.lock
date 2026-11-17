@@ -789,6 +789,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-cal",
  "brenn-provider-kit",
+ "serde",
  "serde_json",
 ]
 
