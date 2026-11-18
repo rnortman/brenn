@@ -668,7 +668,9 @@ interface tools {
 /// `tool-requests` input port. The request names neither the caller nor the
 /// user it acts for: the host keeps both on the pending record. The component
 /// answers through `complete`, and acts for the request's user through
-/// `call-async-for`; it addresses no channel and names no user.
+/// `call-async-for`; it addresses no channel and names no user. `pending`
+/// asks whether the host still holds a request, so a component can skip work
+/// for one whose caller is gone.
 interface provides {
     use tools.{tool-error};
 
@@ -699,6 +701,11 @@ interface provides {
     /// `denied`.
     call-async-for: func(serving: string, tool: string, args-json: string, call-id: string)
         -> result<_, tool-error>;
+
+    /// Whether `id` is pending for this component: true exactly where
+    /// `complete` would not answer `not-pending`. Reads nothing else and
+    /// changes nothing; it draws on no per-activation count.
+    pending: func(id: string) -> bool;
 }
 
 interface config {

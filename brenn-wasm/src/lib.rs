@@ -1022,6 +1022,34 @@ pub trait ProvidesHost: Send + Sync {
         id: &str,
         name: &str,
     ) -> Result<BlobHold, RequestAttachmentRefusal>;
+
+    /// Whether `id` is pending for this component: true exactly where
+    /// `complete` would not refuse it `NotPending`. Changes nothing.
+    ///
+    /// The provider kit drops, unbuilt and unissued, every call of a request
+    /// this answers `false` for. An implementation that tracks no requests
+    /// answers `true` for the ids it hands the component, or the component
+    /// issues no call for them.
+    fn is_pending(&self, id: &str) -> bool;
+
+    /// What the requests pending for this component weigh, for the fuel of
+    /// the activation about to run. `new_requests` are the bodies of the
+    /// requests that activation is handed new; each is a request body the
+    /// host wrote, and a request whose id one of them carries adds nothing,
+    /// its body and attachments being counted with its message. An
+    /// implementation that tracks no requests answers an empty load.
+    fn pending_load(&self, new_requests: &[&MessageBody]) -> PendingLoad;
+}
+
+/// The weight of the requests the host holds pending for one component, read
+/// once before an activation runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingLoad {
+    /// The summed body length of the pending requests not handed new.
+    pub body_bytes: u64,
+    /// One reference per distinct blob each pending request not handed new
+    /// holds.
+    pub attachments: Vec<brenn_envelope::BlobRef>,
 }
 
 /// Host callback for the `provides` interface. `Some` iff the `Provides`
@@ -1080,6 +1108,15 @@ const PROCESSOR_EPOCH_TICK_MS: u64 = 100;
 /// Epoch deadline ticks per activation (300 × 100 ms ≈ 30 s wall).
 const PROCESSOR_EPOCH_DEADLINE_TICKS: u64 = 300;
 
+// The floor, the rates, the caps and guest memory are constants of the host,
+// not settings. A guest cannot learn a limit at run time, so a component's
+// bounds are compiled in against these figures: a setting raised would lift no
+// bound, and one lowered would put a shipped component under its measured
+// bound, where it traps. A deployment already sets the bus cap and the window
+// depths without a ceiling, so a settable rate would be an unbounded factor on
+// the worst case. What lifts a bound is fuel in proportion to input, which the
+// body and attachment terms give.
+
 /// Per-invocation resource bound constants for `ProcessorComponent`.
 ///
 /// Fuel: at 10M instructions per envelope entry and a default window of 32
@@ -1103,44 +1140,167 @@ pub const PROCESSOR_FUEL_PER_ATTACHMENT_BYTE: u64 = 128;
 /// whatever arrives. The epoch deadline stays the wall-clock bound.
 pub const PROCESSOR_MAX_ATTACHMENT_FUEL: u64 =
     PROCESSOR_FUEL_PER_ATTACHMENT_BYTE * PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION;
+/// Fuel added per byte of body (`MessageBody::len()`) on the new messages of
+/// an activation, for every component whatever its grants, and per byte of
+/// the body of each request the host holds pending for a providing component
+/// and does not hand it new.
+///
+/// A body is input the envelope count does not weigh: the guest validates,
+/// copies and parses every byte of it, and a component that builds from a
+/// request's arguments works through them again. Measured on the real host
+/// under production limits, on `processor-kit-file-test`'s `KitBodyPut` at
+/// 65,536 and 393,216 bytes of body, in the activation that receives,
+/// parses, plans, builds and issues a request and in the one that settles
+/// earlier answers and builds queued requests out of the backlog: the
+/// costliest slope was the arriving activation on a `text` of one `a` and
+/// then line feeds, 137.1 fuel a byte. At 19/28 of the grant, the margin a
+/// component's bounds are held to, 256 leaves 173.7 a byte.
+///
+/// The figure is for a guest on the byte-carrying contract, which is handed
+/// the body's bytes as they are. A string-contract guest is handed them
+/// escaped inside JSON, up to six for one; it is granted the same fuel and no
+/// margin is stated for it.
+///
+/// The rate was sized on arguments that are strings. Arguments that are
+/// dense JSON cost more to parse: about 212 fuel a byte for an array of `0`s,
+/// 163 for an array of empty arrays and 654 for an object of distinct
+/// three-character keys, the last measured two requests an activation, close
+/// to the guest's memory limit, and so an upper figure. The rate claims no
+/// margin for such arguments, which reach a guest inside an array, object or
+/// untyped property a tool declares, or from a component caller
+/// (`dense-request-arguments-outgrow-guest` in `TODO.md`).
+pub const PROCESSOR_FUEL_PER_BODY_BYTE: u64 = 256;
+/// The most fuel body bytes add to one activation, new and pending together:
+/// the rate times the most body bytes a guest's memory can hold, so the most
+/// an activation gains is one figure whatever a deployment sets for the bus
+/// cap, the window depths, the ports or the requests a provider holds.
+pub const PROCESSOR_MAX_BODY_FUEL: u64 =
+    PROCESSOR_FUEL_PER_BODY_BYTE * PROCESSOR_MAX_MEMORY_BYTES as u64;
 
-/// The summed size of the attachments on the new messages of `activation`'s
-/// input windows. Context messages add nothing: their bytes were weighed on
-/// the activation that delivered them new.
-fn new_attachment_bytes(activation: &HostActivation) -> u64 {
+/// The new envelopes of `window` as the fuel rule weighs them. A window whose
+/// `new_from` passes its length is the guest's to refuse as a host invariant
+/// violation, and is weighed here as delivering nothing new.
+fn new_for_fuel(window: &HostPortWindow) -> &[Arc<MessageEnvelope>] {
+    window.checked_new_envelopes().unwrap_or_default()
+}
+
+/// The summed body length of the new messages of `activation`'s input
+/// windows, on every port. Context messages add nothing: their bytes were
+/// weighed on the activation that delivered them new.
+fn new_body_bytes(activation: &HostActivation) -> u64 {
     activation
         .ports
         .iter()
-        .flat_map(|pw| pw.new_envelopes())
-        .flat_map(|envelope| envelope.attachments.iter())
-        .fold(0u64, |sum, (_, blob)| sum.saturating_add(blob.size))
+        .flat_map(new_for_fuel)
+        .fold(0u64, |sum, envelope| {
+            sum.saturating_add(envelope.body.len() as u64)
+        })
 }
 
-/// The fuel `activation` runs on: [`processor_fuel`] over its envelope count
-/// and, when `blobs_granted`, the attachment bytes it delivers new.
-fn activation_fuel(activation: &HostActivation, blobs_granted: bool) -> u64 {
+/// The summed size of the attachments on the new messages of `activation`'s
+/// input windows, plus every blob in `pending`. Context messages add nothing.
+/// A new message's attachments count as given, one blob under two names
+/// twice. `pending` holds the attachments of the pending requests not handed
+/// new, so a request both new and pending counts once, with its message, and
+/// a blob held by several requests counts once for each.
+fn attachment_bytes(activation: &HostActivation, pending: &[brenn_envelope::BlobRef]) -> u64 {
+    activation
+        .ports
+        .iter()
+        .flat_map(new_for_fuel)
+        .flat_map(|envelope| envelope.attachments.iter())
+        .map(|(_, blob)| blob)
+        .chain(pending)
+        .fold(0u64, |sum, blob| sum.saturating_add(blob.size))
+}
+
+/// The bodies of the requests `activation` hands a provider new: the new
+/// envelopes of its `tool-requests` window, and nothing on any other port.
+fn new_request_bodies(activation: &HostActivation) -> Vec<&MessageBody> {
+    activation
+        .ports
+        .iter()
+        .filter(|pw| pw.port == brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT)
+        .flat_map(new_for_fuel)
+        .map(|envelope| &envelope.body)
+        .collect()
+}
+
+/// The fuel `activation` runs on, asking `provides`, when the component has
+/// that seam, for the load of its pending requests.
+fn seam_fuel(
+    activation: &HostActivation,
+    blobs_granted: bool,
+    provides: Option<&dyn ProvidesHost>,
+) -> u64 {
+    let pending = provides.map(|host| host.pending_load(&new_request_bodies(activation)));
+    activation_fuel(activation, blobs_granted, pending.as_ref())
+}
+
+/// `numerator / denominator` of `fuel`, rounded down, `u64::MAX` where the
+/// share passes it.
+///
+/// # Panics
+///
+/// If `denominator` is zero.
+fn fuel_share(fuel: u64, numerator: u64, denominator: u64) -> u64 {
+    assert!(denominator > 0, "a fuel share needs a nonzero denominator");
+    let share = u128::from(fuel) * u128::from(numerator) / u128::from(denominator);
+    u64::try_from(share).unwrap_or(u64::MAX)
+}
+
+/// The fuel `activation` runs on: [`processor_fuel`] over its envelope count,
+/// its new bodies, the `pending` load a providing component's host reports
+/// and, when `blobs_granted`, the attachment bytes new and pending.
+fn activation_fuel(
+    activation: &HostActivation,
+    blobs_granted: bool,
+    pending: Option<&PendingLoad>,
+) -> u64 {
     let total_envelopes: usize = activation.ports.iter().map(|pw| pw.envelopes.len()).sum();
+    let pending_attachments = pending.map_or(&[][..], |load| load.attachments.as_slice());
     processor_fuel(
         total_envelopes,
-        blobs_granted.then(|| new_attachment_bytes(activation)),
+        new_body_bytes(activation),
+        pending.map_or(0, |load| load.body_bytes),
+        blobs_granted.then(|| attachment_bytes(activation, pending_attachments)),
     )
 }
 
-/// An activation's fuel: the envelope rule, plus the attachment rule for a
-/// component granted `blobs`. `new_attachment_bytes` is `None` for a component
-/// without the grant, which gains nothing whatever its messages carry.
-fn processor_fuel(total_envelopes: usize, new_attachment_bytes: Option<u64>) -> u64 {
-    let envelopes =
-        PROCESSOR_FUEL_MINIMUM.max(PROCESSOR_FUEL_PER_ENVELOPE * (total_envelopes as u64));
-    let attachments = new_attachment_bytes.map_or(0, |bytes| {
+/// An activation's fuel:
+///
+/// ```text
+/// max(PROCESSOR_FUEL_MINIMUM, PROCESSOR_FUEL_PER_ENVELOPE × total_envelopes)
+///   + min((new_body_bytes + pending_body_bytes) × PROCESSOR_FUEL_PER_BODY_BYTE,
+///         PROCESSOR_MAX_BODY_FUEL)
+///   + min(attachment_bytes × PROCESSOR_FUEL_PER_ATTACHMENT_BYTE,
+///         PROCESSOR_MAX_ATTACHMENT_FUEL)        (granted `blobs` only)
+/// ```
+///
+/// `attachment_bytes` is `None` for a component without the grant, which
+/// gains nothing whatever its messages carry. Every product and sum
+/// saturates: no cap bounds the number of ports.
+fn processor_fuel(
+    total_envelopes: usize,
+    new_body_bytes: u64,
+    pending_body_bytes: u64,
+    attachment_bytes: Option<u64>,
+) -> u64 {
+    let envelopes = PROCESSOR_FUEL_MINIMUM
+        .max(PROCESSOR_FUEL_PER_ENVELOPE.saturating_mul(total_envelopes as u64));
+    let bodies = new_body_bytes
+        .saturating_add(pending_body_bytes)
+        .saturating_mul(PROCESSOR_FUEL_PER_BODY_BYTE)
+        .min(PROCESSOR_MAX_BODY_FUEL);
+    let attachments = attachment_bytes.map_or(0, |bytes| {
         bytes
             .saturating_mul(PROCESSOR_FUEL_PER_ATTACHMENT_BYTE)
             .min(PROCESSOR_MAX_ATTACHMENT_FUEL)
     });
-    envelopes + attachments
+    envelopes.saturating_add(bodies).saturating_add(attachments)
 }
-// TODO(guest-memory-and-fuel-fixed-constants): this memory limit and the
-// fuel constants are fixed; decide whether a deployment may set them.
+// TODO(guest-memory-and-fuel-fixed-constants): decide whether the attachment
+// rate rises to what a parse costs.
 /// Maximum memory a guest may grow to (bytes). 16 MiB per activation.
 ///
 /// Cap excess is a deterministic trap: `trap_on_grow_failure(true)` is set on
@@ -3364,6 +3524,14 @@ impl processor_bindings::brenn::processor::provides::Host for ProcessorData {
             .do_queue_async(Some(&serving), tool, args_json, &call_id, &[])
             .map_err(QueueRefusal::into_v0_1))
     }
+
+    fn pending(&mut self, id: String) -> wasmtime::Result<bool> {
+        let host = self.provides_host.as_ref().expect(
+            "pending host fn invoked without a provides_host (Provides grant linked but host \
+             unset)",
+        );
+        Ok(host.is_pending(&id))
+    }
 }
 
 // --- store::Host impl ---
@@ -4870,9 +5038,14 @@ impl ProcessorComponent {
     }
 
     /// The fuel `activation` runs on; the `blobs` grant is the blob seam's
-    /// presence, asserted equal at load.
+    /// presence, asserted equal at load, and a providing component's host
+    /// reports what its pending requests weigh.
     fn fuel_for(&self, activation: &HostActivation) -> u64 {
-        activation_fuel(activation, self.blob_host.is_some())
+        seam_fuel(
+            activation,
+            self.blob_host.is_some(),
+            self.provides_host.as_deref(),
+        )
     }
 
     /// Acquire the per-component carry lock for the duration of one activation.
@@ -4928,6 +5101,23 @@ impl ProcessorComponent {
         Self::invoke(store, activation, &self.processor_pre, &mut carry)
     }
 
+    /// `handle` variant granting `numerator / denominator` of the production
+    /// fuel for `activation` — test use only.
+    ///
+    /// The share is taken of the grant the host computes for this activation,
+    /// so a test states a margin without restating the grant's formula. The
+    /// epoch deadline and every other setting are the production ones.
+    #[doc(hidden)]
+    pub fn handle_with_fuel_share(
+        &self,
+        activation: HostActivation,
+        numerator: u64,
+        denominator: u64,
+    ) -> ProcessorOutcome {
+        let fuel = fuel_share(self.fuel_for(&activation), numerator, denominator);
+        self.handle_with_limits(activation, PROCESSOR_EPOCH_DEADLINE_TICKS, fuel)
+    }
+
     /// `handle` variant with an overridden `memory_size` store limit — test use only.
     ///
     /// Allows tests to set a store-level memory cap below the fixture's initial memory
@@ -4960,9 +5150,6 @@ impl ProcessorComponent {
     /// Shared dispatch core: lowers `activation` to the component's contract,
     /// calls `receive`, extracts publishes, and runs `cleanup_leaked_tx`
     /// unconditionally.
-    ///
-    /// `handle`, `handle_with_limits`, and `handle_with_memory_limit` all delegate
-    /// here after building the `Store` with the appropriate settings.
     fn invoke(
         mut store: Store<ProcessorData>,
         activation: HostActivation,
@@ -6821,6 +7008,14 @@ mod processor_store_host_tests {
         ) -> Result<BlobHold, RequestAttachmentRefusal> {
             Err(RequestAttachmentRefusal::NotPending)
         }
+
+        fn is_pending(&self, _id: &str) -> bool {
+            false
+        }
+
+        fn pending_load(&self, _new_requests: &[&MessageBody]) -> PendingLoad {
+            PendingLoad::default()
+        }
     }
 
     /// `complete` answers the guest up to the per-activation cap; the call
@@ -7824,13 +8019,27 @@ mod processor_store_host_tests {
 // shares with publishes, and the `SyncAnswer` → `call-error` mapping.
 
 #[cfg(test)]
-mod attachment_fuel_tests {
+mod activation_fuel_tests {
     use super::*;
+    use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
     use brenn_envelope::testutils::fixture_envelope;
     use brenn_envelope::{AttachmentName, Attachments, BlobId, BlobRef};
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
-    /// An envelope carrying one attachment per entry of `sizes`.
+    /// The fuel each one-byte fixture body adds.
+    const ONE_BODY: u64 = PROCESSOR_FUEL_PER_BODY_BYTE;
+
+    fn blob(id: &str, size: u64) -> BlobRef {
+        BlobRef {
+            id: BlobId::new(id.to_string()),
+            size,
+            content_type: "application/octet-stream".to_string(),
+        }
+    }
+
+    /// An envelope with a one-byte body carrying one attachment per entry of
+    /// `sizes`.
     fn carrying(id: &str, sizes: &[u64]) -> Arc<MessageEnvelope> {
         let mut envelope = fixture_envelope("ephemeral:in", id, MessageBody::text("x"));
         let map: BTreeMap<AttachmentName, BlobRef> = sizes
@@ -7838,33 +8047,54 @@ mod attachment_fuel_tests {
             .enumerate()
             .map(|(i, &size)| {
                 let name = AttachmentName::new(format!("a{i}")).expect("fixture name");
-                let blob = BlobRef {
-                    id: BlobId::new(format!("blob-{id}-{i}")),
-                    size,
-                    content_type: "application/octet-stream".to_string(),
-                };
-                (name, blob)
+                (name, blob(&format!("blob-{id}-{i}"), size))
             })
             .collect();
         envelope.attachments = Attachments::from_map(map);
         Arc::new(envelope)
     }
 
-    fn activation(ports: Vec<(Vec<Arc<MessageEnvelope>>, u32)>) -> HostActivation {
+    /// An envelope whose body is `body`.
+    fn with_body(id: &str, body: &str) -> Arc<MessageEnvelope> {
+        Arc::new(fixture_envelope(
+            "ephemeral:in",
+            id,
+            MessageBody::text(body),
+        ))
+    }
+
+    fn window(port: &str, envelopes: Vec<Arc<MessageEnvelope>>, new_from: u32) -> HostPortWindow {
+        HostPortWindow {
+            port: port.to_string(),
+            envelopes,
+            new_from,
+            dropped: 0,
+        }
+    }
+
+    fn on_ports(ports: Vec<HostPortWindow>) -> HostActivation {
         HostActivation {
-            ports: ports
-                .into_iter()
-                .enumerate()
-                .map(|(i, (envelopes, new_from))| HostPortWindow {
-                    port: format!("in{i}"),
-                    envelopes,
-                    new_from,
-                    dropped: 0,
-                })
-                .collect(),
+            ports,
             deferred: Vec::new(),
             now: None,
             sync: None,
+        }
+    }
+
+    fn activation(ports: Vec<(Vec<Arc<MessageEnvelope>>, u32)>) -> HostActivation {
+        on_ports(
+            ports
+                .into_iter()
+                .enumerate()
+                .map(|(i, (envelopes, new_from))| window(&format!("in{i}"), envelopes, new_from))
+                .collect(),
+        )
+    }
+
+    fn load(body_bytes: u64, attachments: Vec<BlobRef>) -> PendingLoad {
+        PendingLoad {
+            body_bytes,
+            attachments,
         }
     }
 
@@ -7883,57 +8113,308 @@ mod attachment_fuel_tests {
             ),
             (vec![carrying("c2", &[5_000])], 1),
         ]);
-        assert_eq!(new_attachment_bytes(&a), 30);
+        assert_eq!(attachment_bytes(&a, &[]), 30);
     }
 
     #[test]
     fn a_component_granted_blobs_gains_fuel_per_new_attachment_byte() {
-        let base = processor_fuel(3, None);
+        let base = processor_fuel(3, 0, 0, None);
         assert_eq!(base, PROCESSOR_FUEL_MINIMUM);
-        assert_eq!(processor_fuel(3, Some(0)), base);
+        assert_eq!(processor_fuel(3, 0, 0, Some(0)), base);
         assert_eq!(
-            processor_fuel(3, Some(1_000_000)),
+            processor_fuel(3, 0, 0, Some(1_000_000)),
             base + 1_000_000 * PROCESSOR_FUEL_PER_ATTACHMENT_BYTE
         );
         // The envelope rule above its floor is kept and added to.
         assert_eq!(
-            processor_fuel(10, Some(1)),
+            processor_fuel(10, 0, 0, Some(1)),
             10 * PROCESSOR_FUEL_PER_ENVELOPE + PROCESSOR_FUEL_PER_ATTACHMENT_BYTE
         );
     }
 
     #[test]
     fn attachment_fuel_is_capped() {
-        let base = processor_fuel(1, None);
+        let base = processor_fuel(1, 0, 0, None);
         assert_eq!(PROCESSOR_MAX_ATTACHMENT_FUEL, 8_589_934_592);
         let at_cap = PROCESSOR_MAX_ATTACHMENT_FUEL / PROCESSOR_FUEL_PER_ATTACHMENT_BYTE;
         assert_eq!(
-            processor_fuel(1, Some(at_cap)),
+            processor_fuel(1, 0, 0, Some(at_cap)),
             base + PROCESSOR_MAX_ATTACHMENT_FUEL
         );
         assert_eq!(
-            processor_fuel(1, Some(at_cap + 1)),
+            processor_fuel(1, 0, 0, Some(at_cap + 1)),
             base + PROCESSOR_MAX_ATTACHMENT_FUEL
         );
         assert_eq!(
-            processor_fuel(1, Some(u64::MAX)),
+            processor_fuel(1, 0, 0, Some(u64::MAX)),
             base + PROCESSOR_MAX_ATTACHMENT_FUEL
         );
     }
 
     #[test]
     fn the_grant_decides_and_context_adds_nothing() {
+        // One new one-byte body in each case below.
         let a = activation(vec![(
             vec![carrying("c", &[4_000_000]), carrying("n", &[1_000_000])],
             1,
         )]);
-        assert_eq!(activation_fuel(&a, false), PROCESSOR_FUEL_MINIMUM);
         assert_eq!(
-            activation_fuel(&a, true),
-            PROCESSOR_FUEL_MINIMUM + 1_000_000 * PROCESSOR_FUEL_PER_ATTACHMENT_BYTE
+            activation_fuel(&a, false, None),
+            PROCESSOR_FUEL_MINIMUM + ONE_BODY
+        );
+        assert_eq!(
+            activation_fuel(&a, true, None),
+            PROCESSOR_FUEL_MINIMUM + ONE_BODY + 1_000_000 * PROCESSOR_FUEL_PER_ATTACHMENT_BYTE
         );
         let context_only = activation(vec![(vec![carrying("c", &[4_000_000])], 1)]);
-        assert_eq!(activation_fuel(&context_only, true), PROCESSOR_FUEL_MINIMUM);
+        assert_eq!(
+            activation_fuel(&context_only, true, None),
+            PROCESSOR_FUEL_MINIMUM
+        );
+    }
+
+    #[test]
+    fn new_bodies_count_on_every_port_and_context_adds_nothing() {
+        let a = activation(vec![
+            (
+                vec![
+                    with_body("c", &"c".repeat(1_000)),
+                    with_body("n1", &"a".repeat(300)),
+                    with_body("n2", "é"),
+                ],
+                1,
+            ),
+            (
+                vec![with_body("c2", &"c".repeat(5_000)), with_body("n3", "abc")],
+                1,
+            ),
+            (vec![with_body("c3", &"c".repeat(7_000))], 1),
+        ]);
+        // "é" is two bytes of body.
+        assert_eq!(new_body_bytes(&a), 300 + 2 + 3);
+        // Six envelopes put the envelope term above its floor.
+        let expected = 6 * PROCESSOR_FUEL_PER_ENVELOPE + 305 * PROCESSOR_FUEL_PER_BODY_BYTE;
+        assert_eq!(activation_fuel(&a, false, None), expected);
+        assert_eq!(activation_fuel(&a, true, None), expected);
+    }
+
+    #[test]
+    fn a_window_whose_new_from_passes_its_length_weighs_nothing_new() {
+        let a = activation(vec![(vec![carrying("only", &[1_000])], 2)]);
+        assert_eq!(new_body_bytes(&a), 0);
+        assert_eq!(activation_fuel(&a, true, None), PROCESSOR_FUEL_MINIMUM);
+        assert!(new_request_bodies(&a).is_empty());
+    }
+
+    #[test]
+    fn the_body_rate_and_its_cap_are_the_stated_figures() {
+        assert_eq!(PROCESSOR_FUEL_PER_BODY_BYTE, 256);
+        assert_eq!(PROCESSOR_MAX_BODY_FUEL, 4_294_967_296);
+        assert_eq!(
+            PROCESSOR_MAX_BODY_FUEL,
+            PROCESSOR_FUEL_PER_BODY_BYTE * 16 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn body_fuel_is_capped_over_new_and_pending_together_and_saturates() {
+        let base = processor_fuel(1, 0, 0, None);
+        let at_cap = PROCESSOR_MAX_BODY_FUEL / PROCESSOR_FUEL_PER_BODY_BYTE;
+        assert_eq!(
+            processor_fuel(1, at_cap, 0, None),
+            base + PROCESSOR_MAX_BODY_FUEL
+        );
+        assert_eq!(
+            processor_fuel(1, at_cap - 10, 10, None),
+            base + PROCESSOR_MAX_BODY_FUEL
+        );
+        assert_eq!(
+            processor_fuel(1, at_cap, 1, None),
+            base + PROCESSOR_MAX_BODY_FUEL
+        );
+        assert_eq!(
+            processor_fuel(1, 0, at_cap + 1, None),
+            base + PROCESSOR_MAX_BODY_FUEL
+        );
+        assert_eq!(
+            processor_fuel(1, u64::MAX, u64::MAX, None),
+            base + PROCESSOR_MAX_BODY_FUEL
+        );
+        // Every term at its cap, and an envelope count no product can hold.
+        assert_eq!(
+            processor_fuel(usize::MAX, u64::MAX, u64::MAX, Some(u64::MAX)),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn pending_bodies_add_at_the_body_rate_with_and_without_blobs() {
+        let a = activation(vec![(vec![carrying("n", &[])], 0)]);
+        let pending = load(1_000, Vec::new());
+        let expected = PROCESSOR_FUEL_MINIMUM + ONE_BODY + 1_000 * PROCESSOR_FUEL_PER_BODY_BYTE;
+        assert_eq!(activation_fuel(&a, false, Some(&pending)), expected);
+        assert_eq!(activation_fuel(&a, true, Some(&pending)), expected);
+        // Without the `provides` seam there is no load and nothing is granted.
+        assert_eq!(
+            activation_fuel(&a, false, None),
+            PROCESSOR_FUEL_MINIMUM + ONE_BODY
+        );
+    }
+
+    #[test]
+    fn pending_attachments_add_per_request_and_only_with_blobs() {
+        // A new message carries `blob-n-0` (100 bytes) twice over two names
+        // and `blob-n-1` (10 bytes). Requests not handed new hold `blob-n-0`
+        // and two blobs of their own pending.
+        let mut envelope = fixture_envelope("ephemeral:in", "n", MessageBody::text("x"));
+        envelope.attachments = Attachments::from_map(BTreeMap::from([
+            (
+                AttachmentName::new("a").expect("fixture name"),
+                blob("blob-n-0", 100),
+            ),
+            (
+                AttachmentName::new("b").expect("fixture name"),
+                blob("blob-n-0", 100),
+            ),
+            (
+                AttachmentName::new("c").expect("fixture name"),
+                blob("blob-n-1", 10),
+            ),
+        ]));
+        let a = activation(vec![(vec![Arc::new(envelope)], 0)]);
+        let pending = load(
+            0,
+            vec![
+                blob("blob-n-0", 100),
+                blob("pending-0", 2_000),
+                blob("pending-1", 30_000),
+            ],
+        );
+        // The new message's attachments count as given, duplicates and all,
+        // and another request's hold on `blob-n-0` counts again: each
+        // request may work through it.
+        assert_eq!(
+            attachment_bytes(&a, &pending.attachments),
+            210 + 100 + 32_000
+        );
+        assert_eq!(
+            activation_fuel(&a, true, Some(&pending)),
+            PROCESSOR_FUEL_MINIMUM + ONE_BODY + 32_310 * PROCESSOR_FUEL_PER_ATTACHMENT_BYTE
+        );
+        assert_eq!(
+            activation_fuel(&a, false, Some(&pending)),
+            PROCESSOR_FUEL_MINIMUM + ONE_BODY
+        );
+    }
+
+    #[test]
+    fn pending_and_new_attachments_together_stop_at_the_cap() {
+        let at_cap = PROCESSOR_MAX_ATTACHMENT_FUEL / PROCESSOR_FUEL_PER_ATTACHMENT_BYTE;
+        let a = activation(vec![(vec![carrying("n", &[at_cap / 2])], 0)]);
+        let pending = load(0, vec![blob("p", at_cap / 2 + 1), blob("q", u64::MAX)]);
+        assert_eq!(
+            activation_fuel(&a, true, Some(&pending)),
+            PROCESSOR_FUEL_MINIMUM + ONE_BODY + PROCESSOR_MAX_ATTACHMENT_FUEL
+        );
+    }
+
+    /// A seam that records the bodies it is asked about and answers a fixed
+    /// load.
+    struct LoadSeam {
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl ProvidesHost for LoadSeam {
+        fn complete(
+            &self,
+            _id: &str,
+            _outcome_json: &str,
+            _attachments: HeldAttachments,
+        ) -> Result<(), ProvidesCallError> {
+            unreachable!("the grant completes nothing")
+        }
+
+        fn queue_async_for(
+            &self,
+            _serving: &str,
+            _tool: &str,
+            _args_json: &str,
+            _call_id: &str,
+            _with_attachments: bool,
+        ) -> Result<QueuedToolRequest, ToolCallError> {
+            unreachable!("the grant calls nothing")
+        }
+
+        fn request_attachment(
+            &self,
+            _id: &str,
+            _name: &str,
+        ) -> Result<BlobHold, RequestAttachmentRefusal> {
+            unreachable!("the grant opens nothing")
+        }
+
+        fn is_pending(&self, _id: &str) -> bool {
+            unreachable!("the grant asks after no id")
+        }
+
+        fn pending_load(&self, new_requests: &[&MessageBody]) -> PendingLoad {
+            self.asked.lock().unwrap().extend(
+                new_requests
+                    .iter()
+                    .map(|body| body.as_text().expect("fixture bodies are text").to_string()),
+            );
+            load(7, Vec::new())
+        }
+    }
+
+    #[test]
+    fn the_seam_is_handed_the_new_request_bodies_only() {
+        let a = on_ports(vec![
+            window(
+                TOOL_REQUEST_INPUT_PORT,
+                vec![
+                    with_body("c", "request-context"),
+                    with_body("n1", "request-1"),
+                    with_body("n2", "request-2"),
+                ],
+                1,
+            ),
+            window("tool-results", vec![with_body("r", "result")], 0),
+            window("in", vec![with_body("m", "message")], 0),
+        ]);
+        let seam = LoadSeam {
+            asked: Mutex::new(Vec::new()),
+        };
+        // Five envelopes leave the envelope term at its floor. The new bodies
+        // are "request-1", "request-2", "result" and "message", 31 bytes.
+        let without_seam = PROCESSOR_FUEL_MINIMUM + 31 * PROCESSOR_FUEL_PER_BODY_BYTE;
+        assert_eq!(seam_fuel(&a, false, None), without_seam);
+        assert!(seam.asked.lock().unwrap().is_empty());
+        assert_eq!(
+            seam_fuel(&a, false, Some(&seam)),
+            without_seam + 7 * PROCESSOR_FUEL_PER_BODY_BYTE,
+            "the seam's pending body bytes reach the grant"
+        );
+        assert_eq!(
+            *seam.asked.lock().unwrap(),
+            vec!["request-1".to_string(), "request-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_fuel_share_rounds_down_and_saturates() {
+        assert_eq!(fuel_share(28_000, 1, 1), 28_000);
+        assert_eq!(fuel_share(28_000, 19, 28), 19_000);
+        assert_eq!(fuel_share(27, 19, 28), 18);
+        assert_eq!(fuel_share(28_000, 28, 19), 41_263);
+        assert_eq!(fuel_share(u64::MAX, 19, 28), 12_517_433_478_588_624_310);
+        assert_eq!(fuel_share(u64::MAX, 2, 1), u64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "nonzero denominator")]
+    fn a_fuel_share_over_zero_panics() {
+        fuel_share(1, 1, 0);
     }
 }
 

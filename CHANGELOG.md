@@ -4,6 +4,50 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **A guest's fuel follows the bytes it is handed.** Fuel is the per-activation
+  instruction budget a WebAssembly component runs on. Every component is now
+  granted 256 fuel per byte of body on the messages an activation delivers
+  new, and a component that provides tools also 256 per byte of the body of
+  each request the host holds pending for it, in every activation and not
+  only the one the request arrived in; the two together are capped at
+  4,294,967,296. A component granted `blobs` that provides tools is also
+  granted the attachment rate, 128 a byte, for the attachments of the
+  requests the host holds pending for it, within the existing attachment cap
+  of 8,589,934,592. The floor, the per-envelope figure and guest memory are
+  unchanged, and none of them is a setting: a guest cannot learn its limits,
+  so a component's bounds are compiled in against these constants. No
+  activation's grant fell, so a bound measured against the old grant still
+  holds and may be re-measured upward. The rate was sized on arguments that
+  are strings; arguments that are dense JSON cost more to parse and are
+  claimed no margin.
+  - **For Rust callers of `brenn-wasm`, `brenn-tool-registry` and
+    `brenn-activation`:** `ProvidesHost` gains `pending_load`, which an
+    implementation must answer; `ProviderRuntime::begin` takes the call's
+    arguments and returns the request body beside its guard, and
+    `ProviderRuntime` gains `is_pending`; `PortWindow` gains
+    `checked_new_envelopes`, which answers `None` where `new_envelopes`
+    panics, for a window whose `new_from` passes its length.
+- **`provides` gains `pending`, and the provider kit builds nothing for a
+  request that has ended.** `brenn:processor/provides@0.1.0` gains
+  `pending(id) -> bool`, whether the host holds `id` pending for the
+  component; it changes nothing and draws on no budget, and `brenn-guest`
+  reaches it through `provides::pending`. `brenn-provider-kit` asks it before
+  it issues or queues a call and before it decodes a backlog entry: for a
+  request the host has given up — its caller left, its deadline passed — it
+  builds no body, attempts no call and spends neither budget, and it deletes
+  the request's backlog entry unread instead of answering it. Every call it
+  now drops is one the host already refused, so no caller sees a change.
+  - **For authors using `brenn-provider-kit`:** a kit component built from
+    this release imports `provides.pending` and so needs a brenn that serves
+    it; one built against an earlier kit is untouched. `Host` gains
+    `pending`, which an implementation must answer; `MemoryHost` answers
+    every request pending until a test calls `end_request`.
+  - **For Rust callers of `brenn-wasm`:** `ProvidesHost` gains `is_pending`,
+    which an implementation must answer. A test harness that tracks no
+    requests answers `true` for the ids it hands a component: a kit component
+    built from this release drops every call of a request answered `false`,
+    with only a `Debug` log line, so such a harness would see no nested call
+    at all. It answers `pending_load` with an empty load.
 - **A provider component can build a nested call's body.** A provider built on
   `brenn-provider-kit` can now send a body it builds — a document, a MIME
   message around a request's attachment — as an attachment of its nested

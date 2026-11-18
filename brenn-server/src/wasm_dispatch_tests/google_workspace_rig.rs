@@ -182,6 +182,9 @@ pub(super) struct RigOptions<'a> {
     /// The limits every provider activation runs under in place of the
     /// production ones; the production limits when `None`.
     pub limits: Option<ActivationLimits>,
+    /// The bus cap on a message body, `[messaging] max_body_bytes`; the
+    /// default when `None`.
+    pub max_body_bytes: Option<usize>,
 }
 
 impl Default for RigOptions<'_> {
@@ -193,6 +196,7 @@ impl Default for RigOptions<'_> {
             blob_limits: None,
             conversations: false,
             limits: None,
+            max_body_bytes: None,
         }
     }
 }
@@ -308,6 +312,7 @@ pub(super) async fn rig_built(
         blob_limits,
         conversations: with_conversations,
         limits,
+        max_body_bytes,
     } = options;
     let started = stub_rig::start().await;
     let host = started.host.clone();
@@ -363,6 +368,7 @@ pub(super) async fn rig_built(
             caller,
             conversations,
             limits,
+            max_body_bytes,
             vault,
         },
     )

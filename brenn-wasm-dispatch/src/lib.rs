@@ -659,13 +659,16 @@ pub async fn drain_step(cfg: &WasmConsumerConfig, subscriber: &ParticipantId, mo
 
 /// Limits one test activation runs under in place of the production ones.
 ///
-/// One or the other: the component offers no entry that overrides both.
+/// One at a time: the component offers no entry that overrides more than one.
 #[cfg(any(test, feature = "testutils"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationLimits {
     /// The fuel grant, and the epoch deadline in ticks of the processor's
     /// epoch clock.
     Fuel { fuel: u64, epoch_ticks: u64 },
+    /// `numerator / denominator` of the production fuel grant for the
+    /// activation, under the production epoch deadline.
+    FuelShare { numerator: u64, denominator: u64 },
     /// The guest's memory limit in bytes.
     Memory(usize),
 }
@@ -711,6 +714,10 @@ fn run_activation(
         Some(ActivationLimits::Fuel { fuel, epoch_ticks }) => {
             component.handle_with_limits(activation, epoch_ticks, fuel)
         }
+        Some(ActivationLimits::FuelShare {
+            numerator,
+            denominator,
+        }) => component.handle_with_fuel_share(activation, numerator, denominator),
         Some(ActivationLimits::Memory(bytes)) => {
             component.handle_with_memory_limit(activation, bytes)
         }

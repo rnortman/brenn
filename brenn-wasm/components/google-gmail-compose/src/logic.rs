@@ -56,7 +56,7 @@ const SUBJECT_MAX_CHARS: usize = 500;
 /// The most characters a draft's `body` may hold, as its schema states it.
 const BODY_MAX_CHARS: usize = 20_000;
 // TODO(google-write-bodies-in-call-arguments): send the draft as a blob the
-// component builds, once a request's bytes bring fuel.
+// component builds.
 /// The most bytes a draft's body may hold in its CRLF form, a lone line break
 /// counting as the two bytes it becomes. The body travels as base64 of that
 /// form inside `raw`, itself base64url of the message, inside the nested

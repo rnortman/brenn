@@ -679,6 +679,27 @@ fn the_surface_check_refuses_the_blob_tool_call_fixtures_by_name() {
     }
 }
 
+/// `provides` is backend-only: a component that imports its `pending` is
+/// refused on a surface by name.
+#[test]
+fn the_surface_check_refuses_a_provides_pending_importer_by_name() {
+    let bytes = surface_fixture(
+        r#"(import "brenn:processor/provides@0.1.0"
+             (instance (export "pending" (func (param "id" string) (result bool)))))"#,
+    );
+    let refusal = brenn_wasm::check_surface_component(&bytes)
+        .expect_err("a provides importer is refused on a surface");
+    assert_eq!(
+        refusal.stage,
+        brenn_wasm::SurfaceComponentStage::Name,
+        "{refusal}"
+    );
+    assert!(
+        refusal.detail.contains("brenn:processor/provides@0.1.0"),
+        "{refusal}"
+    );
+}
+
 #[test]
 fn the_surface_check_refuses_a_file_that_is_not_a_component_by_name() {
     let refusal = brenn_wasm::check_surface_component(b"not a component")

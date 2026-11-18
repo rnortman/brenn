@@ -229,6 +229,10 @@ impl<B: Served> Host for GuestHost<'_, B> {
         ))
     }
 
+    fn pending(&self, id: &str) -> bool {
+        provides::pending(&pending(id))
+    }
+
     fn log(&self, level: Level, line: String) {
         match level {
             Level::Debug => log::debug(line),

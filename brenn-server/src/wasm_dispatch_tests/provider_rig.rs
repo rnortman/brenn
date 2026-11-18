@@ -20,7 +20,7 @@ use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::config::{ProvidedToolDecl, SystemChannelTuning};
 use brenn_lib::tools::ResolvedToolGrant;
 use brenn_messaging::testutils::{TEST_BLOB_LIMITS, TempBlobDir, install_blob_store_with};
-use brenn_messaging::{Messenger, MountDebt};
+use brenn_messaging::{Messenger, MountDebt, PortSnapshot};
 use brenn_messaging_store::blob::BlobLimits;
 use brenn_tool_registry::bus_wiring::{
     app_result_inbox_entries, inbox_input_port, request_channel_entry, request_inbox_depth,
@@ -36,6 +36,25 @@ use brenn_tool_registry::{
 };
 use serde_json::Value;
 use tokio::task::JoinHandle;
+
+/// The fuel margin a component's bounds are held to: 5/7 of the production
+/// grant less five percent of that, 19/28 of the grant the host computes for
+/// the activation.
+pub(super) const MARGIN: ActivationLimits = ActivationLimits::FuelShare {
+    numerator: 19,
+    denominator: 28,
+};
+
+/// The production epoch deadline of an activation: 300 ticks of 100 ms.
+const PRODUCTION_EPOCH_TICKS: u64 = 300;
+
+/// A grant of `fuel`, under the production epoch deadline.
+pub(super) fn fuel(fuel: u64) -> Option<ActivationLimits> {
+    Some(ActivationLimits::Fuel {
+        fuel,
+        epoch_ticks: PRODUCTION_EPOCH_TICKS,
+    })
+}
 
 /// What a provider rig is built from.
 pub(super) struct ProviderSetup<'a> {
@@ -60,6 +79,9 @@ pub(super) struct ProviderSetup<'a> {
     /// The limits every provider activation runs under in place of the
     /// production ones; the production limits when `None`.
     pub limits: Option<ActivationLimits>,
+    /// The bus cap on a message body, `[messaging] max_body_bytes`; the
+    /// default when `None`.
+    pub max_body_bytes: Option<usize>,
 }
 
 /// The apps of a rig whose conversations call the registry. The rig gives the
@@ -94,7 +116,8 @@ pub(super) struct ProviderRig {
     pub messenger: Arc<Messenger>,
     pub registry: Arc<ToolRegistry>,
     pub runtime: Arc<ProviderRuntime>,
-    pub executor: ToolExecutor,
+    /// Shared so a test can run a drain step on a task of its own.
+    pub executor: Arc<ToolExecutor>,
     pub alert: brenn_obs::alerting::AlertDispatcher,
     pub provider: WasmConsumerConfig,
     pub provider_sub: ParticipantId,
@@ -130,6 +153,7 @@ impl ProviderRig {
             conversations,
             blob_limits,
             limits,
+            max_body_bytes,
         } = setup;
         let (alert, _alerts) = noop_alert_dispatcher();
         let runtime = ProviderRuntime::new(alert.clone());
@@ -141,7 +165,10 @@ impl ProviderRig {
                 .collect(),
         ));
 
-        let defaults = MessagingGlobalConfig::default();
+        let mut defaults = MessagingGlobalConfig::default();
+        if let Some(max_body_bytes) = max_body_bytes {
+            defaults.max_body_bytes = max_body_bytes;
+        }
         let tuning = SystemChannelTuning::default();
         let requests = super::with_own_wasm_subscriber(
             slug,
@@ -372,14 +399,14 @@ impl ProviderRig {
                 }
             });
 
-        let executor = ToolExecutor::new(
+        let executor = Arc::new(ToolExecutor::new(
             messenger.clone(),
             registry.clone().into(),
             Arc::new(ToolCallerGrants::new(caller_grants)),
             runtime.clone(),
             alert.clone(),
             Arc::new(Notify::new()),
-        );
+        ));
 
         ProviderRig {
             messenger,
@@ -487,7 +514,13 @@ impl ProviderRig {
 
     /// Activate the provider on whatever it is owed, under the rig's limits.
     pub async fn serve(&self) {
-        match self.limits {
+        self.serve_under(self.limits).await;
+    }
+
+    /// Activate the provider on whatever it is owed, under `limits`, or the
+    /// production limits when `None`, whatever the rig was built with.
+    pub async fn serve_under(&self, limits: Option<ActivationLimits>) {
+        match limits {
             None => drain_step(&self.provider, &self.provider_sub, MountDebt::Settled).await,
             Some(limits) => {
                 drain_step_with_limits(
@@ -499,5 +532,20 @@ impl ProviderRig {
                 .await;
             }
         }
+    }
+
+    /// The windows the provider's next activation is handed, as the host
+    /// loads them for it.
+    pub async fn owed_windows(&self) -> Vec<PortSnapshot> {
+        let (_, ports) = self
+            .messenger
+            .load_activation_snapshot(
+                &self.provider_sub,
+                &self.provider.inputs,
+                MountDebt::Settled,
+            )
+            .await
+            .expect("the provider is owed an activation");
+        ports
     }
 }

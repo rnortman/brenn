@@ -1039,14 +1039,48 @@ by reference (`docs/message-bus.md` §2.1.2a).
   way into one `warn` per activation, and the activation's first storage
   failure is logged at `error` with its I/O error, so a guest retrying in a
   loop writes one line, not one per call.
-  CPU grows with the attachments handed in: an instance granted `blobs` gets,
-  beside the envelope-count fuel, 128 fuel per byte of attachment on the
-  messages delivered *new* to the activation, capped at 8,589,934,592
-  (`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`, `PROCESSOR_MAX_ATTACHMENT_FUEL`).
-  Attachments on window context, and every attachment for an instance without
-  the grant, add nothing. The 30 s epoch deadline is unchanged and is still the
-  wall-clock bound, so the most any activation gains is bounded whatever
-  arrives.
+  CPU grows with what an activation is handed and, for a provider, with what
+  the host holds for it. Beside the envelope-count fuel, every instance gets
+  256 fuel per byte of body on the messages delivered *new* to the activation
+  (`PROCESSOR_FUEL_PER_BODY_BYTE`); an instance that provides tools also gets
+  256 per byte of the body of each request the host holds pending for it; the
+  two together are capped at 4,294,967,296 (`PROCESSOR_MAX_BODY_FUEL`). An
+  instance granted `blobs` also gets 128 fuel per byte of attachment on the
+  messages delivered new and on the requests the host holds pending for it,
+  capped at 8,589,934,592 (`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`,
+  `PROCESSOR_MAX_ATTACHMENT_FUEL`). Window context adds nothing to either, and
+  an instance without `blobs` gets no attachment fuel. The grant is computed
+  before the guest runs, and nothing the guest does changes it.
+
+  **The worst case one activation can be granted** is 10,000,000 for each
+  envelope of its windows — at most 1,000 a port, and the number of ports is
+  the deployment's, with no ceiling — plus the two caps, 12,884,901,888
+  together. Neither cap depends on `[messaging] max_body_bytes`, which has no
+  ceiling, or on how many requests a provider holds. A provider may be granted
+  for its pending requests on every activation, used or not: for their bodies
+  up to the body cap and, granted `blobs`, for their attachments up to the
+  attachment cap, for as long as the host holds each request — at most its
+  240 s. A provider that spins therefore burns a larger grant on each
+  activation while it holds requests. The 30 s epoch deadline is unchanged and
+  is the wall-clock bound whatever the fuel.
+
+  The body rate pays for a request's bytes as text. A request whose arguments
+  are dense JSON — a long array of small values, an object of many keys —
+  costs more to parse than the rate grants and many times its bytes in guest
+  memory, so an activation handed enough of them traps, on fuel or on memory,
+  and the host then fails every request delivered new to that activation, not
+  only the dense ones. What reaches a provider is bounded by the host's
+  argument check for a conversation's call (top-level keys and their JSON
+  types, one level deep) and by the 64 KiB arguments cap for a component's;
+  neither bounds the inside of an array or object a tool declares or of a
+  property it leaves untyped, and no size keyword of a tool's schema is
+  enforced before the guest parses the request
+  (`dense-request-arguments-outgrow-guest` in `TODO.md`).
+
+  The `provides` interface's `pending` lets a provider ask whether a request
+  id is pending for it. It learns nothing new: `complete` with an outcome the
+  host refuses already answers `not-pending` or `invalid-outcome` by whether
+  the id is pending, and leaves it pending.
 - **What does not bound a component.** Over many activations a component can
   fill the store: each activation may write 64 MiB, and what it publishes
   lives as long as the channels' windows hold it. The store's budget is one
@@ -1149,8 +1183,10 @@ internally-originated.
   must be restricted to operator-trusted, in-tree guests only; accepting an
   out-of-tree guest into an unbounded world is a finding.) A backend
   processor's CPU bound is fuel, scaled by the envelopes an activation is
-  handed and, for an instance granted `blobs`, by the bytes of attachment on
-  its new messages up to a fixed cap (§7.6, "What bounds one activation"); the
+  handed, by the bytes of body on its new messages and on a provider's
+  pending requests up to a fixed cap and, for an instance granted `blobs`, by
+  the bytes of attachment on its new messages and its pending requests up to
+  a fixed cap (§7.6, "What bounds one activation"); the
   epoch deadline bounds its wall clock whatever its fuel.
 - **Output volume is bounded.** Per-activation call budgets and payload-size
   limits must bound what a guest can emit, and guest-produced strings that reach

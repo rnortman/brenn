@@ -1429,6 +1429,25 @@ component GmailTools {
   more than the guest can hold traps; the host fails that activation's new
   requests and alerts, every time the window fills. Nothing at load refuses
   such a window.
+
+  A guest's fuel for one activation is set before it runs:
+  max(50,000,000, 10,000,000 × the envelopes of its windows), plus 256 a byte
+  of body on its new messages and, for a provider, on the requests the host
+  holds pending for it, up to 4,294,967,296, plus, for an instance granted
+  `blobs`, 128 a byte of attachment on its new messages and its pending
+  requests, up to 8,589,934,592. None of it is a setting, and neither is
+  guest memory. A guest cannot learn a limit at run time, so a component's
+  bounds are compiled in against these figures: a setting raised would lift
+  no bound, and one lowered would put a shipped component under its measured
+  bound, where it traps. And a deployment already sets the bus cap and the
+  window depths with no ceiling, so a settable rate would be an unbounded
+  factor on the worst case. Raising `max_body_bytes` raises what a guest must
+  parse and, with it, the fuel it is granted — for its new messages and, for
+  a provider, for the requests it holds pending — up to the body cap. A
+  request weighs more in the guest than on the bus, since its arguments are
+  parsed into a tree, several times their bytes where they are dense JSON, so
+  a raised `max_body_bytes` lowers the number of such requests one activation
+  can hold.
 - `auto_approve` (default `true`) is whether a call skips the approval prompt.
 - `accepts_attachments` (default `false`) is whether a call may hand the tool
   attachments — blobs named by reference (`docs/component-packages.md`, "Blobs

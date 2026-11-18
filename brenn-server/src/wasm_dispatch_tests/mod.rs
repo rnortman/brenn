@@ -81,6 +81,7 @@ mod google_gmail_organize_e2e;
 mod google_gmail_read_e2e;
 mod google_maps_tools_e2e;
 mod google_workspace_rig;
+mod kit_body_fuel_measure;
 mod kit_file_e2e;
 mod provided_e2e;
 mod provider_rig;

@@ -496,8 +496,20 @@ impl<E> PortWindow<E> {
     /// The new messages on this port: `envelopes[new_from..]`. Empty for a
     /// pure-context window. This is the slice a component feeds to its seam;
     /// the `new_from` cast lives here so no consumer re-derives it.
+    ///
+    /// # Panics
+    ///
+    /// If `new_from` passes the window's length, a window no host builds.
+    /// [`Self::checked_new_envelopes`] answers `None` for it instead.
     pub fn new_envelopes(&self) -> &[E] {
-        &self.envelopes[self.new_from as usize..]
+        self.checked_new_envelopes()
+            .expect("a window's new_from is within its envelopes")
+    }
+
+    /// [`Self::new_envelopes`], or `None` for a window whose `new_from`
+    /// passes its length.
+    pub fn checked_new_envelopes(&self) -> Option<&[E]> {
+        self.envelopes.get(self.new_from as usize..)
     }
 
     /// How many new messages this window carries: `envelopes.len() - new_from`.
@@ -811,6 +823,17 @@ mod tests {
         };
         assert_eq!(all_new.new_envelopes(), &["n-1"]);
         assert_eq!(all_new.new_len(), 1);
+
+        assert_eq!(with_new.checked_new_envelopes(), Some(&["n-1", "n-2"][..]));
+        assert_eq!(context_only.checked_new_envelopes(), Some(&[][..]));
+        let past_its_length = PortWindow {
+            port: "in".to_string(),
+            envelopes: vec!["only-one"],
+            new_from: 2,
+            dropped: 0,
+        };
+        assert_eq!(past_its_length.checked_new_envelopes(), None);
+        assert_eq!(past_its_length.new_len(), 0);
 
         let activation: Activation<&str> = Activation {
             ports: vec![with_new, context_only, all_new],

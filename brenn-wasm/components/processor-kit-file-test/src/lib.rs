@@ -13,7 +13,8 @@
 //!   blob forwarded as the completion's attachment `file`.
 //! - `kit-body-put` — `PUT <path>` with a body the component builds when the
 //!   call is issued (`Body::Built`): `text` repeated `times` times, then the
-//!   request's attachment `file`, read in pieces, when it carries one.
+//!   request's attachment `file`, read in pieces, when it carries one —
+//!   written as two lowercase hexadecimal digits a byte when `hex` is true.
 //!   Completes with `{"status", "bytes"}`, the status of the `PUT` and the
 //!   body's length, computed from the arguments and the attachment's header.
 //!
@@ -44,9 +45,11 @@ const PUT_AFTER_HEAD_STEP: u8 = 1;
 /// The content type of the body `kit-body-put` builds.
 const BUILT_TYPE: &str = "application/octet-stream";
 /// The longest `text` `kit-body-put` takes, in characters.
-const TEXT_MAX_CHARS: usize = 1024;
+const TEXT_MAX_CHARS: usize = 393_216;
 /// The most times `kit-body-put` repeats its `text`.
 const TIMES_MAX: u64 = 4096;
+/// The digits `kit-body-put` writes its attachment in when `hex` is true.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 impl Tool for Provided {
     fn name(self) -> &'static str {
@@ -97,22 +100,30 @@ fn path(map: &serde_json::Map<String, Value>) -> Result<String, String> {
     }
 }
 
-/// `kit-body-put`'s arguments: the path, and the text its body repeats.
+/// `kit-body-put`'s arguments: the path, the text its body repeats, and
+/// whether the attachment is written in hexadecimal.
 struct BodyArgs {
     path: String,
     text: String,
     times: u64,
+    hex: bool,
 }
 
 impl BodyArgs {
     fn parse(args: &Value) -> Result<BodyArgs, String> {
-        let map = object(args, &["path", "text", "times"])?;
+        let map = object(args, &["path", "text", "times", "hex"])?;
         let path = path(map)?;
         let text = capped(map, "text", TEXT_MAX_CHARS)?
             .ok_or("`text` is required")?
             .to_string();
         let times = integer(map, "times", 1, TIMES_MAX)?.ok_or("`times` is required")?;
-        Ok(BodyArgs { path, text, times })
+        let hex = brenn_provider_kit::flag(map, "hex")?;
+        Ok(BodyArgs {
+            path,
+            text,
+            times,
+            hex,
+        })
     }
 
     /// The length of the body built from these arguments and the request's
@@ -122,6 +133,7 @@ impl BodyArgs {
             .iter()
             .find(|attached| attached.name == FILE)
             .map_or(0, |attached| attached.size);
+        let file = if self.hex { file * 2 } else { file };
         self.text.len() as u64 * self.times + file
     }
 }
@@ -243,8 +255,21 @@ impl Logic for KitFiles {
             .any(|attached| attached.name == FILE)
         {
             let file = step.open_request(FILE)?;
+            let mut hex = Vec::new();
             for piece in step.pieces(&file) {
-                body.write(&piece?)?;
+                let piece = piece?;
+                if args.hex {
+                    hex.clear();
+                    hex.extend(piece.iter().flat_map(|byte| {
+                        [
+                            HEX_DIGITS[usize::from(byte >> 4)],
+                            HEX_DIGITS[usize::from(byte & 0xf)],
+                        ]
+                    }));
+                    body.write(&hex)?;
+                } else {
+                    body.write(&piece)?;
+                }
             }
         }
         body.finish()

@@ -11,15 +11,17 @@
 
 use std::sync::Arc;
 
+use brenn_envelope::MessageBody;
 use brenn_messaging_store::blob::{BlobHold, HeldAttachments};
 use brenn_wasm::{
-    ProvidesCallError, ProvidesHost, QueuedToolRequest, RequestAttachmentRefusal, ToolCallError,
+    PendingLoad, ProvidesCallError, ProvidesHost, QueuedToolRequest, RequestAttachmentRefusal,
+    ToolCallError,
 };
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::descriptor::{MAX_ASYNC_RESULT_BYTES, ToolError};
-use super::provided::{CompleteError, ProviderRuntime, RequestAttachmentError};
+use super::provided::{CompleteError, ProvidedRequest, ProviderRuntime, RequestAttachmentError};
 use super::tool::ToolOutput;
 use super::wasm_host::WasmToolHost;
 
@@ -116,7 +118,7 @@ impl ProvidesHost for WasmProvidesHost {
         call_id: &str,
         with_attachments: bool,
     ) -> Result<QueuedToolRequest, ToolCallError> {
-        if self.runtime.serving(&self.slug, serving).is_none() {
+        if !self.runtime.is_pending(&self.slug, serving) {
             return Err(ToolCallError::Denied(
                 "the pending call this request serves is not pending for this component"
                     .to_string(),
@@ -137,6 +139,36 @@ impl ProvidesHost for WasmProvidesHost {
                 RequestAttachmentError::NotPending => RequestAttachmentRefusal::NotPending,
                 RequestAttachmentError::NotAttached => RequestAttachmentRefusal::NotAttached,
             })
+    }
+
+    fn is_pending(&self, id: &str) -> bool {
+        self.runtime.is_pending(&self.slug, id)
+    }
+
+    /// # Panics
+    ///
+    /// If a new request body is not text or not a [`ProvidedRequest`]: the
+    /// host builds every body on the request channel, so one that does not
+    /// parse is a host bug.
+    fn pending_load(&self, new_requests: &[&MessageBody]) -> PendingLoad {
+        let new_ids: Vec<&str> = new_requests
+            .iter()
+            .map(|body| match body.as_text().map(ProvidedRequest::id_of) {
+                Some(Ok(id)) => id,
+                None => panic!(
+                    "BUG: a request delivered new to {} is not text ({}) — the host builds \
+                     every body on that channel",
+                    self.slug,
+                    body.summary()
+                ),
+                Some(Err(err)) => panic!(
+                    "BUG: a request delivered new to {} is not a provided-tool request ({err}) \
+                     — the host builds every body on that channel",
+                    self.slug
+                ),
+            })
+            .collect();
+        self.runtime.pending_load(&self.slug, &new_ids)
     }
 }
 
@@ -265,10 +297,11 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_carries_the_served_id_and_no_user() {
         let runtime = runtime();
-        let guard = runtime.begin(
+        let (guard, _) = runtime.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            json!({}),
             HeldAttachments::none(),
         );
         let id = guard.id().as_str();
@@ -296,10 +329,11 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_serving_an_id_not_pending_here_is_denied() {
         let runtime = runtime();
-        let guard = runtime.begin(
+        let (guard, _) = runtime.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            json!({}),
             HeldAttachments::none(),
         );
         let id = guard.id().as_str().to_string();
@@ -321,10 +355,11 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_with_attachments_needs_an_accepting_tool() {
         let runtime = runtime();
-        let guard = runtime.begin(
+        let (guard, _) = runtime.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            json!({}),
             HeldAttachments::none(),
         );
         let host = host(&runtime, PROVIDER);
@@ -350,10 +385,11 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_is_admitted_by_the_providers_own_grants() {
         let runtime = runtime();
-        let guard = runtime.begin(
+        let (guard, _) = runtime.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            json!({}),
             HeldAttachments::none(),
         );
         let id = guard.id().as_str();
@@ -379,10 +415,11 @@ mod tests {
     #[tokio::test]
     async fn a_provider_with_no_tool_grant_is_not_granted_a_nested_call() {
         let runtime = runtime();
-        let guard = runtime.begin(
+        let (guard, _) = runtime.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            json!({}),
             HeldAttachments::none(),
         );
         let (alert, _drain) = noop_alert_dispatcher();
@@ -472,10 +509,11 @@ mod tests {
         let store = messenger.blob_store().unwrap().clone();
         let runtime = runtime();
         let photo = seal_bytes(&store, "image/png", b"png bytes");
-        let guard = runtime.begin(
+        let (guard, _) = runtime.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            json!({}),
             held(&[("photo", &photo)]),
         );
         let id = guard.id().as_str().to_string();
@@ -505,5 +543,76 @@ mod tests {
                 .unwrap_err(),
             RequestAttachmentRefusal::NotPending
         );
+    }
+
+    /// The host reads each new request's id from its body and leaves that
+    /// request out of the load; it asks only for its own instance.
+    #[tokio::test]
+    async fn the_pending_load_leaves_out_the_requests_handed_new() {
+        let runtime = runtime();
+        let begin = |args: Value| {
+            runtime.begin(
+                PROVIDER,
+                "echo-for-user",
+                &pending_ctx(None),
+                args,
+                HeldAttachments::none(),
+            )
+        };
+        let (_new, new_body) = begin(json!({ "q": "new" }));
+        let (_held, held_body) = begin(json!({ "q": "pending a while" }));
+        let mine = host(&runtime, PROVIDER);
+        let handed = MessageBody::text(new_body.as_str());
+        assert_eq!(
+            mine.pending_load(&[&handed]).body_bytes,
+            held_body.len() as u64
+        );
+        assert_eq!(
+            mine.pending_load(&[]).body_bytes,
+            (new_body.len() + held_body.len()) as u64
+        );
+        assert_eq!(
+            host(&runtime, "other").pending_load(&[&handed]),
+            PendingLoad::default()
+        );
+    }
+
+    /// `is_pending` answers for this instance's records alone, and only while
+    /// the request is pending.
+    #[tokio::test]
+    async fn is_pending_names_this_instances_pending_requests() {
+        let runtime = runtime();
+        let (_guard, body) = runtime.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            json!({}),
+            HeldAttachments::none(),
+        );
+        let id = ProvidedRequest::id_of(&body).unwrap().to_string();
+        let mine = host(&runtime, PROVIDER);
+        assert!(mine.is_pending(&id));
+        assert!(!host(&runtime, "other").is_pending(&id));
+        assert!(!mine.is_pending("never-minted"));
+        mine.complete(&id, r#"{"ok": null}"#, HeldAttachments::none())
+            .unwrap();
+        assert!(!mine.is_pending(&id));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "is not a provided-tool request")]
+    async fn a_new_request_body_the_host_did_not_write_panics() {
+        let runtime = runtime();
+        let handed = MessageBody::text("{\"v\": 1}");
+        host(&runtime, PROVIDER).pending_load(&[&handed]);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "is not text")]
+    async fn a_new_request_body_of_bytes_panics() {
+        let runtime = runtime();
+        let handed = MessageBody::from_parts(Some("application/octet-stream"), b"\x00\x01")
+            .expect("a well-formed binary body");
+        host(&runtime, PROVIDER).pending_load(&[&handed]);
     }
 }

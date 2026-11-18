@@ -2644,6 +2644,9 @@ pub mod provides {
         args: serde_json::Value,
     }
 
+    // TODO(dense-request-arguments-outgrow-guest): every new request's
+    // arguments are parsed into a tree before any is handled; nothing bounds
+    // their element count or nesting before this parse.
     /// Parse one request body. A body the host built that does not parse is a
     /// host bug, surfaced as `MalformedEnvelope`.
     pub(crate) fn parse_request(message: &crate::Message) -> Result<ToolRequest, Error> {
@@ -2757,6 +2760,14 @@ pub mod provides {
             Err(Error::NotPending(_)) => Ok(()),
             other => other,
         }
+    }
+
+    /// Whether the host holds request `id` pending for this component: true
+    /// exactly where [`complete`] would not draw `Err(NotPending)`. Reads
+    /// nothing else and changes nothing; a request may still end between
+    /// this answer and a later call.
+    pub fn pending(id: &PendingId) -> bool {
+        raw::pending(&id.0)
     }
 
     /// `tools::call_async_json` on behalf of the user whose request `id` is.

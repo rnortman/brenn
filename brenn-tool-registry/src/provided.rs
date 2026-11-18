@@ -25,7 +25,7 @@
 //! record leaves the table under the table's lock and is dropped after it, so
 //! a last hold's file work never runs under that lock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -37,6 +37,7 @@ use brenn_lib::tools::AclClause;
 use brenn_messaging::{Messenger, PublishResult};
 use brenn_messaging_store::blob::{BlobHold, HeldAttachments};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
+use brenn_wasm::PendingLoad;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,6 +77,16 @@ impl ProvidedRequest {
     /// Parse a request body as the host wrote it.
     pub fn parse(body: &str) -> serde_json::Result<Self> {
         serde_json::from_str(body)
+    }
+
+    /// The id of a request body as the host wrote it, read without building
+    /// the rest: the other members are skipped, not parsed into values.
+    pub fn id_of(body: &str) -> serde_json::Result<&str> {
+        #[derive(Deserialize)]
+        struct IdOnly<'a> {
+            id: &'a str,
+        }
+        serde_json::from_str::<IdOnly<'_>>(body).map(|request| request.id)
     }
 }
 
@@ -139,6 +150,8 @@ struct PendingCall {
     /// The request's attachments: one hold per distinct blob it names, for
     /// the record's life.
     attachments: HeldAttachments,
+    /// The length of the request's body as published.
+    body_bytes: u64,
 }
 
 /// What a nested call serving a pending call inherits from it: the acting
@@ -184,9 +197,11 @@ impl ProviderRuntime {
             .expect("provider runtime pending table lock poisoned")
     }
 
-    /// Record a call to `tool` provided by `instance` under a fresh id,
-    /// holding the request's `attachments`. The record, with its holds, is
-    /// removed when the returned guard drops, if nothing removed it first.
+    /// Record a call to `tool` provided by `instance` with `args` under a
+    /// fresh id, holding the request's `attachments`, and return the request
+    /// body to publish beside the record's guard. The record holds the body's
+    /// length. It is removed, with its holds, when the guard drops, if nothing
+    /// removed it first.
     ///
     /// # Panics
     ///
@@ -197,12 +212,20 @@ impl ProviderRuntime {
         instance: &str,
         tool: &'static str,
         ctx: &ToolCtx,
+        args: Value,
         attachments: HeldAttachments,
-    ) -> PendingGuard {
+    ) -> (PendingGuard, String) {
         let deadline = ctx.deadline.unwrap_or_else(|| {
             panic!("BUG: a call to provided tool {tool:?} began without a deadline")
         });
         let id = PendingId::mint();
+        let body = serde_json::to_string(&ProvidedRequest {
+            v: ProvidedRequest::VERSION,
+            id: id.as_str().to_string(),
+            tool: tool.to_string(),
+            args,
+        })
+        .expect("a request of strings and a JSON value serializes");
         let (completion, rx) = oneshot::channel();
         let previous = self.lock().insert(
             id.0.clone(),
@@ -214,14 +237,16 @@ impl ProviderRuntime {
                 deadline,
                 completion,
                 attachments,
+                body_bytes: body.len() as u64,
             },
         );
         assert!(previous.is_none(), "BUG: a minted pending id {id} collided");
-        PendingGuard {
+        let guard = PendingGuard {
             id,
             runtime: self.clone(),
             rx,
-        }
+        };
+        (guard, body)
     }
 
     /// Answer the call `id` with `outcome`, iff it is pending for `instance`.
@@ -256,6 +281,13 @@ impl ProviderRuntime {
             .map(|serving| serving.acting_user)
     }
 
+    /// Whether `id` is pending for `instance`.
+    pub fn is_pending(&self, instance: &str, id: &str) -> bool {
+        self.lock()
+            .get(id)
+            .is_some_and(|record| record.instance == instance)
+    }
+
     /// What a nested call serving `id` inherits, when `id` is pending for
     /// `instance`.
     pub fn serving(&self, instance: &str, id: &str) -> Option<Serving> {
@@ -288,6 +320,26 @@ impl ProviderRuntime {
             .hold(&name)
             .cloned()
             .ok_or(RequestAttachmentError::NotAttached)
+    }
+
+    /// What the requests pending for `instance` weigh, leaving out those
+    /// whose id is among `new_ids`, the requests the activation about to run
+    /// is handed new and counts with their messages: one reference per
+    /// distinct blob each holds, and the summed body length. Read once, under
+    /// the table's lock.
+    pub fn pending_load(&self, instance: &str, new_ids: &[&str]) -> PendingLoad {
+        let new_ids: HashSet<&str> = new_ids.iter().copied().collect();
+        let pending = self.lock();
+        let mine = pending
+            .iter()
+            .filter(|(id, record)| record.instance == instance && !new_ids.contains(id.as_str()));
+        let mut load = PendingLoad::default();
+        for (_, record) in mine {
+            load.attachments
+                .extend(record.attachments.holds().iter().map(BlobHold::reference));
+            load.body_bytes = load.body_bytes.saturating_add(record.body_bytes);
+        }
+        load
     }
 
     /// Fail every listed id still pending for `instance` with
@@ -479,18 +531,11 @@ impl AsyncTool for ProvidedTool {
             .deadline
             .unwrap_or_else(|| panic!("BUG: provided tool {name:?} admitted without a deadline"));
         let started = Instant::now();
-        let mut guard = self
-            .runtime
-            .begin(&self.instance, name, ctx, attachments.clone());
+        let (mut guard, body) =
+            self.runtime
+                .begin(&self.instance, name, ctx, args, attachments.clone());
 
         let address = canonical_address(&request_inbox_name(&self.instance));
-        let body = serde_json::to_string(&ProvidedRequest {
-            v: ProvidedRequest::VERSION,
-            id: guard.id().as_str().to_string(),
-            tool: name.to_string(),
-            args,
-        })
-        .expect("a request of strings and a JSON value serializes");
         match self
             .runtime
             .messenger()
@@ -753,10 +798,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_record_answers_only_its_own_instance_once() {
         let rt = runtime();
-        let mut guard = rt.begin(
+        let (mut guard, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(Some(alice())),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
         let id = guard.id().as_str().to_string();
@@ -794,16 +840,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn ids_are_distinct_and_a_userless_record_is_pending() {
         let rt = runtime();
-        let a = rt.begin(
+        let (a, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
-        let b = rt.begin(
+        let (b, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
         assert_ne!(a.id(), b.id());
@@ -814,10 +862,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dropping_the_guard_removes_the_record() {
         let rt = runtime();
-        let guard = rt.begin(
+        let (guard, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(Some(alice())),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
         let id = guard.id().as_str().to_string();
@@ -834,10 +883,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_inadmissible_outcome_leaves_the_record_pending() {
         let rt = runtime();
-        let mut guard = rt.begin(
+        let (mut guard, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
         let id = guard.id().as_str().to_string();
@@ -904,10 +954,11 @@ pub(crate) mod tests {
             ToolError::InvalidArgs("bad".to_string()),
             ToolError::Internal("broke".to_string()),
         ] {
-            let mut guard = rt.begin(
+            let (mut guard, _) = rt.begin(
                 PROVIDER,
                 "echo-for-user",
                 &pending_ctx(None),
+                serde_json::json!({}),
                 HeldAttachments::none(),
             );
             let id = guard.id().as_str().to_string();
@@ -922,22 +973,25 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn fail_delivered_answers_only_this_instances_pending_ids() {
         let rt = runtime();
-        let mut live = rt.begin(
+        let (mut live, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
-        let mut done = rt.begin(
+        let (mut done, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
-        let foreign = rt.begin(
+        let (foreign, _) = rt.begin(
             "other",
             "echo-for-user",
             &pending_ctx(None),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
         let done_id = done.id().as_str().to_string();
@@ -1277,10 +1331,11 @@ pub(crate) mod tests {
         let (messenger, _blob_dir) = blob_messenger().await;
         let store = messenger.blob_store().unwrap().clone();
         let rt = runtime();
-        let guard = rt.begin(
+        let (guard, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            serde_json::json!({}),
             HeldAttachments::none(),
         );
         let id = guard.id().as_str().to_string();
@@ -1349,10 +1404,11 @@ pub(crate) mod tests {
         let rt = runtime();
         let photo = seal_bytes(&store, "image/png", b"png bytes");
         let photo_id = photo.id().clone();
-        let guard = rt.begin(
+        let (guard, _) = rt.begin(
             PROVIDER,
             "echo-for-user",
             &pending_ctx(None),
+            serde_json::json!({}),
             held(&[("photo", &photo), ("copy", &photo)]),
         );
         drop(photo);
@@ -1384,8 +1440,10 @@ pub(crate) mod tests {
                 PROVIDER,
                 "echo-for-user",
                 &pending_ctx(None),
+                serde_json::json!({}),
                 held(&[("doc", &doc)]),
             )
+            .0
         };
 
         let completed = begin();
@@ -1424,8 +1482,10 @@ pub(crate) mod tests {
                 PROVIDER,
                 "echo-for-user",
                 &pending_ctx(None),
+                serde_json::json!({}),
                 held(&[("doc", &doc)]),
             )
+            .0
         };
 
         let live = begin();
@@ -1538,5 +1598,118 @@ pub(crate) mod tests {
             "the record held it last"
         );
         assert_eq!(store.usage().sealed, 0);
+    }
+
+    /// `begin` builds the body `execute` publishes and records its length.
+    #[tokio::test]
+    async fn the_recorded_length_is_the_bodys() {
+        let rt = runtime();
+        let (guard, body) = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            json!({ "q": "é" }),
+            HeldAttachments::none(),
+        );
+        let request = ProvidedRequest::parse(&body).unwrap();
+        assert_eq!(request.id, guard.id().as_str());
+        assert_eq!(request.tool, "echo-for-user");
+        assert_eq!(request.args, json!({ "q": "é" }));
+        assert_eq!(
+            rt.pending_load(PROVIDER, &[]),
+            PendingLoad {
+                body_bytes: body.len() as u64,
+                attachments: Vec::new(),
+            }
+        );
+    }
+
+    /// The id is read from a body as published, whatever `id` keys its
+    /// arguments hold.
+    #[tokio::test]
+    async fn id_of_reads_the_requests_own_id() {
+        let rt = runtime();
+        let (guard, body) = rt.begin(
+            PROVIDER,
+            "echo-for-user",
+            &pending_ctx(None),
+            json!({ "id": "not-this", "nested": { "id": "nor-this" } }),
+            HeldAttachments::none(),
+        );
+        assert_eq!(ProvidedRequest::id_of(&body).unwrap(), guard.id().as_str());
+        assert!(ProvidedRequest::id_of("{\"v\": 1}").is_err());
+        assert!(ProvidedRequest::id_of("not json").is_err());
+    }
+
+    /// One reference per distinct blob and the body of each of this
+    /// instance's records not handed new, nothing of another instance's, and
+    /// nothing once a record has ended.
+    #[tokio::test]
+    async fn the_pending_load_is_this_instances_records() {
+        use brenn_envelope::BlobId;
+
+        let (messenger, _blob_dir) = blob_messenger().await;
+        let store = messenger.blob_store().unwrap().clone();
+        let rt = runtime();
+        let photo = seal_bytes(&store, "image/png", b"png bytes");
+        let doc = seal_bytes(&store, "text/plain", b"doc");
+        let begin = |instance: &str, attachments: HeldAttachments| {
+            rt.begin(
+                instance,
+                "echo-for-user",
+                &pending_ctx(None),
+                json!({ "q": instance }),
+                attachments,
+            )
+        };
+        let (with_photo, photo_body) =
+            begin(PROVIDER, held(&[("photo", &photo), ("copy", &photo)]));
+        let (with_both, both_body) = begin(PROVIDER, held(&[("photo", &photo), ("doc", &doc)]));
+        let (foreign, _) = begin("other", held(&[("doc", &doc)]));
+        let photo_id = photo.id().clone();
+        let doc_id = doc.id().clone();
+        let ids = |load: &PendingLoad| {
+            let mut ids: Vec<BlobId> = load
+                .attachments
+                .iter()
+                .map(|blob| blob.id.clone())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let mut expected = vec![photo_id.clone(), photo_id.clone(), doc_id.clone()];
+        expected.sort();
+
+        let load = rt.pending_load(PROVIDER, &[]);
+        assert_eq!(load.body_bytes, (photo_body.len() + both_body.len()) as u64);
+        assert_eq!(ids(&load), expected);
+
+        // A request handed new adds nothing; another holding the same blob
+        // still adds it.
+        let load = rt.pending_load(PROVIDER, &[with_photo.id().as_str()]);
+        assert_eq!(load.body_bytes, both_body.len() as u64);
+        let mut held_by_other = vec![photo_id.clone(), doc_id.clone()];
+        held_by_other.sort();
+        assert_eq!(ids(&load), held_by_other);
+
+        // Another instance's record adds nothing, though its id be named.
+        let load = rt.pending_load(PROVIDER, &[foreign.id().as_str()]);
+        assert_eq!(load.body_bytes, (photo_body.len() + both_body.len()) as u64);
+
+        // A completed record and a dropped guard add nothing.
+        let both_id = with_both.id().as_str().to_string();
+        rt.complete(
+            PROVIDER,
+            &both_id,
+            Ok(ToolOutput {
+                value: json!(1),
+                attachments: HeldAttachments::none(),
+            }),
+        )
+        .unwrap();
+        drop(with_photo);
+        assert_eq!(rt.pending_load(PROVIDER, &[]), PendingLoad::default());
+        assert_eq!(ids(&rt.pending_load("other", &[])), vec![doc_id]);
+        drop((with_both, foreign));
     }
 }

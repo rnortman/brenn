@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use super::google_gmail_attachment_e2e::{file_of, handed, serve_message};
 use super::google_workspace_rig::{self as workspace, APP, Clauses, GMAIL_READ, RigOptions};
+use super::provider_rig::fuel;
 use super::stub_rig::{StubRig, file_bytes, production_blob_limits};
 use super::*;
 
@@ -618,17 +619,17 @@ async fn every_shape_answers_at(len: usize, limits: Option<ActivationLimits>) {
     }
 }
 
-/// The production fuel floor of the activation that reads an answer of
-/// `len` bytes: the minimum, and the rate for each byte of attachment.
+/// The floor and the attachment term of the production grant for the
+/// activation that reads an answer of `len` bytes: the minimum, and the rate
+/// for each byte of attachment. It leaves out what the body term adds for the
+/// result's own body and for the pending request's, so a share of it is no
+/// more than that share of the production grant.
 fn fuel_floor(len: usize) -> u64 {
     brenn_wasm::PROCESSOR_FUEL_MINIMUM + brenn_wasm::PROCESSOR_FUEL_PER_ATTACHMENT_BYTE * len as u64
 }
 
 /// The shape whose forms are largest: each 2.25 times its answer.
 const LARGEST_FORMS: &str = "Windows-1252 decoding to three bytes each";
-
-/// The production epoch deadline of an activation, in ticks.
-const EPOCH_TICKS: u64 = 300;
 
 /// The guest memory the tool's own work may use: three quarters of the
 /// guest's, the rest left to the activation's input windows.
@@ -955,14 +956,7 @@ async fn each_shape_at_the_bound_answers_its_forms() {
 /// `BODY_ANSWER_MAX` measures again and restates the figure here.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_shape_at_the_bound_answers_inside_the_fuel_margin() {
-    every_shape_answers_at(
-        BODY_ANSWER_MAX,
-        Some(ActivationLimits::Fuel {
-            fuel: fuel_floor(BODY_ANSWER_MAX) * 5 / 7,
-            epoch_ticks: EPOCH_TICKS,
-        }),
-    )
-    .await;
+    every_shape_answers_at(BODY_ANSWER_MAX, fuel(fuel_floor(BODY_ANSWER_MAX) * 5 / 7)).await;
 }
 
 /// Every shape at the bound answers what is expected of it in three

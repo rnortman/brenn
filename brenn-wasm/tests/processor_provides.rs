@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_wasm::{
-    ComponentGrant, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome, ProcessorReceiveError,
-    ProvidesCallError, ProvidesHost, QueuedToolRequest, RequestAttachmentRefusal, ToolCallError,
-    ToolHost, ToolHostFn,
+    ComponentGrant, PendingLoad, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
+    ProcessorReceiveError, ProvidesCallError, ProvidesHost, QueuedToolRequest,
+    RequestAttachmentRefusal, ToolCallError, ToolHost, ToolHostFn,
 };
 use serde_json::{Value, json};
 
@@ -69,10 +69,6 @@ impl RecordingProvidesHost {
             refuse_outcome: Some(detail.to_string()),
             ..Self::default()
         })
-    }
-
-    fn is_pending(&self, id: &str) -> bool {
-        self.pending.lock().unwrap().contains(id)
     }
 
     fn completed(&self) -> Vec<(String, Value)> {
@@ -147,6 +143,14 @@ impl ProvidesHost for RecordingProvidesHost {
             return Err(RequestAttachmentRefusal::NotPending);
         }
         Err(RequestAttachmentRefusal::NotAttached)
+    }
+
+    fn is_pending(&self, id: &str) -> bool {
+        self.pending.lock().unwrap().contains(id)
+    }
+
+    fn pending_load(&self, _new_requests: &[&brenn_envelope::MessageBody]) -> PendingLoad {
+        PendingLoad::default()
     }
 }
 
@@ -580,6 +584,28 @@ fn completing_an_id_not_pending_is_refused_not_pending() {
     assert_eq!(completed[0].0, "a");
     let drew = completed[0].1["ok"]["stale"].as_str().unwrap();
     assert!(drew.ends_with("not-pending"), "{drew}");
+}
+
+/// `pending` is served on the backend host from the provides seam: true for
+/// a request it holds, false for an id it does not.
+#[test]
+fn pending_answers_from_the_hosts_pending_table() {
+    let host = RecordingProvidesHost::pending(&["a"]);
+    let outcome = provider(&host).handle(common::host_activation(activation(
+        &[request("a", "pending")],
+        &[],
+    )));
+    assert!(
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
+        "{outcome:?}"
+    );
+    let completed = host.completed();
+    assert_eq!(completed.len(), 1, "{completed:?}");
+    assert_eq!(completed[0].0, "a");
+    assert_eq!(
+        completed[0].1["ok"],
+        json!({ "pending": true, "made_up": false })
+    );
 }
 
 #[test]

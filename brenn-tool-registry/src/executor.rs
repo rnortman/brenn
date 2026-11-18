@@ -2360,10 +2360,11 @@ mod tests {
     #[tokio::test]
     async fn a_serving_request_acts_for_the_pending_calls_user_and_echoes_serving() {
         let h = harness().await;
-        let outer = h.provider.begin(
+        let (outer, _) = h.provider.begin(
             CALLER_SLUG,
             "echo-for-user",
             &crate::provided::tests::pending_ctx(Some(alice())),
+            serde_json::json!({}),
             brenn_messaging_store::blob::HeldAttachments::none(),
         );
         insert_request(
@@ -2410,10 +2411,11 @@ mod tests {
     #[tokio::test]
     async fn a_serving_id_not_pending_for_the_caller_is_denied() {
         let h = harness().await;
-        let theirs = h.provider.begin(
+        let (theirs, _) = h.provider.begin(
             "other",
             "echo-for-user",
             &crate::provided::tests::pending_ctx(Some(alice())),
+            serde_json::json!({}),
             brenn_messaging_store::blob::HeldAttachments::none(),
         );
         insert_request(
@@ -2450,10 +2452,11 @@ mod tests {
     #[tokio::test]
     async fn a_nested_call_whose_record_ends_while_parked_is_denied_without_running() {
         let h = harness().await;
-        let outer = h.provider.begin(
+        let (outer, _) = h.provider.begin(
             CALLER_SLUG,
             "echo-for-user",
             &crate::provided::tests::pending_ctx(Some(alice())),
+            serde_json::json!({}),
             brenn_messaging_store::blob::HeldAttachments::none(),
         );
         insert_request(&h, &request_body("busy", "brenn"), Some(h.results_uuid)).await;
@@ -2545,13 +2548,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_nested_provided_call_ends_by_the_deadline_of_the_call_it_serves() {
         let h = harness().await;
-        let served = h.provider.begin(
+        let (served, _) = h.provider.begin(
             CALLER_SLUG,
             "echo-for-user",
             &crate::provided::tests::ctx(
                 Some(alice()),
                 Some(tokio::time::Instant::now() + Duration::from_secs(10)),
             ),
+            serde_json::json!({}),
             brenn_messaging_store::blob::HeldAttachments::none(),
         );
         let mut body: Value = serde_json::from_str(&provided_body("nested")).unwrap();

@@ -4,7 +4,7 @@
 //! host and blob store for a loop's tests.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use base64ct::{Base64, Encoding};
@@ -307,7 +307,8 @@ fn first_gap(written: &[(u64, u64)]) -> Option<(u64, u64)> {
 /// back on `Err`, a script of refused calls and failed completions, and a
 /// record of the calls, completions and log lines. Calls an activation issued
 /// are dropped when it fails, as the host drops them; completions are not,
-/// as the host sends them at once.
+/// as the host sends them at once. Every request is pending until a test
+/// ends it with [`MemoryHost::end_request`].
 ///
 /// As [`Blobs`] it serves seeded request and result attachments and the
 /// blobs a step builds, under per-call limits, per-activation write and call
@@ -323,6 +324,7 @@ pub struct MemoryHost {
     completions: RefCell<Vec<Completion>>,
     log: RefCell<Vec<(Level, String)>>,
     blobs: RefCell<BlobStore>,
+    ended: RefCell<BTreeSet<String>>,
 }
 
 impl MemoryHost {
@@ -432,6 +434,13 @@ impl MemoryHost {
     /// and dropped by the glue, reaching no caller.
     pub fn requests_not_pending(&self, not_pending: bool) {
         self.blobs.borrow_mut().not_pending = not_pending;
+    }
+
+    /// End request `id`: from now on [`Host::pending`] answers `false` for
+    /// it. Calls and completions for it are still recorded, so a test sees
+    /// what the loop attempted.
+    pub fn end_request(&self, id: &str) {
+        self.ended.borrow_mut().insert(id.to_string());
     }
 
     /// Refuse the next blob create with `error`.
@@ -741,6 +750,10 @@ impl Host for MemoryHost {
 
     fn complete_err(&self, id: &str, kind: ErrorKind, detail: &str) -> Result<(), String> {
         self.answered(id, Answered::Error(kind, detail.to_string()), Vec::new())
+    }
+
+    fn pending(&self, id: &str) -> bool {
+        !self.ended.borrow().contains(id)
     }
 
     fn log(&self, level: Level, line: String) {

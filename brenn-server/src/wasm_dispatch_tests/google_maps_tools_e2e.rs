@@ -145,6 +145,7 @@ async fn rig_with(
             grants: instance.grants.into_iter().collect(),
             blob_limits: None,
             limits: None,
+            max_body_bytes: None,
             native: brenn_oauth::tools::registered(
                 Some(&service),
                 brenn_lib::config::ApiKeyTable::new(std::sync::Arc::new(BTreeMap::from([(

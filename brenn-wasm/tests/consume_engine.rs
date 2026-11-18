@@ -1141,7 +1141,8 @@ const FULL_WINDOW: usize = 8;
 
 /// A full-size window costs well under the fuel a real activation is given.
 ///
-/// Drives the window on a quarter of the production budget and requires success, so
+/// Drives the window on a quarter of the production budget's envelope term, which is
+/// no more than a quarter of the production budget, and requires success, so
 /// the assertion is about *headroom*: a codegen change (a wasmtime bump is the usual
 /// cause) that quadruples instructions-retired per envelope fails here, while a
 /// did-it-trap assertion at the full budget would stay green until the margin was
@@ -1149,7 +1150,7 @@ const FULL_WINDOW: usize = 8;
 #[test]
 fn full_size_window_leaves_fuel_headroom() {
     let comp = load_demo_with_out();
-    let production_budget =
+    let envelope_term =
         PROCESSOR_FUEL_MINIMUM.max((FULL_WINDOW as u64) * PROCESSOR_FUEL_PER_ENVELOPE);
     let envelopes: Vec<String> = (0..FULL_WINDOW)
         .map(|i| envelope_json("brenn:ch", &format!("msg-{i}")))
@@ -1160,13 +1161,13 @@ fn full_size_window_leaves_fuel_headroom() {
     let outcome = comp.handle_with_limits(
         common::host_activation(activation),
         common::GENEROUS_EPOCH_TICKS,
-        production_budget / 4,
+        envelope_term / 4,
     );
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
-        "a full-size window must complete on a quarter of the production fuel budget \
-         ({} of {production_budget}); got {outcome:?}",
-        production_budget / 4
+        "a full-size window must complete on a quarter of the envelope term of the \
+         production budget ({} of {envelope_term}); got {outcome:?}",
+        envelope_term / 4
     );
 }
 

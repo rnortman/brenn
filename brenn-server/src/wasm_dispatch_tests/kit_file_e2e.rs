@@ -9,19 +9,21 @@
 
 use brenn_envelope::AttachmentName;
 use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
-use brenn_messaging::MountDebt;
 use brenn_messaging::testutils::owed_everywhere;
 use brenn_messaging_store::blob::{BlobHold, BlobUsage};
 use brenn_messaging_store::testutils::seal_bytes;
 use brenn_oauth::testutil::ApiSeen;
 use brenn_tool_registry::{HeldAttachments, ToolError, ToolOutput};
+use brenn_wasm::{PROCESSOR_FUEL_MINIMUM, PROCESSOR_FUEL_PER_ENVELOPE};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
-use super::google_workspace_rig::{self as workspace, Clauses, GoogleClass};
+use super::google_workspace_rig::{self as workspace, Clauses, GoogleClass, RigOptions};
+use super::kit_body_fuel_measure::LINE_FEEDS;
+use super::provider_rig::{MARGIN, fuel};
 use super::stub_rig::{StubRig, file_bytes};
 
-const KIT_FILE: GoogleClass = GoogleClass {
+pub(super) const KIT_FILE: GoogleClass = GoogleClass {
     wasm: concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../brenn-wasm/target/components/brenn_processor_kit_file_test.wasm"
@@ -37,13 +39,13 @@ const KIT_FILE: GoogleClass = GoogleClass {
 };
 
 /// Where files are put and got.
-const FILES: &str = "/files/report.pdf";
+pub(super) const FILES: &str = "/files/report.pdf";
 /// The attachment the fixture sends and answers.
 const FILE: &str = "file";
 /// The size of the files moved each way.
 const SIZE: usize = 3 << 20;
 
-const CLAUSES: Clauses<'static> = &[("PUT", FILES), ("HEAD", FILES), ("GET", FILES)];
+pub(super) const CLAUSES: Clauses<'static> = &[("PUT", FILES), ("HEAD", FILES), ("GET", FILES)];
 /// The fixture's Σ `max_concurrency`, its request window's depth.
 const WINDOW: usize = 12;
 /// The most bodies the provider kit builds in one activation.
@@ -54,8 +56,51 @@ const TIMES: usize = 80;
 /// The size of the file a built body ends with.
 const BUILT_FILE_SIZE: usize = 1 << 20;
 
-async fn rig() -> StubRig {
+pub(super) async fn rig() -> StubRig {
     workspace::rig(&KIT_FILE, CLAUSES).await
+}
+
+/// The bus cap the Google guides set, and the size of a large request's body.
+pub(super) const LARGE: usize = 393_216;
+/// The bus cap a deployment runs with when it sets none, and the size of a
+/// default request's body.
+pub(super) const DEFAULT: usize = 65_536;
+/// The `KitBodyPut` requests the fixture admits at once.
+const ADMITTED: usize = 8;
+/// How many large requests wait in the backlog behind four small ones.
+const QUEUED: usize = 2;
+/// How many large requests wait in the backlog behind four small ones on the
+/// envelope term alone: [`QUEUED`] of them drain on the 100M that ten
+/// envelopes bring.
+const QUEUED_PAST_ENVELOPES: usize = 4;
+/// The file each `hex` request carries: the smallest whole number of MiB at
+/// which one hex build, about 34 fuel a byte of file, costs at least twice
+/// the floor.
+const HEX_FILE_SIZE: usize = 3 << 20;
+
+/// A rig whose bus carries requests of [`LARGE`] bytes.
+pub(super) async fn large_rig() -> StubRig {
+    workspace::rig_built(
+        &KIT_FILE,
+        CLAUSES,
+        RigOptions {
+            max_body_bytes: Some(LARGE),
+            ..RigOptions::default()
+        },
+    )
+    .await
+}
+
+/// A `KitBodyPut` `text` for a request body just under `size` bytes, of
+/// [`LINE_FEEDS`], the costliest content a body is built from, a byte of
+/// request.
+fn line_feed_text(size: usize) -> String {
+    LINE_FEEDS.string(size)
+}
+
+/// `KitBodyPut`'s arguments for [`line_feed_text`] of `size`.
+fn line_feeds(size: usize) -> Value {
+    body_args(&line_feed_text(size), 1)
 }
 
 /// Put a 3 MiB PDF with `args`, running `steps` nested calls; every request
@@ -181,6 +226,32 @@ async fn a_body_built_around_an_attachment_is_the_put_body() {
         .expect("KitBodyPut answered");
     let mut body = b"prefix\n".to_vec();
     body.extend_from_slice(&file.bytes);
+    assert_eq!(output.value, json!({ "status": 200, "bytes": body.len() }));
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), 1, "one PUT: {seen:?}");
+    assert_built_put(&seen[0], &body);
+}
+
+/// With `hex`, the attachment is written as two lowercase hexadecimal digits
+/// a byte after the prefix.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_built_around_an_attachment_in_hex_is_the_put_body() {
+    let r = rig().await;
+    let file = File::sealed(&r, BUILT_FILE_SIZE);
+    let output = r
+        .call_running(
+            "KitBodyPut",
+            json!({ "path": FILES, "text": "prefix\n", "times": 1, "hex": true }),
+            file.attachments(),
+            1,
+        )
+        .await
+        .expect("KitBodyPut answered");
+    let mut body = b"prefix\n".to_vec();
+    for byte in &file.bytes {
+        body.extend_from_slice(format!("{byte:02x}").as_bytes());
+    }
+    assert_eq!(body.len(), 7 + 2 * BUILT_FILE_SIZE);
     assert_eq!(output.value, json!({ "status": 200, "bytes": body.len() }));
     let seen = r.stub.lock().unwrap().api_seen.clone();
     assert_eq!(seen.len(), 1, "one PUT: {seen:?}");
@@ -359,7 +430,7 @@ async fn put_past_its_head(
 
 /// Abort a call's task, as a caller that stops waiting does, and wait until
 /// the call is gone.
-async fn drop_caller(call: JoinHandle<Result<ToolOutput, ToolError>>) {
+pub(super) async fn drop_caller(call: JoinHandle<Result<ToolOutput, ToolError>>) {
     call.abort();
     assert!(
         call.await.expect_err("the call was aborted").is_cancelled(),
@@ -370,11 +441,7 @@ async fn drop_caller(call: JoinHandle<Result<ToolOutput, ToolError>>) {
 /// The ids of every request the provider's next activation is handed on its
 /// `tool-requests` port, context and new.
 async fn handed_requests(r: &StubRig) -> Vec<String> {
-    let (_, ports) = r
-        .messenger
-        .load_activation_snapshot(&r.provider_sub, &r.provider.inputs, MountDebt::Settled)
-        .await
-        .expect("the provider is owed an activation");
+    let ports = r.owed_windows().await;
     let requests = ports
         .iter()
         .find(|port| port.port == TOOL_REQUEST_INPUT_PORT)
@@ -455,4 +522,306 @@ async fn a_put_whose_caller_left_sends_no_file() {
     assert_eq!(seen.len(), 1, "the HEAD alone: {seen:?}");
     assert_eq!(seen[0].0, "HEAD");
     assert!(r.inflight_keys().is_empty(), "the component kept a row");
+}
+
+/// Two large requests queued behind four small ones, whose callers then
+/// leave: the activation that settles the four answers drops both backlog
+/// entries unbuilt. It runs on the floor, which building either would
+/// outrun, and completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_build_whose_caller_left_is_dropped_unbuilt() {
+    let r = large_rig().await;
+    let (small, large) = large_queued_behind_four(&r, 2).await;
+    for call in large {
+        drop_caller(call).await;
+    }
+    r.run_nested_calls(BUILD_BUDGET).await;
+
+    r.serve_under(fuel(PROCESSOR_FUEL_MINIMUM)).await;
+    assert!(
+        r.backlog_keys().is_empty(),
+        "the ended entries were dropped"
+    );
+    assert!(
+        r.inflight_keys().is_empty(),
+        "the four answers were settled"
+    );
+    assert!(
+        owed_everywhere(&r.messenger, &r.executor_sub())
+            .await
+            .is_empty(),
+        "a nested call was issued for a request nobody waits on"
+    );
+    assert_answered(small, 1).await;
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), BUILD_BUDGET, "four PUTs and no fifth");
+    for put in &seen {
+        assert_built_put(put, b"x");
+    }
+}
+
+/// The envelope term of the grant `r`'s provider's next activation runs on,
+/// read from the windows it is owed: the whole grant of an activation whose
+/// new messages carry no attachments, before a body or a pending request
+/// brought fuel.
+async fn envelope_term(r: &StubRig) -> u64 {
+    let ports = r.owed_windows().await;
+    let envelopes: usize = ports.iter().map(|port| port.entries.len()).sum();
+    PROCESSOR_FUEL_MINIMUM.max(PROCESSOR_FUEL_PER_ENVELOPE * envelopes as u64)
+}
+
+/// Each call was failed by its provider's activation trapping.
+async fn assert_failed(calls: Vec<JoinHandle<Result<ToolOutput, ToolError>>>) {
+    for call in calls {
+        match call.await.expect("the call's task") {
+            Err(ToolError::Internal(detail))
+                if detail.starts_with("provider activation failed") => {}
+            other => panic!("expected the activation's failure, got {other:?}"),
+        }
+    }
+}
+
+/// Each call answered a built body of `bytes` bytes.
+async fn assert_answered(calls: Vec<JoinHandle<Result<ToolOutput, ToolError>>>, bytes: usize) {
+    for call in calls {
+        let output = call.await.unwrap().expect("KitBodyPut answered");
+        assert_eq!(output.value, json!({ "status": 200, "bytes": bytes }));
+    }
+}
+
+/// `n` `KitBodyPut` calls with `args` and no attachments, once the provider
+/// is owed `owed` requests in all.
+async fn body_puts(
+    r: &StubRig,
+    args: &Value,
+    n: usize,
+    owed: usize,
+) -> Vec<JoinHandle<Result<ToolOutput, ToolError>>> {
+    let calls = (0..n)
+        .map(|_| r.call_for_alice_with("KitBodyPut", args.clone(), HeldAttachments::none()))
+        .collect();
+    r.owed(&r.provider_sub, owed).await;
+    calls
+}
+
+/// Eight default-sized requests, as many as `KitBodyPut` admits at once,
+/// each built from its arguments: the activation they arrive in builds four
+/// and queues four, the next settles four answers and drains the queue, the
+/// last settles the rest, every one under the margin. Every body arrives
+/// whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_default_window_of_built_bodies_completes_inside_the_margin() {
+    let r = rig().await;
+    let text = line_feed_text(DEFAULT);
+    let calls = body_puts(&r, &body_args(&text, 1), ADMITTED, ADMITTED).await;
+
+    r.serve_under(Some(MARGIN)).await;
+    assert_eq!(r.inflight_keys().len(), BUILD_BUDGET, "four are issued");
+    assert_eq!(
+        r.backlog_keys().len(),
+        ADMITTED - BUILD_BUDGET,
+        "four are queued"
+    );
+
+    r.run_nested_calls(BUILD_BUDGET).await;
+    r.serve_under(Some(MARGIN)).await;
+    assert!(r.backlog_keys().is_empty(), "the backlog was drained");
+    assert_eq!(
+        r.inflight_keys().len(),
+        ADMITTED - BUILD_BUDGET,
+        "the queued four are issued"
+    );
+
+    r.run_nested_calls(ADMITTED - BUILD_BUDGET).await;
+    r.serve_under(Some(MARGIN)).await;
+    assert_answered(calls, text.len()).await;
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), ADMITTED, "eight PUTs");
+    for put in &seen {
+        assert_built_put(put, text.as_bytes());
+    }
+    assert!(
+        r.inflight_keys().is_empty(),
+        "the answered requests left rows"
+    );
+}
+
+/// Two requests at the Google guides' bus cap are built and issued in
+/// the activation they arrive in, under the margin.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_large_bodies_are_built_inside_the_margin() {
+    let r = large_rig().await;
+    let text = line_feed_text(LARGE);
+    let calls = body_puts(&r, &body_args(&text, 1), 2, 2).await;
+
+    r.serve_under(Some(MARGIN)).await;
+    assert_eq!(r.inflight_keys().len(), 2, "both are issued");
+    r.run_nested_calls(2).await;
+    r.serve().await;
+    assert_answered(calls, text.len()).await;
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), 2, "two PUTs");
+    for put in &seen {
+        assert_built_put(put, text.as_bytes());
+    }
+}
+
+/// The same two requests on the envelope term alone, the grant before a
+/// body brought fuel: the activation traps and both callers are failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_large_bodies_trap_on_the_envelope_term_alone() {
+    let r = large_rig().await;
+    let calls = body_puts(&r, &line_feeds(LARGE), 2, 2).await;
+    let grant = envelope_term(&r).await;
+    assert_eq!(grant, PROCESSOR_FUEL_MINIMUM);
+
+    r.serve_under(fuel(grant)).await;
+    assert_failed(calls).await;
+    assert!(r.inflight_keys().is_empty(), "the trap kept a row");
+}
+
+/// `KitBodyPut`'s arguments for a body that is the hexadecimal of the
+/// request's attachment after a prefix.
+fn hex_args() -> Value {
+    json!({ "path": FILES, "text": "prefix\n", "times": 1, "hex": true })
+}
+
+/// Five `hex` requests, each carrying `file`, new in one activation under
+/// the production limits: four are built and issued, the fifth queued, and
+/// the four answers are owed to the provider.
+async fn five_hex_one_queued(
+    r: &StubRig,
+    file: &File,
+) -> Vec<JoinHandle<Result<ToolOutput, ToolError>>> {
+    let calls = (0..=BUILD_BUDGET)
+        .map(|_| r.call_for_alice_with("KitBodyPut", hex_args(), file.attachments()))
+        .collect();
+    r.owed(&r.provider_sub, BUILD_BUDGET + 1).await;
+    r.serve().await;
+    assert_eq!(r.inflight_keys().len(), BUILD_BUDGET, "four are issued");
+    assert_eq!(r.backlog_keys().len(), 1, "the fifth is queued");
+    r.run_nested_calls(BUILD_BUDGET).await;
+    calls
+}
+
+/// A body built from a pending request's attachment, in hex, out of the
+/// backlog: the activation that settles the first four answers builds the
+/// fifth on the fuel its request's attachment brings while it is pending,
+/// and every `PUT` is the hex of its file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_hex_build_from_a_pending_attachment_is_issued() {
+    let r = rig().await;
+    let file = File::sealed(&r, HEX_FILE_SIZE);
+    let calls = five_hex_one_queued(&r, &file).await;
+
+    r.serve().await;
+    assert!(r.backlog_keys().is_empty(), "the fifth was built");
+    assert_eq!(r.inflight_keys().len(), 1, "the fifth was issued");
+    r.run_nested().await;
+    r.serve().await;
+
+    let mut body = b"prefix\n".to_vec();
+    for byte in &file.bytes {
+        body.extend_from_slice(format!("{byte:02x}").as_bytes());
+    }
+    assert_answered(calls, body.len()).await;
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), BUILD_BUDGET + 1, "five PUTs");
+    for put in &seen {
+        assert_built_put(put, &body);
+    }
+}
+
+/// The same drain on the envelope term alone, the grant before a pending
+/// request's attachment brought fuel: the activation traps, and the queued
+/// entry and the four in-flight rows are still there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_hex_build_traps_on_the_envelope_term_alone() {
+    let r = rig().await;
+    let file = File::sealed(&r, HEX_FILE_SIZE);
+    let _calls = five_hex_one_queued(&r, &file).await;
+
+    r.serve_under(fuel(envelope_term(&r).await)).await;
+    assert_eq!(r.backlog_keys().len(), 1, "the queued entry was kept");
+    assert_eq!(
+        r.inflight_keys().len(),
+        BUILD_BUDGET,
+        "the four rows were kept"
+    );
+}
+
+/// Four one-character requests and then `large` line-feed requests of
+/// [`LARGE`] bytes, new in one activation under the production limits: the
+/// small four are built and issued, the large queued, and the four answers
+/// are owed to the provider. The small calls, then the large.
+async fn large_queued_behind_four(
+    r: &StubRig,
+    large: usize,
+) -> (
+    Vec<JoinHandle<Result<ToolOutput, ToolError>>>,
+    Vec<JoinHandle<Result<ToolOutput, ToolError>>>,
+) {
+    let small = body_puts(r, &body_args("x", 1), BUILD_BUDGET, BUILD_BUDGET).await;
+    let queued = body_puts(r, &line_feeds(LARGE), large, BUILD_BUDGET + large).await;
+    r.serve().await;
+    assert_eq!(
+        r.inflight_keys().len(),
+        BUILD_BUDGET,
+        "the small four are issued"
+    );
+    assert_eq!(r.backlog_keys().len(), large, "the large are queued");
+    (small, queued)
+}
+
+/// Large requests queued behind four small ones are built out of the
+/// backlog, under the margin, by the activation that settles the four
+/// answers: their bodies bring fuel while the requests are pending. Every
+/// body arrives whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_large_bodies_are_built_from_the_backlog_inside_the_margin() {
+    let r = large_rig().await;
+    let text = line_feed_text(LARGE);
+    let (small, large) = large_queued_behind_four(&r, QUEUED).await;
+    r.run_nested_calls(BUILD_BUDGET).await;
+
+    r.serve_under(Some(MARGIN)).await;
+    assert!(r.backlog_keys().is_empty(), "the backlog was drained");
+    assert_eq!(r.inflight_keys().len(), QUEUED, "the large are issued");
+    assert_answered(small, 1).await;
+
+    r.run_nested_calls(QUEUED).await;
+    r.serve().await;
+    assert_answered(large, text.len()).await;
+    let seen = r.stub.lock().unwrap().api_seen.clone();
+    assert_eq!(seen.len(), BUILD_BUDGET + QUEUED);
+    let (small_puts, large_puts) = seen.split_at(BUILD_BUDGET);
+    for put in small_puts {
+        assert_built_put(put, b"x");
+    }
+    for put in large_puts {
+        assert_built_put(put, text.as_bytes());
+    }
+}
+
+/// The same drain, of [`QUEUED_PAST_ENVELOPES`] large requests, on the
+/// envelope term alone, the grant before a pending request's body brought
+/// fuel: the activation traps, and the queued entries and the four in-flight
+/// rows are still there.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_large_bodies_trap_on_the_envelope_term_alone() {
+    let r = large_rig().await;
+    let _calls = large_queued_behind_four(&r, QUEUED_PAST_ENVELOPES).await;
+    r.run_nested_calls(BUILD_BUDGET).await;
+
+    r.serve_under(fuel(envelope_term(&r).await)).await;
+    assert_eq!(
+        r.backlog_keys().len(),
+        QUEUED_PAST_ENVELOPES,
+        "the queued entries were kept"
+    );
+    assert_eq!(
+        r.inflight_keys().len(),
+        BUILD_BUDGET,
+        "the four rows were kept"
+    );
 }

@@ -74,6 +74,9 @@ pub(super) struct StubProvider<'a> {
     /// The limits every provider activation runs under in place of the
     /// production ones; the production limits when `None`.
     pub limits: Option<ActivationLimits>,
+    /// The bus cap on a message body, `[messaging] max_body_bytes`; the
+    /// default when `None`.
+    pub max_body_bytes: Option<usize>,
     /// The OAuth service's vault, held for the rig's life.
     pub vault: tempfile::TempDir,
 }
@@ -207,6 +210,7 @@ impl StubRig {
             conversations: setup.conversations,
             blob_limits: Some(setup.blob_limits.unwrap_or_else(production_blob_limits)),
             limits: setup.limits,
+            max_body_bytes: setup.max_body_bytes,
         })
         .await;
         base.provider.component.open_store();
@@ -251,6 +255,15 @@ impl StubRig {
         self.owed(&self.executor_sub(), n).await;
         self.executor.drain_step().await;
         self.owed(&self.provider_sub, n).await
+    }
+
+    /// Wait until the executor is owed one request, then run one executor
+    /// drain step on a task of its own, for a nested call the stub's gate
+    /// holds: the step returns once the stub answers it.
+    pub async fn start_nested(&self) -> tokio::task::JoinHandle<()> {
+        self.owed(&self.executor_sub(), 1).await;
+        let executor = self.executor.clone();
+        tokio::spawn(async move { executor.drain_step().await })
     }
 
     /// Serve the request, then run each of its `steps` nested calls and hand

@@ -69,25 +69,6 @@ under the full parallel `make check`; a retry is not a fix. Code site
 (`TODO(blob-restart-test-flaky-under-load)`): the usage assertion in
 `assert_nothing_outlives`.
 
-## `built-body-from-attachment-unfueled-after-arrival`
-
-A kit component's `Logic::body` builds a nested call's body in the activation
-that issues the call: the one its request arrived in, or a later one — after
-an earlier step's answer, or out of the backlog. The host adds fuel for a
-request's attachment bytes only to the activation that request's message is
-new in, so a body built from a request's attachment in any later activation
-is built on the envelope term alone. One that costs more than that grant traps
-the activation; a trapped activation's store writes roll back, so a backlog
-entry whose body cannot be built on the floor is tried again by every later
-activation, and each traps. The kit bounds the bodies built per activation
-(`BUILD_BUDGET`) and its documentation gives the rule a component sizes by;
-nothing enforces it. Decide whether the host grants fuel for a pending
-request's attachment bytes to the activation that opens them, or the kit takes
-a declared bound and refuses a request over it at planning. Done = a real-host
-test in which a body built from a request attachment larger than the floor
-covers is issued from the backlog, or the refusal with a test. The comment
-sits at `Logic::body` in `brenn-provider-kit/src/activation.rs`.
-
 ## `chrono-unmaintained`
 
 RustSec lists `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555)
@@ -118,12 +99,47 @@ Decide how the kit holds a build the activation's remaining write bound
 cannot hold: a body size the component declares, against which the kit
 queues as it queues past `BUILD_BUDGET`, or a typed refusal on which the
 kit requeues a build that other writes preceded. Either way a body larger
-than one activation's whole bound is answered, never requeued, and the
-decision is taken with `built-body-from-attachment-unfueled-after-arrival`,
-whose declared bound at planning would serve both. Done = a kit test against
-`MemoryHost::set_write_budget` in which bodies that together pass the bound
-are each issued, and one that alone passes it is answered once. The comment
+than one activation's whole bound is answered, never requeued. Done = a kit
+test against `MemoryHost::set_write_budget` in which bodies that together pass
+the bound are each issued, and one that alone passes it is answered once. The comment
 sits at `Run::build` in `brenn-provider-kit/src/activation.rs`.
+
+## `dense-request-arguments-outgrow-guest`
+
+A provider's guest parses every new request of an activation into an owned
+`serde_json::Value` before it handles any, and arguments that are dense JSON
+take many times their bytes as a tree. Measured on the
+`processor-kit-file-test` fixture under production limits, with
+`[messaging] max_body_bytes` at 393,216: two requests of that size whose
+arguments are an array of `0`s trap in the guest's allocator, whatever the
+fuel; four trap where the arguments are an array of empty arrays or an
+object of distinct three-character keys. Parsing them costs about 212, 163
+and 654 fuel a byte, the last measured close to the memory limit and not
+separated from the allocator's growth, against the 256 a byte a request's
+body brings (`PROCESSOR_FUEL_PER_BODY_BYTE`), which was sized on string
+arguments. At the default request size the shortfall is fuel and not
+memory: two 65,536-byte requests whose arguments are an object of keys need
+about 73.6M between them, so three or more new in one activation outrun the
+grant. A trapped activation fails every request delivered new to it, so one
+caller's request fails its neighbours'. The host checks a conversation's
+arguments against the tool's schema one level deep, top-level keys and
+types, and a component caller's against nothing but a 64 KiB size cap, so
+dense JSON reaches a guest inside a property its tool declares as an array
+or object or leaves untyped, up to the bus cap, and in any shape from a
+component, up to 64 KiB. A schema's `maxItems` or `maxLength` is enforced by
+the kit in `plan`, after the parse, and by the host not at all. Decide where
+the bound belongs: the host refusing a request by its arguments' element
+count or nesting before it is published; the host checking a declared
+array's or object's contents and limits; the guest parsing a request when
+the kit reaches it and not all at once, or without building a tree for
+arguments its tool will refuse; or the weight of a parsed request counted
+into `wasm-window-byte-cap`'s arithmetic and left to the operator. Done = a
+real-host test in which a provider handed a full window of the densest
+arguments the host delivers to it, at a bus cap of 393,216, answers or
+refuses each without trapping, or a recorded decision beside
+`parse_request` that the bound is the component's and the operator's, with
+the figures in `docs/component-packages.md`. The comment is at
+`parse_request` in `brenn-wasm/components/guest/src/lib.rs`.
 
 ## `gmail-body-forms-above-bound`
 
@@ -165,12 +181,11 @@ attachment. Gmail takes a draft with a file as a MIME message, which the
 component builds around the request's attachment and sends as a body it builds
 (`Body::Built`), the form the provider kit has. The draft's own body moves to
 that form first (`google-write-bodies-in-call-arguments`). That body is built
-on the fuel of the activation that issues its call, which has no attachment
-term outside the activation the request arrived in
-(`built-body-from-attachment-unfueled-after-arrival`), so the tool bounds the
-file by what it measures there. Done when a draft tool attaches a file the
-agent holds, or a recorded decision that it is not wanted. The comment sits at
-the draft's create call in
+on the fuel of the activation that issues its call, which the host fuels at
+the attachment rate for as long as the request is pending, so the tool bounds
+the file by what its build costs a byte against that rate. Done when a draft
+tool attaches a file the agent holds, or a recorded decision that it is not
+wanted. The comment sits at the draft's create call in
 `brenn-wasm/components/google-gmail-compose/src/logic.rs`.
 
 ## `google-write-bodies-in-call-arguments`
@@ -202,10 +217,20 @@ today. With `attendees` bounded only at 50 addresses of 320 characters and
 `recurrence` at the read's 20 lines of 1,000, two settles cost 62.2M before
 any description, more than the whole floor. `GmailDraft` was not measured; its
 floor activation has more steps, so less fuel a step, than the calendar build
-spends on ASCII alone at 65,536 bytes. Three findings. The host grants fuel
-for a request's attachment bytes and none for the bytes of its body, so a
-component that builds from large arguments builds on the floor; the move waits
-on `guest-memory-and-fuel-fixed-constants` for that. A settle costs about what
+spends on ASCII alone at 65,536 bytes. These figures predate the body term.
+Three findings. A request's body bytes now bring fuel, 256 a byte, in the
+activation the request arrives in and in every later activation of the
+provider while the host holds the request pending, and the kit builds no body
+for a request that has ended, so a body built from a request's arguments is
+paid for wherever it is built. What no term pays for is the settle of a late
+answer — the decode of the in-flight row of a request the host has given up,
+for which only the answer's own bytes bring fuel — and bodies past the term's
+cap. Today's component, its description in its arguments and echoed in
+Google's answer, settles five late answers to the widest `CalendarUpdate` with
+a description of 2,000 U+0001 in one activation on about 55.1M of a 146.5M
+grant, inside the margin, because the echo's bytes bring fuel in proportion;
+an answer that does not echo the arguments would leave that decode on the
+envelope term. A settle costs about what
 a build does, because the kit's in-flight row holds the caller's arguments
 whole and every answer decodes it, and `CalendarUpdate`'s settle parses them
 again for the event id; storing only what a settle needs is the second lever
@@ -220,55 +245,36 @@ that they stay. The comments sit at `EVENT_FIELD_MAX_CHARS` in
 
 ## `guest-memory-and-fuel-fixed-constants`
 
-A processor guest's linear memory (`PROCESSOR_MAX_MEMORY_BYTES`, 16 MiB) and
-its fuel (`PROCESSOR_FUEL_MINIMUM`, `PROCESSOR_FUEL_PER_ENVELOPE`,
-`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`) are constants; `docs/config-dsl.md`
-names the memory figure and no deployment setting moves either. A component
-that reads a blob inside the guest sets a bound of its own under them: the
-out-of-tree Fastmail bundle's body tool refuses an answer over 2 MiB, met fuel
-before memory for HTML-only mail, and had its HTML renderer rewritten to fit
-the fuel rate; the same bundle's file listing reads at most 192 KiB of
-multi-status, bound by fuel alone — parsing the XML cost about 200 fuel per
-byte on average at 1 MiB against the 128 granted, so the bound is what the 50M
-floor covers, and memory holds more than five times as much; and `GmailBody`'s
-Gmail read refuses an answer over 768 KiB, set by fuel under a 1.4 test margin
-with five percent of it spare, its costliest message spending about 127 fuel
-per answer byte where memory peaks under 8.2 MiB. The fuel grant has no term
-for the bytes of a request's own body: an activation runs on the floor or on
-10M an envelope, and only attachment bytes add to it, so a component that
-builds a document from large arguments builds on the floor. Measured for
-`google-calendar-write` sending its body as a blob
-(`google-write-bodies-in-call-arguments`, which holds the figures): building
-costs about 66 fuel per description byte in ASCII and 460 per control
-character, and settling the answer about 16 and 400, the kit's in-flight row
-holding the arguments whole; under the 1.4 test margin a description of 65,536
-bytes held for no input, and by the slopes, an estimate, no bound above
-today's 2,000 characters holds for the costliest input. Not measured: whether
-that component as it ships, with the description in its arguments and echoed
-in Google's answer, completes five late answers in one activation on the floor
-within the same margin when the description is dense in escaped characters.
-The slopes put five such settles at about 36M against the 33.9M the margin
-allows, before the echoed description is counted; whether they reach the 50M
-floor is not known. The provider kit's `BUILD_BUDGET` is sized against
-`PROCESSOR_FUEL_MINIMUM` and is redone with it. Decide whether a request's
-body bytes bring fuel as its attachment bytes do, and whether either limit
-becomes a deployment or per-instance setting under a ceiling, with the window
-arithmetic of `wasm-window-byte-cap` and the security posture for untrusted
-guests redone against the larger figure, or stays fixed. Done when a setting
-has a test of a guest that completes under a raised limit and fails under the
-default, or the decision that both stay constants is recorded beside them and
-in `docs/config-dsl.md`. Either way, done includes that activation of
-`google-calendar-write` measured, five late answers on the floor with the
-costliest description it admits, and held by a test or by a lowered bound. The
-comment sits at `PROCESSOR_MAX_MEMORY_BYTES` in `brenn-wasm/src/lib.rs`.
+The attachment rate, 128 fuel a byte (`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`),
+was sized for a transform by range (a base64 decode, about 79 a byte). A
+component that parses an attachment inside the guest spends more: the
+out-of-tree Fastmail bundle's file listing parses its multi-status at about
+200 fuel a byte on average at 1 MiB and reads at most 192 KiB, bound by fuel
+alone where memory holds more than five times as much; the same bundle's body
+tool refuses an answer over 2 MiB, met fuel before memory for HTML-only mail,
+and had its HTML renderer rewritten to fit the rate; and `GmailBody`'s Gmail
+read refuses an answer over 768 KiB, set by fuel under the test margin, its
+costliest message spending about 127 fuel per answer byte where memory peaks
+under 8.2 MiB. So each sets a bound of its own that fuel fixes before memory
+does. Guest memory is 16 MiB (`PROCESSOR_MAX_MEMORY_BYTES`). Both are
+constants by a decision recorded beside them and in `docs/config-dsl.md`;
+what is undecided is whether the attachment rate rises to what a parse costs,
+with the worst-case grant and the posture redone against it, and those bounds
+re-measured. Done = the rate raised with at least one in-tree bound lifted by
+it under test, or a recorded decision that 128 stays. The comment sits at
+`PROCESSOR_MAX_MEMORY_BYTES` in `brenn-wasm/src/lib.rs`.
 
 ## `kit-sweep-decodes-expired-backlog-rows-unbudgeted`
 
 The provider kit's sweep decodes every backlog entry that has waited past
 `BACKLOG_MAX_WAIT_MS` to read when it was queued, then answers it. The decode
 is of the whole row, the caller's arguments included, which are as large as
-`[messaging] max_body_bytes` allows; no budget counts it and no envelope pays
-for it. An activation that meets enough such entries traps, its store writes
+`[messaging] max_body_bytes` allows; no budget counts it. The entry of a
+request the host still holds is paid for by that request's body, up to the
+body term's cap, and the entry of a request that has ended is deleted on its
+key without being decoded, so the activation that traps is one that meets
+more expired entries of pending requests than the cap pays for. An activation
+that meets enough such entries traps, its store writes
 roll back, and every later activation meets the same entries: the instance
 stops serving until its store is cleared. It needs a backlog left unserved for
 a minute, which is an outage of the API behind it. The sweep also reads every

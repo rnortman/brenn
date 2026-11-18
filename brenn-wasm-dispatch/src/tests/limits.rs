@@ -79,3 +79,45 @@ async fn an_override_replaces_the_activations_fuel_or_memory() {
         "the production memory limit, given as an override, completes"
     );
 }
+
+/// A share of the production grant: the whole of it completes, a share too
+/// small to instantiate traps, and the whole of it then completes again.
+#[tokio::test]
+async fn a_fuel_share_scales_the_production_grant() {
+    let (messenger, _in_entries, out_entry, _out_sub, wasm_sub, cfg, _alerts, _db) =
+        build_multiport_setup_with_depths(
+            "share",
+            &[("share-ch", Depth::Bounded(4), Depth::Bounded(4))],
+        )
+        .await;
+    let out = out_entry.address.as_str();
+
+    let whole = ActivationLimits::FuelShare {
+        numerator: 1,
+        denominator: 1,
+    };
+    drain_step_with_limits(&cfg, &wasm_sub, MountDebt::Owed, whole).await;
+    assert_eq!(
+        completed(&messenger, out).await,
+        1,
+        "the whole production grant completes"
+    );
+
+    let sliver = ActivationLimits::FuelShare {
+        numerator: 1,
+        denominator: 1_000_000_000,
+    };
+    drain_step_with_limits(&cfg, &wasm_sub, MountDebt::Owed, sliver).await;
+    assert_eq!(
+        completed(&messenger, out).await,
+        1,
+        "a billionth of the production grant traps the activation"
+    );
+
+    drain_step_with_limits(&cfg, &wasm_sub, MountDebt::Owed, whole).await;
+    assert_eq!(
+        completed(&messenger, out).await,
+        2,
+        "the whole grant completes what the sliver trapped on"
+    );
+}

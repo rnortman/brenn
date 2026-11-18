@@ -341,6 +341,23 @@ fn the_blob_provider_imports_tools_and_provides() {
     );
 }
 
+/// The kit asks the host whether a request is still pending before it builds
+/// or issues anything for it, so a kit component imports `provides.pending`.
+#[test]
+fn the_kit_file_fixture_imports_provides_pending() {
+    let engine = engine();
+    let provides = instance_members(
+        &engine,
+        "processor-kit-file-test",
+        "brenn:processor/provides@0.1.0",
+    )
+    .expect("processor-kit-file-test imports provides");
+    assert!(
+        provides.iter().any(|m| m == "pending"),
+        "processor-kit-file-test does not import pending: {provides:?}"
+    );
+}
+
 /// A component served by the kit's `serve_with_blobs` opens a request's
 /// attachments by pending id, so the kit suites run `open-request`.
 #[test]

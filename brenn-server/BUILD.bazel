@@ -90,64 +90,98 @@ rust_library(
 # finer crates: the dispatch families that read only a guest left with
 # `brenn-wasm-dispatch`, and the three that also drive the tool executor and the
 # repo-sync fixtures are what is left here.
+_TEST_DATA = [
+    "//:config/specs/google-calendar-read.brenn",
+    "//:config/specs/google-calendar-write.brenn",
+    "//:config/specs/google-gmail-compose.brenn",
+    "//:config/specs/google-gmail-organize.brenn",
+    "//:config/specs/google-gmail-read.brenn",
+    "//:config/specs/google-maps-tools.brenn",
+    "//brenn-tool",
+    "//brenn-wasm/components/processor-kit-file-test:spec/processor-kit-file-test.brenn",
+    "//brenn-wasm:fixture_git_forge_parser",
+    "//brenn-wasm:fixture_git_sync_consumer",
+    "//brenn-wasm:fixture_google_calendar_read",
+    "//brenn-wasm:fixture_google_calendar_write",
+    "//brenn-wasm:fixture_google_gmail_compose",
+    "//brenn-wasm:fixture_google_gmail_organize",
+    "//brenn-wasm:fixture_google_gmail_read",
+    "//brenn-wasm:fixture_google_maps_tools",
+    "//brenn-wasm:fixture_processor_blob_provider_test",
+    "//brenn-wasm:fixture_processor_blobs_test",
+    "//brenn-wasm:fixture_processor_kit_file_test",
+    "//brenn-wasm:fixture_processor_provider_test",
+    "//brenn-wasm:fixture_processor_tool_test",
+    "//brenn-wasm:fixture_replay",
+    "//brenn-wasm:fixture_replay_fault_test",
+    "//brenn-wasm:fixture_replay_generic",
+]
+
+# The test binary's build, shared by every target that builds it.
+_TEST_FEATURES = ["testutils"]
+
+_TEST_DEPS = all_crate_deps(normal_dev = True) + [
+    "//attach/client",
+    "//attach/conformance",
+    "//brenn-cal",
+    "//brenn-tool-registry",
+    "//brenn-wasm-dispatch",
+    "//git-fixture",
+]
+
+_TEST_PROC_MACRO_DEPS = all_crate_deps(proc_macro_dev = True)
+
+# The blob transfer tests run the real `brenn-tool` against a real socket; its
+# path is handed over as a runfile, as `//brenn-tool:cli` does.
+_TEST_RUSTC_ENV = {
+    "BRENN_TOOL_BIN": "$(rootpath //brenn-tool)",
+    "CARGO_MANIFEST_DIR": "brenn-server",
+}
+
 rust_test(
     name = "brenn-server_test",
     size = "large",
     crate = ":brenn-server",
-    crate_features = ["testutils"],
-    data = [
-        "//:config/specs/google-calendar-read.brenn",
-        "//:config/specs/google-calendar-write.brenn",
-        "//:config/specs/google-gmail-compose.brenn",
-        "//:config/specs/google-gmail-organize.brenn",
-        "//:config/specs/google-gmail-read.brenn",
-        "//:config/specs/google-maps-tools.brenn",
-        "//brenn-tool",
-        "//brenn-wasm/components/processor-kit-file-test:spec/processor-kit-file-test.brenn",
-        "//brenn-wasm:fixture_git_forge_parser",
-        "//brenn-wasm:fixture_git_sync_consumer",
-        "//brenn-wasm:fixture_google_calendar_read",
-        "//brenn-wasm:fixture_google_calendar_write",
-        "//brenn-wasm:fixture_google_gmail_compose",
-        "//brenn-wasm:fixture_google_gmail_organize",
-        "//brenn-wasm:fixture_google_gmail_read",
-        "//brenn-wasm:fixture_google_maps_tools",
-        "//brenn-wasm:fixture_processor_blob_provider_test",
-        "//brenn-wasm:fixture_processor_blobs_test",
-        "//brenn-wasm:fixture_processor_kit_file_test",
-        "//brenn-wasm:fixture_processor_provider_test",
-        "//brenn-wasm:fixture_processor_tool_test",
-        "//brenn-wasm:fixture_replay",
-        "//brenn-wasm:fixture_replay_fault_test",
-        "//brenn-wasm:fixture_replay_generic",
-    ],
+    crate_features = _TEST_FEATURES,
+    data = _TEST_DATA,
     edition = "2024",
     # The repo-sync fetch-classification tests read a bogus remote's ssh
     # failure. Without this, ssh rejects the host's own `/etc/ssh` config
     # inside the sandbox and never reaches name resolution, so the failure
     # classifies as a conflict instead of a transient error.
     env = {"GIT_SSH_COMMAND": "ssh -F /dev/null"},
-    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-    # The blob transfer tests run the real `brenn-tool` against a real socket;
-    # its path is handed over as a runfile, as `//brenn-tool:cli` does.
-    rustc_env = {
-        "BRENN_TOOL_BIN": "$(rootpath //brenn-tool)",
-        "CARGO_MANIFEST_DIR": "brenn-server",
-    },
+    proc_macro_deps = _TEST_PROC_MACRO_DEPS,
+    rustc_env = _TEST_RUSTC_ENV,
     tags = ["requires-git"],
     # ts-rs exports from tests, so this binary is also the generator behind
     # `//frontend:generated_types`. Without the override the generated types —
     # and so every bundle built from them — would inherit testonly.
     testonly = False,
     visibility = ["//frontend:__pkg__"],
-    deps = all_crate_deps(normal_dev = True) + [
-        "//attach/client",
-        "//attach/conformance",
-        "//brenn-cal",
-        "//brenn-tool-registry",
-        "//brenn-wasm-dispatch",
-        "//git-fixture",
+    deps = _TEST_DEPS,
+)
+
+# `wasm_dispatch_tests::kit_body_fuel_measure::measure`, which finds the least
+# grant a provider-kit activation completes on at two request body sizes and
+# prints the fuel a body byte costs. Run by hand with
+# `bazel test --test_output=all`.
+rust_test(
+    name = "kit_body_fuel_measure",
+    size = "enormous",
+    args = [
+        "--ignored",
+        "--exact",
+        "wasm_dispatch_tests::kit_body_fuel_measure::measure",
+        "--nocapture",
     ],
+    crate = ":brenn-server",
+    crate_features = _TEST_FEATURES,
+    data = _TEST_DATA,
+    edition = "2024",
+    proc_macro_deps = _TEST_PROC_MACRO_DEPS,
+    rustc_env = _TEST_RUSTC_ENV,
+    tags = ["manual"],
+    deps = _TEST_DEPS,
 )
 
 # Its own suite because `//surface:dist` is downstream of every surface crate,

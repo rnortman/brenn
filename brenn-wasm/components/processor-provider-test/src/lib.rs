@@ -16,6 +16,8 @@
 //   "stale" — complete a made-up id, then complete the real request with the
 //             error text that drew and whether `drop_not_pending` dropped a
 //             second such completion: `{"stale": "<diagnostic>", "dropped": true}`.
+//   "pending" — complete with whether the host holds the request and a
+//             made-up id pending: `{"pending": true, "made_up": false}`.
 //   "fail"  — return `Err` from the activation, completing nothing.
 //   other   — complete with an `invalid_args` error.
 //
@@ -75,6 +77,16 @@ fn serve(request: &ToolRequest) -> Result<(), Error> {
             };
             let dropped = drop_not_pending(provides::complete(&made_up, &json!({}))).is_ok();
             provides::complete(&request.id, &json!({ "stale": drew, "dropped": dropped }))
+        }
+        Some("pending") => {
+            let made_up = PendingId::from("0".repeat(32));
+            provides::complete(
+                &request.id,
+                &json!({
+                    "pending": provides::pending(&request.id),
+                    "made_up": provides::pending(&made_up),
+                }),
+            )
         }
         // Through `drop_not_pending`, which passes every error but `NotPending`.
         Some("fail") => drop_not_pending(Err(Error::failed("fail mode"))),

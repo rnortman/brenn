@@ -165,6 +165,24 @@ impl ProvidesHost for ProvidesSeam {
             .cloned()
             .ok_or(RequestAttachmentRefusal::NotAttached)
     }
+
+    fn is_pending(&self, id: &str) -> bool {
+        id == "pending"
+    }
+
+    fn pending_load(&self, _new_requests: &[&MessageBody]) -> PendingLoad {
+        PendingLoad {
+            body_bytes: 0,
+            attachments: self
+                .request
+                .lock()
+                .unwrap()
+                .holds()
+                .iter()
+                .map(BlobHold::reference)
+                .collect(),
+        }
+    }
 }
 
 /// Fields drop in order: the holds in `data` before the directory their

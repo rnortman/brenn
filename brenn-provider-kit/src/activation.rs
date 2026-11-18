@@ -10,13 +10,15 @@
 //!
 //! 1. **Sweep.** In-flight rows past [`INFLIGHT_TTL_MS`] are deleted; backlog
 //!    entries that have waited in the backlog past [`BACKLOG_MAX_WAIT_MS`] are
-//!    deleted and answered `internal`.
+//!    deleted and answered `internal`, or deleted unread where the host no
+//!    longer holds their request.
 //! 2. **Results.** Each result claims its request's in-flight row and
 //!    advances it: the request completes, fails, or issues or queues its next
 //!    step. A request more than [`HOST_DEADLINE_MS`] older than the activation
 //!    that delivered it is answered `internal` instead and not advanced.
 //! 3. **Backlog.** Entries are issued oldest first; the drain stops at the
-//!    first entry a budget leaves it unable to issue.
+//!    first entry a budget leaves it unable to issue. An entry whose request
+//!    the host no longer holds is deleted unread.
 //! 4. **New requests.** Each is planned, then issued or queued; once the
 //!    drain has left an entry behind, every one is queued.
 //! 5. **Guard.** A backlog with no call issued this activation and no live
@@ -26,6 +28,11 @@
 //! At the end of every activation that returns `Ok`, a non-empty backlog
 //! implies an in-flight row issued within [`NESTED_WORST_CASE_MS`], whose
 //! result activates the instance again.
+//!
+//! A call — a new request's first, or the next step an answer advances to —
+//! is issued or queued only for a request the host still holds
+//! ([`Host::pending`]); otherwise it is dropped, built and attempted by
+//! nothing and charged to neither budget.
 //!
 //! Each step — planning a request, advancing it on an answer, building a
 //! call's body, issuing a backlog entry — runs with a [`Step`] over the host's
@@ -86,13 +93,13 @@ pub const CALL_BUDGET: usize = 32;
 /// The most bodies the loop builds ([`Logic::body`]) in one activation, a
 /// failed build included: a build can fail having spent its whole cost. A
 /// call whose body is built past it is queued, as a call past
-/// [`CALL_BUDGET`] is. An activation's least fuel is the host's floor
-/// (`PROCESSOR_FUEL_MINIMUM`, 50M), which covers its first five envelopes;
-/// every further envelope adds its own 10M. With at most four builds in an
-/// activation, a component whose other steps cost S and whose build costs B
-/// is safe where S + 4B fits the floor. The drain builds out of the backlog
-/// in activations that carry no envelope for it, so the floor is what such
-/// a build runs on.
+/// [`CALL_BUDGET`] is. The loop builds only for a request the host still
+/// holds, whether the request is new, advanced on an answer, or drained from
+/// the backlog, and the host grants fuel for a pending request's body and
+/// attachments to every activation of the provider while it holds the
+/// request. So a build is paid for by its own request's bytes in whichever
+/// activation runs it, and a component sizes a build by what it costs a byte
+/// against those rates, four builds sharing one activation.
 pub const BUILD_BUDGET: usize = 4;
 
 /// The store namespace of in-flight rows, keyed by call id.
@@ -151,6 +158,11 @@ pub trait Host: Blobs {
     /// dropped, not an error.
     fn complete_err(&self, id: &str, kind: ErrorKind, detail: &str) -> Result<(), Self::Error>;
 
+    /// Whether the host holds request `id` pending for this instance. A
+    /// request it does not hold can no longer be answered and its calls are
+    /// refused, so the loop builds and issues nothing for it.
+    fn pending(&self, id: &str) -> bool;
+
     fn log(&self, level: Level, line: String);
 }
 
@@ -202,6 +214,9 @@ pub trait Logic {
     /// arguments, and a build fails only on what it meets at issue time: the
     /// blob pool, the activation's bound on bytes written, which every build
     /// and blob write of the activation shares, a request no longer pending.
+    /// The loop starts no build for a request the host has already given up;
+    /// one that ends while its body is built, or between the build and the
+    /// call, still reaches this or the call's refusal.
     /// A failure answers the request and no call is attempted, so a body the
     /// write bound refuses fails its request even where a later activation
     /// would have built it.
@@ -209,9 +224,6 @@ pub trait Logic {
     /// # Panics
     /// By default, naming the fault: a `Logic` that returns `Body::Built`
     /// defines this.
-    // TODO(built-body-from-attachment-unfueled-after-arrival): fuel a body
-    // built from a request's attachment outside the activation the request
-    // arrived in, or refuse one over a declared bound when it is planned.
     fn body(
         call: &Queued<Self::Tool>,
         _step: &Step<'_>,
@@ -318,7 +330,9 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
     /// and keys ascend by, so the backlog is read only up to the first entry
     /// whose request arrived within the wait. An entry before that point that
     /// does not parse — another build wrote it — is answered and deleted on its
-    /// key alone, as an in-flight row expires on its age alone.
+    /// key alone, as an in-flight row expires on its age alone. An entry
+    /// before that point whose request the host no longer holds is deleted
+    /// on its key, undecoded and unanswered.
     // TODO(kit-sweep-decodes-expired-backlog-rows-unbudgeted): read a row's
     // times without decoding the whole row, and bound the entries answered
     // per activation.
@@ -336,6 +350,9 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
             let (received_at_ms, id) = parse_key(&key).map_err(H::fault)?;
             if self.now_ms.saturating_sub(received_at_ms) <= BACKLOG_MAX_WAIT_MS {
                 break;
+            }
+            if self.dropped_ended(&key, id)? {
+                continue;
             }
             let detail = match checked_row::<L::Tool>(&key, &bytes) {
                 Ok(entry) => {
@@ -471,11 +488,17 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
 
     /// Issue backlog entries oldest first, stopping at the first a budget
     /// leaves this activation unable to issue: an entry is never skipped to
-    /// reach a later one. Once the call budget is spent the drain stops
-    /// without decoding the next row; until then each entry is decoded before
-    /// deciding, since whether the build budget holds it depends on its body.
+    /// reach a later one. An entry whose request the host no longer holds is
+    /// deleted on its key, undecoded, and the drain goes on. Once the call
+    /// budget is spent the drain stops without decoding the next row; until
+    /// then each entry is decoded before deciding, since whether the build
+    /// budget holds it depends on its body.
     fn drain(&mut self) -> Result<(), H::Error> {
         for (key, bytes) in self.host.scan(BACKLOG_NS)? {
+            let (_, id) = parse_key(&key).map_err(H::fault)?;
+            if self.dropped_ended(&key, id)? {
+                continue;
+            }
             if self.attempted >= CALL_BUDGET {
                 self.host.log(
                     Level::Debug,
@@ -554,8 +577,22 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
         carried
     }
 
-    /// Issue `entry`'s call if the budgets allow, or keep it in the backlog.
+    /// Issue `entry`'s call if the budgets allow, or keep it in the backlog;
+    /// drop it, spending neither budget, when the host no longer holds its
+    /// request.
     fn issue_or_queue(&mut self, entry: Queued<L::Tool>) -> Result<(), H::Error> {
+        if !self.host.pending(&entry.id) {
+            self.host.log(
+                Level::Debug,
+                format!(
+                    "dropped {} step {} for {}: the request is no longer pending",
+                    entry.tool.name(),
+                    entry.call.step,
+                    entry.id
+                ),
+            );
+            return Ok(());
+        }
         let Some(reason) = self.held(&entry) else {
             return self.issue(entry);
         };
@@ -760,6 +797,23 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
                 .complete_err(&entry.id, ErrorKind::Internal, &detail)?;
         }
         Ok(())
+    }
+
+    /// Delete the backlog entry under `key`, unread, when the host no longer
+    /// holds its request `id`; whether it did.
+    fn dropped_ended(&self, key: &[u8], id: &str) -> Result<bool, H::Error> {
+        if self.host.pending(id) {
+            return Ok(false);
+        }
+        self.host.delete(BACKLOG_NS, key)?;
+        self.host.log(
+            Level::Debug,
+            format!(
+                "dropped backlog entry {} unread: the request is no longer pending",
+                String::from_utf8_lossy(key)
+            ),
+        );
+        Ok(true)
     }
 
     /// A backlog entry, parsed and checked against its key.
@@ -2413,5 +2467,113 @@ mod tests {
             panic!("completed with {:?}", completion.answer);
         };
         assert!(detail.contains("`serve_with_blobs`"), "{detail}");
+    }
+
+    /// The line the loop logs for request `n`'s call at `step`, dropped
+    /// because the host no longer holds the request.
+    fn dropped(n: usize, step: u8) -> String {
+        format!(
+            "dropped fixture-lookup step {step} for {}: the request is no longer pending",
+            id(n)
+        )
+    }
+
+    #[test]
+    fn a_new_request_that_has_ended_is_planned_and_dropped_spending_no_budget() {
+        let host = MemoryHost::new();
+        host.end_request(&id(0));
+        run(&host, input(0, requests(0..CALL_BUDGET + 1), vec![])).unwrap();
+        assert_eq!(
+            ids(&host.take_calls()),
+            (1..=CALL_BUDGET).map(id).collect::<Vec<_>>()
+        );
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        assert!(host.take_completions().is_empty());
+        assert!(
+            host.rows(INFLIGHT_NS)
+                .iter()
+                .all(|(_, bytes)| InFlight::<Fixture>::decode(bytes).unwrap().id != id(0))
+        );
+        assert!(logged(&host, Level::Debug, &dropped(0, 1)));
+    }
+
+    #[test]
+    fn a_late_answer_advanced_into_a_call_is_dropped() {
+        let host = MemoryHost::new();
+        run(&host, input(0, requests(0..1), vec![])).unwrap();
+        let first = host.take_calls().remove(0);
+        host.end_request(&id(0));
+        run(&host, input(1, vec![], vec![result(&first, true)])).unwrap();
+        assert!(host.take_calls().is_empty());
+        assert!(host.take_completions().is_empty());
+        assert!(host.rows(INFLIGHT_NS).is_empty());
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        assert!(logged(&host, Level::Debug, &dropped(0, 2)));
+    }
+
+    /// The ended request's entry holds bytes no build could decode, so the
+    /// drain is seen to delete it on its key alone.
+    #[test]
+    fn the_drain_deletes_an_ended_requests_entry_unread_and_issues_the_next() {
+        let host = MemoryHost::new();
+        host.insert(
+            BACKLOG_NS,
+            entry(0, 1, 1_000, 1_000).key().as_bytes(),
+            b"not a backlog row",
+        );
+        insert_entry(&host, &entry(1, 1, 1_000, 1_000));
+        host.end_request(&id(0));
+        run(&host, input(2_000, vec![], vec![])).unwrap();
+        assert_eq!(ids(&host.take_calls()), [id(1)]);
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        assert!(host.take_completions().is_empty());
+        assert!(logged(
+            &host,
+            Level::Debug,
+            &format!(
+                "dropped backlog entry {} unread: the request is no longer pending",
+                entry(0, 1, 1_000, 1_000).key()
+            )
+        ));
+    }
+
+    #[test]
+    fn the_sweep_deletes_an_ended_requests_expired_entry_unanswered() {
+        let host = MemoryHost::new();
+        host.insert(
+            BACKLOG_NS,
+            entry(0, 1, 0, 0).key().as_bytes(),
+            b"not a backlog row",
+        );
+        insert_entry(&host, &entry(1, 1, 0, 0));
+        host.end_request(&id(0));
+        run(&host, input(BACKLOG_MAX_WAIT_MS + 1_000, vec![], vec![])).unwrap();
+        assert!(host.take_calls().is_empty());
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        assert_eq!(
+            errors(&host.take_completions()),
+            [(
+                id(1).as_str(),
+                ErrorKind::Internal,
+                format!("this request waited 61 {WAITED}").as_str()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_ended_request_spends_none_of_the_build_budget() {
+        let host = MemoryHost::new();
+        host.end_request(&id(0));
+        let new = (0..=BUILD_BUDGET)
+            .map(|n| built(n, json!({ "text": id(n) })))
+            .collect();
+        run_builder(&host, input(0, new, vec![])).unwrap();
+        let calls = host.take_calls();
+        assert_eq!(ids(&calls), (1..=BUILD_BUDGET).map(id).collect::<Vec<_>>());
+        for call in &calls {
+            assert_eq!(call.body, built_body(&call.id));
+        }
+        assert!(host.rows(BACKLOG_NS).is_empty());
+        assert!(host.take_completions().is_empty());
     }
 }

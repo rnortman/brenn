@@ -292,6 +292,14 @@ impl ProvidesHost for NothingPendingProvidesHost {
     ) -> Result<brenn_wasm::BlobHold, RequestAttachmentRefusal> {
         Err(RequestAttachmentRefusal::NotPending)
     }
+
+    fn is_pending(&self, _id: &str) -> bool {
+        false
+    }
+
+    fn pending_load(&self, _new_requests: &[&MessageBody]) -> brenn_wasm::PendingLoad {
+        brenn_wasm::PendingLoad::default()
+    }
 }
 
 /// No-op provides-host handle for tests that grant `Provides` but serve nothing.

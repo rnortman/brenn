@@ -103,6 +103,22 @@ and the tool-result body grow by added fields, which `brenn-guest` ignores; `v`
 moves only for a change a provider built against the older body would misread,
 and `brenn-guest` refuses a version it does not know.
 
+`provides` has since gained **`pending(id)`**, a function beside `complete`
+and `call-async-for`: whether `id` is pending for the component, true exactly
+where `complete` would not answer `not-pending`. It reads nothing else,
+changes nothing and draws on no per-activation count, and it tells a provider
+nothing `complete` did not: a refused completion already answers `not-pending`
+or `invalid-outcome` by whether the id is pending. A component imports only
+the functions it calls, so an artifact built before it links as it did; one
+that calls it needs a brenn new enough to serve it, by the same ordering rule
+as `calls`. A surface links no `provides`, so a kind that imports it is
+refused there by name. `brenn-guest` reaches it through `provides::pending`.
+The provider kit asks it before it issues or queues a call and before it
+decodes a backlog entry: for a request the host no longer holds it builds no
+body, attempts no call, keeps no row and spends neither of its budgets, and it
+deletes such a backlog entry unread. A kit component built from a brenn that
+has `pending` imports it.
+
 A third additive change in force: **`mqtt-publish-expiring`**, a new function
 in the existing `brenn:processor/mqtt` interface. It is `mqtt-publish` plus the
 MQTT 5 message-expiry interval, under the same `mqtt` grant, budgets and
@@ -1127,39 +1143,72 @@ Four limits are the component's to design for:
   attachment on its caller's inbox. Size `blob_budget_bytes` at or above the
   sum, over the inboxes that receive attachment answers, of the inbox's depth
   × `max_blob_bytes` (`docs/config-dsl.md`, "The OAuth tools").
-- **A body is built on the fuel of the activation that issues its call.**
+- **A request's bytes bring fuel while the host holds it.** A request's body,
+  at 256 fuel a byte (`PROCESSOR_FUEL_PER_BODY_BYTE`), and, for a component
+  granted `blobs`, its attachments, at 128 a byte, bring fuel to the
+  activation that delivers the request and to every later activation of the
+  provider while the host holds the request pending; an answer's bytes bring
+  fuel to the activation that delivers it. The kit builds a body only for a
+  request that is new or still pending, in whichever activation issues its
+  call — on arrival, out of the backlog, at a later step — so a build is paid
+  for by its request's bytes wherever it happens, and so is the settle of a
+  pending request, whose in-flight row holds the arguments whole. A component
+  therefore sizes a build and a settle by what they cost a byte against the
+  rates at the margin, not by a sum of steps on the host's 50M floor. The
+  body rate was sized on the kit's arriving and draining activations, for
+  the byte-carrying contract every kit component is on, and on arguments
+  that are strings; a component whose passes over a request's bytes cost more
+  a byte than the rate covers measures its bound against it.
+
+  A tool that declares an array or object argument admits requests that cost
+  more a byte to parse than the rate grants — about 212 fuel a byte for an
+  array of `0`s, 163 for an array of empty arrays, 654 for an object of
+  distinct three-character keys — and that take several times their bytes in
+  guest memory once parsed, every new request of an activation being parsed
+  before any is handled. No bound a component declares holds before that
+  parse: the host checks a conversation's call for its top-level keys and
+  their JSON types and reads no size keyword (`maxItems`, `maxLength`), it
+  checks a component's call for nothing but the 64 KiB arguments cap, and the
+  kit's own bound runs in `plan`, after every new request has been parsed. A
+  declared bound still limits what the component itself then works through,
+  and is declared as before. The parse is bounded only by the deployment's
+  `[messaging] max_body_bytes`, which has no ceiling, for a conversation's
+  call, and by 64 KiB for a component's; so such a component measures its
+  fuel and its memory with dense arguments at the bus cap its guide tells a
+  deployment to set, the default where it names none, and says in that guide
+  that a higher cap is outside what it measured
+  (`dense-request-arguments-outgrow-guest` in `TODO.md`).
+
+  What the rule leaves on the floor, the envelope term alone: the settle of a
+  late answer — an answer to a request the host has given up, which the kit
+  still claims, decodes and advances, paid for only by the answer's own
+  bytes, so that where arguments are large and the answer does not echo them
+  a component's bound is still set by the late answers one activation
+  settles; the rows the sweep and a scan read for requests that have ended;
+  and bodies past the cap — new and pending bodies together are paid for up
+  to 16 MiB an activation, so a component whose Σ `max_concurrency` × the
+  bus cap can pass that holds more than it is granted for.
+
   At most `BUILD_BUDGET` (4) bodies are built per activation, a failed build
-  included, so a component sizes its bound for S + nB on the host's 50M
-  floor, where S is a step's cost, B a build's, and n the most bodies one of
-  its activations can build — late answers counted, since the kit advances
-  an answer the host has given up on — and never more than `BUILD_BUDGET`;
-  a component that has not worked n out takes 4. `max_concurrency` bounds
-  neither the answers nor the ended requests' messages an activation is
-  handed, so a component whose late answers build can reach `BUILD_BUDGET`
-  and queue whatever its Σ. Through the fifth envelope every step shares the
-  50M, so the count is every step the floor activation runs, not the builds
-  alone: the builds; the steps that plan or advance and then queue; the
-  answers that settle, each of which decodes an in-flight row holding the
-  request's arguments; and, when the build budget stops the drain, the one
-  decode at which it stops. A settle is not the cheap step: the row it
-  decodes holds the caller's arguments whole, and decoding them costs by
-  their size, far more for a character JSON escapes than for a plain one, so
-  where the arguments are large a component's bound is set as much by the
-  answers one activation settles as by the bodies it builds. `plan` refuses
-  everything `body` could refuse on the arguments, so that `body` fails only
-  on what it meets at issue time (the blob pool, the activation's bound on
-  bytes written, a request no longer pending), because a failed build spends
-  the budget like any other. Every build and every other blob write of an
-  activation share its bound on bytes written (64 MiB), and a build that
-  bound refuses answers its request rather than waiting for a later
-  activation: where bodies together pass it, the build that crosses it and
-  every build after it in that activation fail, though each alone would
-  have been built.
-  A request's attachment adds fuel only in the activation the request
-  arrived in, so a body built from one is bounded by what the floor covers,
-  not by the attachment rate. A trap while draining rolls the store back,
-  so it repeats on each later activation until the entries have waited
-  `BACKLOG_MAX_WAIT_MS` and the sweep answers them unbuilt.
+  included. `max_concurrency` bounds neither the answers nor the ended
+  requests' messages an activation is handed, so a component can still reach
+  `BUILD_BUDGET` and queue whatever its Σ, and a queued build is paid for
+  when it is drained. The kit drops, unbuilt and unissued, the call of a
+  request that has ended, a late answer's next call included, so those spend
+  neither budget. `plan` refuses everything `body` could refuse on the
+  arguments, so that `body` fails only on what it meets at issue time (the
+  blob pool, the activation's bound on bytes written, a request no longer
+  pending), because a failed build spends the budget like any other. Every
+  build and every other blob write of an activation share its bound on bytes
+  written (64 MiB), and a build that bound refuses answers its request rather
+  than waiting for a later activation: where bodies together pass it, the
+  build that crosses it and every build after it in that activation fail,
+  though each alone would have been built.
+  A body built from a request's attachment is bounded by the attachment rate
+  and the write bound, in whichever activation builds it. A trap while
+  draining still rolls the store back, so it repeats on each later
+  activation until the entries have waited `BACKLOG_MAX_WAIT_MS` and the
+  sweep answers them unbuilt.
 
 `MemoryHost` serves `Blobs` in memory for a host test: `seed_request` and
 `seed_result` give a request or a result an attachment's bytes; the limits,

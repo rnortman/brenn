@@ -1,12 +1,19 @@
 //! The `google-calendar-write` component, end to end, on the rig in
 //! [`super::google_workspace_rig`].
 
-use brenn_tool_registry::ToolError;
-use serde_json::json;
+use std::sync::Arc;
+use std::time::Duration;
+
+use brenn_tool_registry::{HeldAttachments, ToolError};
+use brenn_wasm_dispatch::ActivationLimits;
+use serde_json::{Value, json};
 
 use super::google_workspace_rig::{
-    self as workspace, BEARER, CALENDAR_WRITE, Clauses, FirstRead, google_query,
+    self as workspace, ACCOUNT, BEARER, CALENDAR_WRITE, Clauses, FirstRead, google_query,
 };
+use super::kit_body_fuel_measure::{least, narrow};
+use super::kit_file_e2e::drop_caller;
+use super::provider_rig::{MARGIN, fuel};
 use super::stub_rig::{Pairs, StubRig};
 
 const PRIMARY_EVENTS: &str = "/calendar/v3/calendars/primary/events";
@@ -329,4 +336,195 @@ async fn calendar_delete_refuses_a_series_without_the_flag() {
     );
     r.owed(&r.executor_sub(), 0).await;
     r.assert_finished(&id);
+}
+
+/// How many late answers the measured activation settles.
+const LATE_ANSWERS: usize = 5;
+/// The most characters `CalendarUpdate` admits in `description`.
+const DESCRIPTION_CHARS: usize = 2_000;
+
+/// `n` characters of four UTF-8 bytes, the first naming `i` so that strings
+/// built for different `i` differ.
+fn four_byte(i: usize, n: usize) -> String {
+    let first = char::from_u32(0x1_0000 + u32::try_from(i).unwrap()).unwrap();
+    std::iter::once(first)
+        .chain(std::iter::repeat_n('\u{1d11e}', n - 1))
+        .collect()
+}
+
+/// `CalendarUpdate`'s arguments with every field at the bound the component
+/// admits, each at its widest serialized form, and `description` the
+/// [`DESCRIPTION_CHARS`] characters of `unit`. `account` names alice's
+/// connected account, the one value that reaches Google.
+fn widest_update(unit: char) -> Value {
+    let widest = |n: usize| "\u{1}".repeat(n);
+    json!({
+        "id": "e".repeat(1024),
+        "calendar": four_byte(0, 320),
+        "summary": widest(1000),
+        "start": widest(64),
+        "end": widest(64),
+        "description": unit.to_string().repeat(DESCRIPTION_CHARS),
+        "location": widest(1000),
+        "attendees": (0..50).map(|i| four_byte(i, 40)).collect::<Vec<_>>(),
+        "time_zone": widest(64),
+        "recurrence": (0..5)
+            .map(|i| format!("{i}{}", "\"".repeat(499)))
+            .collect::<Vec<_>>(),
+        "notify": "externalOnly",
+        "account": ACCOUNT,
+    })
+}
+
+/// Google's answer to the patch `args` asks for: the event with every field
+/// written, in the shape the events.get mask gives it.
+fn echo(args: &Value) -> Value {
+    let when = |key: &str| json!({ "dateTime": args[key], "timeZone": args["time_zone"] });
+    json!({
+        "id": args["id"],
+        "status": "confirmed",
+        "summary": args["summary"],
+        "description": args["description"],
+        "location": args["location"],
+        "start": when("start"),
+        "end": when("end"),
+        "attendees": args["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|email| json!({ "email": email, "responseStatus": "needsAction" }))
+            .collect::<Vec<_>>(),
+        "recurrence": args["recurrence"],
+    })
+}
+
+/// Wait until the stub has received `n` API requests.
+async fn stub_saw(r: &StubRig, n: usize) {
+    for _ in 0..3000 {
+        if r.stub.lock().unwrap().api_seen.len() >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the stub never received {n} requests");
+}
+
+/// Bring the provider to the activation that settles [`LATE_ANSWERS`] late
+/// answers to the widest `CalendarUpdate` whose `description` is of `unit`,
+/// and assert that activation is the one meant: five in-flight rows, and
+/// five results owed, each Google's echo with the description whole.
+///
+/// The stub holds every request until it takes a permit. Each write is
+/// called, its request served, which issues its patch, and its nested call
+/// started on a task of its own; once the stub has the patch, the call is
+/// past the executor's check that its request is pending, and the caller is
+/// dropped, which ends the request and frees the tool's one permit for the
+/// next write. Only then are the five patches answered, so no answer reaches
+/// the provider before the last is issued.
+async fn late_answers(unit: char) -> StubRig {
+    let r = rig().await;
+    let args = widest_update(unit);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    {
+        let mut stub = r.stub.lock().unwrap();
+        stub.api_gate = Some(gate.clone());
+        stub.api_body = echo(&args).to_string().into_bytes();
+    }
+    let mut steps = Vec::new();
+    for n in 1..=LATE_ANSWERS {
+        let call = r.call_for_alice_with("CalendarUpdate", args.clone(), HeldAttachments::none());
+        r.requested_id().await;
+        r.serve().await;
+        steps.push(r.start_nested().await);
+        stub_saw(&r, n).await;
+        drop_caller(call).await;
+    }
+    gate.add_permits(LATE_ANSWERS);
+    for step in steps {
+        step.await.expect("the executor's drain step");
+    }
+
+    let results = r.owed(&r.provider_sub, LATE_ANSWERS).await;
+    assert_eq!(
+        r.inflight_keys().len(),
+        LATE_ANSWERS,
+        "five writes in flight"
+    );
+    for result in &results {
+        let ok = &result["outcome"]["ok"];
+        assert_eq!(ok["status"], 200, "a late answer is the stub's echo");
+        let event: Value =
+            serde_json::from_str(ok["body"].as_str().expect("a text body")).expect("JSON");
+        assert_eq!(
+            event["description"], args["description"],
+            "the echo's description is whole"
+        );
+    }
+    r
+}
+
+/// Whether the late answers' settle, of a description of `unit`, completes
+/// under `limits`, or the production limits when `None`.
+async fn settles(unit: char, limits: Option<ActivationLimits>) -> (bool, u64) {
+    let r = late_answers(unit).await;
+    r.serve_under(limits).await;
+    let left = r.inflight_keys().len();
+    assert!(left == 0 || left == LATE_ANSWERS, "{left} rows left");
+    (left == 0, 0)
+}
+
+/// The parts of the production grant a share is counted in: one part of a
+/// grant near 140M is about 34,000 fuel.
+const SHARE_PARTS: u64 = 4096;
+
+/// The `description` contents measured: a control character, `"` and `\`,
+/// each escaped in the echo's JSON and again in the answer carrying it, and
+/// four-byte characters.
+const DESCRIPTIONS: [char; 4] = ['\u{1}', '"', '\\', '\u{1d11e}'];
+
+/// The least grant the late answers' settle completes on, for each
+/// description content, and the least share of the production grant it
+/// completes on, from which the production grant for that activation follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: run by hand"]
+async fn measure_late_answers() {
+    for unit in DESCRIPTIONS {
+        assert!(settles(unit, None).await.0, "the production grant settles");
+        let (least, _) = least(|grant| settles(unit, fuel(grant))).await;
+        let parts = narrow(0, SHARE_PARTS, 1, &|numerator| {
+            settles(
+                unit,
+                Some(ActivationLimits::FuelShare {
+                    numerator,
+                    denominator: SHARE_PARTS,
+                }),
+            )
+        })
+        .await;
+        println!(
+            "late answers, description of {unit:?}: completes on {least}, \
+             {parts}/{SHARE_PARTS} of the production grant ({:.3} of it), \
+             which is about {}",
+            parts as f64 / SHARE_PARTS as f64,
+            least * SHARE_PARTS / parts
+        );
+    }
+}
+
+/// Five late answers to the widest `CalendarUpdate`, its description of
+/// U+0001, the costliest of [`DESCRIPTIONS`], each answered with Google's
+/// echo, are settled in one activation under the margin: the kit decodes
+/// each in-flight row, reads the echo, and completes a request the host no
+/// longer holds, leaving no row. Measured by `measure_late_answers`, it
+/// completes on about 55.1M of a 146.5M production grant. A failure here is
+/// answered by measuring again and correcting this figure or the
+/// component's bounds, never by raising the share.
+#[tokio::test(flavor = "multi_thread")]
+async fn five_late_answers_to_the_widest_update_settle_inside_the_margin() {
+    let r = late_answers(DESCRIPTIONS[0]).await;
+    r.serve_under(Some(MARGIN)).await;
+    assert!(
+        r.inflight_keys().is_empty(),
+        "the five late answers were settled"
+    );
 }
