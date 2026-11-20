@@ -1,7 +1,8 @@
 //! The wrapper's decisions, in `std` plus `serde_json`: validating
 //! `CalendarCreate`'s, `CalendarUpdate`'s and `CalendarDelete`'s arguments,
-//! building their Calendar calls as `api-request` arguments, and reading
-//! `api-request`'s answer. Nothing here names the guest SDK, so the whole
+//! building their Calendar calls as `api-request` arguments, building the
+//! event a write sends as the call's body, and reading `api-request`'s
+//! answer. Nothing here names the guest SDK, so the whole
 //! module runs on the host under test. Tools are the generated `Provided`
 //! enum, whose SDK-facing parts are wasm32-only.
 
@@ -12,51 +13,62 @@ mod spec;
 
 use brenn_google_workspace::args::{account, id_list, is_printable_ascii};
 use brenn_google_workspace::calendar::{
-    ATTENDEES_MAX, Compact, EVENT_GET_FIELDS, EVENT_TEXT_MAX_BYTES, PRIMARY_CALENDAR, calendar_id,
-    calendar_id_rule, compact_event, event_id, event_path, events_path, is_calendar_id,
-    is_event_id, time, written_event_max_chars,
+    ATTENDEES_MAX, Compact, EVENT_TEXT_MAX_BYTES, EVENT_WRITE_FIELDS, PRIMARY_CALENDAR,
+    calendar_id, calendar_id_rule, compact_event, event_id, event_path, events_path,
+    is_calendar_id, is_event_id, time,
 };
-use brenn_google_workspace::call::{delete_call, get_call, json_call};
+use brenn_google_workspace::call::{delete_call, get_call, new_call};
 use brenn_google_workspace::scope::{Scope, google_error, no_body_refused, with_write_hint};
 use brenn_google_workspace::settings::Settings;
-use brenn_google_workspace::text::{fit_text, shape};
+use brenn_google_workspace::text::shape;
 use brenn_provider_kit::{
-    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic, NestedError,
-    Next, Query, Tool, Unreadable, bounded, capped, choice, copy, flag, google, internal,
-    no_such_step, object, query, read_api_result, stored,
+    Answer, ApiCall, Args, Blob, Body, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic,
+    NestedError, Next, Query, Queued, Step, Tool, Unreadable, bounded, capped, choice, copy, flag,
+    google, internal, no_such_step, object, query, read_api_result, stored,
 };
 use serde_json::{Value, json};
 
 use crate::spec::Provided;
 
-// TODO(google-write-bodies-in-call-arguments): send the event as a blob the
-// component builds.
-/// The most characters an event write's `summary` or `location` may hold. A
-/// write's arguments travel as one JSON body inside the nested call's args,
-/// which the host caps at 64 KiB: with every argument at its cap, each at its
-/// escaped width — `summary` and `location` at 7 bytes a character (escaped in
-/// the body and again in the args), `description` at 7, `recurrence` at 4
-/// (printable ASCII whose `"` and `\` escape twice), `attendees` at
-/// `ATTENDEES_MAX_BYTES` plus their `{"email":…}` wrapping, `start`, `end`
-/// and `time_zone` at 7 with `time_zone` written into both times, `account` at
-/// 6, the calendar id and an update's event id in the path at their bytes —
-/// the widest admitted create serializes to about 52 500 bytes and the widest
-/// update to about 53 600.
+/// The most characters an event write's `summary` or `location` may hold:
+/// the component's own bound for a title and a place. A write's answer, like
+/// a read's, returns each cut to `EVENT_TEXT_MAX_BYTES`.
 const EVENT_FIELD_MAX_CHARS: usize = 1000;
-/// The most characters an event write's `description` may hold; see
-/// `EVENT_FIELD_MAX_CHARS` for the call's budget.
-const EVENT_DESCRIPTION_MAX_CHARS: usize = 2000;
+// TODO(calendar-write-bounds-set-by-guest-fuel): bound the description by
+// Google's limit or the instance's blob limits.
+/// The most characters an event write's `description` may hold. Fuel holds
+/// it, under the host's fixed guest limits: the description rides the
+/// request's arguments, the in-flight row and the built body, each a pass the
+/// request's body bytes pay for, and a row of an ended request whose answer
+/// has not come, which nothing pays for. Measured on the real host at this
+/// bound, every other field at its widest, the costliest activation is the
+/// window of a create, an update and a delete new over five ended updates'
+/// rows, with a description of line feeds: 19.5M fuel of a 73.3M grant, 0.266
+/// of it, against the margin of 19/28. One such row adds up to 1.66M (U+0001)
+/// to every activation until its answer comes or 420 s pass. Such rows have
+/// the least room in an activation whose own bytes bring nothing above the
+/// grant's 50M floor: one small create over five ended updates' rows of
+/// U+0001 completes on 8.4M of a 50.1M grant, and the margin absorbs 15 more
+/// rows beside the five there, against 22 over the window. 8,000 is chosen
+/// and is not the most that held: nothing above it was measured.
+const EVENT_DESCRIPTION_MAX_CHARS: usize = 8_000;
 /// The most characters an event write's `time_zone` may hold: an IANA name,
 /// passed to Google as given.
 const EVENT_TIME_ZONE_MAX_CHARS: usize = 64;
+// TODO(calendar-write-bounds-set-by-guest-fuel): measure the attendee budget
+// at a higher cap.
 /// The most UTF-8 bytes an event write's `attendees` may hold together. A
 /// calendar id holds nothing JSON escapes (`calendar_id_shape` refuses `"`,
-/// `\` and controls), so its bytes are what it adds to the call; see
-/// `EVENT_FIELD_MAX_CHARS` for the call's budget.
+/// `\` and controls), so its bytes are what it adds to the event. Its cost
+/// above this bound is unmeasured.
 const ATTENDEES_MAX_BYTES: usize = 8_000;
-/// The most lines an event write's `recurrence` may hold.
+// TODO(calendar-write-bounds-set-by-guest-fuel): measure the recurrence
+// bounds at higher caps.
+/// The most lines an event write's `recurrence` may hold. Its cost above
+/// this bound is unmeasured.
 const RECURRENCE_WRITE_MAX: usize = 5;
 /// The most characters one `recurrence` line may hold, each printable ASCII.
+/// Its cost above this bound is unmeasured.
 const RECURRENCE_LINE_MAX_CHARS: usize = 500;
 /// Google's `sendUpdates` words, in the order the schema states them: who
 /// Google emails about a write.
@@ -122,7 +134,7 @@ impl Logic for CalendarWrites {
     fn plan(
         tool: Provided,
         args: &Value,
-        _: &brenn_provider_kit::Step<'_>,
+        _: &Step<'_>,
         settings: &Settings,
     ) -> Result<Call, String> {
         plan(tool, args, settings)
@@ -131,11 +143,35 @@ impl Logic for CalendarWrites {
     fn advance(
         state: &InFlight,
         outcome: Result<Value, NestedError>,
-        _: &mut brenn_provider_kit::Step<'_>,
+        _: &mut Step<'_>,
         settings: &Settings,
     ) -> Next {
         advance(state, outcome, settings)
     }
+
+    fn body(call: &Queued<Provided>, step: &Step<'_>, _: &Settings) -> Result<Blob, Failure> {
+        match (call.tool, call.call.step) {
+            (Provided::CalendarCreate, 1) => event_json(call, step, EventWriteArgs::parse_create),
+            (Provided::CalendarUpdate, 1) => event_json(call, step, EventWriteArgs::parse_update),
+            (tool, step) => Err(no_such_step(tool, step)),
+        }
+    }
+}
+
+/// The event a write sends, built as the call's body: `event_body` of the
+/// stored arguments, as `application/json`. A row this build did not write is
+/// `internal`.
+fn event_json(
+    call: &Queued<Provided>,
+    step: &Step<'_>,
+    parse: fn(&Value) -> Result<EventWriteArgs, String>,
+) -> Result<Blob, Failure> {
+    let args = call.stored(parse)?;
+    let event = event_body(&args, call.tool == Provided::CalendarUpdate);
+    let bytes = serde_json::to_vec(&event).expect("a JSON value serializes");
+    let mut out = step.append("application/json")?;
+    out.write(&bytes)?;
+    out.finish()
 }
 
 /// Validate a request's arguments and build its first nested call. An error is
@@ -416,38 +452,43 @@ fn event_body(args: &EventWriteArgs, complete: bool) -> Value {
     Value::Object(body)
 }
 
+// TODO(calendar-write-blob-body-unconfirmed-against-live-google): create and
+// update an event with a description near its bound against a real account.
 /// An event write's query: whom Google notifies, always sent, and the
-/// events.get mask, so the answer is the event `compact_event` reads.
+/// write's mask, so the answer is the event `compact_event` reads, without
+/// its description.
 fn event_write_query(args: &EventWriteArgs) -> Query {
     query([
         ("sendUpdates", args.notify.to_string()),
         ("maxAttendees", ATTENDEES_MAX.to_string()),
-        ("fields", EVENT_GET_FIELDS.to_string()),
+        ("fields", EVENT_WRITE_FIELDS.to_string()),
     ])
 }
 
-/// events.insert of the arguments' event on their calendar.
+/// events.insert of the arguments' event on their calendar, its body the
+/// event `Logic::body` builds.
 fn event_insert_call(args: &EventWriteArgs, settings: &Settings) -> ApiCall {
-    json_call(
+    new_call(
         settings,
         "POST",
         args.account.as_deref(),
         events_path(&args.calendar),
         event_write_query(args),
-        event_body(args, false),
+        Some(Body::Built),
     )
 }
 
-/// events.patch of the arguments' event: only the fields named change.
+/// events.patch of the arguments' event, its body the event `Logic::body`
+/// builds: only the fields named change.
 fn event_patch_call(args: &EventWriteArgs, settings: &Settings) -> ApiCall {
     let id = args.id.as_deref().expect("an update's parse requires `id`");
-    json_call(
+    new_call(
         settings,
         "PATCH",
         args.account.as_deref(),
         event_path(&args.calendar, id),
         event_write_query(args),
-        event_body(args, true),
+        Some(Body::Built),
     )
 }
 
@@ -585,7 +626,7 @@ fn delete_accepted(state: &InFlight) -> Result<Next, Failure> {
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
     let body = match read_api_result(outcome, &state.target, google::API_NAME) {
         Ok(Answer::Body(body)) => body,
-        Ok(Answer::NoBody { status }) => return settle(state.tool, no_body(state, status)),
+        Ok(Answer::NoBody { status }) => return settle(no_body(state, status)),
         Ok(Answer::Relay(value)) => return Next::Complete(value),
         Ok(Answer::Unreadable(why)) => return unreadable(state, why),
         Ok(Answer::Error { status, body }) => {
@@ -603,31 +644,19 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
         }
         Err(failure) => return Next::Fail(at_write(state, failure)),
     };
-    settle(
-        state.tool,
-        match (state.tool, state.step) {
-            (Provided::CalendarCreate, 1) => {
-                compact_event(&body, "events.insert", None, written_event_max_chars())
-                    .map(Next::Complete)
-                    .map_err(|failure| at_write(state, failure))
-            }
-            (Provided::CalendarUpdate, 1) => stored(state, EventWriteArgs::parse_update)
-                .and_then(|args| {
-                    compact_event(
-                        &body,
-                        "events.patch",
-                        args.id.as_deref(),
-                        written_event_max_chars(),
-                    )
-                })
-                .map(Next::Complete)
-                .map_err(|failure| at_write(state, failure)),
-            (Provided::CalendarDelete, DELETE_READ_STEP) => delete_checked(state, &body, settings),
-            // Google's acceptance of a delete, whatever its body.
-            (Provided::CalendarDelete, DELETE_STEP) => delete_accepted(state),
-            (tool, step) => Err(no_such_step(tool, step)),
-        },
-    )
+    settle(match (state.tool, state.step) {
+        (Provided::CalendarCreate, 1) => compact_event(&body, "events.insert", None, None)
+            .map(Next::Complete)
+            .map_err(|failure| at_write(state, failure)),
+        (Provided::CalendarUpdate, 1) => stored(state, EventWriteArgs::parse_update)
+            .and_then(|args| compact_event(&body, "events.patch", args.id.as_deref(), None))
+            .map(Next::Complete)
+            .map_err(|failure| at_write(state, failure)),
+        (Provided::CalendarDelete, DELETE_READ_STEP) => delete_checked(state, &body, settings),
+        // Google's acceptance of a delete, whatever its body.
+        (Provided::CalendarDelete, DELETE_STEP) => delete_accepted(state),
+        (tool, step) => Err(no_such_step(tool, step)),
+    })
 }
 
 /// A nested read that was cut or refused, decided by the step's shape: a
@@ -635,17 +664,12 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: 
 /// with why.
 fn unreadable(state: &InFlight, why: Unreadable) -> Next {
     if let Some(hint) = write_hint(state.tool, state.step) {
-        return settle(state.tool, Err(why.failure(google::API_NAME, Some(hint))));
+        return settle(Err(why.failure(google::API_NAME, Some(hint))));
     }
-    settle(
-        state.tool,
-        match (state.tool, state.step) {
-            (Provided::CalendarDelete, DELETE_READ_STEP) => {
-                Err(why.failure(google::API_NAME, None))
-            }
-            (tool, step) => Err(no_such_step(tool, step)),
-        },
-    )
+    settle(match (state.tool, state.step) {
+        (Provided::CalendarDelete, DELETE_READ_STEP) => Err(why.failure(google::API_NAME, None)),
+        (tool, step) => Err(no_such_step(tool, step)),
+    })
 }
 
 /// The hint a write step's failure carries when Google may have acted: what
@@ -679,18 +703,10 @@ fn no_body(state: &InFlight, status: u64) -> Result<Next, Failure> {
 }
 
 /// A step's decision as the request's next move, a completed answer held to
-/// the result ceiling — after a written event's description is cut to fit it.
-fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
+/// the result ceiling.
+fn settle(decided: Result<Next, Failure>) -> Next {
     match decided {
-        Ok(Next::Complete(value)) => {
-            let (value, hint) = match tool {
-                Provided::CalendarCreate | Provided::CalendarUpdate => {
-                    (fit_text(value, "description", COMPACT_RESULT_CEILING), None)
-                }
-                Provided::CalendarDelete => (value, None),
-            };
-            bounded(value, COMPACT_RESULT_CEILING, hint)
-        }
+        Ok(Next::Complete(value)) => bounded(value, COMPACT_RESULT_CEILING, None),
         Ok(next) => next,
         Err(failure) => Next::Fail(failure),
     }
@@ -701,7 +717,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use brenn_google_workspace::args::{
-        ACCOUNT_MAX_CHARS, HOST_ARGS_CAP_BYTES, MAX_CHARS_DEFAULT, printable_ascii_pattern,
+        ACCOUNT_MAX_CHARS, HOST_ARGS_CAP_BYTES, printable_ascii_pattern,
     };
     use brenn_google_workspace::calendar::{
         CALENDAR_ID_MAX_CHARS, EVENT_ID_MAX_CHARS, TIME_MAX_CHARS, calendar_id_pattern,
@@ -711,7 +727,7 @@ mod tests {
         EVENT, EVENT_ID, admits_characters, calendar_id_probes, completed, cut_read, description,
         escaped_widest, event_with, follow, four_byte, lookup, no_body_parts,
     };
-    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body};
+    use brenn_provider_kit::testutil::{MemoryHost, failure, google, http, nested};
     use brenn_provider_kit::{
         Bound, Probes, QueryValue, ToolBounds, check, cut, hold_probes, hold_required,
         input_schema, internal, probes,
@@ -734,20 +750,10 @@ mod tests {
         advance(state, outcome, &settings())
     }
 
-    /// `body` compacted as the event `EVENT_ID`, its description cut at
-    /// `written_event_max_chars`, which the shared crate's tests hold to a
-    /// `CalendarEvent` read's default.
+    /// `body` compacted as the event `EVENT_ID`, without its description.
     fn read_event(body: &str) -> Next {
         let body: Value = serde_json::from_str(body).unwrap();
-        Next::Complete(
-            compact_event(
-                &body,
-                "events.get",
-                Some(EVENT_ID),
-                written_event_max_chars(),
-            )
-            .unwrap(),
-        )
+        Next::Complete(compact_event(&body, "events.get", Some(EVENT_ID), None).unwrap())
     }
 
     /// An event's start and end, timed, in one zone.
@@ -816,9 +822,52 @@ mod tests {
         write_state(Provided::CalendarUpdate, args)
     }
 
-    /// A call's JSON body.
-    fn json_body(call: &ApiCall) -> Value {
-        serde_json::from_str(text_body(call)).unwrap()
+    /// The queued first call of `tool` on `args`, as the kit hands it to
+    /// `Logic::body`.
+    fn queued(tool: Provided, args: &Value) -> Queued<Provided> {
+        Queued {
+            id: "r000".to_string(),
+            tool,
+            args: args.clone(),
+            derived: Map::new(),
+            call: plan(tool, args, &settings()).unwrap(),
+            received_at_ms: 0,
+            queued_at_ms: 0,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// The body `Logic::body` builds for `queued`: its content type and
+    /// bytes.
+    fn built(queued: &Queued<Provided>) -> Result<(String, Vec<u8>), Failure> {
+        let host = MemoryHost::new();
+        let step = Step::planning(&host, "r000", Vec::new());
+        let blob = CalendarWrites::body(queued, &step, &settings())?;
+        let mut bytes = Vec::new();
+        for piece in step.pieces(&blob) {
+            bytes.extend(piece.unwrap());
+        }
+        Ok((blob.content_type().to_string(), bytes))
+    }
+
+    /// The event `tool`'s first call on `args` sends: a built body of
+    /// `application/json`, as JSON.
+    fn sent(tool: Provided, args: &Value) -> Value {
+        let queued = queued(tool, args);
+        assert_eq!(queued.call.api.body, Some(Body::Built));
+        let (content_type, bytes) = built(&queued).unwrap();
+        assert_eq!(content_type, "application/json");
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The event `CalendarCreate` sends for `args`.
+    fn create_sent(args: Value) -> Value {
+        sent(Provided::CalendarCreate, &args)
+    }
+
+    /// The event `CalendarUpdate` sends for `args`.
+    fn update_sent(args: Value) -> Value {
+        sent(Provided::CalendarUpdate, &args)
     }
 
     /// The paths of every `null` in `value`.
@@ -838,19 +887,19 @@ mod tests {
         }
     }
 
-    /// An event write's query: `notify`'s word, then the read's mask.
+    /// An event write's query: `notify`'s word, then the write's mask.
     fn event_write_query_with(notify: &str) -> Query {
         query([
             ("sendUpdates", notify.to_string()),
             ("maxAttendees", "50".to_string()),
-            ("fields", EVENT_GET_FIELDS.to_string()),
+            ("fields", EVENT_WRITE_FIELDS.to_string()),
             ("prettyPrint", "false".to_string()),
         ])
     }
 
     #[test]
     fn a_create_posts_only_the_fields_given_with_send_updates() {
-        let call = create(create_args(json!({
+        let args = create_args(json!({
             "calendar": "team@group.calendar.example.com",
             "description": "Agenda",
             "location": "Room 4",
@@ -858,8 +907,8 @@ mod tests {
             "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
             "notify": "externalOnly",
             "account": "alice@example.com",
-        })))
-        .unwrap();
+        }));
+        let call = create(args.clone()).unwrap();
         assert_eq!(
             call,
             ApiCall {
@@ -870,12 +919,12 @@ mod tests {
                 path: "/calendar/v3/calendars/team@group.calendar.example.com/events".to_string(),
                 query: event_write_query_with("externalOnly"),
                 headers: BTreeMap::new(),
-                body: call.body.clone(),
+                body: Some(Body::Built),
                 response_attachment: None,
             }
         );
         assert_eq!(
-            json_body(&call),
+            create_sent(args),
             json!({
                 "summary": "Lunch",
                 "description": "Agenda",
@@ -888,10 +937,11 @@ mod tests {
         );
         // The fewest arguments: only those fields, on `primary`, and
         // `sendUpdates=none` sent although nobody was named.
-        let call = create(json!({ "summary": "Lunch", "start": START, "end": END })).unwrap();
+        let fewest = json!({ "summary": "Lunch", "start": START, "end": END });
+        let call = create(fewest.clone()).unwrap();
         assert_eq!(call.path, "/calendar/v3/calendars/primary/events");
         assert_eq!(call.query, event_write_query_with("none"));
-        let body = json_body(&call);
+        let body = create_sent(fewest);
         assert_eq!(
             body,
             json!({
@@ -938,7 +988,7 @@ mod tests {
             assert_eq!(call.method, "PATCH");
             assert_eq!(call.path, "/calendar/v3/calendars/primary/events/e1");
             assert_eq!(call.query, event_write_query_with("none"));
-            let body = json_body(&call);
+            let body = update_sent(args.clone());
             let keys: BTreeSet<&str> = body
                 .as_object()
                 .unwrap()
@@ -956,7 +1006,7 @@ mod tests {
             assert_eq!(found, expected_nulls, "{args}");
         }
         assert_eq!(
-            json_body(&update(update_args(json!({}))).unwrap()),
+            update_sent(update_args(json!({}))),
             json!({
                 "start": { "dateTime": START, "date": null, "timeZone": ZONE },
                 "end": { "dateTime": END, "date": null, "timeZone": ZONE },
@@ -982,16 +1032,16 @@ mod tests {
         }
         let all_day = json!({ "start": "2026-11-02", "end": "2026-11-03" });
         // A create sends the date alone, `time_zone` beside it when given.
-        let body = json_body(&create(over(json!({ "summary": "Trip" }), all_day.clone())).unwrap());
+        let body = create_sent(over(json!({ "summary": "Trip" }), all_day.clone()));
         assert_eq!(body["start"], json!({ "date": "2026-11-02" }));
         assert_eq!(body["end"], json!({ "date": "2026-11-03" }));
-        let body = json_body(&create(create_args(all_day.clone())).unwrap());
+        let body = create_sent(create_args(all_day.clone()));
         assert_eq!(
             body["start"],
             json!({ "date": "2026-11-02", "timeZone": ZONE })
         );
         // An update clears the other kind, so an event moves between them.
-        let body = json_body(&update(over(json!({ "id": "e1" }), all_day)).unwrap());
+        let body = update_sent(over(json!({ "id": "e1" }), all_day));
         assert_eq!(
             body["start"],
             json!({ "date": "2026-11-02", "dateTime": null })
@@ -1000,7 +1050,7 @@ mod tests {
             body["end"],
             json!({ "date": "2026-11-03", "dateTime": null })
         );
-        let body = json_body(&update(json!({ "id": "e1", "start": START, "end": END })).unwrap());
+        let body = update_sent(json!({ "id": "e1", "start": START, "end": END }));
         assert_eq!(body["start"], json!({ "dateTime": START, "date": null }));
     }
 
@@ -1071,8 +1121,10 @@ mod tests {
             assert_eq!(update(args.clone()).unwrap_err(), refusal, "{args}");
         }
         // An empty list is a change: every attendee removed.
-        let call = update(json!({ "id": "e1", "attendees": [] })).unwrap();
-        assert_eq!(json_body(&call), json!({ "attendees": [] }));
+        assert_eq!(
+            update_sent(json!({ "id": "e1", "attendees": [] })),
+            json!({ "attendees": [] })
+        );
     }
 
     #[test]
@@ -1189,25 +1241,45 @@ mod tests {
     }
 
     #[test]
-    fn a_written_events_description_is_cut_as_an_events_read_cuts_it() {
-        let whole = usize::try_from(MAX_CHARS_DEFAULT).unwrap() + 1;
-        let body = event_with(json!({ "description": "d".repeat(whole) }));
-        let read = read_event(&body);
-        let answer = completed(read.clone());
-        assert_eq!(answer["description"], json!("d".repeat(whole - 1)));
-        assert_eq!(answer["description_truncated"], json!(true));
-        assert_eq!(answer["description_chars"], json!(whole));
+    fn a_written_events_answer_carries_no_description() {
+        let body = event_with(json!({ "description": "d".repeat(EVENT_DESCRIPTION_MAX_CHARS) }));
         for state in [
             create_state(create_args(json!({}))),
             update_state(update_args(json!({ "id": EVENT_ID }))),
         ] {
-            assert_eq!(
-                answered(&state, http(200, &body)),
-                read,
-                "{}",
-                state.tool.name()
-            );
+            let name = state.tool.name();
+            let answer = completed(answered(&state, http(200, &body)));
+            for key in ["description", "description_chars", "description_truncated"] {
+                assert_eq!(answer.get(key), None, "{name}: {key}");
+            }
+            assert_eq!(answer["id"], json!(EVENT_ID), "{name}");
         }
+    }
+
+    #[test]
+    fn a_writes_body_is_built_from_its_stored_arguments() {
+        // A row whose arguments no longer parse is not one this build wrote.
+        let mut stale = queued(Provided::CalendarUpdate, &update_args(json!({})));
+        stale.args = json!({ "id": "e1" });
+        assert_eq!(
+            built(&stale),
+            Err(internal(
+                "stored calendar-update arguments no longer parse: `CalendarUpdate` changes \
+                 nothing: name a field"
+            ))
+        );
+        // The delete's steps carry no body.
+        let delete = queued(Provided::CalendarDelete, &json!({ "id": "e1" }));
+        assert_eq!(
+            built(&delete),
+            Err(no_such_step(Provided::CalendarDelete, DELETE_READ_STEP))
+        );
+        let mut at_delete = delete;
+        at_delete.call.step = DELETE_STEP;
+        assert_eq!(
+            built(&at_delete),
+            Err(no_such_step(Provided::CalendarDelete, DELETE_STEP))
+        );
     }
 
     #[test]
@@ -1708,6 +1780,18 @@ mod tests {
     #[test]
     fn argument_caps_count_characters_not_bytes() {
         admits_characters(create, create_args(json!({})), "account", ACCOUNT_MAX_CHARS);
+        admits_characters(
+            create,
+            create_args(json!({})),
+            "description",
+            EVENT_DESCRIPTION_MAX_CHARS,
+        );
+        admits_characters(
+            update,
+            update_args(json!({})),
+            "description",
+            EVENT_DESCRIPTION_MAX_CHARS,
+        );
     }
 
     /// Every argument `tool` takes, with the bound its parser holds it to,
@@ -1922,11 +2006,17 @@ mod tests {
     #[test]
     fn every_description_states_its_parsers_budgets() {
         let spec = spec_text();
+        let description_bound = format!("`description` at most {EVENT_DESCRIPTION_MAX_CHARS}.");
+        let answered_without = "without its `description`".to_string();
         for (tool, budget) in [
             (Provided::CalendarCreate, attendees_budget(1)),
             (Provided::CalendarUpdate, attendees_budget(0)),
             (Provided::CalendarCreate, recurrence_bound()),
             (Provided::CalendarUpdate, recurrence_bound()),
+            (Provided::CalendarCreate, description_bound.clone()),
+            (Provided::CalendarUpdate, description_bound),
+            (Provided::CalendarCreate, answered_without.clone()),
+            (Provided::CalendarUpdate, answered_without),
         ] {
             assert!(
                 description(&spec, tool.name()).contains(&budget),

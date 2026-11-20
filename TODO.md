@@ -69,6 +69,63 @@ under the full parallel `make check`; a retry is not a fix. Code site
 (`TODO(blob-restart-test-flaky-under-load)`): the usage assertion in
 `assert_nothing_outlives`.
 
+## `calendar-write-blob-body-unconfirmed-against-live-google`
+
+`CalendarCreate` and `CalendarUpdate` admit a description of up to 8,000
+characters and no longer ask Google for the description back: their
+`fields` mask leaves it out. The event's bytes and headers reach Google as
+before, and the form is proven against a stub that records bytes; no run has
+reached Google. Unconfirmed: that Google stores a description of that length
+whole, and that it answers the masked write as the stub does. Done when one
+event is created and one updated, each with a description near the bound,
+through a deployed brenn against a real account and read back whole with
+`CalendarEvent`, or the bound or the mask is corrected to what Google takes.
+The comment sits at `event_write_query` in
+`brenn-wasm/components/google-calendar-write/src/logic.rs`.
+
+## `calendar-write-bounds-set-by-guest-fuel`
+
+`CalendarCreate` and `CalendarUpdate` send the event as a blob body the
+component builds, so the 64 KiB arguments cap no longer bounds an event's
+fields. Its description is bounded at 8,000 characters, which fuel sets under
+the host's fixed guest limits and not Google. Measured on the real host
+under production limits, every other field at its widest, least completing
+grant by bisection to 50,000 fuel, as shares of the production grant at the
+bound for the window new (a create, an update and a delete in one
+activation), the window settling, five late answers to ended updates, the
+window new over five ended updates' rows, and the window new beside five
+late answers: U+0001 0.172, 0.204, 0.137, 0.263, 0.196; `"` 0.174, 0.210,
+0.120, 0.257, 0.186; `\` 0.175, 0.210, 0.120, 0.257, 0.186; line feeds
+0.183, 0.211, 0.120, 0.266, 0.190; U+1D11E 0.165, 0.182, 0.102, 0.209,
+0.165; ASCII 0.131, 0.185, 0.097, 0.175, 0.146. The activation that binds is
+the window new over five ended rows, with line feeds: 19.5M of a 73.3M
+grant, against the margin of 19/28. Five ended rows is the count measured
+and nothing bounds the count: one such row adds 1.66M fuel (U+0001), 1.21M
+(`"`, `\`), 1.22M (line feeds), 0.73M (U+1D11E) or 0.60M (ASCII) to every
+activation until its answer comes or 420 s pass. The margin absorbs, in that
+order of contents, 22, 25, 25, 24, 52 and 57 more over the window new; 49,
+61, 61, 60, 112 and 130 beside the late answers; and 15, 22, 22, 22, 41 and
+50 over one small create, the least room, because a small request's bytes
+bring nothing above the grant's 50M floor (U+0001: 8.4M of a 50.1M grant).
+`kit-sweep-decodes-expired-backlog-rows-unbudgeted` is what would bound it. 8,000 is a cap chosen by the owner's proxy and not a
+measured ceiling: nothing above it was measured. Raising it takes the same
+measurement at the raised bound, and the unpaid pass over ended requests'
+rows bounded first. Its attendees stay at 8,000 bytes together and its
+recurrence at five lines of 500 characters, figures first derived from the
+arguments cap and kept unmeasured: what they cost at higher caps was last
+measured before a request's body bytes brought fuel and while a late answer
+to an ended request was still decoded, when two settles at 50 addresses of
+320 characters and 20 lines of 1,000 cost 62.2M fuel with no description,
+and has not been measured since. Lifting any of the three waits on a
+measurement of the widest event at the raised caps under the margin, on the
+kit's in-flight row storing only what a settle needs, or on
+`guest-memory-and-fuel-fixed-constants`. Done = the description bounded by
+Google's own limit or by the instance's blob limits, and the attendee and
+recurrence caps measured and raised to what the margin holds, each with a
+real-host test at the bound; or a recorded decision that they stay. The
+comments sit at the description, attendee and recurrence constants in
+`brenn-wasm/components/google-calendar-write/src/logic.rs`.
+
 ## `chrono-unmaintained`
 
 RustSec lists `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555)
@@ -94,7 +151,9 @@ build after it in that activation fails too, and four such failures with
 nothing outstanding answer the backlog unattempted. `GmailDraft` returns
 `Body::Built` and bounds its files at 10,485,760 bytes together so that its
 widest message is under a quarter of the bound and four builds stay inside
-it; a component whose body can pass a quarter of the bound meets this. A
+it; `google-calendar-write` also returns `Body::Built`, its widest event
+under 76,000 bytes, far inside a quarter of the bound; a component whose
+body can pass a quarter of the bound meets this. A
 refusal cannot be told from
 any other failed build today (`blob-append-finish-erases-write-error`).
 Decide how the kit holds a build the activation's remaining write bound
@@ -176,37 +235,6 @@ does not answer body text by reference, and the note removed. The comment
 sits in `GmailBody`'s body reader in
 `brenn-wasm/components/google-gmail-read/src/logic.rs`.
 
-## `gmail-draft-late-answers-over-fuel-margin`
-
-Five late answers to the widest `GmailDraft` reply's read of its original,
-settled in one activation, do not complete inside the test margin: each
-settle decodes the in-flight row, which holds the caller's arguments whole,
-and parses those arguments again before the kit drops the upload for a
-request that has ended, and Google's answer brings no fuel for them.
-Measured on the real host under production limits, the row carrying five
-files under the longest names and content types, least completing grant by
-bisection to 50,000 fuel, at a body of 10,000 and then 20,000 bytes. The
-read step's activation is handed 7 envelopes on a grant of 72,000,640, the
-margin's share of it 48.9M: U+0001 26.1M (0.362) and 49.8M (0.692); `"` and
-`\` each 17.7M (0.246) and 33.1M (0.460); U+1D11E 6.05M (0.084) and 9.81M
-(0.136); line feeds 10.1M (0.140) and 17.9M (0.249). Base, slope a body byte
-and the body at which the margin is met, a straight line through the two
-points: U+0001 2.29M, 2,376.6, about 19,600 bytes; `"` and `\` 2.32M,
-1,539.9, about 30,200; U+1D11E 2.29M, 376.2, about 123,800; line feeds
-2.25M, 784.0, about 59,400. So U+0001 at the bound is over the margin, and
-completes on the whole grant. The upload step's activation, which only
-decodes the row, holds the margin: 12 envelopes on 120,577,280, the
-margin's share 81.8M; U+0001 22.0M (0.182) and 42.0M (0.348); `"` and `\`
-13.6M (0.113) and 25.3M (0.210); U+1D11E 3.47M (0.029) and 5.00M (0.042);
-line feeds 7.77M (0.064) and 13.6M (0.113); base, slope and limit U+0001
-1.94M, 2,001.8, about 39,900; `"` and `\` 1.91M, 1,168.7, about 68,400;
-U+1D11E 1.94M, 153.1, about 521,800; line feeds 1.94M, 582.9, about
-137,000. Done when that activation holds the margin under test — the row
-trimmed to what a settle reads, a late answer to an ended request no longer
-advanced, or the body bound lowered — or a recorded decision that the risk
-stands. The comment sits at `BODY_MAX_BYTES` in
-`brenn-wasm/components/google-gmail-compose/src/logic.rs`.
-
 ## `gmail-draft-upload-unconfirmed-against-live-google`
 
 `GmailDraft` creates its draft by uploading the message it builds to Gmail's
@@ -219,69 +247,6 @@ name and type. Done when one new draft and one reply draft, each with a file,
 are created through a deployed brenn against a real account and read back, or
 the form is corrected to what Google takes. The comment sits at the upload
 call in `brenn-wasm/components/google-gmail-compose/src/logic.rs`.
-
-## `google-write-bodies-in-call-arguments`
-
-`CalendarCreate` and `CalendarUpdate` (`google-calendar-write`) send the body
-they build as text inside their nested call's arguments, so their bounds are
-derived from the 64 KiB arguments cap and not from Google: an event's
-description at 2,000 characters, its attendees at 8,000 bytes together, five
-recurrence lines of 500 characters. The provider kit has the form that
-would lift them, a body the component builds and sends as a blob
-(`Body::Built`). The move was built and measured for the calendar writes and
-not made. Measured on the real host under production limits, the component
-sending its body as a blob, the write not asking Google for the description
-back, `summary` and `location` at 1,000 four-byte characters, 50 attendees of
-40 four-byte characters and five recurrence lines of 500, least completing
-grant by bisection to 50,000 fuel: two writes new in one activation cost 6.5M
-fuel with a four-byte description and, at 65,536 bytes of description, 15.2M
-in ASCII, 17.5M in four-byte characters, 46.0M in `"` and 67.0M in U+0001;
-those two writes' answers settled in one activation cost 12.9M and then 15.0M,
-17.3M, 43.9M and 65.8M. Per step and per byte of description that is about 66,
-84, 301 and 462 fuel for a build and 16, 34, 237 and 404 for a settle. One
-activation on the 50M floor can be handed three writes and two late answers,
-or five late answers, and a bound holds where that activation completes on 95
-% of the floor ÷ 1.4, about 33.9M: five settles already take 32.2M with next
-to no description, which by the slopes leaves room for about 800 bytes of
-U+0001 or 1,400 of `"` — an estimate, and below the 2,000 characters accepted
-today. That estimate understates the grant: a late answer arrives with its
-ended request as a context envelope, which the envelope term counts.
-`GmailDraft`'s activation settling five late answers was measured at twelve
-envelopes on a grant of 120,577,280 for late answers to its upload, and at
-seven envelopes on 72,000,640 for late answers to a reply's read of its
-original, not on the 50M floor. That measurement is `GmailDraft`'s: the
-calendar writes' activation settling five late answers with the body sent as
-a blob was not measured with it, and the 146.5M grant given below is today's
-component's, whose answer echoes the description. So that activation's
-envelope count and grant are to be measured before the estimate is relied
-on; the room the estimate gives for a description is correspondingly larger
-than stated. With `attendees` bounded only at 50 addresses of 320 characters and
-`recurrence` at the read's 20 lines of 1,000, two settles cost 62.2M before
-any description, more than the whole floor. These figures predate the body
-term.
-Three findings. A request's body bytes now bring fuel, 256 a byte, in the
-activation the request arrives in and in every later activation of the
-provider while the host holds the request pending, and the kit builds no body
-for a request that has ended, so a body built from a request's arguments is
-paid for wherever it is built. What no term pays for is the settle of a late
-answer — the decode of the in-flight row of a request the host has given up,
-for which only the answer's own bytes bring fuel — and bodies past the term's
-cap. Today's component, its description in its arguments and echoed in
-Google's answer, settles five late answers to the widest `CalendarUpdate` with
-a description of 2,000 U+0001 in one activation on about 55.1M of a 146.5M
-grant, inside the margin, because the echo's bytes bring fuel in proportion;
-an answer that does not echo the arguments would leave that decode on the
-envelope term. A settle costs about what
-a build does, because the kit's in-flight row holds the caller's arguments
-whole and every answer decodes it, and `CalendarUpdate`'s settle parses them
-again for the event id; storing only what a settle needs is the second lever
-if fuel alone does not reach a bound worth having. And a write asks Google for
-the event back with its description, inline, so a longer description needs
-that field out of the write's mask or the answer read as a blob. Done =
-`google-calendar-write` sends its bodies as blobs with bounds that are
-Google's or are measured above today's, each with a test at the bound; or a
-recorded decision that they stay. The comment sits at `EVENT_FIELD_MAX_CHARS`
-in `brenn-wasm/components/google-calendar-write/src/logic.rs`.
 
 ## `guest-memory-and-fuel-fixed-constants`
 
@@ -1212,37 +1177,6 @@ the head of `messaging_virtual_tools` in `brenn-lib/src/integration.rs`.
 Done = no messaging tool text directs an app without `MessagingPublish` to
 send to `brenn:`, with a test for an `EphemeralPublish`-only app over every
 messaging tool's description and schema.
-
-## `correctness-max-concurrency-one-does-not-bound-attachment-decodes-per-activation`
-
-The provider kit's `Run::answer` (`brenn-provider-kit/src/activation.rs`)
-stops advancing a request 240 s (`HOST_DEADLINE_MS`) after the activation
-that delivered it, but the host's deadline for the call counts from when
-the host takes it, before the call waits for the tool's permit
-(`ToolRegistry::invoke_for_llm`, the executor's `dequeued +
-PROVIDED_TOOL_CEILING`), and a nested provided call inherits the served
-call's deadline when that is earlier. An answer arriving between the
-host's deadline and the kit's cutoff is still advanced: a late
-`GmailAttachment` step 2 decodes up to 50 MB for nobody and can share an
-activation's 64 MiB write bound and fuel cap with a live request, failing
-it `internal`; a late `GmailDraft` step 1 parses the caller's arguments,
-body included, again after its caller has been answered, though the kit
-then drops the upload it would issue. Under `max_concurrency = 1` the window is
-the request's own permit wait. Closing it needs the host's deadline for a
-provided-tool request carried to the provider on the `provides` contract
-(or a way for a step to ask whether a request is still pending), and the
-kit's `answer` and backlog cutting on that instead of on `received_at_ms +
-HOST_DEADLINE_MS`. That is a WIT addition visible to out-of-tree
-providers; its shape (absolute deadline or remaining budget, and its
-relation to the activation's wall-clock `now`) needs a design.
-
-Code site
-(`TODO(correctness-max-concurrency-one-does-not-bound-attachment-decodes-per-activation)`):
-the age check in `Run::answer`.
-
-Done = no answer is advanced after the host has answered its caller, with
-a test that delivers a request whose host deadline started before its
-admission wait.
 
 ## `correctness-no-single-instance-guard-before-startup-side-effects`
 
@@ -5419,6 +5353,21 @@ a decision on each new field, as production constructors do, and move the rest o
 `..`. Done = a new `ResolvedChannel` field needs no edit outside production constructors, the
 shared test constructors and the tests that state it on purpose. Code site:
 `test_channel_entry` in `brenn-lib/src/messaging/test_support.rs`.
+
+## `quality-row-owner-fault-split-by-pendingness`
+
+`brenn-provider-kit`'s `Run::answer` faults a result whose call id is another request's in two
+ways with two messages. For a request the host no longer holds, `owned_call_id` reads the call
+id's text: "result {call_id} serves {id}, but its call id is not that request's". For a request
+it still holds, `claim` decodes the row and compares its `id`: "… but its in-flight row is
+{other}'s", and a mis-addressed result with no row under its call id is skipped as a duplicate.
+Which message an operator sees, and whether the fault fires at all, depends on whether the
+request ended before the answer came. Running `owned_call_id` for every result before the
+`pending` branch gives one message and makes the no-row case a fault on the live path too;
+`claim`'s check then covers only a row whose `id` disagrees with its own key, a corrupt store,
+and its message should say so. Done = one check and one message for a mis-addressed call id
+on both paths, with the kit's tests asserting it, or a recorded decision that the pending path
+keeps skipping. Code site: `Run::answer` in `brenn-provider-kit/src/activation.rs`.
 
 ## `webhook-replay-recorded-before-publish`
 

@@ -34,13 +34,13 @@
 /// grant, inside the 19/28 margin a component's bounds are held to.
 ///
 /// The body's bound, 20,000 bytes, is kept by choice: the body rides the
-/// request's in-flight row, which a late answer's settle decodes on the
-/// envelope term alone. Five late answers to the widest reply settled in one
-/// activation, with the costliest body, were measured at 0.348 of their
-/// grant for the upload and 0.692 for the read of the original, which also
-/// parses the arguments again; by the measured slopes the read's meets the
-/// margin at a body of about 19,600 bytes, so at this bound it is over the
-/// margin, though inside the grant.
+/// request's in-flight row, which a settle of a pending request decodes and
+/// that request's bytes pay for. A late answer, to a request the host has
+/// given up, is dropped unread; the sweep still passes over its row on the
+/// envelope term alone. Five late answers to the widest reply in one
+/// activation, with the costliest body, were measured at 0.116 of their
+/// grant for the upload and 0.195 for the read of the original, inside the
+/// margin.
 ///
 /// The instance's `config = { ... };` map is flat: `provider` is the
 /// `oauth_provider` name; `gmail_host` is the `host[:port]` Gmail is called

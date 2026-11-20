@@ -59,29 +59,24 @@ const BODY_MAX_CHARS: usize = 20_000;
 /// The most bytes a draft's body may hold in its CRLF form, a lone line break
 /// counting as the two bytes it becomes. The message is built as the upload's
 /// body, so the body is not under the host's cap on a nested call's
-/// arguments; it rides the request's in-flight row whole, which every settle
-/// of the row decodes, a late answer's included, on the envelope term alone.
-/// Measured on the real host, five late answers to the widest reply settled
-/// in one activation, the body of U+0001, the costliest content for both
-/// steps:
-/// - to the upload, the settle decodes the row: about 42.0M fuel of a 120.6M
-///   grant over 12 envelopes, 0.348 of it, at about 2,000 fuel a body byte,
-///   meeting the 19/28 margin at a body of about 39,900 bytes;
-/// - to the read of the original, the settle also parses the arguments again
-///   in `draft_reply`, and the kit drops the upload it returns: about 49.8M
-///   of a 72.0M grant over 7 envelopes, 0.692 of it, at about 2,380 fuel a
-///   body byte, meeting the margin at a body of about 19,600 bytes.
+/// arguments; it rides the request's in-flight row whole. A settle of a
+/// pending request decodes the row and is paid for by that request's body
+/// bytes. A late answer, to a request the host has given up, is dropped
+/// unread; what it still costs, on the envelope term alone, is the sweep's
+/// pass over the row and the answer's own parse. Measured on the real host,
+/// five late answers to the widest reply in one activation, the body of
+/// U+0001, the costliest content for both steps:
+/// - to the upload: about 14.0M fuel of a 120.6M grant over 12 envelopes,
+///   0.116 of it, at about 670 fuel a body byte, meeting the 19/28 margin at
+///   a body of about 121,000 bytes;
+/// - to the read of the original: about 14.0M of a 72.0M grant over 7
+///   envelopes, 0.195 of it, at about 670 fuel a body byte, meeting the
+///   margin at a body of about 71,900 bytes.
 ///
-/// The lower figure, about 19,600 bytes, is where a late-answer activation
-/// meets the margin: at this bound the read step's late answers are over it,
-/// though inside the grant. An activation settling late answers to both
-/// steps was not measured; it is bounded by five of the read step's, the
-/// costlier, and as the two steps' activations are granted differently, its
-/// share is taken as no higher than the read step's. The bound is kept at
-/// 20,000 by choice and not raised; before any rise the builds and both
+/// An activation with late answers to both steps was not measured; it is
+/// bounded by five of the read step's, the smaller grant. The bound is kept
+/// at 20,000 by choice and not raised; before any rise the builds and both
 /// steps' late answers would be measured at it.
-// TODO(gmail-draft-late-answers-over-fuel-margin): five late answers to the
-// widest reply's read settle over the margin at this bound.
 const BODY_MAX_BYTES: usize = 20_000;
 /// The most files a draft carries.
 const FILES_MAX: usize = 5;
@@ -361,12 +356,7 @@ fn upload_call(account: Option<&str>, reply: bool, settings: &Settings) -> ApiCa
 /// a time. Everything but the files comes from the caller's arguments and,
 /// for a reply, `derived`; a row this build did not write is `internal`.
 fn draft_message(call: &Queued<Provided>, step: &Step<'_>) -> Result<Blob, Failure> {
-    let args = DraftArgs::parse(&call.args).map_err(|reason| {
-        internal(format!(
-            "stored {} arguments no longer parse: {reason}",
-            call.tool.name()
-        ))
-    })?;
+    let args = call.stored(DraftArgs::parse)?;
     files(&call.attachments).map_err(|reason| {
         internal(format!(
             "stored {} attachments no longer pass: {reason}",

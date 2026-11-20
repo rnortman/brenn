@@ -152,6 +152,15 @@ forms whenever that answer is within its bound of 786,432 bytes. It is the
 sender's doing, not the operator's configuration, and mail is untrusted
 input.
 
+The cap bounds the calendar writes' requests too, each measured whole as it
+crosses the bus. `CalendarCreate` and `CalendarUpdate` take a description of
+up to 8,000 characters; at the default 64 KiB a description dense in
+characters JSON escapes (a control character takes six bytes) is refused
+above about 6,100 of them with every other field at its widest, so such a
+write needs the cap this section sets. A deployment that instead kept the
+default cap and lowered `max_response_bytes` has such a write refused
+`invalid_args`, the refusal naming the request's size and the cap.
+
 The cap also sizes what each result inbox can weigh: a full window is up to
 `retain_depth` × `max_body_bytes` before the component parses it — 32 ×
 384 KiB is 12 MiB for `gmail-read` and `calendar-read`, 16 × 384 KiB is
@@ -345,7 +354,7 @@ new calendar-read: GoogleCalendarRead {
 }
 
 new calendar-write: GoogleCalendarWrite {
-  grants = [log, store, config, tools, provides];
+  grants = [log, store, config, tools, provides, blobs];
   store_path = "/var/lib/brenn/google-calendar-write.db";
   tool api-request {
     allow { provider = "google"; user = "*"; method = "GET"; host = "www.googleapis.com"; path = "/calendar/v3/calendars/*/events/*"; }
@@ -492,6 +501,14 @@ must finish inside `api-request`'s 60 s bound on a whole request, body
 included (`TODO.md`, `api-request-transfer-time-bound`): a draft at the file
 bound needs about 2 Mbit/s to Google.
 
+**What a calendar write leaves in the blob pool.** Each `CalendarCreate` and
+`CalendarUpdate` builds the event it sends as a blob of at most about
+76,000 bytes, named by the nested call's row on `brenn:tools/api-request`
+until the bus GC pass that follows that row leaving its window. Nothing is
+built for a refused call, and a request's own bytes are not blobs. With
+every row of that window's default 16 a widest write, the instance adds about
+1.2 MB to the sum.
+
 **The clauses.** Each instance holds one clause per endpoint its own tools
 call, and nothing wider:
 
@@ -514,7 +531,8 @@ call, and nothing wider:
 - `calendar-write` — the `GET` of one event, which `CalendarDelete` reads
   first; the `POST` for `calendars/*/events`, which creates an event; the
   `PATCH` for `calendars/*/events/*`, which changes one; and the `DELETE` for
-  the same path, which deletes one.
+  the same path, which deletes one. The class requires `blobs`: it builds the
+  event a create or an update sends as the body of its `POST` or `PATCH`.
 
 Every method but `GET` is admitted only for a stamped call. Each write path is
 exact: a clause's path matches only a path with the same number of segments
@@ -703,8 +721,9 @@ labels may already be changed (asking again is safe). Neither component
 retries a write.
 
 The three Calendar writes answer what Google holds. `CalendarCreate` answers
-the new event as `CalendarEvent` does, with its new `id`; `CalendarUpdate`
-answers the event as Google holds it after the change, the same way. Times
+the new event as `CalendarEvent` does, without its `description`, with its
+new `id`; `CalendarUpdate` answers the event as Google holds it after the
+change, the same way; `CalendarEvent` reads the description back. Times
 are written as given: two `YYYY-MM-DD` dates make an all-day event (`end`
 the day after the last day), two RFC 3339 times with an offset a timed one;
 nothing is converted. An update changes only the fields named, `attendees`

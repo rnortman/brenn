@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::blob::Attached;
-use crate::call::Call;
-use crate::row::{InFlight, Tool, tool_name};
+use crate::call::{Call, Failure};
+use crate::row::{InFlight, Tool, reparse, tool_name};
 
 /// A queued request: everything its in-flight row needs, and the whole call,
 /// which has not been issued.
@@ -58,6 +58,12 @@ impl<T: Tool> Queued<T> {
     /// then the pending id. A request holds at most one entry.
     pub fn key(&self) -> String {
         format!("{:020}/{}", self.received_at_ms, self.id)
+    }
+
+    /// The entry's stored arguments, parsed again, as [`crate::stored`]
+    /// parses an in-flight row's: a failure is the component's, `internal`.
+    pub fn stored<A>(&self, parse: fn(&Value) -> Result<A, String>) -> Result<A, Failure> {
+        reparse(self.tool, &self.args, parse)
     }
 
     /// The in-flight row this request keeps once its call is issued at `now_ms`.
@@ -118,6 +124,26 @@ mod tests {
             queued_at_ms: received_at_ms + 500,
             attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_queued_rows_stored_arguments_parse_again_or_are_internal() {
+        fn parse_q(args: &Value) -> Result<String, String> {
+            args.get("q")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "`q` is required".to_string())
+        }
+        let mut row = queued(1_000, "a");
+        assert_eq!(row.stored(parse_q), Ok("x".to_string()));
+        row.args = json!({});
+        assert_eq!(
+            row.stored(parse_q),
+            Err(crate::testutil::failure(
+                crate::call::ErrorKind::Internal,
+                "stored fixture-search arguments no longer parse: `q` is required"
+            ))
+        );
     }
 
     #[test]

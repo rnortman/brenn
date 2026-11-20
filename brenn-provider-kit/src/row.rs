@@ -23,6 +23,22 @@ pub(crate) fn call_id(id: &str, step: u8) -> String {
     format!("{id}/{step}")
 }
 
+/// Whether `call_id` is one [`call_id`] writes for request `id`, read from
+/// its text alone. A result whose call id is another request's is a host
+/// fault.
+pub(crate) fn owned_call_id(id: &str, call_id: &str) -> Result<(), String> {
+    let step = call_id
+        .strip_prefix(id)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|step| step.parse::<u8>().ok());
+    match step {
+        Some(step) if self::call_id(id, step) == call_id => Ok(()),
+        _ => Err(format!(
+            "result {call_id} serves {id}, but its call id is not that request's"
+        )),
+    }
+}
+
 /// A request's row. Its JSON names the tool by registry name, so a row
 /// outlives a reordering of the enum but not a renamed or removed tool.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -156,10 +172,19 @@ pub fn stored<T: Tool, A>(
     state: &InFlight<T>,
     parse: fn(&Value) -> Result<A, String>,
 ) -> Result<A, Failure> {
-    parse(&state.args).map_err(|reason| {
+    reparse(state.tool, &state.args, parse)
+}
+
+/// `tool`'s stored `args`, parsed again; a failure is `internal`.
+pub(crate) fn reparse<T: Tool, A>(
+    tool: T,
+    args: &Value,
+    parse: fn(&Value) -> Result<A, String>,
+) -> Result<A, Failure> {
+    parse(args).map_err(|reason| {
         internal(format!(
             "stored {} arguments no longer parse: {reason}",
-            state.tool.name()
+            tool.name()
         ))
     })
 }
@@ -418,6 +443,31 @@ mod tests {
                 "a".repeat(32)
             ))
         );
+    }
+
+    #[test]
+    fn a_call_id_is_its_requests_only_as_call_id_writes_it() {
+        assert_eq!(owned_call_id("r000", "r000/1"), Ok(()));
+        assert_eq!(owned_call_id("r000", "r000/255"), Ok(()));
+        for (id, call_id) in [
+            ("r000", "r001/1"),
+            ("r00", "r000/1"),
+            ("r000", "r000"),
+            ("r000", "r000/"),
+            ("r000", "r000/x"),
+            ("r000", "r000/256"),
+            ("r000", "r000/+1"),
+            ("r000", "r000/01"),
+            ("r000", "r000/1/2"),
+        ] {
+            assert_eq!(
+                owned_call_id(id, call_id),
+                Err(format!(
+                    "result {call_id} serves {id}, but its call id is not that request's"
+                )),
+                "{call_id}"
+            );
+        }
     }
 
     fn parse_q(args: &Value) -> Result<String, String> {

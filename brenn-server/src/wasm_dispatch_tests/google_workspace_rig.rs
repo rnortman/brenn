@@ -42,6 +42,12 @@ pub(super) struct GoogleClass {
 /// The grants of a class that handles no attachments.
 const PROVIDER_GRANTS: &str = "log, store, config, tools, provides";
 
+/// The grants of a class that handles attachments or builds its bodies.
+pub(super) const BLOB_PROVIDER_GRANTS: &str = "log, store, config, tools, provides, blobs";
+
+/// The bus cap the deployer guide sets, `[messaging] max_body_bytes`.
+pub(super) const GUIDE_BUS_CAP: usize = 393_216;
+
 pub(super) const GMAIL_READ: GoogleClass = GoogleClass {
     wasm: concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -54,7 +60,7 @@ pub(super) const GMAIL_READ: GoogleClass = GoogleClass {
     class: "GoogleGmailRead",
     slug: "gmail-read",
     host_key: "gmail_host",
-    grants: "log, store, config, tools, provides, blobs",
+    grants: BLOB_PROVIDER_GRANTS,
 };
 
 pub(super) const GMAIL_COMPOSE: GoogleClass = GoogleClass {
@@ -69,7 +75,7 @@ pub(super) const GMAIL_COMPOSE: GoogleClass = GoogleClass {
     class: "GoogleGmailCompose",
     slug: "gmail-compose",
     host_key: "gmail_host",
-    grants: "log, store, config, tools, provides, blobs",
+    grants: BLOB_PROVIDER_GRANTS,
 };
 
 pub(super) const GMAIL_ORGANIZE: GoogleClass = GoogleClass {
@@ -114,7 +120,7 @@ pub(super) const CALENDAR_WRITE: GoogleClass = GoogleClass {
     class: "GoogleCalendarWrite",
     slug: "calendar-write",
     host_key: "calendar_host",
-    grants: PROVIDER_GRANTS,
+    grants: BLOB_PROVIDER_GRANTS,
 };
 
 /// The component that calls a provided tool on its own account.

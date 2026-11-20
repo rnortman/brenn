@@ -329,6 +329,48 @@ where
     hi
 }
 
+/// The least grant `run` completes on, to within [`PRECISION`], given the
+/// production grant it completes on.
+pub(super) async fn least_under<F, Fut>(grant: u64, run: F) -> u64
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    narrow(0, grant, PRECISION, &|fuel| {
+        let completed = run(fuel);
+        async move { (completed.await, 0) }
+    })
+    .await
+}
+
+/// Run `measure` on every one of `inputs`, `at_once` at a time; the results
+/// in the inputs' order.
+pub(super) async fn measure_all<I, O, F, Fut>(inputs: Vec<I>, at_once: usize, measure: F) -> Vec<O>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: Fn(I) -> Fut,
+    Fut: std::future::Future<Output = O> + Send + 'static,
+{
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(at_once));
+    let tasks: Vec<_> = inputs
+        .into_iter()
+        .map(|input| {
+            let permits = permits.clone();
+            let run = measure(input);
+            tokio::spawn(async move {
+                let _permit = permits.acquire_owned().await.unwrap();
+                run.await
+            })
+        })
+        .collect();
+    let mut out = Vec::new();
+    for task in tasks {
+        out.push(task.await.expect("a measured cell"));
+    }
+    out
+}
+
 /// One slope: the least grants at the two sizes, their body bytes, and the
 /// fuel a byte between them.
 async fn slope<F, Fut>(label: String, run: F) -> f64

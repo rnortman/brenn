@@ -3,15 +3,19 @@
 
 use std::sync::Arc;
 
-use brenn_tool_registry::{HeldAttachments, ToolError};
+use brenn_messaging::testutils::owed_everywhere;
+use brenn_tool_registry::{HeldAttachments, ToolError, ToolOutput};
 use brenn_wasm_dispatch::ActivationLimits;
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 
 use super::google_workspace_rig::{
-    self as workspace, ACCOUNT, BEARER, CALENDAR_WRITE, Clauses, FirstRead, google_query,
+    self as workspace, ACCOUNT, BEARER, CALENDAR_WRITE, Clauses, FirstRead, GUIDE_BUS_CAP,
+    RigOptions, google_query,
 };
-use super::kit_body_fuel_measure::{least, narrow};
-use super::provider_rig::{MARGIN, fuel};
+use super::kit_body_fuel_measure::{least_under, measure_all};
+use super::kit_file_e2e::BUILD_BUDGET;
+use super::provider_rig::{MARGIN, fuel, margin_of};
 use super::stub_rig::{Pairs, StubRig};
 
 const PRIMARY_EVENTS: &str = "/calendar/v3/calendars/primary/events";
@@ -76,15 +80,16 @@ async fn a_userless_caller_is_denied_with_the_reason() {
     }
 }
 
-/// The query an event write sends: whom Google notifies, and the events.get
-/// mask so the answer is the event as `CalendarEvent` reads it.
+/// The query an event write sends: whom Google notifies, and the write's
+/// mask, so the answer is the event as `CalendarEvent` reads it, without its
+/// description.
 fn event_write_query(notify: &str) -> Pairs {
     google_query(&[
         ("sendUpdates", notify),
         ("maxAttendees", "50"),
         (
             "fields",
-            "id,status,summary,description,location,start,end,\
+            "id,status,summary,location,start,end,\
              organizer(email,displayName,self),\
              attendees(email,displayName,responseStatus,optional,self),\
              attendeesOmitted,recurrence,recurringEventId,hangoutLink,\
@@ -93,10 +98,18 @@ fn event_write_query(notify: &str) -> Pairs {
     ])
 }
 
-/// The one body the stub received, as JSON.
+/// The one body the stub received, the event the component built, as JSON;
+/// it was sent as `application/json`.
 fn the_body(r: &StubRig) -> serde_json::Value {
     let bodies = r.bodies();
     assert_eq!(bodies.len(), 1, "exactly one request carried a body");
+    let stub = r.stub.lock().unwrap();
+    let sent = stub
+        .api_seen
+        .iter()
+        .find(|seen| !seen.body.is_empty())
+        .unwrap();
+    assert_eq!(sent.headers["content-type"], "application/json");
     serde_json::from_slice(&bodies[0]).unwrap()
 }
 
@@ -172,7 +185,8 @@ async fn calendar_create_posts_one_insert_with_send_updates_none() {
 
 /// `CalendarUpdate` sends one `PATCH` of the event on the named calendar
 /// whose body holds only the fields named, a given time complete with the
-/// other kind's key `null`, and answers the event as Google holds it.
+/// other kind's key `null`, and answers the event as Google holds it,
+/// without a description even where Google's answer carries one.
 #[tokio::test]
 async fn calendar_update_patches_only_the_named_fields() {
     let path = "/calendar/v3/calendars/team@example.com/events/e1";
@@ -207,8 +221,6 @@ async fn calendar_update_patches_only_the_named_fields() {
         json!({
             "id": "e1",
             "summary": "Offsite",
-            "description": "Bring a laptop",
-            "description_chars": 14,
             "start": { "date": "2026-11-05" },
             "end": { "date": "2026-11-07" },
             "status": "confirmed",
@@ -336,10 +348,22 @@ async fn calendar_delete_refuses_a_series_without_the_flag() {
     r.assert_finished(&id);
 }
 
-/// How many late answers the measured activation settles.
+/// How many ended requests' rows, or late answers, the measured activations
+/// carry.
 const LATE_ANSWERS: usize = 5;
-/// The most characters `CalendarUpdate` admits in `description`.
-const DESCRIPTION_CHARS: usize = 2_000;
+/// The most characters `CalendarCreate` and `CalendarUpdate` admit in
+/// `description`.
+const DESCRIPTION_MAX_CHARS: usize = 8_000;
+/// The description bounds measured.
+const RUNGS: [usize; 2] = [4_000, 8_000];
+/// The calendar every widest write names: four-byte characters.
+fn widest_calendar() -> String {
+    four_byte(0, 320)
+}
+/// The event every widest update and delete names.
+fn widest_id() -> String {
+    "e".repeat(1024)
+}
 
 /// `n` characters of four UTF-8 bytes, the first naming `i` so that strings
 /// built for different `i` differ.
@@ -350,19 +374,30 @@ fn four_byte(i: usize, n: usize) -> String {
         .collect()
 }
 
+/// `chars` characters of `unit`, after one `a` when `unit` is whitespace,
+/// which alone would be refused as blank.
+fn description(unit: char, chars: usize) -> String {
+    if unit.is_whitespace() {
+        std::iter::once('a')
+            .chain(std::iter::repeat_n(unit, chars - 1))
+            .collect()
+    } else {
+        unit.to_string().repeat(chars)
+    }
+}
+
 /// `CalendarUpdate`'s arguments with every field at the bound the component
 /// admits, each at its widest serialized form, and `description` the
-/// [`DESCRIPTION_CHARS`] characters of `unit`. `account` names alice's
+/// [`description`] of `chars` characters of `unit`, or none for `None`. `account` names alice's
 /// connected account, the one value that reaches Google.
-fn widest_update(unit: char) -> Value {
+fn widest_update(content: Option<(char, usize)>) -> Value {
     let widest = |n: usize| "\u{1}".repeat(n);
-    json!({
-        "id": "e".repeat(1024),
-        "calendar": four_byte(0, 320),
+    let mut args = json!({
+        "id": widest_id(),
+        "calendar": widest_calendar(),
         "summary": widest(1000),
         "start": widest(64),
         "end": widest(64),
-        "description": unit.to_string().repeat(DESCRIPTION_CHARS),
         "location": widest(1000),
         "attendees": (0..50).map(|i| four_byte(i, 40)).collect::<Vec<_>>(),
         "time_zone": widest(64),
@@ -371,18 +406,42 @@ fn widest_update(unit: char) -> Value {
             .collect::<Vec<_>>(),
         "notify": "externalOnly",
         "account": ACCOUNT,
+    });
+    if let Some((unit, chars)) = content {
+        args["description"] = json!(description(unit, chars));
+    }
+    args
+}
+
+/// `CalendarCreate`'s counterpart of [`widest_update`]: the same event, on
+/// the same calendar, without an id.
+fn widest_create(unit: char, chars: usize) -> Value {
+    let mut args = widest_update(Some((unit, chars)));
+    args.as_object_mut().unwrap().remove("id");
+    args
+}
+
+/// `CalendarDelete`'s arguments naming the widest update's event, a
+/// recurring series.
+fn widest_delete() -> Value {
+    json!({
+        "id": widest_id(),
+        "calendar": widest_calendar(),
+        "series": true,
+        "account": ACCOUNT,
     })
 }
 
-/// Google's answer to the patch `args` asks for: the event with every field
-/// written, in the shape the events.get mask gives it.
-fn echo(args: &Value) -> Value {
+/// Google's answer to every widest write, the delete's read included: the
+/// event with every field written, in the shape the write's mask gives it,
+/// so without its description.
+fn echo() -> Value {
+    let args = widest_update(None);
     let when = |key: &str| json!({ "dateTime": args[key], "timeZone": args["time_zone"] });
     json!({
         "id": args["id"],
         "status": "confirmed",
         "summary": args["summary"],
-        "description": args["description"],
         "location": args["location"],
         "start": when("start"),
         "end": when("end"),
@@ -396,25 +455,114 @@ fn echo(args: &Value) -> Value {
     })
 }
 
-/// Bring the provider to the activation that settles [`LATE_ANSWERS`] late
-/// answers to the widest `CalendarUpdate` whose `description` is of `unit`,
-/// and assert that activation is the one meant: five in-flight rows, and
-/// five results owed, each Google's echo with the description whole.
-///
-/// The stub holds every request until it takes a permit. Each write is
-/// called and its request served, which issues its patch; the patch is then
-/// made a late answer, which also frees the tool's one permit for the next
-/// write. Only then are the five patches answered, so no answer reaches the
-/// provider before the last is issued.
-async fn late_answers(unit: char) -> StubRig {
-    let r = rig().await;
-    let args = widest_update(unit);
+/// A rig at the bound: alice's one account connected, the bus cap at
+/// [`GUIDE_BUS_CAP`], and the stub answering every request with [`echo`].
+async fn bound_rig() -> StubRig {
+    let r = workspace::rig_built(
+        &CALENDAR_WRITE,
+        CLAUSES,
+        RigOptions {
+            max_body_bytes: Some(GUIDE_BUS_CAP),
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    r.stub.lock().unwrap().api_body = echo().to_string().into_bytes();
+    r
+}
+
+/// The activations measured. Each tool's `max_concurrency` is 1, so the
+/// request inbox is three deep and the window is one request of each tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// The window new: a widest create, a widest update and a delete, handed
+    /// to one activation; two events built and three calls issued.
+    WindowNew,
+    /// The window settling: those three requests' answers, all three
+    /// pending, handed to one activation; two settle and the delete's read
+    /// issues its `DELETE`.
+    WindowSettles,
+    /// [`LATE_ANSWERS`] late answers to the widest update, each request
+    /// ended.
+    Late,
+    /// The window new over the rows of [`LATE_ANSWERS`] ended widest updates
+    /// whose answers have not come.
+    OverEndedRows,
+    /// The window new, handed beside [`LATE_ANSWERS`] late answers to ended
+    /// widest updates.
+    BesideLateAnswers,
+    /// One small create, new over the rows of [`LATE_ANSWERS`] ended widest
+    /// updates whose answers have not come: its bytes bring nothing above the
+    /// grant's floor, so the rows meet the least room for them.
+    SmallOverEndedRows,
+}
+
+const SHAPES: [Shape; 6] = [
+    Shape::WindowNew,
+    Shape::WindowSettles,
+    Shape::Late,
+    Shape::OverEndedRows,
+    Shape::BesideLateAnswers,
+    Shape::SmallOverEndedRows,
+];
+
+fn small_create() -> Value {
+    json!({
+        "summary": "Lunch",
+        "start": "2026-11-02T12:00:00-05:00",
+        "end": "2026-11-02T13:00:00-05:00",
+        "account": ACCOUNT,
+    })
+}
+
+/// A rig brought to a measured activation, the calls it serves, and the
+/// executor steps the stub's gate holds.
+struct Staged {
+    r: StubRig,
+    calls: Vec<JoinHandle<Result<ToolOutput, ToolError>>>,
+    held: Vec<JoinHandle<()>>,
+}
+
+/// Call the window's three requests on `r`, their descriptions `chars` of
+/// `unit`, and wait until the provider is owed them beside `already` other
+/// envelopes.
+async fn call_window(
+    r: &StubRig,
+    unit: char,
+    chars: usize,
+    already: usize,
+) -> Vec<JoinHandle<Result<ToolOutput, ToolError>>> {
+    let calls = vec![
+        r.call_for_alice_with(
+            "CalendarCreate",
+            widest_create(unit, chars),
+            HeldAttachments::none(),
+        ),
+        r.call_for_alice_with(
+            "CalendarUpdate",
+            widest_update(Some((unit, chars))),
+            HeldAttachments::none(),
+        ),
+        r.call_for_alice_with("CalendarDelete", widest_delete(), HeldAttachments::none()),
+    ];
+    r.owed(&r.provider_sub, already + 3).await;
+    calls
+}
+
+/// Stage [`LATE_ANSWERS`] widest updates on a [`bound_rig`], their
+/// descriptions `chars` of `unit`, each ended with its patch held at the
+/// stub's gate. The stub holds every request until it takes a permit. Each
+/// update is called and its request served, which issues its patch; the
+/// patch is then made a late answer, which also frees the tool's one permit
+/// for the next update. The rig, the gate, and the held executor steps.
+async fn ended_updates(
+    unit: char,
+    chars: usize,
+) -> (StubRig, Arc<tokio::sync::Semaphore>, Vec<JoinHandle<()>>) {
+    let r = bound_rig().await;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    {
-        let mut stub = r.stub.lock().unwrap();
-        stub.api_gate = Some(gate.clone());
-        stub.api_body = echo(&args).to_string().into_bytes();
-    }
+    r.stub.lock().unwrap().api_gate = Some(gate.clone());
+    let args = widest_update(Some((unit, chars)));
     let mut steps = Vec::new();
     for n in 1..=LATE_ANSWERS {
         let call = r.call_for_alice_with("CalendarUpdate", args.clone(), HeldAttachments::none());
@@ -422,81 +570,509 @@ async fn late_answers(unit: char) -> StubRig {
         r.serve().await;
         steps.push(r.end_held(call, n).await);
     }
+    assert_eq!(r.inflight_keys().len(), LATE_ANSWERS);
+    (r, gate, steps)
+}
 
-    let results = r.answer_late(&gate, steps).await;
-    for result in &results {
+/// Let the ended updates' patches be answered and assert each answer is
+/// owed to the provider as Google's echo, with every row still in flight.
+async fn answer_ended(r: &StubRig, gate: &tokio::sync::Semaphore, steps: Vec<JoinHandle<()>>) {
+    for result in r.answer_late(gate, steps).await {
         let ok = &result["outcome"]["ok"];
         assert_eq!(ok["status"], 200, "a late answer is the stub's echo");
-        let event: Value =
-            serde_json::from_str(ok["body"].as_str().expect("a text body")).expect("JSON");
-        assert_eq!(
-            event["description"], args["description"],
-            "the echo's description is whole"
-        );
     }
-    r
 }
 
-/// Whether the late answers' settle, of a description of `unit`, completes
-/// under `limits`, or the production limits when `None`.
-async fn settles(unit: char, limits: Option<ActivationLimits>) -> (bool, u64) {
-    let r = late_answers(unit).await;
-    r.serve_under(limits).await;
-    (r.settled_late(LATE_ANSWERS), 0)
+/// Bring a rig to the activation `shape` names, descriptions `chars` of
+/// `unit`.
+async fn stage(shape: Shape, unit: char, chars: usize) -> Staged {
+    match shape {
+        Shape::WindowNew => {
+            let r = bound_rig().await;
+            let calls = call_window(&r, unit, chars, 0).await;
+            Staged {
+                r,
+                calls,
+                held: Vec::new(),
+            }
+        }
+        Shape::WindowSettles => {
+            let r = bound_rig().await;
+            let calls = call_window(&r, unit, chars, 0).await;
+            r.serve().await;
+            assert_eq!(r.inflight_keys().len(), 3, "the window was issued");
+            r.run_nested_calls(3).await;
+            Staged {
+                r,
+                calls,
+                held: Vec::new(),
+            }
+        }
+        Shape::Late => {
+            let (r, gate, steps) = ended_updates(unit, chars).await;
+            answer_ended(&r, &gate, steps).await;
+            Staged {
+                r,
+                calls: Vec::new(),
+                held: Vec::new(),
+            }
+        }
+        Shape::OverEndedRows => {
+            let (r, _, held) = ended_updates(unit, chars).await;
+            let calls = call_window(&r, unit, chars, 0).await;
+            Staged { r, calls, held }
+        }
+        Shape::BesideLateAnswers => {
+            let (r, gate, steps) = ended_updates(unit, chars).await;
+            answer_ended(&r, &gate, steps).await;
+            let calls = call_window(&r, unit, chars, LATE_ANSWERS).await;
+            Staged {
+                r,
+                calls,
+                held: Vec::new(),
+            }
+        }
+        Shape::SmallOverEndedRows => {
+            let (r, _, held) = ended_updates(unit, chars).await;
+            let calls = vec![r.call_for_alice_with(
+                "CalendarCreate",
+                small_create(),
+                HeldAttachments::none(),
+            )];
+            r.owed(&r.provider_sub, 1).await;
+            Staged { r, calls, held }
+        }
+    }
 }
 
-/// The parts of the production grant a share is counted in: one part of a
-/// grant near 140M is about 34,000 fuel.
-const SHARE_PARTS: u64 = 4096;
+/// How many calls the executor is owed.
+async fn issued(r: &StubRig) -> usize {
+    owed_everywhere(&r.messenger, &r.executor_sub()).await.len()
+}
 
-/// The `description` contents measured: a control character, `"` and `\`,
-/// each escaped in the echo's JSON and again in the answer carrying it, and
-/// four-byte characters.
-const DESCRIPTIONS: [char; 4] = ['\u{1}', '"', '\\', '\u{1d11e}'];
+/// Whether the activation `shape` names completed on `r`: what it issues is
+/// owed to the executor and the rows it leaves are in the store. A failed
+/// activation's store writes roll back, leaving the rows it was handed, and
+/// the requests new in it are failed without a call.
+async fn completed(shape: Shape, r: &StubRig) -> bool {
+    let rows = r.inflight_keys().len();
+    match shape {
+        Shape::WindowNew => issued(r).await == 3 && rows == 3,
+        Shape::WindowSettles => issued(r).await == 1 && rows == 1,
+        Shape::Late => r.settled_late(LATE_ANSWERS),
+        Shape::OverEndedRows => issued(r).await == 3 && rows == LATE_ANSWERS + 3,
+        Shape::BesideLateAnswers => issued(r).await == 3 && rows == 3,
+        Shape::SmallOverEndedRows => issued(r).await == 1 && rows == LATE_ANSWERS + 1,
+    }
+}
 
-/// The least grant the late answers' settle completes on, for each
-/// description content, and the least share of the production grant it
-/// completes on, from which the production grant for that activation follows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// Run the activation `shape` names, descriptions `chars` of `unit`, under
+/// `limits` given its production grant, or the production limits when
+/// `None`: whether it completed, the production grant and the envelopes it
+/// was handed.
+async fn run_shape(
+    shape: Shape,
+    unit: char,
+    chars: usize,
+    limits: impl Fn(u64) -> Option<ActivationLimits>,
+) -> (bool, u64, usize) {
+    let Staged { r, calls, held } = stage(shape, unit, chars).await;
+    let envelopes = r
+        .owed_windows()
+        .await
+        .iter()
+        .map(|port| port.entries.len())
+        .sum();
+    let grant = r.production_grant().await;
+    r.serve_under(limits(grant)).await;
+    let done = completed(shape, &r).await;
+    for call in calls {
+        call.abort();
+    }
+    for step in held {
+        step.abort();
+    }
+    (done, grant, envelopes)
+}
+
+/// The `description` contents measured: a control character, `"`, `\` and
+/// line feeds, each escaped in the request's JSON and again in the row, a
+/// four-byte character, and an ASCII letter.
+const DESCRIPTIONS: [char; 6] = ['\u{1}', '"', '\\', '\n', '\u{1d11e}', 'a'];
+
+/// The measured cells run this many at a time.
+const MEASURED_AT_ONCE: usize = 6;
+
+/// The description content each gated activation is held at: the costliest
+/// share of its grant at the bound, by `measure_window_and_late_answers`.
+const COSTLIEST_W: char = '\n';
+const COSTLIEST_S: char = '\n';
+const COSTLIEST_L: char = '\u{1}';
+const COSTLIEST_R: char = '\n';
+const COSTLIEST_M: char = '\u{1}';
+
+/// One activation's figures: its production grant, the envelopes it was
+/// handed, and the least grant it completes on, `None` when the production
+/// grant does not carry it.
+#[derive(Clone, Copy, Debug)]
+struct Figures {
+    grant: u64,
+    envelopes: usize,
+    least: Option<u64>,
+}
+
+impl Figures {
+    /// The least grant's share of the production grant.
+    fn share(&self) -> Option<f64> {
+        self.least.map(|least| least as f64 / self.grant as f64)
+    }
+
+    /// The fuel left under the margin: [`MARGIN`]'s share of the production
+    /// grant less the least grant.
+    fn headroom(&self) -> Option<i64> {
+        self.least
+            .map(|least| margin_of(self.grant) as i64 - least as i64)
+    }
+}
+
+/// `shape` measured at a description of `chars` characters of `unit`.
+async fn measure_shape(shape: Shape, unit: char, chars: usize) -> Figures {
+    let (done, grant, envelopes) = run_shape(shape, unit, chars, |_| None).await;
+    let least = if done {
+        Some(
+            least_under(grant, |g| async move {
+                run_shape(shape, unit, chars, |_| fuel(g)).await.0
+            })
+            .await,
+        )
+    } else {
+        None
+    };
+    let figures = Figures {
+        grant,
+        envelopes,
+        least,
+    };
+    println!("{shape:?}, {chars} of {unit:?}: {figures:?}");
+    figures
+}
+
+/// The least grant and share of the production grant each measured
+/// activation completes on, for each description content at each rung; the
+/// fuel one ended request's row adds, and how many more such rows the margin
+/// absorbs over the window, beside the late answers and over one small
+/// create; and the byte length of the widest update's
+/// request with no description, as the registry publishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "a measurement: run by hand"]
-async fn measure_late_answers() {
-    for unit in DESCRIPTIONS {
-        assert!(settles(unit, None).await.0, "the production grant settles");
-        let (least, _) = least(|grant| settles(unit, fuel(grant))).await;
-        let parts = narrow(0, SHARE_PARTS, 1, &|numerator| {
-            settles(
-                unit,
-                Some(ActivationLimits::FuelShare {
-                    numerator,
-                    denominator: SHARE_PARTS,
-                }),
-            )
-        })
-        .await;
-        println!(
-            "late answers, description of {unit:?}: completes on {least}, \
-             {parts}/{SHARE_PARTS} of the production grant ({:.3} of it), \
-             which is about {}",
-            parts as f64 / SHARE_PARTS as f64,
-            least * SHARE_PARTS / parts
+async fn measure_window_and_late_answers() {
+    {
+        let r = bound_rig().await;
+        let _call = r.call_for_alice_with(
+            "CalendarUpdate",
+            widest_update(None),
+            HeldAttachments::none(),
         );
+        r.requested_id().await;
+        let ports = r.owed_windows().await;
+        let request = ports
+            .iter()
+            .flat_map(|port| &port.entries)
+            .map(|(_, envelope)| envelope.body.len())
+            .sum::<usize>();
+        println!("the widest update's request with no description: {request} bytes");
+    }
+    let mut cells = Vec::new();
+    for chars in RUNGS {
+        for unit in DESCRIPTIONS {
+            for shape in SHAPES {
+                cells.push((shape, unit, chars));
+            }
+        }
+    }
+    let results = measure_all(cells.clone(), MEASURED_AT_ONCE, |(shape, unit, chars)| {
+        measure_shape(shape, unit, chars)
+    })
+    .await;
+    let find = |shape: Shape, unit: char, chars: usize| {
+        cells
+            .iter()
+            .zip(&results)
+            .find(|((s, u, c), _)| (*s, *u, *c) == (shape, unit, chars))
+            .map(|(_, figures)| *figures)
+            .unwrap()
+    };
+    for ((shape, unit, chars), figures) in cells.iter().zip(&results) {
+        match figures.least {
+            Some(least) => println!(
+                "{shape:?}, {chars} of {unit:?}: {} envelopes, completes on {least} of a \
+                 production grant of {}, {:.4} of it",
+                figures.envelopes,
+                figures.grant,
+                figures.share().unwrap()
+            ),
+            None => println!(
+                "{shape:?}, {chars} of {unit:?}: {} envelopes, does not complete on its \
+                 production grant of {}",
+                figures.envelopes, figures.grant
+            ),
+        }
+    }
+    for chars in RUNGS {
+        for unit in DESCRIPTIONS {
+            let window = find(Shape::WindowNew, unit, chars);
+            let over = find(Shape::OverEndedRows, unit, chars);
+            let beside = find(Shape::BesideLateAnswers, unit, chars);
+            let small = find(Shape::SmallOverEndedRows, unit, chars);
+            let (Some(window_least), Some(over_least)) = (window.least, over.least) else {
+                continue;
+            };
+            let row = over_least.saturating_sub(window_least) / LATE_ANSWERS as u64;
+            let spare = |figures: Figures| match (figures.headroom(), row) {
+                (Some(headroom), row) if row > 0 => format!("{}", headroom.max(0) as u64 / row),
+                _ => "-".to_string(),
+            };
+            println!(
+                "{chars} of {unit:?}: an ended row adds {row}; rows to spare over ended rows {}, \
+                 beside late answers {}, small create over ended rows {}",
+                spare(over),
+                spare(beside),
+                spare(small)
+            );
+        }
     }
 }
 
-/// Five late answers to the widest `CalendarUpdate`, its description of
-/// U+0001, the costliest of [`DESCRIPTIONS`], each answered with Google's
-/// echo, are settled in one activation under the margin: the kit decodes
-/// each in-flight row, reads the echo, and completes a request the host no
-/// longer holds, leaving no row. Measured by `measure_late_answers`, it
-/// completes on about 55.1M of a 146.5M production grant. A failure here is
+/// Run the activation `shape` names at the bound, descriptions of `unit`,
+/// under the margin, and assert it completed; the staged rig.
+async fn inside_the_margin(shape: Shape, unit: char) -> Staged {
+    let staged = stage(shape, unit, DESCRIPTION_MAX_CHARS).await;
+    staged.r.serve_under(Some(MARGIN)).await;
+    assert!(
+        completed(shape, &staged.r).await,
+        "{shape:?} completed inside the margin"
+    );
+    staged
+}
+
+/// Carry the window's requests on from the measured activation: run each
+/// nested call issued, and the activation its answer brings, until none is
+/// issued; then assert every request was answered with Google's event, or
+/// the delete's answer.
+async fn answer_window(r: &StubRig, calls: Vec<JoinHandle<Result<ToolOutput, ToolError>>>) {
+    loop {
+        let owed = issued(r).await;
+        if owed == 0 {
+            break;
+        }
+        r.owed(&r.executor_sub(), owed).await;
+        r.executor.drain_step().await;
+        r.serve().await;
+    }
+    for call in calls {
+        let answer = call.await.unwrap().expect("the request was answered");
+        assert_eq!(answer.value["id"], json!(widest_id()));
+    }
+    assert!(r.inflight_keys().is_empty(), "no row is left");
+}
+
+/// The window new — a widest create, a widest update and a delete handed to
+/// one activation, two events built at the bound — completes inside the
+/// margin. Measured by `measure_window_and_late_answers`, with line feeds,
+/// the costliest content, it completes on about 13.4M of a 73.3M production
+/// grant, 0.183 of it. The request inbox is three deep: a fourth request
+/// waits for a tool's permit. Four builds of the largest event the stub
+/// received fit the activation's blob write bound. A failure here is
 /// answered by measuring again and correcting this figure or the
 /// component's bounds, never by raising the share.
 #[tokio::test(flavor = "multi_thread")]
-async fn five_late_answers_to_the_widest_update_settle_inside_the_margin() {
-    let r = late_answers(DESCRIPTIONS[0]).await;
+async fn the_window_new_builds_inside_the_margin() {
+    let Staged { r, calls, .. } = stage(Shape::WindowNew, COSTLIEST_W, DESCRIPTION_MAX_CHARS).await;
+    let fourth = r.call_for_alice_with(
+        "CalendarCreate",
+        widest_create(COSTLIEST_W, DESCRIPTION_MAX_CHARS),
+        HeldAttachments::none(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        owed_everywhere(&r.messenger, &r.provider_sub).await.len(),
+        3,
+        "the request inbox is three deep"
+    );
     r.serve_under(Some(MARGIN)).await;
     assert!(
-        r.settled_late(LATE_ANSWERS),
-        "the five late answers were settled"
+        completed(Shape::WindowNew, &r).await,
+        "the window was built inside the margin"
     );
+    answer_window(&r, calls).await;
+    let largest = r.bodies().iter().map(Vec::len).max().unwrap();
+    assert!(
+        (largest * BUILD_BUDGET) as u64
+            <= brenn_wasm::PROCESSOR_MAX_BLOB_BYTES_WRITTEN_PER_ACTIVATION,
+        "{largest} bytes"
+    );
+    fourth.abort();
+}
+
+/// The window settling — its three requests' answers, all pending, in one
+/// activation — completes inside the margin: the create and the update
+/// settle, and the delete's read issues its `DELETE`. Measured by
+/// `measure_window_and_late_answers`, with line feeds, the costliest content,
+/// it completes on about 23.8M of a 112.5M production grant, 0.211 of it. A
+/// failure here is
+/// answered by measuring again and correcting this figure or the
+/// component's bounds, never by raising the share.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_settles_inside_the_margin() {
+    let Staged { r, calls, .. } = inside_the_margin(Shape::WindowSettles, COSTLIEST_S).await;
+    answer_window(&r, calls).await;
+}
+
+/// Five late answers to the widest `CalendarUpdate` at the bound, each
+/// answered with Google's event, are settled in one activation under the
+/// margin: the kit drops each answer unread and deletes its row, leaving no
+/// row. What the activation still pays for is the sweep's pass over the five
+/// rows and the answers' own parse. Measured by
+/// `measure_window_and_late_answers`, with U+0001, the costliest content, it
+/// completes on about 17.6M of a 128.6M production grant, 0.137 of it. A
+/// failure here is answered by
+/// measuring again and correcting this figure or the component's bounds,
+/// never by raising the share.
+#[tokio::test(flavor = "multi_thread")]
+async fn five_late_answers_to_the_widest_update_settle_inside_the_margin() {
+    inside_the_margin(Shape::Late, COSTLIEST_L).await;
+}
+
+/// The window new over the rows of five ended widest updates, their answers
+/// not come, completes inside the margin: five in-flight rows before it,
+/// eight after it, three calls issued. Five is the count measured, not a
+/// ceiling: nothing bounds how many ended requests' rows a store holds
+/// until their answers come or 420 s pass. Measured by
+/// `measure_window_and_late_answers`, with line feeds, the costliest content,
+/// it completes on about 19.5M of a 73.3M production grant, 0.266 of it, the
+/// costliest activation measured; one ended row adds about 1.22M, and the
+/// margin absorbs 24 more here, where the window's bytes raise the grant;
+/// over one small create on the grant's floor it absorbs 22 more of line
+/// feeds and 15 of U+0001, the least room measured. The three new
+/// requests are answered once their calls are. A failure here is answered by
+/// measuring again and correcting this figure or the component's bounds,
+/// never by raising the share.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_new_over_five_ended_rows_builds_inside_the_margin() {
+    let Staged { r, calls, held } = inside_the_margin(Shape::OverEndedRows, COSTLIEST_R).await;
+    let gate = r.stub.lock().unwrap().api_gate.take().unwrap();
+    gate.add_permits(LATE_ANSWERS);
+    for step in held {
+        step.await.expect("the executor's drain step");
+    }
+    answer_window(&r, calls).await;
+}
+
+/// The window new handed beside five late answers to ended widest updates
+/// completes inside the margin: five results owed and three requests new
+/// before it, three in-flight rows after it. Five is the count measured,
+/// not a ceiling. Measured by `measure_window_and_late_answers`, with U+0001,
+/// the costliest content, it completes on about 32.9M of a 168.3M production
+/// grant, 0.196 of it; one ended row adds about 1.66M, and the margin absorbs
+/// 49 more here, where the window's bytes and the late answers' raise the
+/// grant. The three new requests are answered once their
+/// calls are. A failure here is answered by measuring again and correcting
+/// this figure or the component's bounds, never by raising the share.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_new_beside_five_late_answers_builds_inside_the_margin() {
+    let Staged { r, calls, .. } = inside_the_margin(Shape::BesideLateAnswers, COSTLIEST_M).await;
+    r.stub.lock().unwrap().api_gate = None;
+    answer_window(&r, calls).await;
+}
+
+/// The event the widest write `args` describes, as the component sends it:
+/// each field given, `start` and `end` with the zone, an update's times
+/// complete.
+fn sent_event(args: &Value, update: bool) -> Value {
+    let when = |key: &str| {
+        let mut time = json!({ "dateTime": args[key], "timeZone": args["time_zone"] });
+        if update {
+            time["date"] = Value::Null;
+        }
+        time
+    };
+    json!({
+        "summary": args["summary"],
+        "description": args["description"],
+        "location": args["location"],
+        "start": when("start"),
+        "end": when("end"),
+        "attendees": args["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|email| json!({ "email": email }))
+            .collect::<Vec<_>>(),
+        "recurrence": args["recurrence"],
+    })
+}
+
+/// The widest write `tool` of `args` is sent whole: one request, its body
+/// the event the arguments describe, the description whole, and the caller
+/// answered with Google's event.
+async fn assert_sent_whole(tool: &str, args: Value, update: bool) {
+    let r = bound_rig().await;
+    let answer = r
+        .call_running(tool, args.clone(), HeldAttachments::none(), 1)
+        .await;
+    let answer = answer.expect("the component answered");
+    assert_eq!(answer.value["id"], json!(widest_id()));
+    assert_eq!(answer.value.get("description"), None);
+    assert_eq!(r.seen().len(), 1, "one request");
+    assert_eq!(the_body(&r), sent_event(&args, update));
+}
+
+/// A create at the description bound, every other field at its widest,
+/// sends the event whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_at_the_description_bound_sends_the_event_whole() {
+    assert_sent_whole(
+        "CalendarCreate",
+        widest_create('\u{1}', DESCRIPTION_MAX_CHARS),
+        false,
+    )
+    .await;
+}
+
+/// An update at the description bound, every other field at its widest,
+/// sends the event whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_at_the_description_bound_sends_the_event_whole() {
+    assert_sent_whole(
+        "CalendarUpdate",
+        widest_update(Some(('\u{1}', DESCRIPTION_MAX_CHARS))),
+        true,
+    )
+    .await;
+}
+
+/// A description one character over the bound is refused before any call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_description_over_the_bound_is_refused_before_any_call() {
+    let r = rig().await;
+    let answer = r
+        .call_running(
+            "CalendarCreate",
+            json!({
+                "summary": "Lunch",
+                "start": "2026-11-02T12:00:00-05:00",
+                "end": "2026-11-02T13:00:00-05:00",
+                "description": "a".repeat(DESCRIPTION_MAX_CHARS + 1),
+            }),
+            HeldAttachments::none(),
+            0,
+        )
+        .await;
+    assert_eq!(
+        answer.map(|output| output.value),
+        Err(ToolError::InvalidArgs(format!(
+            "`description` is longer than {DESCRIPTION_MAX_CHARS} characters"
+        )))
+    );
+    assert!(r.seen().is_empty(), "nothing reached Google");
 }

@@ -4,6 +4,27 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Existing `calendar-write` instances must add `blobs` to their `grants`;
+  `CalendarCreate` and `CalendarUpdate` now take a description of up to 8,000
+  characters.** For operators: without the `blobs` grant the configuration is
+  refused at load; the instance's clauses are unchanged. Each write now builds
+  the event it sends to Google as a blob (a stored byte payload), which stays
+  in the blob pool for a while — up to about 76 KB per write. For callers: a
+  write's answer no longer echoes `description` or `description_chars`; read
+  the description back with `CalendarEvent`. A request larger than the bus
+  cap is still refused before the tool sees it: at the default 64 KiB, that
+  takes a description of more than about 6,100 characters after JSON escaping
+  (a control character takes six bytes) beside every other field at its
+  widest.
+- **The provider kit drops a late answer unread.** For authors of kit
+  components: `Logic::advance` is no longer called for an answer to a request
+  the host has already given up on (its caller left or its deadline passed);
+  the kit deletes the request's in-flight row without decoding it and logs one
+  `Debug` line. The kit's own 240-second cutoff is gone: the host's `pending`
+  check is the only cut. No caller sees a change — everything this skips was
+  already being dropped. A test harness that tracks no requests and answers
+  `pending` true sees every answer advanced, whatever its age. Out-of-tree
+  components pick this up when they move their brenn pin.
 - **`GmailDraft` attaches files; existing `gmail-compose` instances must
   change two lines.** `GmailDraft`, the Gmail draft-writing tool, now takes
   up to 5 files (10,485,760 bytes together) in the call's `attachments`,

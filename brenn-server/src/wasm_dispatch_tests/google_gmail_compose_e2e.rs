@@ -4,7 +4,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
 use brenn_messaging::testutils::{held, owed_everywhere, publish_attached};
 use brenn_messaging_store::blob::BlobHold;
 use brenn_messaging_store::testutils::seal_bytes;
@@ -14,10 +13,10 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use super::google_workspace_rig::{
-    self as workspace, ACCOUNT, APP, BEARER, Clauses, FirstRead, GMAIL_COMPOSE, PRODUCER,
-    RigOptions, SRC, google_query, insufficient_scope_body, scope_denied,
+    self as workspace, ACCOUNT, APP, BEARER, Clauses, FirstRead, GMAIL_COMPOSE, GUIDE_BUS_CAP,
+    PRODUCER, RigOptions, SRC, google_query, insufficient_scope_body, scope_denied,
 };
-use super::kit_body_fuel_measure::{AMPLE_FUEL, PRECISION, narrow};
+use super::kit_body_fuel_measure::{AMPLE_FUEL, least_under, measure_all};
 use super::kit_file_e2e::BUILD_BUDGET;
 use super::provider_rig::{MARGIN, fuel};
 use super::stub_rig::{Pairs, StubRig, assert_could_not_be_issued, file_bytes};
@@ -946,10 +945,6 @@ const BUILD_CONTENTS: [Content; 5] = [ASCII, LINE_FEEDS, CONTROL, QUOTES, FOUR_B
 /// The bodies a late answer's settle is measured with.
 const LATE_CONTENTS: [Content; 5] = [CONTROL, QUOTES, BACKSLASHES, FOUR_BYTE, LINE_FEEDS];
 
-/// The bus cap the bound's rigs run with, the deployer guide's figure: a
-/// body of [`CONTROL`] at its bound is admitted only above the default.
-const BUS_CAP: usize = 393_216;
-
 /// The widest reply's thread: a Gmail id at its 128 characters.
 fn wide_thread() -> String {
     "t".repeat(128)
@@ -1022,14 +1017,15 @@ fn bound_files(split: Split, request: usize) -> Vec<File> {
 }
 
 /// A rig at the bound: alice's one account connected, the bus cap at
-/// [`BUS_CAP`], and the stub answering the widest reply's original and
-/// every upload.
+/// [`GUIDE_BUS_CAP`], since a body of [`CONTROL`] at its bound is admitted
+/// only above the default, and the stub answering the widest reply's
+/// original and every upload.
 async fn bound_rig() -> StubRig {
     let r = workspace::rig_built(
         &GMAIL_COMPOSE,
         CLAUSES,
         RigOptions {
-            max_body_bytes: Some(BUS_CAP),
+            max_body_bytes: Some(GUIDE_BUS_CAP),
             ..RigOptions::default()
         },
     )
@@ -1066,46 +1062,6 @@ async fn to_the_build(
 /// completed.
 async fn built(r: &StubRig, n: usize) -> bool {
     owed_everywhere(&r.messenger, &r.executor_sub()).await.len() == n
-}
-
-/// The production grant of the activation `r`'s provider is owed next, by
-/// the host's fuel rule over every envelope it is handed, the new bodies and
-/// the pending requests' not handed new, and the attachments of both: the
-/// component is granted `blobs`.
-async fn production_grant(r: &StubRig) -> u64 {
-    let ports = r.owed_windows().await;
-    let envelopes: usize = ports.iter().map(|port| port.entries.len()).sum();
-    let mut body_bytes = 0u64;
-    let mut attachment_bytes = 0u64;
-    let mut new_ids = Vec::new();
-    for port in &ports {
-        for (_, envelope) in &port.entries[port.new_from..] {
-            body_bytes += envelope.body.len() as u64;
-            attachment_bytes += envelope
-                .attachments
-                .iter()
-                .map(|(_, blob)| blob.size)
-                .sum::<u64>();
-            if port.port == TOOL_REQUEST_INPUT_PORT {
-                let request: Value =
-                    serde_json::from_str(envelope.body.as_text().unwrap()).unwrap();
-                new_ids.push(request["id"].as_str().unwrap().to_string());
-            }
-        }
-    }
-    let new_ids: Vec<&str> = new_ids.iter().map(String::as_str).collect();
-    let pending = r.runtime.pending_load(&r.provider.slug, &new_ids);
-    attachment_bytes += pending
-        .attachments
-        .iter()
-        .map(|blob| blob.size)
-        .sum::<u64>();
-    brenn_wasm::processor_fuel(
-        envelopes,
-        body_bytes,
-        pending.body_bytes,
-        Some(attachment_bytes),
-    )
 }
 
 /// The text a body of `content` at its bound decodes to: CRLF line breaks.
@@ -1259,7 +1215,7 @@ async fn build_run(
         })
         .collect();
     let (r, calls) = to_the_build(cell.reply, cell.content, &files).await;
-    let grant = production_grant(&r).await;
+    let grant = r.production_grant().await;
     r.serve_under(limits(grant)).await;
     let completed = built(&r, cell.n).await;
     let mut reason = None;
@@ -1275,20 +1231,6 @@ async fn build_run(
         }
     }
     (completed, grant, reason)
-}
-
-/// The least grant `run` completes on, to within [`PRECISION`], given the
-/// production grant it completes on.
-async fn least_under<F, Fut>(grant: u64, run: F) -> u64
-where
-    F: Fn(u64) -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    narrow(0, grant, PRECISION, &|fuel| {
-        let completed = run(fuel);
-        async move { (completed.await, 0) }
-    })
-    .await
 }
 
 /// `cell` measured: the least grant it completes on and its share of the
@@ -1336,34 +1278,6 @@ async fn measure_cell(cell: Cell) -> (String, Option<u64>) {
     )
 }
 
-/// Run `measure` on every one of `inputs`, [`MEASURED_AT_ONCE`] at a time;
-/// the results in the inputs' order.
-async fn measure_all<I, O, F, Fut>(inputs: Vec<I>, measure: F) -> Vec<O>
-where
-    I: Send + 'static,
-    O: Send + 'static,
-    F: Fn(I) -> Fut,
-    Fut: std::future::Future<Output = O> + Send + 'static,
-{
-    let permits = Arc::new(tokio::sync::Semaphore::new(MEASURED_AT_ONCE));
-    let tasks: Vec<_> = inputs
-        .into_iter()
-        .map(|input| {
-            let permits = permits.clone();
-            let run = measure(input);
-            tokio::spawn(async move {
-                let _permit = permits.acquire_owned().await.unwrap();
-                run.await
-            })
-        })
-        .collect();
-    let mut out = Vec::new();
-    for task in tasks {
-        out.push(task.await.expect("a measured cell"));
-    }
-    out
-}
-
 /// The least grant and share of the production grant each build activation
 /// completes on: new drafts and replies, one and two to an activation,
 /// files of [`FILES_MAX_BYTES`] together in each split and none, each body
@@ -1393,7 +1307,7 @@ async fn measure_draft_builds() {
             }
         }
     }
-    let results = measure_all(cells.clone(), measure_cell).await;
+    let results = measure_all(cells.clone(), MEASURED_AT_ONCE, measure_cell).await;
     for (line, _) in &results {
         println!("{line}");
     }
@@ -1440,8 +1354,7 @@ fn widest_row_files(request: usize) -> Vec<File> {
 /// The step of the widest reply that its late answers answer.
 #[derive(Clone, Copy, Debug)]
 enum LateStep {
-    /// The read of the reply's original: the settle parses the arguments
-    /// again, and the kit drops the upload it returns.
+    /// The read of the reply's original, whose step would issue the upload.
     Read,
     /// The reply's upload.
     Upload,
@@ -1487,10 +1400,11 @@ async fn late_answers(step: LateStep, content: Content, body_bytes: usize) -> St
     r
 }
 
-/// Whether `r`'s late answers to `step` were all settled: no row is left.
-/// For [`LateStep::Read`] the settle must also have issued nothing: the
-/// executor is owed no upload and the stub saw the five reads alone, so a
-/// request left pending by the staging cannot pass as a settle.
+/// Whether `r`'s late answers to `step` were all settled: the kit dropped
+/// each unread and no row is left. For [`LateStep::Read`] nothing must have
+/// been issued either: the executor is owed no upload and the stub saw the
+/// five reads alone, so a request left pending by the staging cannot pass as
+/// a settle.
 async fn settled(r: &StubRig, step: LateStep) -> bool {
     let settled = r.settled_late(LATE_ANSWERS);
     if settled && let LateStep::Read = step {
@@ -1523,7 +1437,7 @@ async fn settle_run(
         .iter()
         .map(|port| port.entries.len())
         .sum();
-    let grant = production_grant(&r).await;
+    let grant = r.production_grant().await;
     r.serve_under(limits(grant)).await;
     (settled(&r, step).await, grant, envelopes)
 }
@@ -1538,11 +1452,11 @@ const COSTLIEST_LATE_READ: Content = CONTROL;
 /// Five late answers to the widest reply's upload, its body of U+0001 at the
 /// bound, the costliest content, its row carrying five files under the
 /// longest names and content types, are settled in one activation under the
-/// margin:
-/// the kit decodes each in-flight row and completes a request the host no
-/// longer holds, leaving no row. Measured by `measure_draft_late_answers`,
-/// the activation is handed 12 envelopes and completes on about 42.0M of a
-/// 120.6M production grant, 0.348 of it. A failure here is answered by
+/// margin: the kit drops each answer unread and deletes its row, leaving no
+/// row. What the activation still pays for is the sweep's pass over the five
+/// rows and the answers' own parse. Measured by `measure_draft_late_answers`,
+/// the activation is handed 12 envelopes and completes on about 14.0M of a
+/// 120.6M production grant, 0.116 of it. A failure here is answered by
 /// measuring again and correcting this figure or the component's bounds,
 /// never by raising the share.
 #[tokio::test(flavor = "multi_thread")]
@@ -1558,18 +1472,18 @@ async fn five_late_answers_to_the_widest_draft_settle_inside_the_margin() {
 /// Five late answers to the widest reply's read of its original, its body
 /// of U+0001 at the bound, the costliest content, its row carrying five
 /// files under the longest names and content types, are settled in one
-/// activation on its production grant: each settle decodes the in-flight
-/// row and parses the arguments again, the kit drops the upload for a
-/// request the host no longer holds, and no row is left and nothing is
-/// issued. Measured by `measure_draft_late_answers`, the activation is
-/// handed 7 envelopes and completes on about 49.8M of a 72.0M production
-/// grant, 0.692 of it: over the margin, so this holds the grant and not the
-/// margin. A failure here is answered by measuring again, never by raising
-/// the share.
+/// activation under the margin: the kit drops each answer unread and deletes
+/// its row, so no step runs, no row is left and nothing is issued. What the
+/// activation still pays for is the sweep's pass over the five rows and the
+/// answers' own parse. Measured by `measure_draft_late_answers`, the
+/// activation is handed 7 envelopes and completes on about 14.0M of a 72.0M
+/// production grant, 0.195 of it. A failure here is answered by measuring
+/// again and correcting this figure or the component's bounds, never by
+/// raising the share.
 #[tokio::test(flavor = "multi_thread")]
-async fn five_late_answers_to_the_widest_replys_read_settle() {
+async fn five_late_answers_to_the_widest_replys_read_settle_inside_the_margin() {
     let r = late_answers(LateStep::Read, COSTLIEST_LATE_READ, BODY_MAX_BYTES).await;
-    r.serve_under(None).await;
+    r.serve_under(Some(MARGIN)).await;
     assert!(
         settled(&r, LateStep::Read).await,
         "the five late answers were settled"
@@ -1594,18 +1508,22 @@ async fn measure_draft_late_answers() {
             }
         }
     }
-    let results = measure_all(inputs.clone(), |(step, content, size)| async move {
-        let (completed, grant, envelopes) = settle_run(step, content, size, |_| None).await;
-        if !completed {
-            let (ample, _, _) = settle_run(step, content, size, |_| fuel(AMPLE_FUEL)).await;
-            return (grant, envelopes, None, ample);
-        }
-        let least = least_under(grant, |g| async move {
-            settle_run(step, content, size, |_| fuel(g)).await.0
-        })
-        .await;
-        (grant, envelopes, Some(least), true)
-    })
+    let results = measure_all(
+        inputs.clone(),
+        MEASURED_AT_ONCE,
+        |(step, content, size)| async move {
+            let (completed, grant, envelopes) = settle_run(step, content, size, |_| None).await;
+            if !completed {
+                let (ample, _, _) = settle_run(step, content, size, |_| fuel(AMPLE_FUEL)).await;
+                return (grant, envelopes, None, ample);
+            }
+            let least = least_under(grant, |g| async move {
+                settle_run(step, content, size, |_| fuel(g)).await.0
+            })
+            .await;
+            (grant, envelopes, Some(least), true)
+        },
+    )
     .await;
     for ((step, content, size), (grant, envelopes, least, ample)) in inputs.iter().zip(&results) {
         match least {

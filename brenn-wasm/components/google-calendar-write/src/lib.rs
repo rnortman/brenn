@@ -9,7 +9,10 @@
 //! `api-request` for the caller's user — an event's `POST` or `PATCH`, or a
 //! delete's read of the event; answering a result either completes the
 //! request from `api-request`'s answer or plans the delete's `DELETE`, so a
-//! request has at most one nested call outstanding. A request's own problem —
+//! request has at most one nested call outstanding. The loop is served with
+//! the SDK's `blobs`: the body of an event's `POST` or `PATCH` is the event
+//! the component builds from the request's arguments, which keeps it out of
+//! the nested call's arguments and their cap. A request's own problem —
 //! bad arguments, Brenn's refusal, Google's error — is answered with
 //! `complete_err`, and a missing credential is relayed as `api-request`
 //! answered it; only a structural fault (a bad `config`, a store failure, a
@@ -31,7 +34,10 @@ impl Processor for GoogleCalendarWrite {
     fn receive(activation: Activation) -> Result<Option<Body>, Error> {
         let settings =
             Settings::from_lookup(config::get, "calendar_host").map_err(Error::failed)?;
-        brenn_provider_kit_guest::serve::<logic::CalendarWrites>(&activation, &settings)?;
+        brenn_provider_kit_guest::serve_with_blobs::<logic::CalendarWrites>(
+            &activation,
+            &settings,
+        )?;
         Ok(None)
     }
 }

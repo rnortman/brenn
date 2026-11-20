@@ -4,7 +4,7 @@
 use brenn_provider_kit::{Args, Failure, capped, cut};
 use serde_json::{Value, json};
 
-use crate::args::{MAX_CHARS_DEFAULT, id_arg, is_token};
+use crate::args::{id_arg, is_token};
 use crate::text::{plain, put_cut_text, shape};
 
 /// The most UTF-8 bytes of an email address copied into an event answer (the
@@ -29,13 +29,27 @@ pub fn event_path(calendar: &str, id: &str) -> String {
 /// The calendar a tool reads when the caller names none.
 pub const PRIMARY_CALENDAR: &str = "primary";
 
-/// events.get's mask: one event's own text, its times, organizer, attendees,
-/// recurrence and conference link.
-pub const EVENT_GET_FIELDS: &str = "id,status,summary,description,location,start,end,\
-                                organizer(email,displayName,self),\
-                                attendees(email,displayName,responseStatus,optional,self),\
-                                attendeesOmitted,recurrence,recurringEventId,hangoutLink,\
-                                conferenceData/entryPoints(entryPointType,uri)";
+/// An event mask: one event's own text, its times, organizer, attendees,
+/// recurrence and conference link, with `description` where it is given.
+macro_rules! event_fields {
+    ($($description:literal)?) => {
+        concat!(
+            "id,status,summary,",
+            $($description,)?
+            "location,start,end,",
+            "organizer(email,displayName,self),",
+            "attendees(email,displayName,responseStatus,optional,self),",
+            "attendeesOmitted,recurrence,recurringEventId,hangoutLink,",
+            "conferenceData/entryPoints(entryPointType,uri)"
+        )
+    };
+}
+/// events.get's mask: one event's own text, description included, its
+/// times, organizer, attendees, recurrence and conference link.
+pub const EVENT_GET_FIELDS: &str = event_fields!("description,");
+/// An event write's mask: `EVENT_GET_FIELDS` without `description`, which a
+/// write's answer does not carry.
+pub const EVENT_WRITE_FIELDS: &str = event_fields!();
 /// events.get's `maxAttendees`: past it Google returns only the calendar
 /// read's own attendee entry and marks the event `attendeesOmitted`. It bounds the read
 /// and the answer alike, and is the most attendees an event write may name.
@@ -308,14 +322,9 @@ pub fn self_response<'a>(event: &Compact<'a>) -> Result<Option<&'a str>, Failure
     Ok(found.flatten())
 }
 
-/// The `max_chars` a written event's answer cuts `description` at: a write
-/// takes no `max_chars`, so `CalendarEvent`'s default.
-pub fn written_event_max_chars() -> usize {
-    usize::try_from(MAX_CHARS_DEFAULT).expect("MAX_CHARS_DEFAULT fits usize")
-}
-
-/// One event as events.get, insert or patch answers it: `id`, `summary`, `description` (cut at
-/// `max_chars` characters, `description_chars` its whole length), `start`,
+/// One event as events.get, insert or patch answers it: `id`, `summary`,
+/// `description` (cut at `max_chars` characters, `description_chars` its
+/// whole length; with `max_chars` `None`, neither, whatever the body holds), `start`,
 /// `end`, `location`, `status`, `organizer`, `self_response`, `attendees`
 /// with their counts or `attendees_omitted`, `recurrence`,
 /// `recurring_event_id` and `conference`. An event whose id is not the one
@@ -325,7 +334,7 @@ pub fn compact_event(
     body: &Value,
     api: &str,
     expected: Option<&str>,
-    max_chars: usize,
+    max_chars: Option<usize>,
 ) -> Result<Value, Failure> {
     let mut event = Compact::of(body, api)?;
     if let Some(expected) = expected
@@ -335,7 +344,9 @@ pub fn compact_event(
     }
     event.id("id", "id", is_event_id)?;
     event.text("summary", "summary", EVENT_TEXT_MAX_BYTES)?;
-    if let Some(description) = event.string("description")? {
+    if let Some(max_chars) = max_chars
+        && let Some(description) = event.string("description")?
+    {
         put_cut_text(&mut event.out, "description", description, max_chars);
     }
     event.when("start")?;
@@ -514,10 +525,33 @@ mod tests {
     }
 
     #[test]
-    fn a_written_events_description_bound_is_an_event_reads_default() {
+    fn an_event_writes_mask_is_an_event_reads_without_description() {
         assert_eq!(
-            written_event_max_chars(),
-            crate::args::max_chars(&Args::new()).unwrap()
+            EVENT_GET_FIELDS.replacen("description,", "", 1),
+            EVENT_WRITE_FIELDS
         );
+        assert!(!EVENT_WRITE_FIELDS.contains("description"));
+    }
+
+    #[test]
+    fn an_event_carries_its_description_only_when_given_a_bound() {
+        let body = json!({ "id": "e1", "summary": "Lunch", "description": "Agenda for lunch" });
+        let cut = compact_event(&body, "events.get", Some("e1"), Some(6)).unwrap();
+        assert_eq!(cut["description"], json!("Agenda"));
+        assert_eq!(cut["description_truncated"], json!(true));
+        assert_eq!(cut["description_chars"], json!(16));
+        let whole = compact_event(&body, "events.get", Some("e1"), Some(100)).unwrap();
+        assert_eq!(whole["description"], json!("Agenda for lunch"));
+        assert_eq!(whole.get("description_truncated"), None);
+        let written = compact_event(&body, "events.patch", Some("e1"), None).unwrap();
+        let mut without = body.clone();
+        without.as_object_mut().unwrap().remove("description");
+        assert_eq!(
+            written,
+            compact_event(&without, "events.patch", Some("e1"), Some(6)).unwrap()
+        );
+        for key in ["description", "description_chars", "description_truncated"] {
+            assert_eq!(written.get(key), None, "{key}");
+        }
     }
 }

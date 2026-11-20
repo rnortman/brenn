@@ -12,6 +12,7 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
 use brenn_lib::messaging::config::{MessagingGlobalConfig, ProvidedToolDecl};
 use brenn_lib::tools::ResolvedToolGrant;
 use brenn_messaging_store::blob::{BlobLimits, BlobUsage};
@@ -299,6 +300,46 @@ impl StubRig {
     /// The blob store's usage.
     pub fn blob_usage(&self) -> BlobUsage {
         self.messenger.blob_store().expect("a blob store").usage()
+    }
+
+    /// The production grant of the activation the provider is owed next, by
+    /// the host's fuel rule over every envelope it is handed, the new bodies
+    /// and the pending requests' not handed new, and the attachments of both,
+    /// as for a component granted `blobs`.
+    pub async fn production_grant(&self) -> u64 {
+        let ports = self.owed_windows().await;
+        let envelopes: usize = ports.iter().map(|port| port.entries.len()).sum();
+        let mut body_bytes = 0u64;
+        let mut attachment_bytes = 0u64;
+        let mut new_ids = Vec::new();
+        for port in &ports {
+            for (_, envelope) in &port.entries[port.new_from..] {
+                body_bytes += envelope.body.len() as u64;
+                attachment_bytes += envelope
+                    .attachments
+                    .iter()
+                    .map(|(_, blob)| blob.size)
+                    .sum::<u64>();
+                if port.port == TOOL_REQUEST_INPUT_PORT {
+                    let request: Value =
+                        serde_json::from_str(envelope.body.as_text().unwrap()).unwrap();
+                    new_ids.push(request["id"].as_str().unwrap().to_string());
+                }
+            }
+        }
+        let new_ids: Vec<&str> = new_ids.iter().map(String::as_str).collect();
+        let pending = self.runtime.pending_load(&self.provider.slug, &new_ids);
+        attachment_bytes += pending
+            .attachments
+            .iter()
+            .map(|blob| blob.size)
+            .sum::<u64>();
+        brenn_wasm::processor_fuel(
+            envelopes,
+            body_bytes,
+            pending.body_bytes,
+            Some(attachment_bytes),
+        )
     }
 
     /// The stub's answer to a request for `path`.

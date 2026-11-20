@@ -395,7 +395,9 @@ pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
                 .and_then(|args| compact_events(&body, args.max))
                 .map(Next::Complete),
             (Provided::CalendarEvent, 1) => stored(state, EventArgs::parse)
-                .and_then(|args| compact_event(&body, "events.get", Some(&args.id), args.max_chars))
+                .and_then(|args| {
+                    compact_event(&body, "events.get", Some(&args.id), Some(args.max_chars))
+                })
                 .map(Next::Complete),
             (Provided::CalendarFreeBusy, 1) => stored(state, FreeBusyArgs::parse)
                 .and_then(|args| compact_free_busy(&body, &args))

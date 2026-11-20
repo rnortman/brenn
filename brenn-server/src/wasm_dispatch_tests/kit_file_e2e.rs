@@ -18,7 +18,9 @@ use brenn_wasm::{PROCESSOR_FUEL_MINIMUM, processor_fuel};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
-use super::google_workspace_rig::{self as workspace, Clauses, GoogleClass, RigOptions};
+use super::google_workspace_rig::{
+    self as workspace, BLOB_PROVIDER_GRANTS, Clauses, GUIDE_BUS_CAP, GoogleClass, RigOptions,
+};
 use super::kit_body_fuel_measure::LINE_FEEDS;
 use super::provider_rig::{MARGIN, fuel};
 use super::stub_rig::{StubRig, file_bytes};
@@ -35,7 +37,7 @@ pub(super) const KIT_FILE: GoogleClass = GoogleClass {
     class: "ProcessorKitFileTest",
     slug: "kit-file",
     host_key: "host",
-    grants: "log, store, config, tools, provides, blobs",
+    grants: BLOB_PROVIDER_GRANTS,
 };
 
 /// Where files are put and got.
@@ -61,7 +63,7 @@ pub(super) async fn rig() -> StubRig {
 }
 
 /// The bus cap the Google guides set, and the size of a large request's body.
-pub(super) const LARGE: usize = 393_216;
+pub(super) const LARGE: usize = GUIDE_BUS_CAP;
 /// The bus cap a deployment runs with when it sets none, and the size of a
 /// default request's body.
 pub(super) const DEFAULT: usize = 65_536;
@@ -500,9 +502,9 @@ async fn a_put_whose_request_left_the_window_still_sends_the_file() {
     r.assert_finished(&id);
 }
 
-/// A put whose caller is gone before its `PUT` step sends nothing: the step
-/// finds the request no longer pending, no nested call is issued and no row
-/// is kept.
+/// A put whose caller is gone before its `PUT` step sends nothing: the kit
+/// finds the request no longer pending and drops the `HEAD`'s answer unread,
+/// so no step runs, no nested call is issued and no row is kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_put_whose_caller_left_sends_no_file() {
     let r = rig().await;

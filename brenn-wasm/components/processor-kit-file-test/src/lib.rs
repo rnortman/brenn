@@ -239,12 +239,7 @@ impl Logic for KitFiles {
         if !matches!(call.tool, Provided::KitBodyPut) || call.call.step != FIRST_STEP {
             return Err(no_such_step(call.tool, call.call.step));
         }
-        let args = BodyArgs::parse(&call.args).map_err(|reason| {
-            internal(format!(
-                "stored {} arguments no longer parse: {reason}",
-                call.tool.name()
-            ))
-        })?;
+        let args = call.stored(BodyArgs::parse)?;
         let mut body = step.append(BUILT_TYPE)?;
         for _ in 0..args.times {
             body.write(args.text.as_bytes())?;

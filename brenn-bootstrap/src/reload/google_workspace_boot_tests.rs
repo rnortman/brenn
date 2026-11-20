@@ -154,7 +154,7 @@ const CALENDAR_WRITE: Class = Class {
         ("DELETE", "/calendar/v3/calendars/*/events/*"),
     ],
     result_depth: 16,
-    grants: PROVIDER_GRANTS,
+    grants: "log, store, config, tools, provides, blobs",
 };
 
 /// The class's packaged specification.

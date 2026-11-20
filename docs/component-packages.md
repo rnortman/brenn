@@ -113,10 +113,11 @@ the functions it calls, so an artifact built before it links as it did; one
 that calls it needs a brenn new enough to serve it, by the same ordering rule
 as `calls`. A surface links no `provides`, so a kind that imports it is
 refused there by name. `brenn-guest` reaches it through `provides::pending`.
-The provider kit asks it before it issues or queues a call and before it
-decodes a backlog entry: for a request the host no longer holds it builds no
-body, attempts no call, keeps no row and spends neither of its budgets, and it
-deletes such a backlog entry unread. A kit component built from a brenn that
+The provider kit asks it before it reads a result's in-flight row, before it
+issues or queues a call and before it decodes a backlog entry: for a request
+the host no longer holds it builds no body, attempts no call, keeps no row and
+spends neither of its budgets, calls no `advance`, and deletes such a request's
+in-flight row and backlog entry unread. A kit component built from a brenn that
 has `pending` imports it.
 
 A third additive change in force: **`mqtt-publish-expiring`**, a new function
@@ -1114,6 +1115,10 @@ the blob's size before reading, and builds the blobs it completes with.
 body around the request's attachments: it returns `Body::Built`, opens each
 file by name in `Logic::body` and writes the uploaded message a piece at a
 time, under bounds on the files' count and bytes it checks in `plan`.
+`google-calendar-write`'s `CalendarCreate` and `CalendarUpdate` also return
+`Body::Built`, built from the arguments alone: `Logic::body` parses the
+stored arguments again and writes the event's JSON, so no field of the event
+rides the nested call's arguments or their cap.
 
 Four limits are the component's to design for:
 
@@ -1130,17 +1135,13 @@ Four limits are the component's to design for:
   write is `WriteError::Quota`. `max_concurrency` bounds the requests the
   host holds pending, not the answers an activation delivers: a nested call
   admitted late can answer after the host has given up its request and a
-  newer one has taken the slot. The host's 240 s deadline counts from when
-  the host takes the call, before the call waits for the tool's permit, and
-  a nested provided call may inherit an earlier deadline from the call it
-  serves. The kit cannot see that deadline, so it cuts off 240 s after the
-  activation that delivered the request: it does not advance an answer
-  arriving later than that, and answers that request `internal`, which the
-  host drops once it no longer holds it. An answer that arrives between the
-  host's deadline and the kit's cutoff is still advanced, so
-  `max_concurrency` with the cutoff does not guarantee one blob-building
-  step per activation; a late answer can still share an activation's bounds
-  with a live one. `GmailAttachment` and `GmailBody` each declare 1.
+  newer one has taken the slot. The kit asks the host whether it still
+  holds the request before it reads the answer's in-flight row; an answer to
+  a request the host has given up is dropped unread, so it runs no step and
+  shares no bound with a live one. The kit has no cutoff of its own. What
+  remains is a request that ends while its step runs: that step still runs,
+  its completion is dropped by the host and its next call by the kit.
+  `GmailAttachment` and `GmailBody` each declare 1.
 - **An answer rests after it is read.** An answer asked for as an attachment
   rests on the component's `brenn:tool-results/<slug>` for that inbox's
   window after the component has read it, and so does a completion's
@@ -1183,13 +1184,10 @@ Four limits are the component's to design for:
   that a higher cap is outside what it measured
   (`dense-request-arguments-outgrow-guest` in `TODO.md`).
 
-  What the rule leaves on the floor, the envelope term alone: the settle of a
-  late answer — an answer to a request the host has given up, which the kit
-  still claims, decodes and advances, paid for only by the answer's own
-  bytes, so that where arguments are large and the answer does not echo them
-  a component's bound is still set by the late answers one activation
-  settles; the rows the sweep and a scan read for requests that have ended;
-  and bodies past the cap — new and pending bodies together are paid for up
+  What the rule leaves on the floor, the envelope term alone: a late
+  answer's own parse — an answer to a request the host has given up, which
+  the kit drops unread; the rows the sweep and a scan read for requests that
+  have ended; and bodies past the cap — new and pending bodies together are paid for up
   to 16 MiB an activation, so a component whose Σ `max_concurrency` × the
   bus cap can pass that holds more than it is granted for.
 
@@ -1198,8 +1196,8 @@ Four limits are the component's to design for:
   requests' messages an activation is handed, so a component can still reach
   `BUILD_BUDGET` and queue whatever its Σ, and a queued build is paid for
   when it is drained. The kit drops, unbuilt and unissued, the call of a
-  request that has ended, a late answer's next call included, so those spend
-  neither budget. `plan` refuses everything `body` could refuse on the
+  request that has ended, the next call of a request that ends while its
+  answer is advanced included, so those spend neither budget. `plan` refuses everything `body` could refuse on the
   arguments, so that `body` fails only on what it meets at issue time (the
   blob pool, the activation's bound on bytes written, a request no longer
   pending), because a failed build spends the budget like any other. Every

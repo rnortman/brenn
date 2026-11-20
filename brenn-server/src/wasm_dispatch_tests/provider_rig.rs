@@ -45,6 +45,18 @@ pub(super) const MARGIN: ActivationLimits = ActivationLimits::FuelShare {
     denominator: 28,
 };
 
+/// [`MARGIN`]'s share of `grant`.
+pub(super) fn margin_of(grant: u64) -> u64 {
+    let ActivationLimits::FuelShare {
+        numerator,
+        denominator,
+    } = MARGIN
+    else {
+        unreachable!("the margin is a share of the grant")
+    };
+    grant * numerator / denominator
+}
+
 /// The production epoch deadline of an activation: 300 ticks of 100 ms.
 const PRODUCTION_EPOCH_TICKS: u64 = 300;
 

@@ -12,10 +12,10 @@
 //!    entries that have waited in the backlog past [`BACKLOG_MAX_WAIT_MS`] are
 //!    deleted and answered `internal`, or deleted unread where the host no
 //!    longer holds their request.
-//! 2. **Results.** Each result claims its request's in-flight row and
-//!    advances it: the request completes, fails, or issues or queues its next
-//!    step. A request more than [`HOST_DEADLINE_MS`] older than the activation
-//!    that delivered it is answered `internal` instead and not advanced.
+//! 2. **Results.** A result for a request the host no longer holds
+//!    ([`Host::pending`]) deletes its in-flight row unread and advances
+//!    nothing. Otherwise it claims the row and advances the request: the
+//!    request completes, fails, or issues or queues its next step.
 //! 3. **Backlog.** Entries are issued oldest first; the drain stops at the
 //!    first entry a budget leaves it unable to issue. An entry whose request
 //!    the host no longer holds is deleted unread.
@@ -49,13 +49,15 @@ use crate::answer::{NestedError, not_issued, result_summary};
 use crate::backlog::{Queued, parse_key};
 use crate::blob::{Attached, Blob, Blobs, OpenError, Step};
 use crate::call::{ApiCall, BUILT_BODY_ATTACHMENT, Body, Call, ErrorKind, Failure, Next};
-use crate::row::{InFlight, Tool, claim, issued_at_ms, row_expired};
+use crate::row::{InFlight, Tool, claim, issued_at_ms, owned_call_id, row_expired};
 
 /// The host's ceiling on a provided-tool call (`PROVIDED_TOOL_CEILING`). The
 /// host counts it from when it takes the call, before the call waits for the
 /// tool's permit, and a nested provided call may inherit an earlier deadline
 /// from the call it serves; so the host may answer a request well before this
-/// long after the provider receives it.
+/// long after the provider receives it. The loop has no cutoff of its own on
+/// it: whether the host still holds a request is [`Host::pending`]'s answer.
+/// [`INFLIGHT_TTL_MS`] and [`BACKLOG_MAX_WAIT_MS`] are built from it.
 pub const HOST_DEADLINE_MS: u64 = 240_000;
 
 /// `api-request`'s execution worst case once a call is admitted: a token
@@ -70,8 +72,10 @@ pub const NESTED_WORST_CASE_MS: u64 = 180_000;
 /// request (`HOST_DEADLINE_MS` after receipt, and receipt is no later than
 /// issue), and an admitted call's answer is due within
 /// `NESTED_WORST_CASE_MS` of admission. An answer later than this — possible
-/// only after the executor's unbounded admission wait — finds no row and is
-/// skipped as stale.
+/// only after the executor's unbounded admission wait — serves a request the
+/// host no longer holds, so it is dropped unread on its call id like any
+/// answer to an ended request; this TTL bounds only how long that request's
+/// row waits for it.
 pub const INFLIGHT_TTL_MS: u64 = HOST_DEADLINE_MS + NESTED_WORST_CASE_MS;
 
 /// A backlog entry that has waited longer than this is answered `internal`
@@ -160,7 +164,8 @@ pub trait Host: Blobs {
 
     /// Whether the host holds request `id` pending for this instance. A
     /// request it does not hold can no longer be answered and its calls are
-    /// refused, so the loop builds and issues nothing for it.
+    /// refused, so for it the loop reads no in-flight row, advances nothing,
+    /// and builds and issues nothing.
     fn pending(&self, id: &str) -> bool;
 
     fn log(&self, level: Level, line: String);
@@ -192,6 +197,12 @@ pub trait Logic {
     /// What a request does once its outstanding call answered `outcome`.
     /// `step` reaches the request's and the answer's attachments; what it
     /// attaches goes with [`Next::Complete`].
+    ///
+    /// Called only for a request the host holds when its answer is read. An
+    /// answer to a request that has ended never reaches it, so this is not
+    /// the place for anything a component needs done for every answer. A
+    /// request that ends while this runs is still advanced; its completion
+    /// is dropped by the host and its next call by the loop.
     fn advance(
         state: &InFlight<Self::Tool>,
         outcome: Result<Value, NestedError>,
@@ -390,12 +401,16 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
         Ok(())
     }
 
-    /// Answer one result: claim its request's row and advance the request.
-    /// A request more than [`HOST_DEADLINE_MS`] older than the activation that
-    /// delivered it is answered `internal` and not advanced. The host's own
-    /// deadline is not visible here and may fall earlier (see
-    /// [`HOST_DEADLINE_MS`]), so an answer arriving between that deadline and
-    /// this cutoff is still advanced.
+    /// Answer one result. For a request the host no longer holds, the result's
+    /// call id is checked against the request on its text alone and the row
+    /// under it is deleted unread: nothing is decoded, advanced or completed.
+    /// For a request the host holds, the row is claimed and the request
+    /// advanced.
+    ///
+    /// A result whose call id is another request's is a host fault on both
+    /// paths, found two ways: by its text for an ended request, by the
+    /// decoded row's `id` for a held one, which skips such a result when no
+    /// row is stored under its call id.
     fn answer(&mut self, result: Delivered) -> Result<(), H::Error> {
         let Some(id) = result.serving else {
             self.host.log(
@@ -404,6 +419,20 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
             );
             return Ok(());
         };
+        // TODO(quality-row-owner-fault-split-by-pendingness): one check and
+        // one message for a result whose call id is another request's.
+        if !self.host.pending(&id) {
+            owned_call_id(&id, &result.call_id).map_err(H::fault)?;
+            self.host.delete(INFLIGHT_NS, result.call_id.as_bytes())?;
+            self.host.log(
+                Level::Debug,
+                format!(
+                    "dropped result {} unread: the request is no longer pending",
+                    result.call_id
+                ),
+            );
+            return Ok(());
+        }
         let row = self.host.get(INFLIGHT_NS, result.call_id.as_bytes())?;
         let Some(state) =
             claim::<L::Tool>(&id, &result.call_id, row.as_deref()).map_err(H::fault)?
@@ -418,32 +447,6 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
             return Ok(());
         };
         self.host.delete(INFLIGHT_NS, result.call_id.as_bytes())?;
-        // TODO(correctness-max-concurrency-one-does-not-bound-attachment-decodes-per-activation):
-        // cut on the host's actual deadline for this request, which the
-        // provides contract does not carry.
-        let age = self.now_ms.saturating_sub(state.received_at_ms);
-        if age > HOST_DEADLINE_MS {
-            self.host.log(
-                Level::Info,
-                format!(
-                    "{} step {} result for {id} arrived {age} ms after the request: \
-                     past the host's deadline, not advanced",
-                    state.tool.name(),
-                    state.step,
-                ),
-            );
-            return self.host.complete_err(
-                &id,
-                ErrorKind::Internal,
-                &format!(
-                    "step {} of this request was answered {} s after the request arrived, \
-                     past the {} s a provided tool is given; the request was not advanced",
-                    state.step,
-                    age / 1000,
-                    HOST_DEADLINE_MS / 1000
-                ),
-            );
-        }
         self.host.log(
             Level::Info,
             format!(
@@ -1364,6 +1367,7 @@ mod tests {
         );
     }
 
+    /// The request is pending: `MemoryHost` holds every request not ended.
     #[test]
     fn a_result_for_another_requests_row_is_a_fault() {
         let host = MemoryHost::new();
@@ -1377,6 +1381,8 @@ mod tests {
         );
     }
 
+    /// The result's request is pending: `MemoryHost` holds every request not
+    /// ended.
     #[test]
     fn a_corrupt_row_is_a_fault() {
         let host = MemoryHost::new();
@@ -1409,6 +1415,8 @@ mod tests {
         );
     }
 
+    /// The second result's request is pending: `MemoryHost` holds every
+    /// request not ended.
     #[test]
     fn a_result_serving_nothing_or_finding_no_row_is_skipped() {
         let host = MemoryHost::new();
@@ -1465,29 +1473,41 @@ mod tests {
         assert!(host.rows(INFLIGHT_NS).is_empty());
     }
 
+    /// The loop keeps no clock on a request: an answer past the host's
+    /// deadline advances a request the host still holds, and completes
+    /// nothing for one it has given up.
     #[test]
-    fn an_answer_past_the_host_deadline_is_not_advanced() {
+    fn an_answer_past_the_host_deadline_is_advanced_while_the_request_is_pending() {
         let host = MemoryHost::new();
         run(&host, input(0, requests(0..1), vec![])).unwrap();
-        run(&host, input(1, requests(1..2), vec![])).unwrap();
-        let calls = host.take_calls();
-        let answers = calls.iter().map(|call| result(call, true)).collect();
-        run(&host, input(HOST_DEADLINE_MS + 1, vec![], answers)).unwrap();
+        let first = host.take_calls().remove(0);
+        run(
+            &host,
+            input(HOST_DEADLINE_MS + 1, vec![], vec![result(&first, false)]),
+        )
+        .unwrap();
         assert_eq!(
-            errors(&host.take_completions()),
-            [(
-                id(0).as_str(),
-                ErrorKind::Internal,
-                "step 1 of this request was answered 240 s after the request arrived, past \
-                 the 240 s a provided tool is given; the request was not advanced"
-            )]
+            host.take_completions(),
+            [Completion {
+                id: id(0),
+                answer: Answered::Value(json!({ "tool": "fixture-lookup", "step": 1 })),
+                attachments: Vec::new(),
+            }]
         );
-        let next = host.take_calls();
-        assert_eq!(ids(&next), [id(1).as_str()]);
-        assert_eq!(next[0].call_id, format!("{}/2", id(1)));
-        let rows = host.rows(INFLIGHT_NS);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, next[0].call_id.as_bytes());
+        assert!(host.rows(INFLIGHT_NS).is_empty());
+
+        let host = MemoryHost::new();
+        run(&host, input(0, requests(0..1), vec![])).unwrap();
+        let first = host.take_calls().remove(0);
+        host.end_request(&id(0));
+        run(
+            &host,
+            input(HOST_DEADLINE_MS + 1, vec![], vec![result(&first, false)]),
+        )
+        .unwrap();
+        assert!(host.take_completions().is_empty());
+        assert!(host.take_calls().is_empty());
+        assert!(host.rows(INFLIGHT_NS).is_empty());
     }
 
     /// One scripted activation: when, how many new requests, how many of the
@@ -2497,18 +2517,152 @@ mod tests {
         assert!(logged(&host, Level::Debug, &dropped(0, 1)));
     }
 
+    /// The line the loop logs for the result `call_id`, dropped unread
+    /// because the host no longer holds its request.
+    fn dropped_result(call_id: &str) -> String {
+        format!("dropped result {call_id} unread: the request is no longer pending")
+    }
+
     #[test]
-    fn a_late_answer_advanced_into_a_call_is_dropped() {
+    fn a_late_answer_to_an_ended_request_is_dropped_unread() {
         let host = MemoryHost::new();
         run(&host, input(0, requests(0..1), vec![])).unwrap();
         let first = host.take_calls().remove(0);
         host.end_request(&id(0));
+        host.take_log();
         run(&host, input(1, vec![], vec![result(&first, true)])).unwrap();
         assert!(host.take_calls().is_empty());
         assert!(host.take_completions().is_empty());
         assert!(host.rows(INFLIGHT_NS).is_empty());
         assert!(host.rows(BACKLOG_NS).is_empty());
-        assert!(logged(&host, Level::Debug, &dropped(0, 2)));
+        assert_eq!(
+            host.take_log(),
+            [(Level::Debug, dropped_result(&format!("{}/1", id(0))))]
+        );
+    }
+
+    /// [`Steps`]' plan, and an `advance` that must never run.
+    struct NeverAdvanced;
+
+    impl Logic for NeverAdvanced {
+        type Tool = Fixture;
+        type Settings = ();
+
+        fn plan(
+            tool: Fixture,
+            args: &Value,
+            step: &Step<'_>,
+            settings: &(),
+        ) -> Result<Call, String> {
+            Steps::plan(tool, args, step, settings)
+        }
+
+        fn advance(
+            state: &InFlight<Fixture>,
+            _: Result<Value, NestedError>,
+            _: &mut Step<'_>,
+            _: &(),
+        ) -> Next {
+            panic!("advanced {}, which the host no longer holds", state.id)
+        }
+    }
+
+    #[test]
+    fn a_late_answer_to_an_ended_request_calls_no_advance() {
+        let host = MemoryHost::new();
+        host.activate::<NeverAdvanced>(&(), input(0, requests(0..1), vec![]))
+            .unwrap();
+        let first = host.take_calls().remove(0);
+        host.end_request(&id(0));
+        host.activate::<NeverAdvanced>(&(), input(1, vec![], vec![result(&first, true)]))
+            .unwrap();
+        assert!(host.take_completions().is_empty());
+        assert!(host.rows(INFLIGHT_NS).is_empty());
+    }
+
+    /// The ended request's row holds only the issue time the sweep reads, so
+    /// no build could decode it and the loop is seen to delete it on its key
+    /// alone.
+    #[test]
+    fn a_late_answer_deletes_its_row_undecoded() {
+        let host = MemoryHost::new();
+        host.insert(INFLIGHT_NS, b"r000/1", br#"{"issued_at_ms":0}"#);
+        host.end_request(&id(0));
+        let late = Delivered {
+            call_id: "r000/1".to_string(),
+            serving: Some(id(0)),
+            outcome: Ok(json!({ "more": true })),
+            attachments: Vec::new(),
+        };
+        host.activate::<NeverAdvanced>(&(), input(1, vec![], vec![late]))
+            .unwrap();
+        assert!(host.rows(INFLIGHT_NS).is_empty());
+        assert!(host.take_completions().is_empty());
+        assert!(host.take_calls().is_empty());
+    }
+
+    #[test]
+    fn a_late_answer_with_no_row_completes_nothing() {
+        let host = MemoryHost::new();
+        host.insert(INFLIGHT_NS, b"r001/1", br#"{"issued_at_ms":0}"#);
+        host.end_request(&id(0));
+        let late = Delivered {
+            call_id: "r000/1".to_string(),
+            serving: Some(id(0)),
+            outcome: Ok(json!({})),
+            attachments: Vec::new(),
+        };
+        host.activate::<NeverAdvanced>(&(), input(1, vec![], vec![late]))
+            .unwrap();
+        assert!(host.take_completions().is_empty());
+        assert_eq!(
+            host.rows(INFLIGHT_NS),
+            [(b"r001/1".to_vec(), br#"{"issued_at_ms":0}"#.to_vec())]
+        );
+        assert_eq!(host.take_log(), [(Level::Debug, dropped_result("r000/1"))]);
+    }
+
+    #[test]
+    fn a_late_answer_under_another_requests_call_id_is_a_fault() {
+        let host = MemoryHost::new();
+        run(&host, input(0, requests(1..2), vec![])).unwrap();
+        let other = host.take_calls().remove(0);
+        host.end_request(&id(0));
+        let mut foreign = result(&other, false);
+        foreign.serving = Some(id(0));
+        assert_eq!(
+            run(&host, input(1, vec![], vec![foreign])),
+            Err(format!(
+                "result {}/1 serves {}, but its call id is not that request's",
+                id(1),
+                id(0)
+            ))
+        );
+        assert_eq!(host.rows(INFLIGHT_NS).len(), 1);
+        assert_eq!(host.rows(INFLIGHT_NS)[0].0, other.call_id.as_bytes());
+    }
+
+    #[test]
+    fn a_pending_requests_answer_beside_an_ended_ones_is_advanced() {
+        let host = MemoryHost::new();
+        run(&host, input(0, requests(0..2), vec![])).unwrap();
+        let calls = host.take_calls();
+        host.end_request(&id(0));
+        let answers = calls.iter().map(|call| result(call, true)).collect();
+        run(&host, input(1, vec![], answers)).unwrap();
+        let next = host.take_calls();
+        assert_eq!(ids(&next), [id(1).as_str()]);
+        assert_eq!(next[0].call_id, format!("{}/2", id(1)));
+        assert!(host.take_completions().is_empty());
+        let rows = host.rows(INFLIGHT_NS);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, next[0].call_id.as_bytes());
+        assert!(logged(
+            &host,
+            Level::Debug,
+            &dropped_result(&format!("{}/1", id(0)))
+        ));
+        assert!(!logged(&host, Level::Debug, &dropped(0, 2)));
     }
 
     /// The ended request's entry holds bytes no build could decode, so the
