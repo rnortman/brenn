@@ -69,7 +69,7 @@ pub(super) const GMAIL_COMPOSE: GoogleClass = GoogleClass {
     class: "GoogleGmailCompose",
     slug: "gmail-compose",
     host_key: "gmail_host",
-    grants: PROVIDER_GRANTS,
+    grants: "log, store, config, tools, provides, blobs",
 };
 
 pub(super) const GMAIL_ORGANIZE: GoogleClass = GoogleClass {

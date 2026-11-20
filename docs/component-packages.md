@@ -1110,6 +1110,10 @@ worked example of both directions and of a built body (`KitBodyPut`); `google-gm
 one that reads an answer by range and builds the blob it completes with, and
 its `GmailBody` one that holds an answer whole, under a bound it checks on
 the blob's size before reading, and builds the blobs it completes with.
+`google-gmail-compose`'s `GmailDraft` is the one that builds a nested call's
+body around the request's attachments: it returns `Body::Built`, opens each
+file by name in `Logic::body` and writes the uploaded message a piece at a
+time, under bounds on the files' count and bytes it checks in `plan`.
 
 Four limits are the component's to design for:
 

@@ -4,6 +4,25 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **`GmailDraft` attaches files; existing `gmail-compose` instances must
+  change two lines.** `GmailDraft`, the Gmail draft-writing tool, now takes
+  up to 5 files (10,485,760 bytes together) in the call's `attachments`,
+  each attached under the name the call gives it; more is refused before
+  anything reaches Google. To make room, the draft is now built as a blob
+  (brenn's binary attachment store) and sent to Gmail's upload endpoint
+  instead of being encoded into the request text. Upgrading needs:
+  - `blobs` added to the instance's `grants` — without it the configuration
+    is refused at load.
+  - Its `api-request` clause for `POST /gmail/v1/users/me/drafts` replaced
+    with one for `POST /upload/gmail/v1/users/me/drafts` — with the old
+    clause the instance loads but every draft is refused.
+
+  The guide's instance block shows both. A draft without files carries the
+  same message as before, and the body limit stays 20,000 bytes. Drafts with
+  files hold blob space for a while (the files, and the built message of up
+  to about 14.4 MB), so review `blob_budget_bytes`.
+- Bumped wasmtime from 48.0.8 to 48.0.10, clearing RUSTSEC-2026-0566
+  through RUSTSEC-2026-0573.
 - **A guest's fuel follows the bytes it is handed.** Fuel is the per-activation
   instruction budget a WebAssembly component runs on. Every component is now
   granted 256 fuel per byte of body on the messages an activation delivers

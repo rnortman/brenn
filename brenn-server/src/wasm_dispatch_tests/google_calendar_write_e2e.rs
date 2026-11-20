@@ -2,7 +2,6 @@
 //! [`super::google_workspace_rig`].
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use brenn_tool_registry::{HeldAttachments, ToolError};
 use brenn_wasm_dispatch::ActivationLimits;
@@ -12,7 +11,6 @@ use super::google_workspace_rig::{
     self as workspace, ACCOUNT, BEARER, CALENDAR_WRITE, Clauses, FirstRead, google_query,
 };
 use super::kit_body_fuel_measure::{least, narrow};
-use super::kit_file_e2e::drop_caller;
 use super::provider_rig::{MARGIN, fuel};
 use super::stub_rig::{Pairs, StubRig};
 
@@ -398,29 +396,16 @@ fn echo(args: &Value) -> Value {
     })
 }
 
-/// Wait until the stub has received `n` API requests.
-async fn stub_saw(r: &StubRig, n: usize) {
-    for _ in 0..3000 {
-        if r.stub.lock().unwrap().api_seen.len() >= n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the stub never received {n} requests");
-}
-
 /// Bring the provider to the activation that settles [`LATE_ANSWERS`] late
 /// answers to the widest `CalendarUpdate` whose `description` is of `unit`,
 /// and assert that activation is the one meant: five in-flight rows, and
 /// five results owed, each Google's echo with the description whole.
 ///
 /// The stub holds every request until it takes a permit. Each write is
-/// called, its request served, which issues its patch, and its nested call
-/// started on a task of its own; once the stub has the patch, the call is
-/// past the executor's check that its request is pending, and the caller is
-/// dropped, which ends the request and frees the tool's one permit for the
-/// next write. Only then are the five patches answered, so no answer reaches
-/// the provider before the last is issued.
+/// called and its request served, which issues its patch; the patch is then
+/// made a late answer, which also frees the tool's one permit for the next
+/// write. Only then are the five patches answered, so no answer reaches the
+/// provider before the last is issued.
 async fn late_answers(unit: char) -> StubRig {
     let r = rig().await;
     let args = widest_update(unit);
@@ -435,21 +420,10 @@ async fn late_answers(unit: char) -> StubRig {
         let call = r.call_for_alice_with("CalendarUpdate", args.clone(), HeldAttachments::none());
         r.requested_id().await;
         r.serve().await;
-        steps.push(r.start_nested().await);
-        stub_saw(&r, n).await;
-        drop_caller(call).await;
-    }
-    gate.add_permits(LATE_ANSWERS);
-    for step in steps {
-        step.await.expect("the executor's drain step");
+        steps.push(r.end_held(call, n).await);
     }
 
-    let results = r.owed(&r.provider_sub, LATE_ANSWERS).await;
-    assert_eq!(
-        r.inflight_keys().len(),
-        LATE_ANSWERS,
-        "five writes in flight"
-    );
+    let results = r.answer_late(&gate, steps).await;
     for result in &results {
         let ok = &result["outcome"]["ok"];
         assert_eq!(ok["status"], 200, "a late answer is the stub's echo");
@@ -468,9 +442,7 @@ async fn late_answers(unit: char) -> StubRig {
 async fn settles(unit: char, limits: Option<ActivationLimits>) -> (bool, u64) {
     let r = late_answers(unit).await;
     r.serve_under(limits).await;
-    let left = r.inflight_keys().len();
-    assert!(left == 0 || left == LATE_ANSWERS, "{left} rows left");
-    (left == 0, 0)
+    (r.settled_late(LATE_ANSWERS), 0)
 }
 
 /// The parts of the production grant a share is counted in: one part of a
@@ -524,7 +496,7 @@ async fn five_late_answers_to_the_widest_update_settle_inside_the_margin() {
     let r = late_answers(DESCRIPTIONS[0]).await;
     r.serve_under(Some(MARGIN)).await;
     assert!(
-        r.inflight_keys().is_empty(),
+        r.settled_late(LATE_ANSWERS),
         "the five late answers were settled"
     );
 }

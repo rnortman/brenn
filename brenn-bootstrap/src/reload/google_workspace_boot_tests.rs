@@ -93,10 +93,10 @@ const GMAIL_COMPOSE: Class = Class {
     tools: &[("gmail-draft", "GmailDraft")],
     clauses: &[
         ("GET", "/gmail/v1/users/me/messages/*"),
-        ("POST", "/gmail/v1/users/me/drafts"),
+        ("POST", "/upload/gmail/v1/users/me/drafts"),
     ],
     result_depth: 16,
-    grants: PROVIDER_GRANTS,
+    grants: "log, store, config, tools, provides, blobs",
 };
 
 const GMAIL_ORGANIZE: Class = Class {

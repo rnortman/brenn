@@ -14,7 +14,7 @@ use brenn_messaging_store::blob::{BlobHold, BlobUsage};
 use brenn_messaging_store::testutils::seal_bytes;
 use brenn_oauth::testutil::ApiSeen;
 use brenn_tool_registry::{HeldAttachments, ToolError, ToolOutput};
-use brenn_wasm::{PROCESSOR_FUEL_MINIMUM, PROCESSOR_FUEL_PER_ENVELOPE};
+use brenn_wasm::{PROCESSOR_FUEL_MINIMUM, processor_fuel};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
@@ -49,7 +49,7 @@ pub(super) const CLAUSES: Clauses<'static> = &[("PUT", FILES), ("HEAD", FILES), 
 /// The fixture's Σ `max_concurrency`, its request window's depth.
 const WINDOW: usize = 12;
 /// The most bodies the provider kit builds in one activation.
-const BUILD_BUDGET: usize = 4;
+pub(super) const BUILD_BUDGET: usize = 4;
 /// How many times `KitBodyPut` repeats its text: the built body is over the
 /// 64 KiB a component's call arguments are capped at.
 const TIMES: usize = 80;
@@ -567,7 +567,7 @@ async fn a_queued_build_whose_caller_left_is_dropped_unbuilt() {
 async fn envelope_term(r: &StubRig) -> u64 {
     let ports = r.owed_windows().await;
     let envelopes: usize = ports.iter().map(|port| port.entries.len()).sum();
-    PROCESSOR_FUEL_MINIMUM.max(PROCESSOR_FUEL_PER_ENVELOPE * envelopes as u64)
+    processor_fuel(envelopes, 0, 0, None)
 }
 
 /// Each call was failed by its provider's activation trapping.

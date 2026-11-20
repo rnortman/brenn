@@ -168,6 +168,10 @@ peak and the windows' weight share the 16 MiB: a `gmail-read` result window
 sized near the guest's memory traps a body answer the tool would otherwise
 take. A trap on that answer fails no request, so the caller waits out the
 request's ceiling (240 s) before it is answered.
+`GmailDraft` holds about 2.2 MiB in the guest while it builds a draft's
+message — one 1 MiB piece of a file, its base64, and the write buffer —
+whatever the files' size, beside `gmail-compose`'s windows of 6 MiB and
+768 KiB.
 
 Operators who already have the Maps guide's `messaging` block need nothing
 more: the cap is bus-wide, and the value is the same.
@@ -180,7 +184,7 @@ For Gmail that costs most HTML mail: a message over 40 KiB is answered by
 also costs long threads: a thread whose messages' headers together pass the
 limit is answered without `to` and `cc`, and one whose remaining headers
 still pass it is refused and read one message at a time (section 7,
-step 18). For Calendar it costs wide windows: `CalendarEvents` and
+step 19). For Calendar it costs wide windows: `CalendarEvents` and
 `CalendarFreeBusy` refuse a window whose answer passes the limit and say
 what to narrow.
 
@@ -298,11 +302,11 @@ new gmail-read: GoogleGmailRead {
 }
 
 new gmail-compose: GoogleGmailCompose {
-  grants = [log, store, config, tools, provides];
+  grants = [log, store, config, tools, provides, blobs];
   store_path = "/var/lib/brenn/google-gmail-compose.db";
   tool api-request {
     allow { provider = "google"; user = "*"; method = "GET"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/messages/*"; }
-    allow { provider = "google"; user = "*"; method = "POST"; host = "gmail.googleapis.com"; path = "/gmail/v1/users/me/drafts"; }
+    allow { provider = "google"; user = "*"; method = "POST"; host = "gmail.googleapis.com"; path = "/upload/gmail/v1/users/me/drafts"; }
     rate_limit { burst = 10; sustained_per_minute = 30; }
   }
   config = {
@@ -451,6 +455,43 @@ with it — a larger one is answered `invalid_args` naming `max_blob_bytes`.
 The inbox's depth cannot go below 2 × Σ = 28, so it is not
 the lever.
 
+**What `GmailDraft` leaves in the blob pool.** A draft adds two kinds of
+bytes:
+
+- *The files.* A file is charged to the pool once, when it was written;
+  attaching it to a call adds no bytes and extends its life. The request's
+  row on `brenn:tool-requests/gmail-compose` (depth Σ `max_concurrency` = 2,
+  not the operator's to tune) holds every attachment of the call until the
+  bus GC pass that follows the row leaving that window, whatever became of
+  the call, and the host holds them until the call ends. That is true of a
+  call the tool refuses for count or size too: the request was published
+  with up to 32 attachments before the component saw it (`TODO.md`,
+  `tool-provide-attachment-count`).
+- *The built message.* New bytes, at most 14,414,490 a draft — the files'
+  base64, a third larger than the files, and under 65,536 bytes of headers,
+  text and framing — written while the draft is built and named by the
+  nested call's row on `brenn:tools/api-request` (depth 16 by default,
+  shared with every other caller of `api-request`) until the bus GC pass that
+  follows that row leaving its window. Nothing is built for a refused call.
+
+By the rule above, which counts a row for its window, the instance adds
+16 × 14.5 MB, about 231 MB, to the sum when every row of
+`brenn:tools/api-request`'s window is a draft upload at the file bound. The
+rule leaves out a term: rows are deleted by the hourly GC pass, not when newer
+rows push them out of the window, so every draft uploaded between two passes
+stays charged, and about 74 drafts at the file bound inside one hour fill the
+default 1 GiB pool, after which every producer in the deployment is refused
+until the pass (`TODO.md`, `blob-budget-rule-sized-by-window`). An operator
+who expects that volume raises `blob_budget_bytes` or lowers the instance's
+`rate_limit`.
+
+The default `max_blob_bytes`, 64 MiB, carries every draft. A deployment that
+lowered it under a draft's built message fails that draft `internal`, after
+its files were read; 16 MiB carries every draft the tool admits. The upload
+must finish inside `api-request`'s 60 s bound on a whole request, body
+included (`TODO.md`, `api-request-transfer-time-bound`): a draft at the file
+bound needs about 2 Mbit/s to Google.
+
 **The clauses.** Each instance holds one clause per endpoint its own tools
 call, and nothing wider:
 
@@ -462,8 +503,10 @@ call, and nothing wider:
   blob and answers its body forms as attachments. `GmailBody` calls
   `messages.get`, which the one-message clause already admits.
 - `gmail-compose` — the `GET` of one message, for a reply's original, and the
-  `POST` for `drafts`, which creates a draft in the user's Drafts and sends
-  nothing.
+  `POST` for `/upload/gmail/v1/users/me/drafts`, which uploads the message the
+  component builds and creates a draft in the user's Drafts, sending nothing.
+  The class requires `blobs`: it opens the files a call attaches and builds
+  the uploaded message as a blob.
 - `gmail-organize` — the `POST` for `messages/batchModify`, which adds and
   removes labels on the messages named.
 - `calendar-read` — Calendar's calendar list, one calendar's events and one
@@ -475,9 +518,10 @@ call, and nothing wider:
 
 Every method but `GET` is admitted only for a stamped call. Each write path is
 exact: a clause's path matches only a path with the same number of segments
-and every literal segment equal, with no prefix match. So `drafts` does not
-admit `drafts/send`; `calendars/*/events/*` admits neither `…/move` nor
-`…/instances`, which have one segment more; and `calendars/*/events` does not
+and every literal segment equal, with no prefix match. So the upload path
+admits neither `/upload/gmail/v1/users/me/drafts/send` nor the JSON path
+`/gmail/v1/users/me/drafts`; `calendars/*/events/*` admits neither `…/move`
+nor `…/instances`, which have one segment more; and `calendars/*/events` does not
 admit `calendars/*/clear`, which has the same number of segments but whose
 literal `clear` is not `events`. The `*` segments take a label, message,
 thread, calendar or event id. A clause that does not admit a call's method,
@@ -546,7 +590,10 @@ delete, no trash. Neither the scopes nor the clauses alone make that true:
 - **Sending.** `gmail.modify` and `gmail.compose` can send at the API level.
   What keeps mail from being sent is the components' exact clauses: no
   component calls `drafts/send` or `messages/send`, and no clause in the
-  blocks above admits either. `gmail.send` goes in no scope set.
+  blocks above admits either. `gmail.send` goes in no scope set. A draft
+  can carry any file its caller can attach — one fetched with
+  `GmailAttachment`, or one the user gave the assistant — and it reaches
+  anyone only when the user sends the draft from Gmail.
 - **Trashing.** `gmail.modify` can trash at the API level, and the
   `batchModify` clause admits any body, including one that adds the `TRASH`
   or `SPAM` label — which moves mail to a folder Gmail empties after 30
@@ -785,7 +832,7 @@ sections 3 and 5 in place.
    that conversation, then to label the message with one of your own labels.
    Expect one `GmailDraft` call; the diagnostic log shows one `GET` line for
    `/gmail/v1/users/me/messages/<id>`, then one `POST` line for
-   `/gmail/v1/users/me/drafts`, each status 200, and nothing else. The draft
+   `/upload/gmail/v1/users/me/drafts`, each status 200, and nothing else. The draft
    is in Gmail's Drafts. Its subject is the one the assistant gave, when it
    gave `subject` (section 6 tells it to give the thread's own); otherwise it
    is the original's with `Re:` before it, and the answer's `subject` names
@@ -800,36 +847,48 @@ sections 3 and 5 in place.
    log shows one `POST` line for `/gmail/v1/users/me/messages/batchModify`,
    status 204, and the label is on the message in Gmail. Remove it the same
    way, by asking.
-8. **Calendars.** Ask the assistant to list your calendars. Expect one
+8. **Draft with a file.** Pick a message that carries an attachment, such as
+   a PDF. Ask the assistant to fetch the attachment with `GmailAttachment`,
+   then to draft a reply to that message carrying the file. Expect one
+   `GmailDraft` call naming the file in its `attachments`; the log shows one
+   `GET` line for `/gmail/v1/users/me/messages/<id>`, then one `POST` line
+   for `/upload/gmail/v1/users/me/drafts`, each status 200. Open the draft in
+   Gmail: the file shows under the name the call gave it, opens as the
+   original did, and the draft is in the original's conversation unless the
+   answer said `in_thread: false`. This step is the live check of the upload
+   form: if Google refuses the upload (a 400), or the draft shows without the
+   file or under another name, record it beside this step. Nothing is sent:
+   delete the draft in Gmail when done.
+9. **Calendars.** Ask the assistant to list your calendars. Expect one
    `CalendarList` call; the diagnostic log shows one `api-request` line for
    `www.googleapis.com` `/calendar/v3/users/me/calendarList`, status 200.
    Your own calendar is marked `primary: true`. This step is the live check
    of the Calendar shapes the tools read.
-9. **This week.** Ask what is on your calendar this week. Expect one
-   `CalendarEvents` call on `primary` whose `from` and `to` carry your
-   offset; the log shows one line for `/calendar/v3/calendars/primary/events`.
-   Recurring meetings appear as their occurrences, all-day events with
-   `date`, and an invitation you declined with `self_response: "declined"`.
-10. **One event.** Ask for the details of one of those events, on `primary`.
+10. **This week.** Ask what is on your calendar this week. Expect one
+    `CalendarEvents` call on `primary` whose `from` and `to` carry your
+    offset; the log shows one line for `/calendar/v3/calendars/primary/events`.
+    Recurring meetings appear as their occurrences, all-day events with
+    `date`, and an invitation you declined with `self_response: "declined"`.
+11. **One event.** Ask for the details of one of those events, on `primary`.
     Expect one `CalendarEvent` call answering its description, its attendees
     with `attendees_total` and `attendee_responses`, and, when you are a
     guest, `self_response` — on `primary`, your own response.
-11. **Free/busy.** Ask when you are free on Tuesday. Expect one
+12. **Free/busy.** Ask when you are free on Tuesday. Expect one
     `CalendarFreeBusy` call; the log shows one `POST` line for
     `/calendar/v3/freeBusy`, status 200, and the answer lists your busy
     intervals for the day.
-12. **Another calendar.** Ask for this week's events on a calendar other
-    than your own from step 8 — a shared or subscribed one, such as a
+13. **Another calendar.** Ask for this week's events on a calendar other
+    than your own from step 9 — a shared or subscribed one, such as a
     holidays calendar. Expect `CalendarEvents` with that calendar's `id` as
     `calendar`; an id with `#` appears in the log as `%23`.
-13. **Create.** Ask the assistant to create an event tomorrow with one
+14. **Create.** Ask the assistant to create an event tomorrow with one
     attendee — another of your own addresses — without saying whom to
     notify. Expect one `CalendarCreate` call; the log shows one `POST` line
     for `/calendar/v3/calendars/primary/events` with `sendUpdates=none`, the
     event is in Google Calendar, and no invitation mail arrives. This is the
     live check of `sendUpdates` and of the timed shape. Then ask for an
     all-day event by giving dates: the check of the `date` shape.
-14. **Update.** Ask to move the timed event an hour later. Expect one
+15. **Update.** Ask to move the timed event an hour later. Expect one
     `CalendarUpdate` call; the log shows one `PATCH` line, and the event is
     moved in Google Calendar, its description and attendees untouched. Then
     ask for the all-day event to be given a time: expect one `PATCH` line and
@@ -838,16 +897,16 @@ sections 3 and 5 in place.
     key `null` clears that key. If Google refuses the `PATCH`, or saves the
     event holding both a date and a time (the tool then answers `internal`
     naming `events.patch`), record it beside this step.
-15. **Delete.** Ask to delete the timed event. Expect one `CalendarDelete`
+16. **Delete.** Ask to delete the timed event. Expect one `CalendarDelete`
     call; the log shows one `GET` line, then one `DELETE` line, status 204,
     and the answer names its summary. Delete the all-day event the same way.
-16. **A series.** Ask to delete a recurring meeting without saying "the
+17. **A series.** Ask to delete a recurring meeting without saying "the
     whole series". Expect the refusal naming it as a series and no `DELETE`
     line in the log.
-17. **No account.** A second Brenn user who has not connected asks the
+18. **No account.** A second Brenn user who has not connected asks the
     assistant for their mail. The assistant is answered `credential_invalid`
     and offers to connect, with a link.
-18. **When a step fails**, the tool's error says whose answer it is.
+19. **When a step fails**, the tool's error says whose answer it is.
     - A `denied` quoting Google's 403 is Google's refusal: the account was
       connected without the Gmail read scope (reconnect with
       `gmail_readonly`), or Google refuses restricted scopes to the
@@ -960,12 +1019,12 @@ sections 3 and 5 in place.
          only remedy left.
 
     Fix the cause and restart.
-19. **No token in the container.** In the agent's container home, `grep -r`
+20. **No token in the container.** In the agent's container home, `grep -r`
     for the start of the access token (`ya29.`) and for the refresh token
     (`1//`). Nothing should match.
-20. **Vault modes.** `ls -la` of the vault shows `0700` directories and
+21. **Vault modes.** `ls -la` of the vault shows `0700` directories and
     `0600` files, owned by the server's user.
-21. **Disconnect.** Ask the assistant to disconnect one account. Then confirm
+22. **Disconnect.** Ask the assistant to disconnect one account. Then confirm
     that Brenn no longer appears at `myaccount.google.com/permissions` for
     that account, and that its file is gone from the vault.
 

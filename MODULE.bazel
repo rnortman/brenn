@@ -15,15 +15,18 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_rust", version = "0.73.0")
 bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.73.0")
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
+
 # `dev_dependency`: the musl cc toolchain exists for brenn's own static release
 # binary, and the module registers its toolchains unconditionally — a
 # dependent module would inherit a musl `cc` toolchain matching its plain
 # linux platform and link every host tool against musl. Hidden from
 # dependents, present for brenn as root.
 bazel_dep(name = "toolchains_musl", version = "0.1.27.bcr.1", dev_dependency = True)
+
 # `dev_dependency`: `sh_binary` for //tools/scrub, a package only brenn's own
 # check lane builds.
 bazel_dep(name = "rules_shell", version = "0.6.1", dev_dependency = True)
+
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
 bazel_dep(name = "aspect_rules_js", version = "3.4.0")
 bazel_dep(name = "rules_nodejs", version = "6.7.3")
@@ -145,6 +148,7 @@ toolchains_musl.config(
 bazel_dep(name = "toolchains_llvm", version = "1.12.0", dev_dependency = True)
 
 sysroot = use_repo_rule("@toolchains_llvm//toolchain:sysroot.bzl", "sysroot")
+
 sysroot(
     name = "org_chromium_sysroot_linux_x64",
     dev_dependency = True,
@@ -180,7 +184,10 @@ llvm.extra_target_compatible_with(
 )
 use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
 
-register_toolchains("@llvm_toolchain//:all", dev_dependency = True)
+register_toolchains(
+    "@llvm_toolchain//:all",
+    dev_dependency = True,
+)
 
 # ---------------------------------------------------------------------------
 # Third-party crates: the root workspace hub
@@ -200,6 +207,14 @@ register_toolchains("@llvm_toolchain//:all", dev_dependency = True)
 #
 # A stale lockfile fails brenn's own build with rules_rust's digest-mismatch
 # error, which names that command.
+#
+# A one-package repin, `CARGO_BAZEL_REPIN=<crate> CARGO_BAZEL_REPIN_ONLY=crates
+# bazel mod deps`, has also moved the Windows-only `windows-sys` dependency of
+# `errno`, `rustix`, `rustls-platform-verifier`, `tempfile` and `winapi-util`
+# between 0.61.2 and 0.52.0, with no package version changing. The cause is not
+# known. Such a move is not part of the bump: set those five entries in
+# `Cargo.lock` back and re-render with the workspace command above, which keeps
+# them as `Cargo.lock` has them.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 
 # wasmtime's compiler, optimized in every compilation mode. Loading a component

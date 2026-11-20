@@ -1,6 +1,7 @@
 //! The wrapper's decisions, in `std` plus `serde_json`: validating
-//! `GmailDraft`'s arguments, building its Gmail calls as `api-request`
-//! arguments, and reading `api-request`'s answer. Nothing here names the
+//! `GmailDraft`'s arguments and files, building its Gmail calls as
+//! `api-request` arguments, building the message a draft uploads as the
+//! call's body, and reading `api-request`'s answer. Nothing here names the
 //! guest SDK, so the whole module runs on the host under test. The tool is
 //! the generated `Provided` enum, whose SDK-facing parts are wasm32-only.
 
@@ -16,7 +17,7 @@ mod spec;
 mod compose;
 
 use brenn_google_workspace::args::{account, is_printable_ascii};
-use brenn_google_workspace::call::{get_call, json_call};
+use brenn_google_workspace::call::{get_call, new_call};
 #[cfg(test)]
 use brenn_google_workspace::gmail::decode;
 use brenn_google_workspace::gmail::{
@@ -26,17 +27,17 @@ use brenn_google_workspace::scope::{Scope, google_error, no_body_refused, with_w
 use brenn_google_workspace::settings::Settings;
 use brenn_google_workspace::text::shape;
 use brenn_provider_kit::{
-    Answer, ApiCall, Args, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure, Logic, NestedError,
-    Next, Query, Tool, Unreadable, bounded, capped, copy, google, internal, no_such_step, object,
-    read_api_result, stored,
+    Answer, ApiCall, Args, Attached, Blob, Body, COMPACT_RESULT_CEILING, Call, ErrorKind, Failure,
+    Logic, NestedError, Next, Queued, Step, Tool, Unreadable, bounded, capped, copy, google,
+    internal, no_such_step, object, query, read_api_result, stored,
 };
 use serde_json::{Value, json};
 
 use crate::spec::Provided;
 
-/// The path Gmail creates drafts at. Nothing below it is ever called: a
-/// draft is sent only by the user, from Gmail.
-const DRAFTS_PATH: &str = "/gmail/v1/users/me/drafts";
+/// The path Gmail creates a draft at from an uploaded message. Nothing below
+/// it is ever called: a draft is sent only by the user, from Gmail.
+const DRAFTS_UPLOAD_PATH: &str = "/upload/gmail/v1/users/me/drafts";
 /// `GmailDraft`'s read of the message a reply answers.
 const DRAFT_ORIGINAL_STEP: u8 = 1;
 /// `GmailDraft`'s `POST`: a fresh draft's first step, a reply's second.
@@ -55,16 +56,53 @@ const HEADER_VALUE_MAX_BYTES: usize = 980;
 const SUBJECT_MAX_CHARS: usize = 500;
 /// The most characters a draft's `body` may hold, as its schema states it.
 const BODY_MAX_CHARS: usize = 20_000;
-// TODO(google-write-bodies-in-call-arguments): send the draft as a blob the
-// component builds.
 /// The most bytes a draft's body may hold in its CRLF form, a lone line break
-/// counting as the two bytes it becomes. The body travels as base64 of that
-/// form inside `raw`, itself base64url of the message, inside the nested
-/// call's args, which the host caps at 64 KiB: with `to`, `cc` and a reply's
-/// `In-Reply-To` and `References` at `HEADER_VALUE_MAX_BYTES`, `subject` at
-/// its cap as encoded-words, the longest thread id and `account` at its
-/// escaped width, the widest admitted call serializes to about 49 000 bytes.
+/// counting as the two bytes it becomes. The message is built as the upload's
+/// body, so the body is not under the host's cap on a nested call's
+/// arguments; it rides the request's in-flight row whole, which every settle
+/// of the row decodes, a late answer's included, on the envelope term alone.
+/// Measured on the real host, five late answers to the widest reply settled
+/// in one activation, the body of U+0001, the costliest content for both
+/// steps:
+/// - to the upload, the settle decodes the row: about 42.0M fuel of a 120.6M
+///   grant over 12 envelopes, 0.348 of it, at about 2,000 fuel a body byte,
+///   meeting the 19/28 margin at a body of about 39,900 bytes;
+/// - to the read of the original, the settle also parses the arguments again
+///   in `draft_reply`, and the kit drops the upload it returns: about 49.8M
+///   of a 72.0M grant over 7 envelopes, 0.692 of it, at about 2,380 fuel a
+///   body byte, meeting the margin at a body of about 19,600 bytes.
+///
+/// The lower figure, about 19,600 bytes, is where a late-answer activation
+/// meets the margin: at this bound the read step's late answers are over it,
+/// though inside the grant. An activation settling late answers to both
+/// steps was not measured; it is bounded by five of the read step's, the
+/// costlier, and as the two steps' activations are granted differently, its
+/// share is taken as no higher than the read step's. The bound is kept at
+/// 20,000 by choice and not raised; before any rise the builds and both
+/// steps' late answers would be measured at it.
+// TODO(gmail-draft-late-answers-over-fuel-margin): five late answers to the
+// widest reply's read settle over the margin at this bound.
 const BODY_MAX_BYTES: usize = 20_000;
+/// The most files a draft carries.
+const FILES_MAX: usize = 5;
+/// The most bytes a draft's files hold together. Base64 in 76-character
+/// lines writes 78 bytes for every 57, so files this size write at most
+/// 14 348 954 bytes, and everything else in the widest built message is
+/// under 65 536: one built message is under 14 414 490 bytes, and the kit's
+/// `BUILD_BUDGET` of four in one activation write under 57 657 960 bytes of
+/// the host's 64 MiB an activation. Measured on the real host, a build costs
+/// about 28 fuel a file byte of the 128 the host grants one, and the
+/// costliest activation building drafts at this bound, two replies, completes
+/// on about 0.22 of its production grant, inside the 19/28 margin.
+const FILES_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// The most characters a file's name holds: the name the caller attached it
+/// under, the file name the recipient sees.
+const FILE_NAME_MAX_CHARS: usize = 64;
+/// The most bytes a file's content type holds as the host records it.
+const CONTENT_TYPE_MAX_BYTES: usize = 255;
+/// The file bytes the base64 encoder takes at once: a whole number of lines,
+/// so each slice encodes to 79 872 bytes the build writes in one call.
+const ENCODE_SLICE_BYTES: usize = compose::LINE_INPUT_BYTES * 1024;
 /// What the caller is told when a draft's `POST` may have been acted on and
 /// its answer was lost or unreadable.
 const DRAFT_UNKNOWN_HINT: &str = "the draft may have been created before its answer was lost: \
@@ -103,43 +141,98 @@ impl Logic for GmailCompose {
     fn plan(
         tool: Provided,
         args: &Value,
-        _: &brenn_provider_kit::Step<'_>,
+        step: &Step<'_>,
         settings: &Settings,
     ) -> Result<Call, String> {
-        plan(tool, args, settings)
+        plan(tool, args, step.request_attachments(), settings)
     }
 
     fn advance(
         state: &InFlight,
         outcome: Result<Value, NestedError>,
-        _: &mut brenn_provider_kit::Step<'_>,
+        _: &mut Step<'_>,
         settings: &Settings,
     ) -> Next {
         advance(state, outcome, settings)
     }
+
+    fn body(call: &Queued<Provided>, step: &Step<'_>, _: &Settings) -> Result<Blob, Failure> {
+        match (call.tool, call.call.step) {
+            (Provided::GmailDraft, DRAFT_CREATE_STEP) => draft_message(call, step),
+            (tool, step) => Err(no_such_step(tool, step)),
+        }
+    }
 }
 
-/// Validate a request's arguments and build its first nested call. An error is
-/// the request's `invalid_args` detail, naming the argument.
-pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, String> {
+/// Validate a request's arguments and files and build its first nested call.
+/// An error is the request's `invalid_args` detail, naming the argument or
+/// the bound.
+pub fn plan(
+    tool: Provided,
+    args: &Value,
+    attachments: &[Attached],
+    settings: &Settings,
+) -> Result<Call, String> {
     match tool {
         Provided::GmailDraft => {
             let draft = DraftArgs::parse(args)?;
-            Ok(match (&draft.reply_to_id, &draft.subject) {
-                (Some(id), _) => Call {
+            files(attachments)?;
+            let account = draft.account.as_deref();
+            Ok(match &draft.reply_to_id {
+                Some(id) => Call {
                     step: DRAFT_ORIGINAL_STEP,
-                    api: draft_original_call(id, draft.account.as_deref(), settings),
+                    api: draft_original_call(id, account, settings),
                 },
-                (None, Some(subject)) => Call {
+                None => Call {
                     step: DRAFT_CREATE_STEP,
-                    api: draft_create_call(&draft, subject, None, settings),
+                    api: upload_call(account, false, settings),
                 },
-                (None, None) => {
-                    unreachable!("a draft's parse refuses one without `subject` or `reply_to_id`")
-                }
             })
         }
     }
+}
+
+/// The request's files as a draft takes them: at most `FILES_MAX`, at most
+/// `FILES_MAX_BYTES` together, each named as a quoted `filename` holds it
+/// unescaped and typed as a header line holds it unfolded.
+fn files(attachments: &[Attached]) -> Result<(), String> {
+    if attachments.len() > FILES_MAX {
+        return Err(format!(
+            "`GmailDraft` takes at most {FILES_MAX} files; this call attaches {}",
+            attachments.len()
+        ));
+    }
+    let total: u64 = attachments.iter().map(|file| file.size).sum();
+    if total > FILES_MAX_BYTES {
+        return Err(format!(
+            "the files are {total} bytes together; a draft takes at most {FILES_MAX_BYTES}"
+        ));
+    }
+    for file in attachments {
+        if !is_file_name(&file.name) {
+            return Err(format!(
+                "attachment {:?}'s name must be 1 to {FILE_NAME_MAX_CHARS} letters, digits, \
+                 `.`, `_` or `-`",
+                file.name
+            ));
+        }
+        if !is_printable_ascii(&file.content_type, CONTENT_TYPE_MAX_BYTES) {
+            return Err(format!(
+                "attachment `{}`'s content type must be 1 to {CONTENT_TYPE_MAX_BYTES} printable \
+                 ASCII characters",
+                file.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` is 1 to `FILE_NAME_MAX_CHARS` of `[A-Za-z0-9._-]`.
+fn is_file_name(name: &str) -> bool {
+    (1..=FILE_NAME_MAX_CHARS).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// `GmailDraft`'s arguments, each header value held to what the message
@@ -176,16 +269,6 @@ impl DraftArgs {
             account: account(map)?,
         })
     }
-}
-
-/// What a reply takes from its original, each value held to what the message
-/// builder writes as is.
-struct Reply {
-    /// The original's thread, which the draft is filed in.
-    thread_id: String,
-    /// The threading headers, when the original's `Message-ID` is one
-    /// printable ASCII token of at most `HEADER_VALUE_MAX_BYTES`.
-    threading: Option<Threading>,
 }
 
 /// A reply's `In-Reply-To` and `References`.
@@ -252,45 +335,135 @@ fn draft_original_call(id: &str, account: Option<&str>, settings: &Settings) -> 
     )
 }
 
-// TODO(gmail-draft-attachments): a draft carrying a file from the request's
-// attachment, in a MIME message the component builds as the call's body.
-/// drafts.create of the message the arguments describe under `subject`, as
-/// `raw`, filed in the original's thread for a reply. The `POST` creates a
-/// draft and sends nothing.
-fn draft_create_call(
-    args: &DraftArgs,
-    subject: &str,
-    reply: Option<&Reply>,
-    settings: &Settings,
-) -> ApiCall {
-    let threading = reply.and_then(|reply| reply.threading.as_ref());
-    let message = compose::message(&compose::Message {
-        to: &args.to,
-        cc: args.cc.as_deref(),
-        subject,
-        in_reply_to: threading.map(|threading| threading.in_reply_to.as_str()),
-        references: threading.map(|threading| threading.references.as_str()),
-        body: &args.body,
-    });
-    let mut message = json!({ "raw": compose::base64url(&message) });
-    if let Some(reply) = reply {
-        message["threadId"] = json!(reply.thread_id);
-    }
-    json_call(
+// TODO(gmail-draft-upload-unconfirmed-against-live-google): create a draft
+// with a file and a reply draft through a deployed Brenn against a real
+// account, and correct the form if Google refuses it.
+/// drafts.create by upload, its body the message `Logic::body` builds: for a
+/// new draft the message alone (`uploadType=media`), for a reply the
+/// metadata naming the thread and the message (`uploadType=multipart`). The
+/// `POST` creates a draft and sends nothing.
+fn upload_call(account: Option<&str>, reply: bool, settings: &Settings) -> ApiCall {
+    let upload_type = if reply { "multipart" } else { "media" };
+    new_call(
         settings,
         "POST",
-        args.account.as_deref(),
-        DRAFTS_PATH.to_string(),
-        Query::new(),
-        json!({ "message": message }),
+        account,
+        DRAFTS_UPLOAD_PATH.to_string(),
+        query([("uploadType", upload_type.to_string())]),
+        Some(Body::Built),
     )
 }
 
-/// A reply's original read: the draft's `POST` next, filed in the original's
-/// thread with the headers derived from the original's, carrying in
-/// `derived` the original's `thread_id`, which the answer is checked
-/// against, and the `in_reply_to` and derived `subject` it names. An
-/// original whose id is not the one asked for is Google's fault.
+/// The message a draft uploads, built front to back as the call's body: for
+/// a reply, inside the `multipart/related` frame naming its thread; the
+/// head; the text's base64; each file's part, its bytes read in pieces and
+/// encoded in slices so the build holds one piece and one slice's lines at
+/// a time. Everything but the files comes from the caller's arguments and,
+/// for a reply, `derived`; a row this build did not write is `internal`.
+fn draft_message(call: &Queued<Provided>, step: &Step<'_>) -> Result<Blob, Failure> {
+    let args = DraftArgs::parse(&call.args).map_err(|reason| {
+        internal(format!(
+            "stored {} arguments no longer parse: {reason}",
+            call.tool.name()
+        ))
+    })?;
+    files(&call.attachments).map_err(|reason| {
+        internal(format!(
+            "stored {} attachments no longer pass: {reason}",
+            call.tool.name()
+        ))
+    })?;
+    let reply = args.reply_to_id.is_some();
+    let thread_id = if reply {
+        Some(derived_value(call, "thread_id", is_gmail_id)?.ok_or_else(|| unwritten("thread_id"))?)
+    } else {
+        None
+    };
+    let is_header = |value: &str| is_printable_ascii(value, HEADER_VALUE_MAX_BYTES);
+    let subject = match &args.subject {
+        Some(subject) => subject.as_str(),
+        None => derived_value(call, "subject", |subject| {
+            !subject.chars().any(char::is_control)
+        })?
+        .ok_or_else(|| unwritten("subject"))?,
+    };
+    let head = compose::Head {
+        to: &args.to,
+        cc: args.cc.as_deref(),
+        subject,
+        in_reply_to: derived_value(call, "in_reply_to", is_header)?,
+        references: derived_value(call, "references", is_header)?,
+    };
+    let content_type = if reply {
+        compose::RELATED_TYPE
+    } else {
+        compose::MESSAGE_TYPE
+    };
+    let mut out = step.append(content_type)?;
+    if let Some(thread_id) = thread_id {
+        out.write(compose::related_open(thread_id).as_bytes())?;
+    }
+    let with_files = !call.attachments.is_empty();
+    out.write(compose::head(&head, with_files).as_bytes())?;
+    let mut lines = compose::Lines::default();
+    // One slice's lines and the line a held remainder completes.
+    let mut encoded = Vec::with_capacity(compose::encoded_len(
+        ENCODE_SLICE_BYTES + compose::LINE_INPUT_BYTES,
+    ));
+    lines.push(args.body.as_str().as_bytes(), &mut encoded);
+    lines.finish(&mut encoded);
+    out.write(&encoded)?;
+    for file in &call.attachments {
+        out.write(compose::file_head(&file.name, &file.content_type).as_bytes())?;
+        let blob = step.open_request(&file.name)?;
+        let mut lines = compose::Lines::default();
+        for piece in step.pieces(&blob) {
+            for slice in piece?.chunks(ENCODE_SLICE_BYTES) {
+                encoded.clear();
+                lines.push(slice, &mut encoded);
+                out.write(&encoded)?;
+            }
+        }
+        encoded.clear();
+        lines.finish(&mut encoded);
+        out.write(&encoded)?;
+    }
+    if with_files {
+        out.write(compose::MIXED_CLOSE.as_bytes())?;
+    }
+    if reply {
+        out.write(compose::RELATED_CLOSE.as_bytes())?;
+    }
+    out.finish()
+}
+
+/// `derived`'s string `key`, when present, held to `valid`: anything else is
+/// a row this build did not write.
+fn derived_value<'a>(
+    call: &'a Queued<Provided>,
+    key: &str,
+    valid: impl Fn(&str) -> bool,
+) -> Result<Option<&'a str>, Failure> {
+    match call.derived.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) if valid(value) => Ok(Some(value)),
+        Some(_) => Err(unwritten(key)),
+    }
+}
+
+/// A stored reply missing `key` from `derived`, or holding one this build
+/// would not have written.
+fn unwritten(key: &str) -> Failure {
+    internal(format!(
+        "stored GmailDraft reply has no usable `{key}` in `derived`"
+    ))
+}
+
+/// A reply's original read: the draft's upload next, carrying in `derived`
+/// the original's `thread_id`, which the upload names and the answer is
+/// checked against, the `in_reply_to` and `references` the message carries
+/// when the original has a usable `Message-ID`, and the derived `subject`.
+/// An original whose id is not the one asked for is Google's fault.
 fn draft_reply(state: &InFlight, body: &Value, settings: &Settings) -> Result<Next, Failure> {
     let api = "messages.get";
     let args = stored(state, DraftArgs::parse)?;
@@ -323,25 +496,20 @@ fn draft_reply(state: &InFlight, body: &Value, settings: &Settings) -> Result<Ne
     });
     let mut derived = Args::new();
     derived.insert("thread_id".to_string(), json!(thread_id));
-    if let Some(threading) = &threading {
+    if let Some(threading) = threading {
         derived.insert("in_reply_to".to_string(), json!(threading.in_reply_to));
+        derived.insert("references".to_string(), json!(threading.references));
     }
-    let subject = match &args.subject {
-        Some(subject) => subject.clone(),
-        None => {
-            let subject = derived_subject(original_subject)?;
-            derived.insert("subject".to_string(), json!(subject));
-            subject
-        }
-    };
-    let reply = Reply {
-        thread_id,
-        threading,
-    };
+    if args.subject.is_none() {
+        derived.insert(
+            "subject".to_string(),
+            json!(derived_subject(original_subject)?),
+        );
+    }
     Ok(Next::Call {
         call: Call {
             step: DRAFT_CREATE_STEP,
-            api: draft_create_call(&args, &subject, Some(&reply), settings),
+            api: upload_call(args.account.as_deref(), true, settings),
         },
         derived,
     })
@@ -513,19 +681,17 @@ fn settle(tool: Provided, decided: Result<Next, Failure>) -> Next {
 mod tests {
     use std::collections::BTreeMap;
 
-    use brenn_google_workspace::args::{
-        ACCOUNT_MAX_CHARS, HOST_ARGS_CAP_BYTES, printable_ascii_pattern,
-    };
+    use brenn_google_workspace::args::{ACCOUNT_MAX_CHARS, printable_ascii_pattern};
     use brenn_google_workspace::gmail::ID_MAX_CHARS;
     use brenn_google_workspace::scope::scope_hint;
     use brenn_google_workspace::testutil::{
         admits_characters, cut_read, description, escaped_widest, follow, four_byte, lookup,
         no_body_parts, wide,
     };
-    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body};
+    use brenn_provider_kit::testutil::{Answered, MemoryHost, failure, google, http, nested};
     use brenn_provider_kit::{
-        Bound, Probes, QueryValue, ToolBounds, check, hold_probes, hold_required, input_schema,
-        internal, probes, query,
+        BUILD_BUDGET, Bound, Delivered, Input, Probes, QueryValue, Request, ToolBounds, WriteError,
+        check, hold_probes, hold_required, input_schema, internal, probes,
     };
     use serde_json::{Map, json};
 
@@ -553,14 +719,14 @@ mod tests {
     }
 
     fn draft(args: Value) -> Result<ApiCall, String> {
-        plan(Provided::GmailDraft, &args, &settings()).map(|call| {
+        plan(Provided::GmailDraft, &args, &[], &settings()).map(|call| {
             assert_eq!(call.step, DRAFT_CREATE_STEP);
             call.api
         })
     }
 
     fn draft_state(args: Value) -> InFlight {
-        let call = plan(Provided::GmailDraft, &args, &settings()).unwrap();
+        let call = plan(Provided::GmailDraft, &args, &[], &settings()).unwrap();
         InFlight::new(
             &"a".repeat(32),
             Provided::GmailDraft,
@@ -598,16 +764,157 @@ mod tests {
         )
     }
 
-    /// What a reply posts after reading `headers` of its original: the
-    /// draft's call, decoded `raw`, and the `derived` its answer reads.
+    /// What a reply uploads after reading `headers` of its original: the
+    /// draft's call, the message its upload carries, and the `derived` the
+    /// build and the answer read. The upload names thread `t1`.
     fn replied(state: &InFlight, headers: &[(&str, &str)]) -> (ApiCall, String, Args) {
         let Next::Call { call, derived } = answered(state, original(headers)) else {
-            panic!("a reply posts after its read");
+            panic!("a reply uploads after its read");
         };
         assert_eq!(call.step, DRAFT_CREATE_STEP);
-        let message = raw_message(&call.api);
-        (call.api, message, derived)
+        let (thread, message) = uploaded(&built(&state.args, &derived, &call, &[]));
+        assert_eq!(thread.as_deref(), Some("t1"));
+        (call.api, String::from_utf8(message).unwrap(), derived)
     }
+
+    /// A file the request attaches: its name, content type and bytes.
+    type File = (String, String, Vec<u8>);
+
+    fn file(name: &str, content_type: &str, bytes: Vec<u8>) -> File {
+        (name.to_string(), content_type.to_string(), bytes)
+    }
+
+    /// `len` bytes of every value.
+    fn bytes(len: usize, seed: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i * 7 + seed * 13) % 256) as u8)
+            .collect()
+    }
+
+    /// The header entries `files` make on a request.
+    fn attached(files: &[File]) -> Vec<Attached> {
+        files
+            .iter()
+            .map(|(name, content_type, bytes)| Attached {
+                name: name.clone(),
+                size: bytes.len() as u64,
+                content_type: content_type.clone(),
+            })
+            .collect()
+    }
+
+    /// An upload's body: its content type and bytes.
+    type Upload = (String, Vec<u8>);
+
+    /// The body `Logic::body` builds for `call` of request `r000`, under
+    /// `args`, `derived` and the request's `files`.
+    fn built(args: &Value, derived: &Args, call: &Call, files: &[File]) -> Upload {
+        let host = MemoryHost::new();
+        for (name, content_type, bytes) in files {
+            host.seed_request("r000", name, content_type, bytes.clone());
+        }
+        let queued = Queued {
+            id: "r000".to_string(),
+            tool: Provided::GmailDraft,
+            args: args.clone(),
+            derived: derived.clone(),
+            call: call.clone(),
+            received_at_ms: 0,
+            queued_at_ms: 0,
+            attachments: attached(files),
+        };
+        let step = Step::planning(&host, "r000", attached(files));
+        let blob = GmailCompose::body(&queued, &step, &settings()).unwrap();
+        let mut bytes = Vec::new();
+        for piece in step.pieces(&blob) {
+            bytes.extend(piece.unwrap());
+        }
+        (blob.content_type().to_string(), bytes)
+    }
+
+    /// A new draft planned from `args` with `files`, and the message its
+    /// upload carries.
+    fn new_draft(args: Value, files: &[File]) -> (ApiCall, String) {
+        let call = plan(Provided::GmailDraft, &args, &attached(files), &settings()).unwrap();
+        assert_eq!(call.step, DRAFT_CREATE_STEP);
+        let (thread, message) = uploaded(&built(&args, &Args::new(), &call, files));
+        assert_eq!(thread, None, "a new draft names no thread");
+        (call.api, String::from_utf8(message).unwrap())
+    }
+
+    const RELATED_OPEN: &str =
+        "--brenn-draft-related\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n";
+    const RELATED_MESSAGE: &str =
+        "\r\n--brenn-draft-related\r\nContent-Type: message/rfc822\r\n\r\n";
+    const RELATED_END: &str = "\r\n--brenn-draft-related--\r\n";
+
+    /// The thread an upload names and the message it carries: a media
+    /// upload is the message alone; a multipart upload is exactly the
+    /// metadata `{"message":{"threadId":…}}` and the message.
+    fn uploaded((content_type, bytes): &Upload) -> (Option<String>, Vec<u8>) {
+        if content_type == "message/rfc822" {
+            return (None, bytes.clone());
+        }
+        assert_eq!(
+            content_type,
+            "multipart/related; boundary=brenn-draft-related"
+        );
+        let rest = bytes
+            .strip_prefix(RELATED_OPEN.as_bytes())
+            .expect("the metadata part opens the upload");
+        let at = rest
+            .windows(RELATED_MESSAGE.len())
+            .position(|window| window == RELATED_MESSAGE.as_bytes())
+            .expect("the message part follows the metadata");
+        let metadata: Value = serde_json::from_slice(&rest[..at]).unwrap();
+        let message = rest[at + RELATED_MESSAGE.len()..]
+            .strip_suffix(RELATED_END.as_bytes())
+            .expect("the closing delimiter ends the upload");
+        let thread = metadata["message"]["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(metadata, json!({ "message": { "threadId": thread } }));
+        (Some(thread), message.to_vec())
+    }
+
+    /// One part of a `multipart/mixed` message: its headers as written, and
+    /// its content, base64 decoded.
+    type Part = (String, Vec<u8>);
+
+    /// A message carrying files: its head through the `multipart/mixed`
+    /// opening, and its parts in order, the text first.
+    fn mixed(message: &str) -> (String, Vec<Part>) {
+        let (head, rest) = message.split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.ends_with("\r\nContent-Type: multipart/mixed; boundary=brenn-draft-mixed"),
+            "{head}"
+        );
+        let rest = rest
+            .strip_suffix("--brenn-draft-mixed--\r\n")
+            .expect("the closing delimiter ends the message");
+        let mut parts = rest.split("--brenn-draft-mixed\r\n");
+        assert_eq!(parts.next(), Some(""), "the first delimiter opens the body");
+        let parts = parts
+            .map(|part| {
+                let (headers, lines) = part.split_once("\r\n\r\n").unwrap();
+                (headers.to_string(), decode::base64url(lines).unwrap())
+            })
+            .collect();
+        (head.to_string(), parts)
+    }
+
+    /// A file part's headers for `name` and `content_type`.
+    fn file_part(name: &str, content_type: &str) -> String {
+        format!(
+            "Content-Type: {content_type}\r\n\
+             Content-Disposition: attachment; filename=\"{name}\"\r\n\
+             Content-Transfer-Encoding: base64"
+        )
+    }
+
+    const TEXT_PART: &str =
+        "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64";
 
     /// A message's header lines before the empty line, unfolded: each
     /// CRLF before a continuation's space removed.
@@ -631,18 +938,6 @@ mod tests {
             .find_map(|line| line.strip_prefix(&format!("{name}: ")).map(str::to_string))
     }
 
-    /// The message a draft call carries in `raw`, decoded.
-    fn raw_message(call: &ApiCall) -> String {
-        let body: Value = serde_json::from_str(text_body(call)).unwrap();
-        let raw = body["message"]["raw"].as_str().unwrap();
-        assert!(
-            raw.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "unpadded base64url"
-        );
-        String::from_utf8(decode::base64url(raw).unwrap()).unwrap()
-    }
-
     /// A message's body, its base64 lines decoded.
     fn message_body(message: &str) -> String {
         let (_, body) = message.split_once("\r\n\r\n").unwrap();
@@ -650,12 +945,14 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_posts_one_raw_message_on_the_gmail_host() {
-        let call = draft(draft_args(json!({
-            "cc": "Bob Example <bob@example.com>",
-            "account": "alice@example.com",
-        })))
-        .unwrap();
+    fn a_draft_uploads_one_message_on_the_gmail_host() {
+        let (call, message) = new_draft(
+            draft_args(json!({
+                "cc": "Bob Example <bob@example.com>",
+                "account": "alice@example.com",
+            })),
+            &[],
+        );
         assert_eq!(
             call,
             ApiCall {
@@ -663,29 +960,18 @@ mod tests {
                 account: Some("alice@example.com".to_string()),
                 method: "POST".to_string(),
                 host: "gmail.example.com".to_string(),
-                path: "/gmail/v1/users/me/drafts".to_string(),
-                query: query([("prettyPrint", "false".to_string())]),
+                path: "/upload/gmail/v1/users/me/drafts".to_string(),
+                query: query([
+                    ("prettyPrint", "false".to_string()),
+                    ("uploadType", "media".to_string()),
+                ]),
                 headers: BTreeMap::new(),
-                body: call.body.clone(),
+                body: Some(Body::Built),
                 response_attachment: None,
             }
         );
-        let body: Value = serde_json::from_str(text_body(&call)).unwrap();
         assert_eq!(
-            body.as_object().unwrap().keys().collect::<Vec<_>>(),
-            ["message"]
-        );
-        assert_eq!(
-            body["message"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .collect::<Vec<_>>(),
-            ["raw"],
-            "a fresh draft names no thread"
-        );
-        assert_eq!(
-            raw_message(&call),
+            message,
             "To: alice@example.com\r\n\
              Cc: Bob Example <bob@example.com>\r\n\
              Subject: Lunch\r\n\
@@ -699,12 +985,13 @@ mod tests {
 
     #[test]
     fn a_non_ascii_subject_and_body_are_encoded() {
-        let call = draft(draft_args(json!({
-            "subject": "Grüße aus Köln",
-            "body": "Привет,\nмир\r\n🎵",
-        })))
-        .unwrap();
-        let message = raw_message(&call);
+        let (_, message) = new_draft(
+            draft_args(json!({
+                "subject": "Grüße aus Köln",
+                "body": "Привет,\nмир\r\n🎵",
+            })),
+            &[],
+        );
         assert!(message.is_ascii(), "{message}");
         assert!(
             message.contains("\r\nSubject: =?utf-8?B?R3LDvMOfZSBhdXMgS8O2bG4=?=\r\n"),
@@ -777,8 +1064,8 @@ mod tests {
             assert_eq!(draft(args.clone()).unwrap_err(), refusal, "{args}");
         }
         // A body may hold any character.
-        let call = draft(draft_args(json!({ "body": "a\u{1}\tb\r" }))).unwrap();
-        assert_eq!(message_body(&raw_message(&call)), "a\u{1}\tb\r\n");
+        let (_, message) = new_draft(draft_args(json!({ "body": "a\u{1}\tb\r" })), &[]);
+        assert_eq!(message_body(&message), "a\u{1}\tb\r\n");
     }
 
     #[test]
@@ -790,13 +1077,13 @@ mod tests {
             "`subject` is required unless `reply_to_id` is given"
         );
         args["reply_to_id"] = json!("m0");
-        assert!(plan(Provided::GmailDraft, &args, &settings()).is_ok());
+        assert!(plan(Provided::GmailDraft, &args, &[], &settings()).is_ok());
     }
 
     #[test]
-    fn a_reply_reads_its_original_then_posts_in_its_thread() {
+    fn a_reply_reads_its_original_then_uploads_in_its_thread() {
         let state = reply_state(json!({ "account": "alice@example.com" }));
-        let read = plan(Provided::GmailDraft, &state.args, &settings()).unwrap();
+        let read = plan(Provided::GmailDraft, &state.args, &[], &settings()).unwrap();
         let mut expected_query = metadata_query(DRAFT_ORIGINAL_FIELDS, DRAFT_ORIGINAL_HEADERS);
         expected_query.insert(
             "prettyPrint".to_string(),
@@ -822,16 +1109,33 @@ mod tests {
             ("References", "<a@example.com>"),
         ];
         let Next::Call { call, derived } = answered(&state, original(&headers)) else {
-            panic!("a reply posts after its read");
+            panic!("a reply uploads after its read");
         };
         assert_eq!(call.step, DRAFT_CREATE_STEP);
         assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.path, DRAFTS_PATH);
+        assert_eq!(call.api.path, DRAFTS_UPLOAD_PATH);
         assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
-        let body: Value = serde_json::from_str(text_body(&call.api)).unwrap();
-        assert_eq!(body["message"]["threadId"], json!("t1"));
         assert_eq!(
-            raw_message(&call.api),
+            call.api.query.get("uploadType"),
+            Some(&QueryValue::One("multipart".to_string()))
+        );
+        assert_eq!(call.api.body, Some(Body::Built));
+        assert_eq!(
+            derived,
+            json!({
+                "thread_id": "t1",
+                "in_reply_to": "<b@example.com>",
+                "references": "<a@example.com> <b@example.com>",
+                "subject": "Re: Lunch",
+            })
+            .as_object()
+            .unwrap()
+            .clone()
+        );
+        let (thread, message) = uploaded(&built(&state.args, &derived, &call, &[]));
+        assert_eq!(thread.as_deref(), Some("t1"));
+        assert_eq!(
+            String::from_utf8(message).unwrap(),
             "To: alice@example.com\r\n\
              Subject: Re: Lunch\r\n\
              In-Reply-To: <b@example.com>\r\n\
@@ -861,7 +1165,7 @@ mod tests {
         let state = reply_state(json!({}));
         let Next::Call { call, derived } = answered(&state, original(&[("Subject", "Lunch")]))
         else {
-            panic!("a reply posts after its read");
+            panic!("a reply uploads after its read");
         };
         assert_eq!(derived.get("thread_id"), Some(&json!("t1")));
         let (row, _) = follow(&state, Next::Call { call, derived });
@@ -948,7 +1252,9 @@ mod tests {
             (vec![("Message-ID", "")], None, None),
             (vec![("Message-ID", &format!("{long_id}x"))], None, None),
         ] {
-            let (call, message, derived) = replied(&state, &headers);
+            // The thread is the original's whether or not its headers were
+            // usable: `replied` holds the upload to `t1`.
+            let (_, message, derived) = replied(&state, &headers);
             assert_eq!(
                 message_header(&message, "In-Reply-To").as_deref(),
                 in_reply_to,
@@ -964,10 +1270,11 @@ mod tests {
                 in_reply_to.map(|id| json!(id)).as_ref(),
                 "{headers:?}"
             );
-            // The thread is the original's whether or not its headers were
-            // usable.
-            let body: Value = serde_json::from_str(text_body(&call)).unwrap();
-            assert_eq!(body["message"]["threadId"], json!("t1"));
+            assert_eq!(
+                derived.get("references"),
+                references.map(|references| json!(references)).as_ref(),
+                "{headers:?}"
+            );
         }
     }
 
@@ -1154,17 +1461,23 @@ mod tests {
         ] {
             let call = draft(args).unwrap();
             assert_eq!(call.method, "POST");
-            assert_eq!(call.path, DRAFTS_PATH);
+            assert_eq!(call.path, DRAFTS_UPLOAD_PATH);
             assert!(!call.path.contains("send"));
-            assert!(call.query.keys().all(|key| key == "prettyPrint"));
+            assert_eq!(
+                call.query.keys().collect::<Vec<_>>(),
+                ["prettyPrint", "uploadType"]
+            );
         }
-        // A reply reads its original and then posts the draft.
         let state = reply_state(json!({}));
         assert_eq!(state.target.method, "GET");
         assert_eq!(state.target.path, format!("{MESSAGES_PATH}/m0"));
         let (row, call) = follow(&state, answered(&state, original(&[])));
         assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.path, DRAFTS_PATH);
+        assert_eq!(call.api.path, DRAFTS_UPLOAD_PATH);
+        assert_eq!(
+            call.api.query.keys().collect::<Vec<_>>(),
+            ["prettyPrint", "uploadType"]
+        );
         // Every answer to the `POST` completes or fails; none issues a call.
         for state in [draft_state(draft_args(json!({}))), row] {
             for outcome in [
@@ -1179,71 +1492,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn the_widest_draft_fits_the_args_cap() {
-        // A reply whose original carries `In-Reply-To` and `References` at
-        // their bounds and the longest thread id; the caller's subject is
-        // wider than any derived one (2 000 bytes against 1 004).
-        let with = |body: String| {
-            let args = json!({
-                "to": "x".repeat(HEADER_VALUE_MAX_BYTES),
-                "cc": "y".repeat(HEADER_VALUE_MAX_BYTES),
-                "subject": four_byte(0, SUBJECT_MAX_CHARS),
-                "body": body,
-                "reply_to_id": "m".repeat(ID_MAX_CHARS),
-                "account": escaped_widest(ACCOUNT_MAX_CHARS),
-            });
-            let call = plan(Provided::GmailDraft, &args, &settings())?;
-            let state = InFlight::new(
-                "a",
-                Provided::GmailDraft,
-                &args,
-                &call,
-                Map::new(),
-                1_000,
-                1_000,
-            );
-            let message_id = format!("<{}>", "i".repeat(HEADER_VALUE_MAX_BYTES - 2));
-            let original = json!({
-                "id": "m".repeat(ID_MAX_CHARS),
-                "threadId": "t".repeat(ID_MAX_CHARS),
-                "payload": { "headers": [
-                    { "name": "Message-ID", "value": message_id },
-                    { "name": "References", "value": "<r@example.com>" },
-                ] },
-            });
-            let Next::Call { call, .. } = answered(&state, http(200, &original.to_string())) else {
-                panic!("a reply posts after its read");
-            };
-            let message = raw_message(&call.api);
-            // Both at the bound: a `Message-ID` that leaves no room to join
-            // the original's `References` is the draft's `References` alone.
-            assert!(message.contains(&format!("\r\nIn-Reply-To: {message_id}\r\n")));
-            assert!(message.contains(&format!("\r\nReferences: {message_id}\r\n")));
-            Ok::<ApiCall, String>(call.api)
-        };
-        let four_byte_body = four_byte(1, BODY_MAX_BYTES / 4);
-        assert_eq!(four_byte_body.len(), BODY_MAX_BYTES);
-        let newline_dense = format!("x{}", "\n".repeat(BODY_MAX_BYTES / 2 - 1));
-        assert_eq!(
-            compose::canonical(&newline_dense).as_str().len(),
-            BODY_MAX_BYTES - 1
-        );
-        for body in [four_byte_body, newline_dense] {
-            let call = with(body).unwrap();
-            let args = serde_json::to_vec(&call).unwrap();
-            assert!(
-                args.len() <= HOST_ARGS_CAP_BYTES,
-                "{} bytes of args",
-                args.len()
-            );
-        }
-        assert_eq!(
-            with(format!("x{}", "\n".repeat(BODY_MAX_CHARS - 1))).unwrap_err(),
-            "`body` is longer than 20000 bytes (UTF-8, a line break counting as two)"
-        );
     }
 
     #[test]
@@ -1434,7 +1682,7 @@ mod tests {
             if let Err(error) = check(&input_schema(&spec, name), &bounds) {
                 panic!("`{name}`'s input_schema: {error}");
             }
-            let plan_with = |args: &Value| plan(tool, args, &settings()).map(drop);
+            let plan_with = |args: &Value| plan(tool, args, &[], &settings()).map(drop);
             let base = admitted_args(tool);
             for key in bounds.required {
                 hold_required(name, key, &base, plan_with);
@@ -1471,6 +1719,16 @@ mod tests {
                     "an original whose subject is over {DERIVED_SUBJECT_MAX_BYTES} bytes is \
                      refused"
                 ),
+            ),
+            (
+                Provided::GmailDraft,
+                format!("at most {FILES_MAX} files of at most {FILES_MAX_BYTES} bytes together"),
+            ),
+            (
+                Provided::GmailDraft,
+                "attached under the name the call gives it, which is the file name the \
+                 recipient sees"
+                    .to_string(),
             ),
         ] {
             assert!(
@@ -1744,5 +2002,503 @@ mod tests {
                 "api-request rejected the wrapper's request: bad wrapper"
             ))
         );
+    }
+
+    #[test]
+    fn a_new_draft_carries_its_files_as_mixed_parts_in_order() {
+        let pdf = file("report.pdf", "application/pdf", bytes(5_000, 1));
+        let (_, message) = new_draft(draft_args(json!({})), std::slice::from_ref(&pdf));
+        let (head, parts) = mixed(&message);
+        assert_eq!(
+            head,
+            "To: alice@example.com\r\n\
+             Subject: Lunch\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=brenn-draft-mixed"
+        );
+        assert_eq!(
+            parts,
+            [
+                (TEXT_PART.to_string(), b"Noon?".to_vec()),
+                (file_part("report.pdf", "application/pdf"), pdf.2.clone()),
+            ]
+        );
+
+        let five = [
+            file("a.txt", "text/plain; charset=utf-8", bytes(1, 2)),
+            file("empty.bin", "application/octet-stream", Vec::new()),
+            file("mail.eml", "message/rfc822", bytes(57, 3)),
+            file("bundle", "Multipart/Mixed; boundary=x", bytes(58, 4)),
+            file("photo.JPG", "image/jpeg", bytes(70_000, 5)),
+        ];
+        let (_, message) = new_draft(draft_args(json!({})), &five);
+        let (_, parts) = mixed(&message);
+        let expected: Vec<Part> = [(TEXT_PART.to_string(), b"Noon?".to_vec())]
+            .into_iter()
+            .chain([
+                (
+                    file_part("a.txt", "text/plain; charset=utf-8"),
+                    five[0].2.clone(),
+                ),
+                (
+                    file_part("empty.bin", "application/octet-stream"),
+                    Vec::new(),
+                ),
+                (
+                    file_part("mail.eml", "application/octet-stream"),
+                    five[2].2.clone(),
+                ),
+                (
+                    file_part("bundle", "application/octet-stream"),
+                    five[3].2.clone(),
+                ),
+                (file_part("photo.JPG", "image/jpeg"), five[4].2.clone()),
+            ])
+            .collect();
+        assert_eq!(parts, expected);
+    }
+
+    /// Requests `r001` to `r005`, each a reply to `m0` without `subject`;
+    /// the fifth attaches `files`. Their reads answered in one activation
+    /// spend the build budget on the first four, so the fifth's upload is
+    /// queued and built when a later activation drains it.
+    #[test]
+    fn a_reply_built_from_the_backlog_carries_its_files_and_derived_headers() {
+        let host = MemoryHost::new();
+        let pdf = file("report.pdf", "application/pdf", bytes(3_000, 6));
+        let ids: Vec<String> = (1..=BUILD_BUDGET + 1).map(|i| format!("r{i:03}")).collect();
+        let mut args = draft_args(json!({ "reply_to_id": "m0" }));
+        args.as_object_mut().unwrap().remove("subject");
+        let requests = ids
+            .iter()
+            .map(|id| Request {
+                id: id.clone(),
+                tool: Provided::GmailDraft.name().to_string(),
+                args: args.clone(),
+                attachments: if *id == ids[BUILD_BUDGET] {
+                    vec![host.seed_request(id, &pdf.0, &pdf.1, pdf.2.clone())]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        host.activate::<GmailCompose>(
+            &settings(),
+            Input {
+                now_ms: 0,
+                requests,
+                results: Vec::new(),
+            },
+        )
+        .unwrap();
+        let reads = host.take_calls();
+        assert_eq!(reads.len(), BUILD_BUDGET + 1);
+        let headers = [
+            ("Subject", "Lunch"),
+            ("Message-ID", "<b@example.com>"),
+            ("References", "<a@example.com>"),
+        ];
+        let results = reads
+            .iter()
+            .map(|read| Delivered {
+                call_id: read.call_id.clone(),
+                serving: Some(read.id.clone()),
+                outcome: original(&headers),
+                attachments: Vec::new(),
+            })
+            .collect();
+        host.activate::<GmailCompose>(
+            &settings(),
+            Input {
+                now_ms: 1,
+                results,
+                requests: Vec::new(),
+            },
+        )
+        .unwrap();
+        let uploads = host.take_calls();
+        assert_eq!(uploads.len(), BUILD_BUDGET);
+        assert!(uploads.iter().all(|upload| upload.id != ids[BUILD_BUDGET]));
+        assert_eq!(
+            host.rows(brenn_provider_kit::activation::BACKLOG_NS).len(),
+            1,
+            "the fifth upload waits"
+        );
+
+        let answer = json!({ "id": "r1", "message": { "id": "m9", "threadId": "t1" } });
+        host.activate::<GmailCompose>(
+            &settings(),
+            Input {
+                now_ms: 2,
+                results: vec![Delivered {
+                    call_id: uploads[0].call_id.clone(),
+                    serving: Some(uploads[0].id.clone()),
+                    outcome: http(200, &answer.to_string()),
+                    attachments: Vec::new(),
+                }],
+                requests: Vec::new(),
+            },
+        )
+        .unwrap();
+        let drained = host.take_calls();
+        assert_eq!(drained.len(), 1);
+        let upload = &drained[0];
+        assert_eq!(upload.id, ids[BUILD_BUDGET]);
+        assert_eq!(upload.call.path, DRAFTS_UPLOAD_PATH);
+        let (_, body) = upload.body.clone().expect("the upload carries its body");
+        let (thread, message) = uploaded(&(upload.body_content_type.clone().unwrap(), body));
+        assert_eq!(thread.as_deref(), Some("t1"));
+        let message = String::from_utf8(message).unwrap();
+        let (head, parts) = mixed(&message);
+        assert_eq!(
+            head,
+            "To: alice@example.com\r\n\
+             Subject: Re: Lunch\r\n\
+             In-Reply-To: <b@example.com>\r\n\
+             References: <a@example.com> <b@example.com>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=brenn-draft-mixed"
+        );
+        assert_eq!(
+            parts,
+            [
+                (TEXT_PART.to_string(), b"Noon?".to_vec()),
+                (file_part("report.pdf", "application/pdf"), pdf.2.clone()),
+            ]
+        );
+    }
+
+    /// `n` attachments of `size` bytes each, named `f1.bin` onward.
+    fn sized(n: usize, size: u64) -> Vec<Attached> {
+        (1..=n)
+            .map(|i| Attached {
+                name: format!("f{i}.bin"),
+                size,
+                content_type: "application/octet-stream".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_draft_refuses_files_past_its_bounds_before_any_call() {
+        let new = draft_args(json!({}));
+        let mut reply = draft_args(json!({ "reply_to_id": "m0" }));
+        reply.as_object_mut().unwrap().remove("subject");
+        let at_bound = {
+            let mut files = sized(FILES_MAX, FILES_MAX_BYTES / FILES_MAX as u64);
+            files[0].size += FILES_MAX_BYTES % FILES_MAX as u64;
+            files
+        };
+        assert_eq!(
+            at_bound.iter().map(|file| file.size).sum::<u64>(),
+            FILES_MAX_BYTES
+        );
+        let mut over = at_bound.clone();
+        over[4].size += 1;
+        let renamed = |name: &str| {
+            let mut files = sized(1, 1);
+            files[0].name = name.to_string();
+            files
+        };
+        let retyped = |content_type: &str| {
+            let mut files = sized(1, 1);
+            files[0].content_type = content_type.to_string();
+            files
+        };
+        let name = "attachment {:?}'s name must be 1 to 64 letters, digits, `.`, `_` or `-`";
+        let content_type =
+            "attachment `f1.bin`'s content type must be 1 to 255 printable ASCII characters";
+        for args in [&new, &reply] {
+            for (files, refusal) in [
+                (
+                    sized(FILES_MAX + 1, 1),
+                    "`GmailDraft` takes at most 5 files; this call attaches 6".to_string(),
+                ),
+                (
+                    over.clone(),
+                    "the files are 10485761 bytes together; a draft takes at most 10485760"
+                        .to_string(),
+                ),
+                (renamed(""), name.replace("{:?}", "\"\"")),
+                (renamed("a b"), name.replace("{:?}", "\"a b\"")),
+                (renamed("é.txt"), name.replace("{:?}", "\"é.txt\"")),
+                (
+                    renamed(&"n".repeat(FILE_NAME_MAX_CHARS + 1)),
+                    name.replace("{:?}", &format!("{:?}", "n".repeat(65))),
+                ),
+                (retyped("text/plain\r\nBcc: x"), content_type.to_string()),
+                (retyped(""), content_type.to_string()),
+                (
+                    retyped(&"t".repeat(CONTENT_TYPE_MAX_BYTES + 1)),
+                    content_type.to_string(),
+                ),
+            ] {
+                assert_eq!(
+                    plan(Provided::GmailDraft, args, &files, &settings()).unwrap_err(),
+                    refusal,
+                    "{files:?}"
+                );
+            }
+            assert!(plan(Provided::GmailDraft, args, &at_bound, &settings()).is_ok());
+            let widest = vec![Attached {
+                name: "n".repeat(FILE_NAME_MAX_CHARS),
+                size: 0,
+                content_type: "t".repeat(CONTENT_TYPE_MAX_BYTES),
+            }];
+            assert!(plan(Provided::GmailDraft, args, &widest, &settings()).is_ok());
+        }
+        // Refused in the activation that receives it: neither the upload nor
+        // a reply's read is issued.
+        let host = MemoryHost::new();
+        let requests = [new, reply]
+            .into_iter()
+            .enumerate()
+            .map(|(i, args)| Request {
+                id: format!("r{i:03}"),
+                tool: Provided::GmailDraft.name().to_string(),
+                args,
+                attachments: sized(FILES_MAX + 1, 1),
+            })
+            .collect();
+        host.activate::<GmailCompose>(
+            &settings(),
+            Input {
+                now_ms: 0,
+                requests,
+                results: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(host.take_calls().is_empty());
+        let completions = host.take_completions();
+        assert_eq!(completions.len(), 2);
+        for completion in completions {
+            assert!(
+                matches!(
+                    completion.answer,
+                    Answered::Error(ErrorKind::InvalidArgs, _)
+                ),
+                "{completion:?}"
+            );
+        }
+    }
+
+    /// The widest draft's upload: a reply with every argument and derived
+    /// header at its bound and five files with the longest names and
+    /// content types. No line but a delimiter starts with `--`, every line
+    /// is under RFC 5322's 998, and what is not the files' base64 is under
+    /// the 65 536 bytes the write bound's arithmetic allows a message.
+    #[test]
+    fn the_widest_upload_keeps_its_lines_and_its_frame_in_bounds() {
+        let args = json!({
+            "to": "x".repeat(HEADER_VALUE_MAX_BYTES),
+            "cc": "y".repeat(HEADER_VALUE_MAX_BYTES),
+            "subject": four_byte(0, SUBJECT_MAX_CHARS),
+            "body": four_byte(1, BODY_MAX_BYTES / 4),
+            "reply_to_id": "m".repeat(ID_MAX_CHARS),
+            "account": escaped_widest(ACCOUNT_MAX_CHARS),
+        });
+        let message_id = format!("<{}>", "i".repeat(HEADER_VALUE_MAX_BYTES - 2));
+        let mut derived = Args::new();
+        derived.insert("thread_id".to_string(), json!("t".repeat(ID_MAX_CHARS)));
+        derived.insert("in_reply_to".to_string(), json!(message_id));
+        derived.insert("references".to_string(), json!(message_id));
+        let content_type = format!(
+            "application/x-{}",
+            "t".repeat(CONTENT_TYPE_MAX_BYTES - "application/x-".len())
+        );
+        let files: Vec<File> = (0..FILES_MAX)
+            .map(|i| {
+                let name = format!("{i}{}", "n".repeat(FILE_NAME_MAX_CHARS - 1));
+                file(&name, &content_type, bytes(1_000 + i, i))
+            })
+            .collect();
+        let call = Call {
+            step: DRAFT_CREATE_STEP,
+            api: upload_call(None, true, &settings()),
+        };
+        let upload = built(&args, &derived, &call, &files);
+        let text = String::from_utf8(upload.1.clone()).unwrap();
+        for line in text.split("\r\n") {
+            assert!(line.len() <= 998, "{} bytes", line.len());
+            if line.starts_with("--") {
+                assert!(
+                    [
+                        "--brenn-draft-related",
+                        "--brenn-draft-related--",
+                        "--brenn-draft-mixed",
+                        "--brenn-draft-mixed--",
+                    ]
+                    .contains(&line),
+                    "{line:?}"
+                );
+            }
+        }
+        let files_base64: usize = files
+            .iter()
+            .map(|(_, _, bytes)| compose::encoded_len(bytes.len()))
+            .sum();
+        let remainder = upload.1.len() - files_base64;
+        assert!(remainder < 65_536, "{remainder} bytes besides the files");
+
+        let (thread, message) = uploaded(&upload);
+        assert_eq!(thread, Some("t".repeat(ID_MAX_CHARS)));
+        let message = String::from_utf8(message).unwrap();
+        assert_eq!(
+            message_header(&message, "In-Reply-To"),
+            Some(message_id.clone())
+        );
+        let (_, parts) = mixed(&message);
+        assert_eq!(parts.len(), FILES_MAX + 1);
+        for ((name, _, bytes), (headers, decoded)) in files.iter().zip(&parts[1..]) {
+            assert_eq!(*headers, file_part(name, &content_type));
+            assert_eq!(decoded, bytes);
+        }
+    }
+
+    #[test]
+    fn a_build_that_cannot_finish_fails_its_request_and_issues_nothing() {
+        let pdf = file("report.pdf", "application/pdf", bytes(100, 7));
+        let run = |host: &MemoryHost| {
+            let attachments = vec![host.seed_request("r000", &pdf.0, &pdf.1, pdf.2.clone())];
+            host.activate::<GmailCompose>(
+                &settings(),
+                Input {
+                    now_ms: 0,
+                    requests: vec![Request {
+                        id: "r000".to_string(),
+                        tool: Provided::GmailDraft.name().to_string(),
+                        args: draft_args(json!({})),
+                        attachments,
+                    }],
+                    results: Vec::new(),
+                },
+            )
+            .unwrap();
+            assert!(host.take_calls().is_empty(), "no upload is attempted");
+            let completions = host.take_completions();
+            assert_eq!(completions.len(), 1);
+            match &completions[0].answer {
+                Answered::Error(ErrorKind::Internal, _) => {}
+                other => panic!("{other:?}"),
+            }
+        };
+        let refused = MemoryHost::new();
+        refused.refuse_next_write(WriteError::Quota);
+        run(&refused);
+        let ended = MemoryHost::new();
+        ended.requests_not_pending(true);
+        run(&ended);
+
+        // Only the create step has a body.
+        let host = MemoryHost::new();
+        let state = reply_state(json!({}));
+        let queued = Queued {
+            id: "r000".to_string(),
+            tool: Provided::GmailDraft,
+            args: state.args.clone(),
+            derived: Args::new(),
+            call: plan(Provided::GmailDraft, &state.args, &[], &settings()).unwrap(),
+            received_at_ms: 0,
+            queued_at_ms: 0,
+            attachments: Vec::new(),
+        };
+        let step = Step::planning(&host, "r000", Vec::new());
+        assert_eq!(
+            GmailCompose::body(&queued, &step, &settings()),
+            Err(no_such_step(Provided::GmailDraft, DRAFT_ORIGINAL_STEP))
+        );
+        // A reply's upload whose row lacks the thread is not one this build
+        // wrote.
+        let queued = Queued {
+            call: Call {
+                step: DRAFT_CREATE_STEP,
+                api: upload_call(None, true, &settings()),
+            },
+            ..queued
+        };
+        assert_eq!(
+            GmailCompose::body(&queued, &step, &settings()),
+            Err(internal(
+                "stored GmailDraft reply has no usable `thread_id` in `derived`"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_stored_reply_that_no_longer_passes_is_internal() {
+        let state = reply_state(json!({}));
+        let derived: Args = json!({
+            "thread_id": "t1",
+            "in_reply_to": "<m0@example.com>",
+            "references": "<m0@example.com>",
+            "subject": "Re: Lunch",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let row = Queued {
+            id: "r000".to_string(),
+            tool: Provided::GmailDraft,
+            args: state.args.clone(),
+            derived: derived.clone(),
+            call: Call {
+                step: DRAFT_CREATE_STEP,
+                api: upload_call(None, true, &settings()),
+            },
+            received_at_ms: 0,
+            queued_at_ms: 0,
+            attachments: Vec::new(),
+        };
+        let host = MemoryHost::new();
+        let step = Step::planning(&host, "r000", Vec::new());
+        let build = |row: &Queued<Provided>| GmailCompose::body(row, &step, &settings());
+        assert!(build(&row).is_ok(), "the row as written builds");
+
+        let long = "a".repeat(HEADER_VALUE_MAX_BYTES + 1);
+        let mut cases: Vec<(&str, Option<Value>)> = vec![("subject", None)];
+        for key in ["thread_id", "subject", "in_reply_to", "references"] {
+            cases.push((key, Some(json!(1))));
+            cases.push((key, Some(json!("a\r\nBcc: bob@example.com"))));
+        }
+        for key in ["in_reply_to", "references"] {
+            cases.push((key, Some(json!(long))));
+        }
+        for (key, value) in cases {
+            let mut derived = derived.clone();
+            match &value {
+                Some(value) => derived.insert(key.to_string(), value.clone()),
+                None => derived.remove(key),
+            };
+            let row = Queued {
+                derived,
+                ..row.clone()
+            };
+            assert_eq!(build(&row), Err(unwritten(key)), "{key} = {value:?}");
+        }
+
+        let mut args = row.args.clone();
+        args.as_object_mut().unwrap().remove("to");
+        let unparsed = Queued {
+            args,
+            ..row.clone()
+        };
+        let refiled = Queued {
+            attachments: vec![Attached {
+                name: "a b".to_string(),
+                size: 1,
+                content_type: "text/plain".to_string(),
+            }],
+            ..row
+        };
+        for (row, words) in [
+            (unparsed, "arguments no longer parse: "),
+            (refiled, "attachments no longer pass: "),
+        ] {
+            let failure = build(&row).unwrap_err();
+            assert_eq!(failure.kind, ErrorKind::Internal);
+            let words = format!("stored {} {words}", Provided::GmailDraft.name());
+            assert!(failure.detail.starts_with(&words), "{}", failure.detail);
+        }
     }
 }

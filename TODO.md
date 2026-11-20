@@ -91,9 +91,11 @@ bound refuses fails `Logic::body`, which answers the request `internal`
 instead of queueing it. Two requests whose bodies are 40 MiB each, arriving
 together, fail the second, which a later activation would have built; every
 build after it in that activation fails too, and four such failures with
-nothing outstanding answer the backlog unattempted. The only component that
-returns `Body::Built` today is a test fixture; `gmail-draft-attachments`
-would be the first to meet it with real files. A refusal cannot be told from
+nothing outstanding answer the backlog unattempted. `GmailDraft` returns
+`Body::Built` and bounds its files at 10,485,760 bytes together so that its
+widest message is under a quarter of the bound and four builds stay inside
+it; a component whose body can pass a quarter of the bound meets this. A
+refusal cannot be told from
 any other failed build today (`blob-append-finish-erases-write-error`).
 Decide how the kit holds a build the activation's remaining write bound
 cannot hold: a body size the component declares, against which the kit
@@ -174,28 +176,57 @@ does not answer body text by reference, and the note removed. The comment
 sits in `GmailBody`'s body reader in
 `brenn-wasm/components/google-gmail-read/src/logic.rs`.
 
-## `gmail-draft-attachments`
+## `gmail-draft-late-answers-over-fuel-margin`
 
-`GmailDraft` writes a single-part `text/plain` message and carries no
-attachment. Gmail takes a draft with a file as a MIME message, which the
-component builds around the request's attachment and sends as a body it builds
-(`Body::Built`), the form the provider kit has. The draft's own body moves to
-that form first (`google-write-bodies-in-call-arguments`). That body is built
-on the fuel of the activation that issues its call, which the host fuels at
-the attachment rate for as long as the request is pending, so the tool bounds
-the file by what its build costs a byte against that rate. Done when a draft
-tool attaches a file the agent holds, or a recorded decision that it is not
-wanted. The comment sits at the draft's create call in
+Five late answers to the widest `GmailDraft` reply's read of its original,
+settled in one activation, do not complete inside the test margin: each
+settle decodes the in-flight row, which holds the caller's arguments whole,
+and parses those arguments again before the kit drops the upload for a
+request that has ended, and Google's answer brings no fuel for them.
+Measured on the real host under production limits, the row carrying five
+files under the longest names and content types, least completing grant by
+bisection to 50,000 fuel, at a body of 10,000 and then 20,000 bytes. The
+read step's activation is handed 7 envelopes on a grant of 72,000,640, the
+margin's share of it 48.9M: U+0001 26.1M (0.362) and 49.8M (0.692); `"` and
+`\` each 17.7M (0.246) and 33.1M (0.460); U+1D11E 6.05M (0.084) and 9.81M
+(0.136); line feeds 10.1M (0.140) and 17.9M (0.249). Base, slope a body byte
+and the body at which the margin is met, a straight line through the two
+points: U+0001 2.29M, 2,376.6, about 19,600 bytes; `"` and `\` 2.32M,
+1,539.9, about 30,200; U+1D11E 2.29M, 376.2, about 123,800; line feeds
+2.25M, 784.0, about 59,400. So U+0001 at the bound is over the margin, and
+completes on the whole grant. The upload step's activation, which only
+decodes the row, holds the margin: 12 envelopes on 120,577,280, the
+margin's share 81.8M; U+0001 22.0M (0.182) and 42.0M (0.348); `"` and `\`
+13.6M (0.113) and 25.3M (0.210); U+1D11E 3.47M (0.029) and 5.00M (0.042);
+line feeds 7.77M (0.064) and 13.6M (0.113); base, slope and limit U+0001
+1.94M, 2,001.8, about 39,900; `"` and `\` 1.91M, 1,168.7, about 68,400;
+U+1D11E 1.94M, 153.1, about 521,800; line feeds 1.94M, 582.9, about
+137,000. Done when that activation holds the margin under test — the row
+trimmed to what a settle reads, a late answer to an ended request no longer
+advanced, or the body bound lowered — or a recorded decision that the risk
+stands. The comment sits at `BODY_MAX_BYTES` in
 `brenn-wasm/components/google-gmail-compose/src/logic.rs`.
+
+## `gmail-draft-upload-unconfirmed-against-live-google`
+
+`GmailDraft` creates its draft by uploading the message it builds to Gmail's
+draft upload path: a new draft as a media upload of `message/rfc822`, a reply
+as a multipart upload whose metadata part names the thread. The wire form is
+taken from Google's reference and proven against a stub that records bytes;
+no run has reached Google. Unconfirmed: that Google accepts each upload as
+built, files a reply in the thread named, and shows each attachment under its
+name and type. Done when one new draft and one reply draft, each with a file,
+are created through a deployed brenn against a real account and read back, or
+the form is corrected to what Google takes. The comment sits at the upload
+call in `brenn-wasm/components/google-gmail-compose/src/logic.rs`.
 
 ## `google-write-bodies-in-call-arguments`
 
-`CalendarCreate` and `CalendarUpdate` (`google-calendar-write`) and
-`GmailDraft` (`google-gmail-compose`) send the body they build as text inside
-their nested call's arguments, so their bounds are derived from the 64 KiB
-arguments cap and not from Google: an event's description at 2,000 characters,
-its attendees at 8,000 bytes together, five recurrence lines of 500
-characters, a draft's body at 20,000 bytes. The provider kit has the form that
+`CalendarCreate` and `CalendarUpdate` (`google-calendar-write`) send the body
+they build as text inside their nested call's arguments, so their bounds are
+derived from the 64 KiB arguments cap and not from Google: an event's
+description at 2,000 characters, its attendees at 8,000 bytes together, five
+recurrence lines of 500 characters. The provider kit has the form that
 would lift them, a body the component builds and sends as a blob
 (`Body::Built`). The move was built and measured for the calendar writes and
 not made. Measured on the real host under production limits, the component
@@ -213,11 +244,21 @@ or five late answers, and a bound holds where that activation completes on 95
 % of the floor ÷ 1.4, about 33.9M: five settles already take 32.2M with next
 to no description, which by the slopes leaves room for about 800 bytes of
 U+0001 or 1,400 of `"` — an estimate, and below the 2,000 characters accepted
-today. With `attendees` bounded only at 50 addresses of 320 characters and
+today. That estimate understates the grant: a late answer arrives with its
+ended request as a context envelope, which the envelope term counts.
+`GmailDraft`'s activation settling five late answers was measured at twelve
+envelopes on a grant of 120,577,280 for late answers to its upload, and at
+seven envelopes on 72,000,640 for late answers to a reply's read of its
+original, not on the 50M floor. That measurement is `GmailDraft`'s: the
+calendar writes' activation settling five late answers with the body sent as
+a blob was not measured with it, and the 146.5M grant given below is today's
+component's, whose answer echoes the description. So that activation's
+envelope count and grant are to be measured before the estimate is relied
+on; the room the estimate gives for a description is correspondingly larger
+than stated. With `attendees` bounded only at 50 addresses of 320 characters and
 `recurrence` at the read's 20 lines of 1,000, two settles cost 62.2M before
-any description, more than the whole floor. `GmailDraft` was not measured; its
-floor activation has more steps, so less fuel a step, than the calendar build
-spends on ASCII alone at 65,536 bytes. These figures predate the body term.
+any description, more than the whole floor. These figures predate the body
+term.
 Three findings. A request's body bytes now bring fuel, 256 a byte, in the
 activation the request arrives in and in every later activation of the
 provider while the host holds the request pending, and the kit builds no body
@@ -236,12 +277,11 @@ whole and every answer decodes it, and `CalendarUpdate`'s settle parses them
 again for the event id; storing only what a settle needs is the second lever
 if fuel alone does not reach a bound worth having. And a write asks Google for
 the event back with its description, inline, so a longer description needs
-that field out of the write's mask or the answer read as a blob. Done = both
-components send their bodies as blobs with bounds that are Google's or are
-measured above today's, each with a test at the bound; or a recorded decision
-that they stay. The comments sit at `EVENT_FIELD_MAX_CHARS` in
-`brenn-wasm/components/google-calendar-write/src/logic.rs` and at
-`BODY_MAX_BYTES` in `brenn-wasm/components/google-gmail-compose/src/logic.rs`.
+that field out of the write's mask or the answer read as a blob. Done =
+`google-calendar-write` sends its bodies as blobs with bounds that are
+Google's or are measured above today's, each with a test at the bound; or a
+recorded decision that they stay. The comment sits at `EVENT_FIELD_MAX_CHARS`
+in `brenn-wasm/components/google-calendar-write/src/logic.rs`.
 
 ## `guest-memory-and-fuel-fixed-constants`
 
@@ -356,6 +396,26 @@ requests are bounded by the arguments cap alone. Done = the check with a
 test, or the sentence in `docs/message-bus.md` and a corrected comment at
 `publish_from_wasm`. The comment sits at `publish_from_wasm` in
 `brenn-messaging/src/publish/mod.rs`.
+
+## `vault-account-file-name-too-long`
+
+The credential vault stores each connected account as one file,
+`<vault_dir>/<provider>/<username>/<account>.json`, the account
+percent-encoded, and writes it through a temporary beside it whose name is 21
+bytes longer (`.tmp-` and 16 hex digits). On a file system that holds a file
+name to 255 bytes, an account whose encoded form is over 229 bytes cannot be
+stored: creating the temporary fails with "File name too long" and the vault
+panics, as it does on any I/O failure. Over 250 bytes the file's own name
+does not fit either, and reading it finds no credential. Every byte outside
+ASCII letters, digits and `@ . - _` encodes to three, so an account can meet
+this well short of 229 characters. The Google tools admit an `account`
+argument of up to 320 characters, so they accept accounts the vault can never
+hold. Met while measuring `GmailDraft`, whose widest-arguments measurement
+therefore names a short account: about 300 bytes under widest arguments of
+about 120 KB. Done when an account of any length a tool admits can be stored,
+or connecting an account the vault cannot store is refused with a message
+that names the bound. The comment sits at `credential_path` in
+`brenn-oauth/src/vault.rs`.
 
 ## `attach-blocking-second-loop-and-dial`
 
@@ -1165,8 +1225,9 @@ call's deadline when that is earlier. An answer arriving between the
 host's deadline and the kit's cutoff is still advanced: a late
 `GmailAttachment` step 2 decodes up to 50 MB for nobody and can share an
 activation's 64 MiB write bound and fuel cap with a live request, failing
-it `internal`; a late `GmailDraft` step 1 issues `drafts.create` after
-its caller has been answered. Under `max_concurrency = 1` the window is
+it `internal`; a late `GmailDraft` step 1 parses the caller's arguments,
+body included, again after its caller has been answered, though the kit
+then drops the upload it would issue. Under `max_concurrency = 1` the window is
 the request's own permit wait. Closing it needs the host's deadline for a
 provided-tool request carried to the provider on the `provides` contract
 (or a way for a step to ask whether a request is still pending), and the

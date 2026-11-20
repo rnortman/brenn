@@ -20,7 +20,9 @@ use brenn_oauth::tools::BlobStoreSlot;
 use brenn_tool_registry::testutil::{clause, grant};
 use brenn_tool_registry::{HeldAttachments, RegisteredTool, ToolError, ToolOutput};
 use serde_json::Value;
+use tokio::task::JoinHandle;
 
+use super::kit_file_e2e::drop_caller;
 use super::provider_rig::{CallerSetup, ConversationSetup, ProviderRig, ProviderSetup};
 use crate::active_bridge::ActiveBridge;
 
@@ -343,6 +345,61 @@ impl StubRig {
                 (seen.method.clone(), path, query)
             })
             .collect()
+    }
+
+    /// Wait until the stub has received `n` API requests.
+    pub async fn saw(&self, n: usize) {
+        for _ in 0..3000 {
+            if self.stub.lock().unwrap().api_seen.len() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the stub never received {n} requests");
+    }
+
+    /// Make a late answer of the request `call`'s next nested call issues,
+    /// one the stub's gate holds: run the executor's drain step on a task of
+    /// its own, wait until the stub has received `seen` requests, which puts
+    /// the step past the executor's check that its request is pending, then
+    /// drop the caller, which ends the request. Returns the drain step; it
+    /// finishes once the gate lets the stub answer.
+    pub async fn end_held(
+        &self,
+        call: JoinHandle<Result<ToolOutput, ToolError>>,
+        seen: usize,
+    ) -> JoinHandle<()> {
+        let step = self.start_nested().await;
+        self.saw(seen).await;
+        drop_caller(call).await;
+        step
+    }
+
+    /// Let `gate` admit one answer for each of `steps`, from
+    /// [`end_held`](Self::end_held), wait for every step, and assert each
+    /// answer is owed to the provider with its row still in flight; returns
+    /// those answers.
+    pub async fn answer_late(
+        &self,
+        gate: &tokio::sync::Semaphore,
+        steps: Vec<JoinHandle<()>>,
+    ) -> Vec<Value> {
+        let n = steps.len();
+        gate.add_permits(n);
+        for step in steps {
+            step.await.expect("the executor's drain step");
+        }
+        let answers = self.owed(&self.provider_sub, n).await;
+        assert_eq!(self.inflight_keys().len(), n, "{n} requests in flight");
+        answers
+    }
+
+    /// Whether the activation handed `n` late answers settled every one: no
+    /// row is left. Panics unless it left none or all `n`.
+    pub fn settled_late(&self, n: usize) -> bool {
+        let left = self.inflight_keys().len();
+        assert!(left == 0 || left == n, "{left} rows left");
+        left == 0
     }
 
     /// The body of every API request the stub saw that carried one, in the

@@ -204,7 +204,8 @@ The answer is `{ threads[], nextPageToken?, resultSizeEstimate }`, each thread
 ### Drafts
 
 The user's drafts, then one of them. Reading drafts needs only the Gmail read
-scope. Creating one is `GmailDraft`, which can also draft a reply to a
+scope. Creating one is `GmailDraft`, which uploads the message it builds,
+can attach up to five files the caller holds, and can also draft a reply to a
 message (Gmail decides whether the reply joins the original's conversation;
 the answer says `in_thread: false` when it does not; see
 `docs/google-workspace.md` section 5); listing and reading them is still through

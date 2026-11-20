@@ -1280,7 +1280,7 @@ fn activation_fuel(
 /// `attachment_bytes` is `None` for a component without the grant, which
 /// gains nothing whatever its messages carry. Every product and sum
 /// saturates: no cap bounds the number of ports.
-fn processor_fuel(
+pub fn processor_fuel(
     total_envelopes: usize,
     new_body_bytes: u64,
     pending_body_bytes: u64,

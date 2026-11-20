@@ -265,6 +265,8 @@ fn user_dir(root: &Path, provider: &str, username: &str) -> PathBuf {
     root.join(component(provider)).join(component(username))
 }
 
+// TODO(vault-account-file-name-too-long): an account encoding to over 229
+// bytes names a file, or its write's temporary, past a 255-byte name limit.
 fn credential_path(root: &Path, provider: &str, username: &str, account: &str) -> PathBuf {
     user_dir(root, provider, username)
         .join(format!("{}.json", utf8_percent_encode(account, COMPONENT)))

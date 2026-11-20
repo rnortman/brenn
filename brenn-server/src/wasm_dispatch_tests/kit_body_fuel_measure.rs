@@ -43,7 +43,7 @@ use super::stub_rig::{StubRig, file_bytes};
 
 /// The bisection stops when the least completing grant is known to within
 /// this much fuel.
-const PRECISION: u64 = 50_000;
+pub(super) const PRECISION: u64 = 50_000;
 /// The two request body sizes each slope is taken between, in bytes.
 const SIZES: [usize; 2] = [DEFAULT, LARGE];
 /// Room left in a request's body for everything but `text`: the request's
@@ -53,7 +53,7 @@ const ENVELOPE_ROOM: usize = 512;
 const MEASURED: usize = 4;
 /// Generous enough for any activation measured here: one that traps on it
 /// traps on something other than fuel.
-const AMPLE_FUEL: u64 = 40_000_000_000;
+pub(super) const AMPLE_FUEL: u64 = 40_000_000_000;
 
 /// What fills a request's `text`.
 #[derive(Clone, Copy, Debug)]
