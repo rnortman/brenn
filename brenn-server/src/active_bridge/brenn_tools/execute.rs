@@ -541,6 +541,43 @@ pub(super) mod tests {
         }
     }
 
+    /// `MqttSend` over the socket admits `attachment` in place of `body` and
+    /// hands the call to the intercept, whose answer it is; a key outside the
+    /// schema is still refused at admission.
+    #[tokio::test]
+    async fn socket_mqtt_send_admits_an_attachment_without_a_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = full_catalog_bridge(dir.path(), None).await;
+        let reference = json!({ "message_id": "m", "name": "a.png", "extra": 1 });
+        assert_eq!(
+            execute_tool(
+                &bridge,
+                CallOrigin::Socket,
+                "MqttSend",
+                json!({ "to": "mqtt:home:cam/snapshot", "attachment": reference }),
+            )
+            .await,
+            Ok(ToolOutcome::Err(json!({
+                "ok": false,
+                "error": "`attachment` must be {\"message_id\": \"<uuid>\", \
+                          \"name\": \"<attachment name>\"}",
+            })))
+        );
+        assert!(matches!(
+            execute_tool(
+                &bridge,
+                CallOrigin::Socket,
+                "MqttSend",
+                json!({
+                    "to": "mqtt:home:cam/snapshot",
+                    "attachments": { "a.png": { "message_id": "m", "name": "a.png" } },
+                }),
+            )
+            .await,
+            Err(ExecuteError::InvalidArgs(_))
+        ));
+    }
+
     /// Every command has an executor: `dispatch` itself, below admission,
     /// answers each `Available` name. `{}` is refused by each family's own
     /// parsing or is a read, so the probe has no effects. The bridge has no

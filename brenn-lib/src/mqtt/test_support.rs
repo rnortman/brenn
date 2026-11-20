@@ -35,6 +35,7 @@ pub fn test_client_identity(slug: &str) -> MqttClientIdentity {
         tls_version_min: TlsVersionMin::Tls12,
         keepalive_secs: Some(30),
         inbound_payload_cap_bytes: 4 * 1024 * 1024,
+        outbound_payload_cap_bytes: 4 * 1024 * 1024,
         last_will: None,
         reconnect_backoff_initial_secs: 1,
         reconnect_backoff_max_secs: 60,

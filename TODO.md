@@ -296,20 +296,6 @@ in-flight and backlog rows than the floor and the guest's memory cover read
 whole completes, each with a test. The comment sits at `sweep` in
 `brenn-provider-kit/src/activation.rs`.
 
-## `mqtt-send-binary-base64`
-
-A conversation publishes bytes to MQTT only as
-`{ binary_base64, content_type? }` inside `MqttSend`'s JSON arguments, the
-one remaining place a conversation base64-encodes a payload; components
-publish bytes through the `mqtt` interface, and `BrennSend` takes bytes as an
-attachment. The form is in the tool's text and in no document. Decide
-whether `MqttSend` takes the payload as an attachment of the call, bounded by
-the broker's and the bus's limits rather than the arguments', and whether the
-base64 form then stays for small payloads; and document the outcome. Done
-when `MqttSend` publishes an attachment's bytes with a test, or
-`docs/message-bus.md` records the base64 form as the contract and why. The
-comment sits at `decode_outbound_body` in `brenn-mqtt/src/payload.rs`.
-
 ## `provider-result-activation-trap-strands-request`
 
 A provider activation that traps while answering a nested call's result

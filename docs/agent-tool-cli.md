@@ -174,7 +174,8 @@ blobs is shown to you — as a tool call and from `brenn-tool call` alike — as
 
 and a result without attachments is the tool's value alone, as always. Name
 those attachments by that `message_id`: `brenn-tool save <message_id>
---attachment <name>`, `BrennSend`'s `attachments`, or another tool call. They
+--attachment <name>`, `BrennSend`'s `attachments`, `MqttSend`'s
+`attachment`, or another tool call. They
 cannot be named after your context is reset — a restart, a compaction, a user
 turn that began with `/` — and the message cannot be read again: call the tool
 again.
@@ -186,6 +187,21 @@ description. It takes the same form as `BrennSend`'s:
 name>"}}`, under the rule above. A refused name refuses the call before the
 tool runs, with the refusal below. A tool without the argument takes no
 attachments; passing it is `invalid_args`.
+
+**Publishing an attachment to MQTT.** `MqttSend` takes one attachment in
+place of `body`: its `attachment` argument is a single reference,
+`{"message_id": "<uuid>", "name": "<attachment name>"}`, under the rule
+above, and the attachment's bytes are published with its content type as the
+MQTT Content Type.
+
+```bash
+brenn-tool call MqttSend --str to=mqtt:home:cam/snapshot \
+    --set 'attachment={"message_id": "0b6a5c2e-7d1f-4e8a-9c3b-2f4d6e8a10e4", "name": "snap.png"}'
+```
+
+A call gives exactly one of `body` and `attachment`. To publish a file of
+your own, `send` it to a channel first and name the attachment from that
+send's answer. `docs/message-bus.md` §2.7.2 has the whole contract.
 
 **`save`** writes an attachment's bytes, or a body's, to `--out`:
 
@@ -233,8 +249,9 @@ everything. Each is a refusal you can read — nothing waits for room.
 `channel_not_readable`, `not_retained`, `no_such_attachment`,
 `tool_channel_attachment`, `too_many_attachments`,
 `duplicate_attachment_name`, `malformed_content_type`, `no_files`,
-`blob_too_large`, `send_files_too_large`, `blob_budget_exhausted` and
-`blobs_unavailable`. `not_read` — after a restart, a compaction, or a user
+`blob_too_large`, `send_files_too_large`, `blob_budget_exhausted`,
+`blobs_unavailable` and `payload_too_large` (an `MqttSend` payload over the
+MQTT client's `outbound_payload_cap_bytes`). `not_read` — after a restart, a compaction, or a user
 turn that began with `/` — is cured by reading the message again
 (`MessageChannelGet`) and retrying; for a tool result, by calling the tool
 again. `tool_channel_attachment` is final: the message is on a channel of

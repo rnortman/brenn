@@ -1027,6 +1027,7 @@ fn ingress_test_broker(slug: &str) -> crate::mqtt::config::MqttClientConfigRaw {
         tls_version_min: "1.2".to_string(),
         keepalive_secs: None,
         inbound_payload_cap_bytes: 4 * 1024 * 1024,
+        outbound_payload_cap_bytes: 4 * 1024 * 1024,
         last_will: None,
         reconnect_backoff_initial_secs: 1,
         reconnect_backoff_max_secs: 60,

@@ -1293,6 +1293,7 @@ vocabulary! {
         opt tls_version_min: V,
         opt keepalive_secs: V,
         opt inbound_payload_cap_bytes: V,
+        opt outbound_payload_cap_bytes: V,
         opt reconnect_backoff_initial_secs: V,
         opt reconnect_backoff_max_secs: V,
         opt session_expiry_secs: V,

@@ -29,8 +29,21 @@ pub enum MqttError {
     BadBase64 { detail: String },
     /// Payload shape is unrecognised (not string, not `{binary_base64, ...}`).
     BadBodyShape,
+    /// The object body's `content_type` is not a string, or is a string the
+    /// bus's content-type rule refuses.
+    BadBodyContentType { detail: String },
+    /// The object body carries a key other than `binary_base64` and
+    /// `content_type`.
+    UnknownBodyKey { key: String },
     /// The MQTT address string is syntactically invalid.
     AddressInvalid { address: String, detail: String },
+    /// The publish, encoded, is larger than the Maximum Packet Size the
+    /// broker advertised for the current connection. Refused before submit.
+    PacketTooLarge {
+        client_slug: String,
+        packet_bytes: usize,
+        broker_max: u32,
+    },
 }
 
 impl MqttError {
@@ -95,11 +108,33 @@ impl fmt::Display for MqttError {
                 write!(
                     f,
                     "invalid `body` argument: must be a string or \
-                     {{ binary_base64: string, content_type?: string }}",
+                     {{ binary_base64: string, content_type?: string }}; \
+                     to publish an attachment of a message, give `attachment` instead of `body`",
+                )
+            }
+            MqttError::BadBodyContentType { detail } => {
+                write!(f, "invalid `content_type` in body: {detail}")
+            }
+            MqttError::UnknownBodyKey { key } => {
+                write!(
+                    f,
+                    "unknown key `{key}` in body: the object form takes `binary_base64` and \
+                     `content_type` only",
                 )
             }
             MqttError::AddressInvalid { address, detail } => {
                 write!(f, "invalid mqtt address '{address}': {detail}")
+            }
+            MqttError::PacketTooLarge {
+                client_slug,
+                packet_bytes,
+                broker_max,
+            } => {
+                write!(
+                    f,
+                    "publish on client '{client_slug}' is a {packet_bytes}-byte MQTT packet; \
+                     the broker accepts at most {broker_max} bytes",
+                )
             }
         }
     }
@@ -142,5 +177,20 @@ mod tests {
             .coarse_kind(),
             "publish failed"
         );
+    }
+
+    #[test]
+    fn packet_too_large_names_the_client_and_both_sizes() {
+        let e = MqttError::PacketTooLarge {
+            client_slug: "home".to_string(),
+            packet_bytes: 1025,
+            broker_max: 1024,
+        };
+        assert_eq!(
+            e.to_string(),
+            "publish on client 'home' is a 1025-byte MQTT packet; \
+             the broker accepts at most 1024 bytes"
+        );
+        assert_eq!(e.coarse_kind(), "publish failed");
     }
 }

@@ -1503,7 +1503,20 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
             description: concat!(
                 "Publish a message to an MQTT topic. Address format: `mqtt:<client>:<topic>`. ",
                 "Example: `mqtt:homeassistant:home/sensor/temperature`.\n\n",
-                "`body` is either a UTF-8 string or `{ binary_base64: string, content_type?: string }`. ",
+                "Give the payload in exactly one of three forms. `body` as a string publishes ",
+                "text, its UTF-8 bytes. `body` as `{ binary_base64: string, content_type?: string }` ",
+                "publishes bytes you compose yourself, decoded, with `content_type` sent as the ",
+                "MQTT Content Type. `attachment` as `{\"message_id\": …, \"name\": …}` publishes ",
+                "an attachment of a message you were shown, by reference: its bytes never enter ",
+                "this conversation, and its content type is sent as the MQTT Content Type. Give ",
+                "the `message_id` and the attachment's name exactly as the message showed them. ",
+                "The source message must still be retained on its channel and must have been ",
+                "shown to this conversation since its context was last reset; otherwise read it ",
+                "again with MessageChannelGet.\n\n",
+                "A payload over the MQTT client's outbound bound (4 MiB unless the deployment ",
+                "sets `outbound_payload_cap_bytes`) is refused with reason `payload_too_large`. ",
+                "A refused attachment or an over-bound payload refuses the call with a `reason` ",
+                "and spends no budget.\n\n",
                 "`qos` is 0, 1, or 2 (default 1). `retain` is true/false (default false).\n\n",
                 "QoS 1/2: blocks until PUBACK/PUBCOMP. QoS 0: fire-and-forget (no broker ack). ",
                 "Wildcards (`+` or `#`) in the topic are rejected — use a concrete topic name. ",
@@ -1533,6 +1546,10 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                             }
                         ]
                     },
+                    "attachment": {
+                        "type": "object",
+                        "description": "Instead of `body`: {\"message_id\": \"<uuid>\", \"name\": \"<attachment name>\"} naming an attachment of a message this conversation was shown; its bytes are published."
+                    },
                     "qos": {
                         "type": "integer",
                         "enum": [0, 1, 2],
@@ -1543,7 +1560,7 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                         "description": "Set the MQTT retain flag (default false)"
                     }
                 },
-                "required": ["to", "body"]
+                "required": ["to"]
             }),
         });
     }
@@ -2757,6 +2774,37 @@ mod tests {
                 "{name}: {description}"
             );
             assert!(!description.contains("brenn-tool"), "{name}: {description}");
+        }
+    }
+
+    #[test]
+    fn mqtt_send_takes_an_attachment_and_states_its_forms_and_bound() {
+        let def = mqtt_virtual_tools(true)
+            .into_iter()
+            .find(|def| def.name == "MqttSend")
+            .unwrap();
+        assert_eq!(
+            def.input_schema["properties"]["attachment"]["type"],
+            "object"
+        );
+        assert_eq!(def.input_schema["required"], serde_json::json!(["to"]));
+        assert_eq!(
+            brenn_envelope::tool_schema::check_input_schema(&def.input_schema),
+            Ok(())
+        );
+        for phrase in [
+            "exactly one of three forms",
+            "`body` as a string",
+            "binary_base64",
+            "`attachment`",
+            "by reference",
+            "MessageChannelGet",
+            "outbound_payload_cap_bytes",
+            "4 MiB",
+            "payload_too_large",
+            "spends no budget",
+        ] {
+            assert!(def.description.contains(phrase), "{phrase}");
         }
     }
 

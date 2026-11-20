@@ -64,7 +64,7 @@ use crate::messaging::{AttachGrant, ComponentGrant, Urgency, WakeMin};
 use crate::mqtt::config::{
     AppMqttIngressSubscriptionRaw, MqttClientConfigRaw, default_backoff_initial,
     default_backoff_max, default_client_urgency, default_inbound_payload_cap,
-    default_subscription_qos, default_tls_version_min,
+    default_outbound_payload_cap, default_subscription_qos, default_tls_version_min,
 };
 use crate::pwa_push::config::{
     PwaPushGlobalConfig, default_endpoint_host_allowlist, default_endpoint_host_allowlist_enforce,
@@ -2160,6 +2160,7 @@ fn mqtt_clients(
                 tls_version_min,
                 keepalive_secs,
                 inbound_payload_cap_bytes,
+                outbound_payload_cap_bytes,
                 reconnect_backoff_initial_secs,
                 reconnect_backoff_max_secs,
                 session_expiry_secs,
@@ -2181,6 +2182,12 @@ fn mqtt_clients(
                     errors,
                 )
                 .unwrap_or_else(default_inbound_payload_cap),
+                outbound_payload_cap_bytes: opt_int(
+                    outbound_payload_cap_bytes.as_ref(),
+                    "outbound_payload_cap_bytes",
+                    errors,
+                )
+                .unwrap_or_else(default_outbound_payload_cap),
                 last_will: None,
                 reconnect_backoff_initial_secs: opt_int(
                     reconnect_backoff_initial_secs.as_ref(),

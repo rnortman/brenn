@@ -596,6 +596,12 @@ impl TempBlobDir {
         brenn_messaging_store::testutils::holds_file(&self.0, id)
     }
 
+    /// Cut the blob `id`'s file to zero bytes behind the store's back, so a
+    /// read of any of its bytes panics.
+    pub fn empty_file(&self, id: &crate::BlobId) {
+        brenn_messaging_store::testutils::empty_file(&self.0, id);
+    }
+
     /// The name of every entry in the directory, sorted.
     pub fn files(&self) -> Vec<String> {
         brenn_messaging_store::testutils::blob_files(&self.0)

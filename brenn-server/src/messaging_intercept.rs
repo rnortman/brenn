@@ -576,62 +576,70 @@ pub(crate) async fn resolve_forwarded(
     let mut forwarded = Vec::with_capacity(entries.len());
     for (new_name, source) in entries {
         let new_name = attachment_name(new_name)?;
-        let (message_id, name) = forwarded_source(context, tool_name, &new_name, source)?;
-        let message_id = message_uuid(message_id)?;
-        let name = attachment_name(name)?;
-        match messenger
-            .admit_conversation_name(
-                bridge.conversation_id,
-                &bridge.app_slug,
-                message_id,
-                &NamedPart::Attachment(name),
-            )
-            .await
-        {
-            Ok(AdmittedPart::Attachment(hold)) => forwarded.push((new_name, hold)),
-            Ok(AdmittedPart::Body(_)) => unreachable!("an attachment name admits a hold"),
-            Err(refused) => {
-                return Err(refusal(
-                    refused.reason(),
-                    format!("attachment {new_name}: {refused}"),
-                ));
-            }
-        }
+        let Some((message_id, name)) = attachment_reference(source) else {
+            return Err(outcome_rejection(
+                context,
+                tool_name,
+                &format!(
+                    "attachment {new_name}: each `attachments` entry must be \
+                     {ATTACHMENT_REFERENCE_SHAPE}"
+                ),
+            ));
+        };
+        let hold = admit_attachment_reference(
+            bridge,
+            messenger,
+            &format!("attachment {new_name}"),
+            message_id,
+            name,
+        )
+        .await?;
+        forwarded.push((new_name, hold));
     }
     Ok(forwarded)
 }
 
-/// One `attachments` entry's `message_id` and `name`, both strings and
-/// nothing else beside them.
-fn forwarded_source<'a>(
-    context: &str,
-    tool_name: &str,
-    new_name: &AttachmentName,
-    source: &'a serde_json::Value,
-) -> Result<(&'a str, &'a str), ToolOutcome> {
-    let shape_err = || {
-        outcome_rejection(
-            context,
-            tool_name,
-            &format!(
-                "attachment {new_name}: each `attachments` entry must be \
-                 {{\"message_id\": \"<uuid>\", \"name\": \"<attachment name>\"}}"
-            ),
-        )
-    };
-    let fields = source.as_object().ok_or_else(shape_err)?;
+/// The shape [`attachment_reference`] accepts, as a refusal states it.
+pub(crate) const ATTACHMENT_REFERENCE_SHAPE: &str =
+    r#"{"message_id": "<uuid>", "name": "<attachment name>"}"#;
+
+/// The `message_id` and `name` of one attachment reference: an object with
+/// exactly those two fields, both strings. `None` for any other value.
+pub(crate) fn attachment_reference(source: &serde_json::Value) -> Option<(&str, &str)> {
+    let fields = source.as_object()?;
     if fields.len() != 2 {
-        return Err(shape_err());
+        return None;
     }
-    let message_id = fields
-        .get("message_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(shape_err)?;
-    let name = fields
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(shape_err)?;
-    Ok((message_id, name))
+    let message_id = fields.get("message_id")?.as_str()?;
+    let name = fields.get("name")?.as_str()?;
+    Some((message_id, name))
+}
+
+/// Admit one attachment reference under the conversation naming rule: one
+/// hold on the blob it names, or the refusal. `label` prefixes the text of a
+/// naming refusal.
+pub(crate) async fn admit_attachment_reference(
+    bridge: &ActiveBridge,
+    messenger: &brenn_messaging::Messenger,
+    label: &str,
+    message_id: &str,
+    name: &str,
+) -> Result<BlobHold, ToolOutcome> {
+    let message_id = message_uuid(message_id)?;
+    let name = attachment_name(name)?;
+    match messenger
+        .admit_conversation_name(
+            bridge.conversation_id,
+            &bridge.app_slug,
+            message_id,
+            &NamedPart::Attachment(name),
+        )
+        .await
+    {
+        Ok(AdmittedPart::Attachment(hold)) => Ok(hold),
+        Ok(AdmittedPart::Body(_)) => unreachable!("an attachment name admits a hold"),
+        Err(refused) => Err(refusal(refused.reason(), format!("{label}: {refused}"))),
+    }
 }
 
 /// `id` as a message's UUID, or the `malformed_message_id` refusal.

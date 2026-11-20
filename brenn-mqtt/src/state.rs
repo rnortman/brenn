@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
@@ -186,6 +187,13 @@ pub struct MqttClientHandle {
     /// atomically for outbound publishes.
     pub client: Mutex<Option<rumqttc::AsyncClient>>,
 
+    /// The Maximum Packet Size the broker advertised in the CONNACK of the
+    /// connection whose client [`Self::client`] holds; `0` when it advertised
+    /// none, a value MQTT 5.0 section 3.2.2.3.6 forbids the broker to send.
+    /// Written and read only under the `client` lock, so a reader sees the
+    /// value of the connection whose client it took.
+    pub(crate) broker_max_packet_size: AtomicU32,
+
     /// Pending QoS ≥ 1 publishes waiting for pkid binding (FIFO order).
     pub pending_publishes: Mutex<std::collections::VecDeque<PendingPublish>>,
 
@@ -264,6 +272,7 @@ impl MqttClientHandle {
                 next_attempt_at: Instant::now(),
             }),
             client: Mutex::new(None),
+            broker_max_packet_size: AtomicU32::new(0),
             pending_publishes: Mutex::new(std::collections::VecDeque::new()),
             inflight_publishes: Mutex::new(HashMap::new()),
             pending_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),

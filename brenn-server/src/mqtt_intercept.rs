@@ -1,6 +1,7 @@
 //! Intercept handler for the MQTT MCP virtual tool.
 //!
-//! - `MqttSend` — PreToolUse Allow; PostToolUse runs `MqttService::publish`.
+//! - `MqttSend` — PreToolUse Allow; PostToolUse publishes a text body, a
+//!   base64 body or an attachment of a message the conversation was shown.
 //!   Counts against the messaging send budget.
 //!
 //! `execute_mqtt_tool` is the execution, independent of the hook.
@@ -10,16 +11,19 @@ use std::borrow::Cow;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_envelope::grants::AppCapability;
+use brenn_lib::access::AppPolicy;
 use brenn_lib::mqtt::address::parse_topic_name;
+use brenn_messaging_store::blob::{BlobError, BlobHold};
 use brenn_mqtt::PublishProps;
-use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
-use brenn_mqtt::payload::decode_outbound_body;
+use brenn_mqtt::egress::{Authorized, MqttEgressError, SendBudget, authorize};
+use brenn_mqtt::payload::{OutboundPayload, decode_outbound_body};
 use brenn_obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
 
 use crate::active_bridge::{ActiveBridge, ToolOutcome};
 use crate::intercept_helpers::{
     PostCard, ToolOk, answer_post_tool_use, outcome_err, outcome_ok, outcome_rejection,
 };
+use crate::messaging_intercept;
 use brenn_render::tools::mqtt::MCP_MQTT_SEND_TOOL;
 
 /// Outcome of `try_handle_mqtt_tool`. `None` means "not an MQTT tool".
@@ -79,16 +83,119 @@ pub(crate) async fn execute_mqtt_tool(
     Some(execute_send(bridge, mcp_name, input).await)
 }
 
-/// `MqttSend`.
+/// What one `MqttSend` call publishes, once every check that precedes the
+/// budget has passed.
+struct PreparedPublish {
+    authorized: Authorized,
+    payload: Vec<u8>,
+    props: PublishProps,
+}
+
+/// `MqttSend`: [`prepare`], then the budget and the publish.
 async fn execute_send(
     bridge: &ActiveBridge,
     tool_name: &str,
     input: &serde_json::Value,
 ) -> ToolOutcome {
+    let PreparedPublish {
+        authorized,
+        payload,
+        props,
+    } = match prepare(bridge, tool_name, input).await {
+        Ok(prepared) => prepared,
+        Err(answer) => return answer,
+    };
+    let client = authorized.client().slug.clone();
+
+    // Pass the `Db` handle, not a held guard: this future runs in a
+    // `tokio::spawn`ed CC event loop and must stay `Send`.
+    let outcome = authorized
+        .publish(
+            bridge.mqtt_service(),
+            payload,
+            props,
+            SendBudget::Conversation {
+                db: bridge.db(),
+                conversation_id: bridge.conversation_id,
+                default_budget: bridge.app_config_default_send_budget(),
+            },
+        )
+        .await;
+
+    match outcome {
+        Ok(()) => outcome_ok(&ToolOk::new()),
+        Err(MqttEgressError::BudgetExhausted) => outcome_err(Cow::Borrowed(
+            "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
+        )),
+        Err(MqttEgressError::BrokerRejected { reason }) => {
+            // Surface a server-side signal for a persistent broker
+            // rejection (e.g. broker-side ACL) so it reaches on-call.
+            // `reason` is broker-derived external input, so it is sanitized.
+            // Not unit-guarded: no fixture seam can synthesize
+            // `PubackOutcome::BrokerRejected` short of a live-broker sim.
+            tracing::warn!(
+                app_slug = %bridge.app_slug,
+                conversation_id = bridge.conversation_id,
+                reason = %sanitize_untrusted_str(&reason, MAX_LOGGED_UNTRUSTED_BYTES),
+                "MqttSend: broker rejected publish"
+            );
+            outcome_err(Cow::Owned(format!("broker rejected publish: {reason}")))
+        }
+        Err(MqttEgressError::PacketTooLarge {
+            packet_bytes,
+            broker_max,
+        }) => {
+            // Both numbers go to the conversation, which is the operator's
+            // own, so it can tell the publish will not fit on any retry.
+            tracing::warn!(
+                app_slug = %bridge.app_slug,
+                conversation_id = bridge.conversation_id,
+                client = %sanitize_untrusted_str(&client, MAX_LOGGED_UNTRUSTED_BYTES),
+                packet_bytes,
+                broker_max,
+                "MqttSend: publish exceeds the broker's maximum packet size"
+            );
+            outcome_err(Cow::Owned(format!(
+                "publish is a {packet_bytes}-byte MQTT packet; the broker of MQTT client \
+                 `{client}` accepts at most {broker_max} bytes"
+            )))
+        }
+        Err(MqttEgressError::Broker(e)) => {
+            // The LLM keeps the full `Display` (the conversation is the
+            // operator's own; the TLS/OS detail is operationally useful in
+            // chat). But the host log needs it too, guaranteeing on-call
+            // visibility regardless. The `Display` embeds broker-derived
+            // external text, so it is sanitized per the log-integrity
+            // posture even though it is not CC-supplied.
+            tracing::warn!(
+                app_slug = %bridge.app_slug,
+                conversation_id = bridge.conversation_id,
+                detail = %sanitize_untrusted_str(&e.to_string(), MAX_LOGGED_UNTRUSTED_BYTES),
+                "MqttSend: broker error"
+            );
+            outcome_err(Cow::Owned(e.to_string()))
+        }
+        Err(
+            e @ (MqttEgressError::AclDenied { .. } | MqttEgressError::ClientNotRegistered { .. }),
+        ) => {
+            unreachable!("Authorized::publish runs neither the ACL nor the session lookup: {e:?}")
+        }
+    }
+}
+
+/// Every step of `MqttSend` before the budget: the arguments, the admission
+/// of an attachment reference, the ACL and the session lookup, the client's
+/// outbound bound, and the read of an attachment's bytes. A refusal here returns
+/// the call's answer and spends no budget.
+async fn prepare(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Result<PreparedPublish, ToolOutcome> {
     let to = match input.get("to").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
-            return reject(tool_name, "missing or empty `to` argument");
+            return Err(reject(tool_name, "missing or empty `to` argument"));
         }
     };
 
@@ -96,52 +203,64 @@ async fn execute_send(
     if brenn_lib::messaging::ChannelScheme::of(&to)
         == Some(brenn_lib::messaging::ChannelScheme::Brenn)
     {
-        return reject(
+        return Err(reject(
             tool_name,
             "MqttSend only accepts `mqtt:` addresses. \
                  Use BrennSend for `brenn:` addresses.",
-        );
+        ));
     }
     if brenn_lib::messaging::ChannelScheme::of(&to)
         == Some(brenn_lib::messaging::ChannelScheme::PwaPush)
     {
-        return reject(
+        return Err(reject(
             tool_name,
             "MqttSend only accepts `mqtt:` addresses. \
                  Use PwaPushSend for `pwa_push:` addresses.",
-        );
+        ));
     }
     if brenn_lib::messaging::ChannelScheme::of(&to)
         == Some(brenn_lib::messaging::ChannelScheme::Webhook)
     {
-        return reject(
+        return Err(reject(
             tool_name,
             "MqttSend only accepts `mqtt:` addresses. \
                  `webhook:` channels are inbound-only in this version.",
-        );
+        ));
     }
 
     // Parse and validate the address (wildcards rejected in publish
-    // context). `enforce_and_publish` requires an already-parsed,
-    // wildcard-validated `MqttAddress`.
-    let addr = match parse_topic_name(&to) {
-        Ok(a) => a,
-        Err(e) => {
-            return reject(tool_name, &e.to_string());
-        }
-    };
+    // context). `authorize` requires an already-parsed, wildcard-validated
+    // `MqttAddress`.
+    let addr = parse_topic_name(&to).map_err(|e| reject(tool_name, &e.to_string()))?;
 
-    let body_value = match input.get("body") {
-        Some(v) => v,
-        None => {
-            return reject(tool_name, "missing `body` argument");
+    let form = match (input.get("body"), input.get("attachment")) {
+        (Some(_), Some(_)) => {
+            return Err(reject(
+                tool_name,
+                "both `body` and `attachment` are given; give exactly one",
+            ));
         }
-    };
-
-    let outbound = match decode_outbound_body(body_value) {
-        Ok(p) => p,
-        Err(e) => {
-            return reject(tool_name, &e.to_string());
+        (None, None) => {
+            return Err(reject(
+                tool_name,
+                "missing payload: give exactly one of `body` and `attachment`",
+            ));
+        }
+        (Some(body), None) => PayloadForm::Inline(
+            decode_outbound_body(body).map_err(|e| reject(tool_name, &e.to_string()))?,
+        ),
+        (None, Some(reference)) => {
+            let Some((message_id, name)) = messaging_intercept::attachment_reference(reference)
+            else {
+                return Err(reject(
+                    tool_name,
+                    &format!(
+                        "`attachment` must be {}",
+                        messaging_intercept::ATTACHMENT_REFERENCE_SHAPE
+                    ),
+                ));
+            };
+            PayloadForm::Attachment { message_id, name }
         }
     };
 
@@ -151,7 +270,7 @@ async fn execute_send(
         .map(|n| n as u8)
         .unwrap_or(1);
     if qos > 2 {
-        return reject(tool_name, "invalid `qos`: must be 0, 1, or 2");
+        return Err(reject(tool_name, "invalid `qos`: must be 0, 1, or 2"));
     }
     let retain = input
         .get("retain")
@@ -176,79 +295,31 @@ async fn execute_send(
         )
     });
 
-    // The service always exists; a per-app grant/ACL denial is handled
-    // inside `enforce_and_publish`, and a per-client session miss after
-    // an ACL pass is a tool error: the policy read above is a snapshot,
-    // and a reload that stops a client swaps the authority naming it
-    // before it stops the session, so an in-flight tool call can hold an
+    // The hold is taken before the ACL; no byte is read until the bound
+    // has passed.
+    let form = match form {
+        PayloadForm::Inline(outbound) => AdmittedForm::Inline(outbound),
+        PayloadForm::Attachment { message_id, name } => AdmittedForm::Attachment(
+            messaging_intercept::admit_attachment_reference(
+                bridge,
+                messenger,
+                "`attachment`",
+                message_id,
+                name,
+            )
+            .await?,
+        ),
+    };
+
+    // A per-app grant/ACL denial comes back from `authorize`, and so does a
+    // per-client session miss after an ACL pass: the policy read above is a
+    // snapshot, and a reload that stops a client swaps the authority naming
+    // it before it stops the session, so an in-flight tool call can hold an
     // authority the registry has already moved past.
-    let svc = bridge.mqtt_service();
-
-    // Pass the `Db` handle, not a held guard: this future runs in a
-    // `tokio::spawn`ed CC event loop and must stay `Send`.
-    let outcome = enforce_and_publish(
-        svc,
-        &policy,
-        &addr,
-        outbound.bytes,
-        PublishProps {
-            content_type: outbound.content_type,
-            qos,
-            retain,
-            message_expiry_s: None,
-        },
-        SendBudget::Conversation {
-            db: bridge.db(),
-            conversation_id: bridge.conversation_id,
-            default_budget: bridge.app_config_default_send_budget(),
-        },
-    )
-    .await;
-
-    match outcome {
-        Ok(()) => outcome_ok(&ToolOk::new()),
+    let authorized = match authorize(bridge.mqtt_service(), &policy, &addr) {
+        Ok(authorized) => authorized,
         Err(MqttEgressError::AclDenied { client }) => {
-            // Distinguish "no grant at all" from "grant held, client not in
-            // the mqtt_publish ACL" via a cheap secondary `has_grant` check
-            // to pick both the security-signal `kind` and the right
-            // operator-facing remedy string.
-            let has_grant = policy.has_grant(AppCapability::MqttPublish);
-            let kind = if has_grant {
-                DenialKind::AclDenied
-            } else {
-                DenialKind::GrantAbsent
-            };
-            // An operator policy actively blocked an LLM MQTT publish — a
-            // security-relevant event, not LLM input error. Signal it like
-            // the durable/ephemeral publish denials via the shared helper: an
-            // app-attributed security-log line per occurrence plus a
-            // once-per-process phone alert. Both the acl_denied and
-            // grant_absent kinds signal — an absent grant is still an
-            // operator-policy denial. The LLM-facing text alone never reaches
-            // the logs. `client` is CC-supplied — the helper sanitizes it; the
-            // trusted `mqtt:` prefix makes the `address=mqtt:<client>` detail
-            // self-describing at the ACL's per-client granularity.
-            signal_publish_denial(
-                bridge.alert_dispatcher(),
-                SecurityEventType::MqttPublishDenied,
-                bridge.denial_origin(),
-                kind,
-                &format!("mqtt:{client}"),
-            );
-            // The two remedy strings stay distinct: each reveals only the
-            // app's own policy state (grant vs allowlist), no namespace bit.
-            let error = if has_grant {
-                Cow::Owned(format!(
-                    "MQTT publish to client `{client}` is not allowed for this app: \
-                     add an \"mqtt_publish\" ACL matcher for that client"
-                ))
-            } else {
-                Cow::Borrowed(
-                    "MQTT publish is not enabled for this app: \
-                     add \"mqtt_publish\" to this app's grants",
-                )
-            };
-            outcome_err(error)
+            return Err(answer_acl_denied(bridge, &policy, &client));
         }
         Err(MqttEgressError::ClientNotRegistered { client }) => {
             // The operator removed the client from the document while
@@ -262,43 +333,143 @@ async fn execute_send(
                 client = %sanitize_untrusted_str(&client, MAX_LOGGED_UNTRUSTED_BYTES),
                 "MqttSend: the client's session is no longer registered (removed by a reload)"
             );
-            outcome_err(Cow::Owned(format!(
+            return Err(outcome_err(Cow::Owned(format!(
                 "MQTT client `{client}` is no longer configured on this server"
-            )))
+            ))));
         }
-        Err(MqttEgressError::BudgetExhausted) => outcome_err(Cow::Borrowed(
-            "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
-        )),
-        Err(MqttEgressError::BrokerRejected { reason }) => {
-            // Surface a server-side signal for a persistent broker
-            // rejection (e.g. broker-side ACL) so it reaches on-call.
-            // `reason` is broker-derived external input, so it is sanitized.
-            // Not unit-guarded: no fixture seam can synthesize
-            // `PubackOutcome::BrokerRejected` short of a live-broker sim.
-            tracing::warn!(
-                app_slug = %bridge.app_slug,
-                conversation_id = bridge.conversation_id,
-                reason = %sanitize_untrusted_str(&reason, MAX_LOGGED_UNTRUSTED_BYTES),
-                "MqttSend: broker rejected publish"
-            );
-            outcome_err(Cow::Owned(format!("broker rejected publish: {reason}")))
-        }
-        Err(MqttEgressError::Broker(e)) => {
-            // The LLM keeps the full `Display` (the conversation is the
-            // operator's own; the TLS/OS detail is operationally useful in
-            // chat). But the host log needs it too, guaranteeing on-call
-            // visibility regardless. The `Display` embeds broker-derived
-            // external text, so it is sanitized per the log-integrity
-            // posture even though it is not CC-supplied.
-            tracing::warn!(
-                app_slug = %bridge.app_slug,
-                conversation_id = bridge.conversation_id,
-                detail = %sanitize_untrusted_str(&e.to_string(), MAX_LOGGED_UNTRUSTED_BYTES),
-                "MqttSend: broker error"
-            );
-            outcome_err(Cow::Owned(e.to_string()))
-        }
+        Err(
+            e @ (MqttEgressError::BudgetExhausted
+            | MqttEgressError::Broker(_)
+            | MqttEgressError::BrokerRejected { .. }
+            | MqttEgressError::PacketTooLarge { .. }),
+        ) => unreachable!("authorize runs neither the budget nor the publish: {e:?}"),
+    };
+
+    // The bound is the session's, checked after the ACL so a denied app
+    // learns nothing of the client's configuration, and before any blob byte
+    // is read.
+    let bound = authorized.client().outbound_payload_cap_bytes;
+    let size = match &form {
+        AdmittedForm::Inline(outbound) => outbound.bytes.len() as u64,
+        AdmittedForm::Attachment(hold) => hold.reference().size,
+    };
+    if size > u64::from(bound) {
+        return Err(messaging_intercept::refusal(
+            "payload_too_large",
+            format!(
+                "payload is {size} bytes; MQTT client `{}` publishes at most {bound} \
+                 (`outbound_payload_cap_bytes`)",
+                authorized.client().slug,
+            ),
+        ));
     }
+
+    let (payload, content_type) = match form {
+        AdmittedForm::Inline(outbound) => (outbound.bytes, outbound.content_type),
+        AdmittedForm::Attachment(hold) => {
+            let content_type = hold.reference().content_type;
+            (read_blob(bridge, hold).await?, Some(content_type))
+        }
+    };
+
+    Ok(PreparedPublish {
+        authorized,
+        payload,
+        props: PublishProps {
+            content_type,
+            qos,
+            retain,
+            message_expiry_s: None,
+        },
+    })
+}
+
+/// The payload form of one call, as its arguments give it.
+enum PayloadForm<'a> {
+    Inline(OutboundPayload),
+    Attachment { message_id: &'a str, name: &'a str },
+}
+
+/// The payload form once an attachment reference is admitted.
+enum AdmittedForm {
+    Inline(OutboundPayload),
+    Attachment(BlobHold),
+}
+
+/// The whole of a held blob, read on the blocking pool since the store's I/O
+/// is synchronous. A store I/O error is the host's fault and is logged at
+/// `warn`.
+async fn read_blob(bridge: &ActiveBridge, hold: BlobHold) -> Result<Vec<u8>, ToolOutcome> {
+    let reference = hold.reference();
+    let len = usize::try_from(reference.size).expect("a blob within the bound fits in memory");
+    let read = tokio::task::spawn_blocking(move || hold.read(0, len))
+        .await
+        .expect("a blob read task does not panic or get cancelled");
+    match read {
+        Ok(bytes) => Ok(bytes),
+        Err(BlobError::Io(e)) => {
+            tracing::warn!(
+                app_slug = %bridge.app_slug,
+                conversation_id = bridge.conversation_id,
+                blob = %reference.id,
+                error = %e,
+                "MqttSend: blob store read failed"
+            );
+            Err(outcome_err(Cow::Owned(format!(
+                "the blob store could not read: {e}"
+            ))))
+        }
+        Err(e) => panic!(
+            "BUG: a read of the whole of blob {} ({len} bytes) failed: {e}",
+            reference.id
+        ),
+    }
+}
+
+/// The answer to an `MqttSend` the app's `mqtt_publish` grant or ACL denies,
+/// with its security signal.
+fn answer_acl_denied(bridge: &ActiveBridge, policy: &AppPolicy, client: &str) -> ToolOutcome {
+    // Distinguish "no grant at all" from "grant held, client not in
+    // the mqtt_publish ACL" via a cheap secondary `has_grant` check
+    // to pick both the security-signal `kind` and the right
+    // operator-facing remedy string.
+    let has_grant = policy.has_grant(AppCapability::MqttPublish);
+    let kind = if has_grant {
+        DenialKind::AclDenied
+    } else {
+        DenialKind::GrantAbsent
+    };
+    // An operator policy actively blocked an LLM MQTT publish — a
+    // security-relevant event, not LLM input error. Signal it like
+    // the durable/ephemeral publish denials via the shared helper: an
+    // app-attributed security-log line per occurrence plus a
+    // once-per-process phone alert. Both the acl_denied and
+    // grant_absent kinds signal — an absent grant is still an
+    // operator-policy denial. The LLM-facing text alone never reaches
+    // the logs. `client` is CC-supplied — the helper sanitizes it; the
+    // trusted `mqtt:` prefix makes the `address=mqtt:<client>` detail
+    // self-describing at the ACL's per-client granularity.
+    signal_publish_denial(
+        bridge.alert_dispatcher(),
+        SecurityEventType::MqttPublishDenied,
+        bridge.denial_origin(),
+        kind,
+        &format!("mqtt:{client}"),
+    );
+    // The two remedy strings stay distinct: each reveals only the
+    // app's own policy state (grant vs allowlist), no namespace bit.
+    let error = if has_grant {
+        Cow::Owned(format!(
+            "MQTT publish to client `{client}` is not allowed for this app: \
+             add an \"mqtt_publish\" ACL matcher for that client"
+        ))
+    } else {
+        Cow::Borrowed(
+            "MQTT publish is not enabled for this app: \
+             add \"mqtt_publish\" to this app's grants",
+        )
+    };
+    outcome_err(error)
 }
 
 /// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
@@ -307,12 +478,18 @@ fn reject(tool_name: &str, error: &str) -> ToolOutcome {
 }
 
 #[cfg(test)]
+mod attachment_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use brenn_cc::session::ApprovalDecision as CcApprovalDecision;
     use serde_json::json;
 
-    use crate::active_bridge::test_support::{post_tool_use_req, pre_tool_use_req};
+    use crate::active_bridge::test_support::{
+        post_tool_use_req, pre_tool_use_req, send_budget_row,
+    };
+    use crate::test_support::mqtt::register_test_client;
 
     #[tokio::test]
     async fn pre_tool_use_send_auto_approves() {
@@ -493,9 +670,8 @@ mod tests {
         }
     }
 
-    // test-6: missing body returns error
     #[tokio::test]
-    async fn mqtt_send_missing_body_returns_error() {
+    async fn mqtt_send_with_neither_payload_form_returns_error() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_mqtt_publish_acl().await;
         let req = post_tool_use_req(
             MCP_MQTT_SEND_TOOL,
@@ -510,8 +686,8 @@ mod tests {
                 assert_eq!(v["ok"], json!(false));
                 let err = v["error"].as_str().unwrap();
                 assert!(
-                    err.contains("body"),
-                    "missing-body error must mention body: {err}"
+                    err.contains("`body`") && err.contains("`attachment`"),
+                    "the error must name both payload forms: {err}"
                 );
             }
             other => panic!("unexpected: {other:?}"),
@@ -595,6 +771,218 @@ mod tests {
         assert!(
             logs_contain("MqttSend: broker error"),
             "broker error must emit a host-side warn for on-call visibility"
+        );
+    }
+
+    /// A publish over the broker's advertised maximum packet size is a tool
+    /// error naming the packet's size, the client and the broker's limit, with
+    /// a host-side warn.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn mqtt_send_over_the_broker_maximum_names_the_limit() {
+        let bridge =
+            crate::active_bridge::ActiveBridge::test_new_for_mqtt_publish_acl(&["home"], &["home"])
+                .await;
+        let handle = bridge
+            .mqtt_service()
+            .get_client("home")
+            .expect("the fixture registers a session for `home`");
+        let _eventloop = brenn_mqtt::test_support::install_unpolled_client(&handle, Some(8)).await;
+
+        assert_eq!(
+            execute_mqtt_tool(
+                &bridge,
+                MCP_MQTT_SEND_TOOL,
+                &json!({ "to": "mqtt:home:cmd/light", "body": "on", "qos": 0 }),
+            )
+            .await,
+            Some(ToolOutcome::Err(json!({
+                "ok": false,
+                "error": "publish is a 16-byte MQTT packet; the broker of MQTT client `home` \
+                          accepts at most 8 bytes",
+            })))
+        );
+        assert!(logs_contain(
+            "MqttSend: publish exceeds the broker's maximum packet size"
+        ));
+    }
+
+    /// A bridge whose app may publish to `home`, with a registered session for
+    /// `home` that publishes at most `bound` bytes a call.
+    async fn bridge_with_bound(bound: u32) -> std::sync::Arc<ActiveBridge> {
+        let bridge = ActiveBridge::test_new_for_mqtt_publish_acl(&["home"], &[]).await;
+        register_test_client(bridge.mqtt_service(), "home", bound);
+        bridge
+    }
+
+    async fn prepared(bridge: &ActiveBridge, input: serde_json::Value) -> PreparedPublish {
+        match prepare(bridge, MCP_MQTT_SEND_TOOL, &input).await {
+            Ok(prepared) => prepared,
+            Err(answer) => panic!("expected the call to be prepared, got {answer:?}"),
+        }
+    }
+
+    fn payload_too_large(len: usize, bound: u32) -> Option<ToolOutcome> {
+        Some(ToolOutcome::Err(json!({
+            "ok": false,
+            "reason": "payload_too_large",
+            "error": format!(
+                "payload is {len} bytes; MQTT client `home` publishes at most {bound} \
+                 (`outbound_payload_cap_bytes`)"
+            ),
+        })))
+    }
+
+    #[tokio::test]
+    async fn a_text_body_publishes_its_utf8_bytes_untyped() {
+        let bridge = bridge_with_bound(1024).await;
+        let p = prepared(
+            &bridge,
+            json!({ "to": "mqtt:home:cmd/light", "body": "café", "qos": 2, "retain": true }),
+        )
+        .await;
+        assert_eq!(p.payload, "café".as_bytes());
+        assert_eq!(
+            p.props,
+            PublishProps {
+                content_type: None,
+                qos: 2,
+                retain: true,
+                message_expiry_s: None,
+            }
+        );
+        assert_eq!(p.authorized.client().slug, "home");
+    }
+
+    #[tokio::test]
+    async fn a_base64_body_publishes_the_decoded_bytes_with_its_content_type() {
+        let bridge = bridge_with_bound(1024).await;
+        let p = prepared(
+            &bridge,
+            json!({
+                "to": "mqtt:home:cam/snapshot",
+                "body": { "binary_base64": "AAEC/w==", "content_type": "image/png" },
+            }),
+        )
+        .await;
+        assert_eq!(p.payload, [0x00, 0x01, 0x02, 0xff]);
+        assert_eq!(
+            p.props,
+            PublishProps {
+                content_type: Some("image/png".to_string()),
+                qos: 1,
+                retain: false,
+                message_expiry_s: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_base64_body_with_an_unknown_key_is_rejected() {
+        let bridge = bridge_with_bound(1024).await;
+        assert_eq!(
+            execute_mqtt_tool(
+                &bridge,
+                MCP_MQTT_SEND_TOOL,
+                &json!({
+                    "to": "mqtt:home:cam/snapshot",
+                    "body": { "binary_base64": "AAEC", "contentType": "image/png" },
+                }),
+            )
+            .await,
+            Some(ToolOutcome::Err(json!({
+                "ok": false,
+                "error": "unknown key `contentType` in body: the object form takes \
+                          `binary_base64` and `content_type` only",
+            })))
+        );
+        assert_eq!(send_budget_row(&bridge).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_payload_exactly_at_the_bound_is_prepared() {
+        let bridge = bridge_with_bound(4).await;
+        let p = prepared(
+            &bridge,
+            json!({ "to": "mqtt:home:cmd/light", "body": "four" }),
+        )
+        .await;
+        assert_eq!(p.payload, b"four");
+    }
+
+    #[tokio::test]
+    async fn a_text_body_over_the_bound_is_refused_before_the_budget() {
+        let bridge = bridge_with_bound(4).await;
+        assert_eq!(
+            execute_mqtt_tool(
+                &bridge,
+                MCP_MQTT_SEND_TOOL,
+                &json!({ "to": "mqtt:home:cmd/light", "body": "fives" }),
+            )
+            .await,
+            payload_too_large(5, 4)
+        );
+        assert_eq!(send_budget_row(&bridge).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_base64_body_over_the_bound_is_refused_on_its_decoded_length() {
+        // Eight base64 characters, five decoded bytes: the bound is on what is
+        // published.
+        let bridge = bridge_with_bound(4).await;
+        assert_eq!(
+            execute_mqtt_tool(
+                &bridge,
+                MCP_MQTT_SEND_TOOL,
+                &json!({ "to": "mqtt:home:cmd/light", "body": { "binary_base64": "AAECAwQ=" } }),
+            )
+            .await,
+            payload_too_large(5, 4)
+        );
+        assert_eq!(send_budget_row(&bridge).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_acl_denial_answers_before_the_bound() {
+        let bridge = bridge_with_bound(4).await;
+        register_test_client(bridge.mqtt_service(), "office", 4);
+        assert_eq!(
+            execute_mqtt_tool(
+                &bridge,
+                MCP_MQTT_SEND_TOOL,
+                &json!({ "to": "mqtt:office:cmd/light", "body": "far too long" }),
+            )
+            .await,
+            Some(ToolOutcome::Err(json!({
+                "ok": false,
+                "error": "MQTT publish to client `office` is not allowed for this app: \
+                          add an \"mqtt_publish\" ACL matcher for that client",
+            })))
+        );
+        assert_eq!(send_budget_row(&bridge).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_published_call_answers_ok_and_spends_one_budget_unit() {
+        let bridge = bridge_with_bound(1024).await;
+        let handle = bridge
+            .mqtt_service()
+            .get_client("home")
+            .expect("the bridge registers a session for `home`");
+        let _eventloop = brenn_mqtt::test_support::install_unpolled_client(&handle, None).await;
+
+        assert_eq!(
+            execute_mqtt_tool(
+                &bridge,
+                MCP_MQTT_SEND_TOOL,
+                &json!({ "to": "mqtt:home:cmd/light", "body": "on", "qos": 0 }),
+            )
+            .await,
+            Some(ToolOutcome::Ok(json!({ "ok": true })))
+        );
+        assert_eq!(
+            send_budget_row(&bridge).await,
+            Some(bridge.app_config_default_send_budget() - 1)
         );
     }
 

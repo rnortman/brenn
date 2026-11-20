@@ -4,6 +4,37 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **`MqttSend` payloads are bounded per client, at 4 MiB unless the
+  deployment says otherwise.** A new `mqtt_client` key,
+  `outbound_payload_cap_bytes` (default 4194304), caps the bytes one
+  `MqttSend` call publishes through that client: the string's UTF-8 length,
+  the decoded length of a base64 body, or the attachment's size. A call over
+  it is refused with `reason` `payload_too_large` and spends no send budget.
+  Text and base64 payloads had no bound before; a deployment publishing more
+  than 4 MiB in one call raises the key. A component's `mqtt-publish` is not
+  held to it and stays capped at `[messaging] max_body_bytes`.
+- **`MqttSend` publishes an attachment's bytes by reference.** A new
+  `attachment` argument, `{"message_id": …, "name": …}`, given instead of
+  `body`, publishes the bytes of an attachment of a message the conversation
+  was shown, with the attachment's content type as the MQTT Content Type. No
+  byte passes through the conversation: it names the attachment as it would
+  forward it with `BrennSend`, under the same naming rule and refusals. A call
+  gives exactly one of `body` and `attachment`. The base64 body stays, for
+  bytes a conversation composes itself.
+- **An MQTT publish larger than the broker accepts is refused before it is
+  sent, instead of dropping the client's session.** When the broker
+  advertises a maximum packet size, a publish whose packet would exceed it
+  is refused on the spot. `MqttSend` answers an error naming the packet's
+  size, the client and the broker's limit; a component's `mqtt-publish`
+  gets `invalid-payload`. Before, the oversize packet took the client's
+  whole session down: every other publish in flight on that client failed
+  with it, and a QoS 0 publish was reported sent when it never was. A
+  broker that advertises no maximum is unaffected.
+- **`MqttSend`'s base64 body is checked strictly.** The object form takes
+  `binary_base64` and `content_type` and nothing else: any other key is
+  refused, naming it, where it used to be ignored (a misspelt `content_type`
+  published untyped bytes). `content_type` must be a string the bus accepts
+  as a content type; a non-string used to be read as absent.
 - **Existing `calendar-write` instances must add `blobs` to their `grants`;
   `CalendarCreate` and `CalendarUpdate` now take a description of up to 8,000
   characters.** For operators: without the `blobs` grant the configuration is

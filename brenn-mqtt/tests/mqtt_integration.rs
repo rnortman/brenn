@@ -297,6 +297,177 @@ async fn qos0_publish_returns_success_and_delivers() {
 }
 
 // ---------------------------------------------------------------------------
+// The broker's Maximum Packet Size: refused before submit, session kept
+// ---------------------------------------------------------------------------
+
+/// The maximum the broker of `broker_max_packet_*` advertises in its CONNACK.
+const BROKER_MAX_PACKET: u32 = 1024;
+
+/// Publish `len` zero bytes on `topic` at `qos`, with no properties.
+async fn publish_zeros(
+    svc: &brenn_mqtt::MqttService,
+    handle: &Arc<brenn_mqtt::MqttClientHandle>,
+    topic: &str,
+    len: usize,
+    qos: u8,
+) -> Result<brenn_mqtt::state::PubackOutcome, brenn_lib::mqtt::MqttError> {
+    svc.publish_on_handle(
+        handle,
+        topic.to_string(),
+        vec![0u8; len],
+        PublishProps {
+            qos,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// The payload length that makes a property-less PUBLISH on `topic` exactly
+/// [`BROKER_MAX_PACKET`] bytes: fixed header 1, remaining length 2 (it is over
+/// 127), topic 2 + its length, packet identifier 2 at QoS 1 and 2, empty
+/// properties 1.
+fn payload_filling_the_maximum(topic: &str, qos: u8) -> usize {
+    let pkid = if qos == 0 { 0 } else { 2 };
+    BROKER_MAX_PACKET as usize - (1 + 2 + 2 + topic.len() + pkid + 1)
+}
+
+/// Against a broker that advertises a Maximum Packet Size, at QoS 0 and at
+/// QoS 1: a publish whose packet is exactly the maximum is delivered — the
+/// size checked is the size encoded — and one a byte over is `PacketTooLarge`
+/// without touching the session, which stays connected, is not dropped at
+/// the broker, and delivers the next in-limit publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_max_packet_size_refuses_over_and_delivers_exact() {
+    broker_gate!();
+
+    let template = format!("{DEFAULT_CONF_TEMPLATE}max_packet_size {BROKER_MAX_PACKET}\n");
+    let harness = BrokerHarness::start_with(&template, &[("acl", DEFAULT_ACL.as_bytes())]);
+    let ca = certs::ca_pem_bytes();
+    let SpawnedClient {
+        svc,
+        client_slug,
+        handle,
+        ..
+    } = spawn_client("maxpkt", &harness, ca.clone(), vec![]).await;
+    let since = harness.log_len();
+
+    for qos in [0u8, 1] {
+        let exact_topic = format!("brenn/itest/maxpkt/exact{qos}");
+        let exact_len = payload_filling_the_maximum(&exact_topic, qos);
+        let mut deliver_rx = direct_subscriber(harness.port, ca.clone(), &exact_topic).await;
+        let result = publish_zeros(&svc, &handle, &exact_topic, exact_len, qos).await;
+        assert!(
+            matches!(result, Ok(brenn_mqtt::state::PubackOutcome::Success)),
+            "QoS {qos}: a packet exactly at the maximum: {result:?}"
+        );
+        let payload = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("QoS {qos}: the exact-maximum publish was not delivered"))
+            .expect("channel closed");
+        assert_eq!(payload.len(), exact_len);
+
+        let over_topic = format!("brenn/itest/maxpkt/over{qos}");
+        let over_len = payload_filling_the_maximum(&over_topic, qos) + 1;
+        let result = publish_zeros(&svc, &handle, &over_topic, over_len, qos).await;
+        assert_eq!(
+            result.err(),
+            Some(brenn_lib::mqtt::MqttError::PacketTooLarge {
+                client_slug: client_slug.clone(),
+                packet_bytes: BROKER_MAX_PACKET as usize + 1,
+                broker_max: BROKER_MAX_PACKET,
+            }),
+            "QoS {qos}: a packet one byte over the maximum",
+        );
+    }
+
+    let after_topic = "brenn/itest/maxpkt/after";
+    let mut deliver_rx = direct_subscriber(harness.port, ca, after_topic).await;
+    let result = publish_zeros(&svc, &handle, after_topic, 16, 1).await;
+    assert!(
+        matches!(result, Ok(brenn_mqtt::state::PubackOutcome::Success)),
+        "the in-limit publish after the refusals: {result:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
+        .await
+        .expect("the in-limit publish after the refusals was not delivered")
+        .expect("channel closed");
+
+    let (label, error) = svc.ingress_health(&client_slug).await;
+    assert_eq!(
+        label,
+        ConnectorHealthLabel::Connected,
+        "the session survived the refusals: {error:?}"
+    );
+    let client_id = session_client_id(&client_slug);
+    let received = format!("Received PUBLISH from {client_id} (");
+    let quoted = format!("'{after_topic}'");
+    let window = harness
+        .wait_for_log(since, 2, "the broker logs the in-limit publish", |log| {
+            log.lines()
+                .any(|line| line.contains(&received) && line.contains(&quoted))
+        })
+        .await;
+    assert!(
+        !window.lines().any(|line| line.contains(&client_id)
+            && (line.to_lowercase().contains("disconnect")
+                || line.contains("closed its connection"))),
+        "the broker recorded a disconnect of {client_id}:\n{window}"
+    );
+}
+
+/// The two egress halves, as the intercept calls them, put a binary payload
+/// and its Content Type on the wire unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorize_then_publish_delivers_bytes_and_content_type() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let SpawnedClient {
+        svc, client_slug, ..
+    } = spawn_client("halves", &harness, ca.clone(), vec![]).await;
+    let topic = "brenn/itest/halves/bin";
+    let mut deliver_rx = direct_subscriber_publish(harness.port, ca, topic).await;
+
+    let policy = wasm_egress_policy(&client_slug);
+    let addr = MqttAddress {
+        client: client_slug.clone(),
+        topic: topic.to_string(),
+    };
+    let payload: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x00, 0xFF];
+    let authorized = brenn_mqtt::egress::authorize(&svc, &policy, &addr)
+        .unwrap_or_else(|e| panic!("authorize: {e:?}"));
+    assert_eq!(authorized.client().slug, client_slug);
+    authorized
+        .publish(
+            &svc,
+            payload.clone(),
+            PublishProps {
+                content_type: Some("image/png".to_string()),
+                qos: 1,
+                ..Default::default()
+            },
+            SendBudget::None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("publish: {e:?}"));
+
+    let received = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
+        .await
+        .expect("no message within 2s")
+        .expect("channel closed");
+    assert_eq!(received.payload.to_vec(), payload);
+    assert_eq!(
+        received
+            .properties
+            .as_ref()
+            .and_then(|p| p.content_type.as_deref()),
+        Some("image/png")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // TLS 1.3 connect + publish/delivery roundtrip
 //
 // A session that incorrectly used TLS 1.2 would fail to connect to the TLS-1.3-
@@ -474,6 +645,60 @@ async fn wasm_egress_publish_reaches_broker() {
         .expect("no message within 2s after permitted WASM egress publish")
         .expect("delivery channel closed");
     assert_eq!(payload, b"wasm-egress", "unexpected payload: {payload:?}");
+}
+
+// `outbound_payload_cap_bytes` bounds `MqttSend` alone: the component's
+// entry, `enforce_and_publish` with no budget, delivers a payload larger than it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_egress_is_not_held_to_the_outbound_bound() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let mut config = test_client_config(
+        "testbroker-wasmbig",
+        harness.port,
+        ca.clone(),
+        TlsVersionMin::Tls12,
+    );
+    config.identity.outbound_payload_cap_bytes = 8;
+    let SpawnedClient {
+        svc, client_slug, ..
+    } = spawn_client_with_config(Arc::new(config), vec![]).await;
+    wait_for_health(
+        &svc,
+        &client_slug,
+        &[ConnectorHealthLabel::Connected],
+        5,
+        "session never reached Connected",
+    )
+    .await;
+
+    let mut deliver_rx = direct_subscriber(harness.port, ca, "brenn/itest/wasmbig/topic").await;
+
+    let payload = vec![0x5a_u8; 64];
+    let result = enforce_and_publish(
+        &svc,
+        &wasm_egress_policy("testbroker-wasmbig"),
+        &MqttAddress {
+            client: "testbroker-wasmbig".to_string(),
+            topic: "brenn/itest/wasmbig/topic".to_string(),
+        },
+        payload.clone(),
+        PublishProps {
+            qos: 1,
+            ..Default::default()
+        },
+        SendBudget::None,
+    )
+    .await;
+    assert!(matches!(result, Ok(())), "expected Ok, got {result:?}");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
+        .await
+        .expect("no message within 2s after a component publish over the outbound bound")
+        .expect("delivery channel closed");
+    assert_eq!(delivered, payload);
 }
 
 // broker-rejected publish maps to BrokerRejected with a non-empty reason.

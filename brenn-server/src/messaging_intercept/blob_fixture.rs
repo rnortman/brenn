@@ -117,7 +117,18 @@ pub(crate) async fn fixture() -> Fixture {
 
 /// [`fixture`] with a blob store of `limits`.
 pub(crate) async fn fixture_with_limits(limits: BlobLimits) -> Fixture {
-    build(limits, None).await
+    build(limits, None, None).await
+}
+
+/// The MQTT client [`fixture_with_mqtt`] grants `testapp` and registers.
+pub(crate) const MQTT_CLIENT: &str = "home";
+
+/// [`fixture`] whose `testapp` also holds `MqttPublish` with an
+/// `mqtt_publish` matcher for [`MQTT_CLIENT`], and whose bridge's MQTT
+/// service holds a session for that client publishing at most `bound` bytes a
+/// call. The session never connects.
+pub(crate) async fn fixture_with_mqtt(bound: u32) -> Fixture {
+    build(TEST_BLOB_LIMITS, None, Some(bound)).await
 }
 
 /// [`fixture`] whose bridge holds `tools` and grants `testapp` each tool
@@ -138,7 +149,12 @@ pub(crate) async fn fixture_with_rate_limited_tools(
     inbox: bool,
     rate_limit: Option<brenn_lib::tools::ResolvedRateLimit>,
 ) -> Fixture {
-    build(TEST_BLOB_LIMITS, Some((tools, granted, inbox, rate_limit))).await
+    build(
+        TEST_BLOB_LIMITS,
+        Some((tools, granted, inbox, rate_limit)),
+        None,
+    )
+    .await
 }
 
 type ToolWiring<'a> = (
@@ -148,7 +164,11 @@ type ToolWiring<'a> = (
     Option<brenn_lib::tools::ResolvedRateLimit>,
 );
 
-async fn build(limits: BlobLimits, tools: Option<ToolWiring<'_>>) -> Fixture {
+async fn build(
+    limits: BlobLimits,
+    tools: Option<ToolWiring<'_>>,
+    mqtt_bound: Option<u32>,
+) -> Fixture {
     let mut durable: Vec<_> = ["src", "dst", "hidden", "tool-requests/watched"]
         .into_iter()
         .map(|name| test_channel_entry(name, vec![]))
@@ -211,6 +231,15 @@ async fn build(limits: BlobLimits, tools: Option<ToolWiring<'_>>) -> Fixture {
         .acls
         .ephemeral_publish
         .push(ChannelMatcher::Exact("ring".to_string()));
+    if mqtt_bound.is_some() {
+        policy.grants.insert(AppCapability::MqttPublish);
+        policy
+            .acls
+            .mqtt_publish
+            .push(brenn_lib::access::acl::MqttClientMatcher {
+                client: MQTT_CLIENT.to_string(),
+            });
+    }
     let mut apps = indexmap::IndexMap::new();
     apps.insert("testapp".to_string(), cfg);
     let rings = vec![ring];
@@ -247,5 +276,8 @@ async fn build(limits: BlobLimits, tools: Option<ToolWiring<'_>>) -> Fixture {
             ActiveBridge::test_new_with_messenger_and_tools(m.clone(), tools, grants).await
         }
     };
+    if let Some(bound) = mqtt_bound {
+        crate::test_support::mqtt::register_test_client(bridge.mqtt_service(), MQTT_CLIENT, bound);
+    }
     Fixture { bridge, m, blobs }
 }

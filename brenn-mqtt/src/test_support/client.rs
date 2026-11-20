@@ -1,5 +1,6 @@
 //! Client-side helpers for a test that drives a real broker: a health poll and
-//! a raw publisher that confirms its own PubAcks.
+//! a raw publisher that confirms its own PubAcks. Beside them, a client that
+//! never connects, for a test that publishes with no broker at all.
 //!
 //! These sit beside the broker harness because every suite that spawns one
 //! needs the same two things — a way to wait for a brenn session to reach a
@@ -11,7 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rumqttc::{AsyncClient, MqttOptions, Transport};
 use tokio::sync::mpsc;
 
-use crate::{MqttService, state::ConnectorHealthLabel, test_support::poll};
+use crate::{
+    MqttService,
+    state::{ConnectorHealthLabel, MqttClientHandle},
+    test_support::poll,
+};
 
 /// The MQTT client id a brenn session for `client_slug` connects with.
 ///
@@ -20,6 +25,27 @@ use crate::{MqttService, state::ConnectorHealthLabel, test_support::poll};
 /// transcribing the format.
 pub fn session_client_id(client_slug: &str) -> String {
     crate::connection::client_id_of_slug(client_slug)
+}
+
+/// Install in `handle` a client that never connects, recording
+/// `broker_max_packet_size` as the Maximum Packet Size its broker advertised
+/// (`None`: none advertised).
+///
+/// Returns the client's event loop, which the caller keeps alive: requests sit
+/// queued in it, unsent, so a QoS 0 publish is accepted with no broker, and a
+/// test can read what was submitted. With it dropped every send fails as on a
+/// closed channel.
+pub async fn install_unpolled_client(
+    handle: &MqttClientHandle,
+    broker_max_packet_size: Option<u32>,
+) -> rumqttc::EventLoop {
+    let (client, eventloop) = crate::connection::unpolled_client(64);
+    let mut guard = handle.client.lock().await;
+    handle
+        .broker_max_packet_size
+        .store(broker_max_packet_size.unwrap_or(0), Ordering::Relaxed);
+    *guard = Some(client);
+    eventloop
 }
 
 /// [`poll::poll_until`] with the client's current health appended to `msg` on

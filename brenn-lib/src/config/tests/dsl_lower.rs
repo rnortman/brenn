@@ -62,7 +62,7 @@ use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
 use crate::mqtt::config::{
     AppMqttIngressSubscriptionRaw, MqttClientConfigRaw, default_backoff_initial,
     default_backoff_max, default_client_urgency, default_inbound_payload_cap,
-    default_subscription_qos, default_tls_version_min,
+    default_outbound_payload_cap, default_subscription_qos, default_tls_version_min,
 };
 use crate::pwa_push::config::PwaPushGlobalConfig;
 use crate::webhook::config::{
@@ -153,6 +153,7 @@ fn mqtt_client_at(slug: &str, url: &str) -> MqttClientConfigRaw {
         tls_version_min: default_tls_version_min(),
         keepalive_secs: None,
         inbound_payload_cap_bytes: default_inbound_payload_cap(),
+        outbound_payload_cap_bytes: default_outbound_payload_cap(),
         last_will: None,
         reconnect_backoff_initial_secs: default_backoff_initial(),
         reconnect_backoff_max_secs: default_backoff_max(),
@@ -2462,6 +2463,7 @@ mqtt_client broker {
     tls_version_min = "1.3";
     keepalive_secs = 30;
     inbound_payload_cap_bytes = 262144;
+    outbound_payload_cap_bytes = 1048576;
     reconnect_backoff_initial_secs = 2;
     reconnect_backoff_max_secs = 120;
     session_expiry_secs = 300;
@@ -2479,6 +2481,7 @@ mqtt_client broker {
                 tls_version_min: "1.3".to_string(),
                 keepalive_secs: Some(30),
                 inbound_payload_cap_bytes: 262144,
+                outbound_payload_cap_bytes: 1048576,
                 last_will: None,
                 reconnect_backoff_initial_secs: 2,
                 reconnect_backoff_max_secs: 120,
@@ -2513,6 +2516,7 @@ mqtt_client broker {
                 tls_version_min: default_tls_version_min(),
                 keepalive_secs: None,
                 inbound_payload_cap_bytes: default_inbound_payload_cap(),
+                outbound_payload_cap_bytes: default_outbound_payload_cap(),
                 last_will: None,
                 reconnect_backoff_initial_secs: default_backoff_initial(),
                 reconnect_backoff_max_secs: default_backoff_max(),

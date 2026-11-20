@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::sync::RwLock;
 
@@ -522,7 +523,11 @@ impl MqttService {
     /// - QoS 1/2: blocks until PUBACK/PUBCOMP.
     ///
     /// Returns `Err(MqttError::NotConnected)` synchronously if the client is
-    /// currently disconnected (no queueing).
+    /// currently disconnected (no queueing), and
+    /// `Err(MqttError::PacketTooLarge)` without submitting anything if the
+    /// encoded packet exceeds the Maximum Packet Size the broker advertised for
+    /// the current connection. The client library would otherwise fail the
+    /// packet in its event loop and drop the whole session with it.
     pub async fn publish_on_handle(
         &self,
         handle: &Arc<MqttClientHandle>,
@@ -570,6 +575,33 @@ impl MqttService {
             }
             Some(c) => c.clone(),
         };
+
+        // Measured as the library will encode it: same topic, QoS, retain,
+        // payload and properties, and a non-zero packet identifier at QoS 1/2,
+        // which the encoder counts only when set. `Bytes::from(Vec)` takes the
+        // buffer without copying, and the measured packet shares it.
+        let payload = bytes::Bytes::from(payload);
+        let broker_max = handle.broker_max_packet_size.load(Ordering::Relaxed);
+        if broker_max != 0 {
+            let mut packet = rumqttc::Publish::new(
+                topic.as_str(),
+                rumq_qos,
+                payload.clone(),
+                properties.clone(),
+            );
+            packet.retain = retain;
+            if qos != 0 {
+                packet.pkid = 1;
+            }
+            let packet_bytes = packet.size();
+            if packet_bytes > broker_max as usize {
+                return Err(MqttError::PacketTooLarge {
+                    client_slug: handle.config.identity.slug.clone(),
+                    packet_bytes,
+                    broker_max,
+                });
+            }
+        }
 
         if qos == 0 {
             drop(client_guard);
@@ -1040,6 +1072,87 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(MqttError::NotConnected { .. })));
+    }
+
+    /// A publish of `len` bytes on topic `t/x` with no properties. Its packet is
+    /// `1 + 1 + (2 + 3 + 1 + len)` bytes at QoS 0 (fixed header, one-byte
+    /// remaining length, topic, empty properties, payload) and two more at QoS
+    /// 1 and 2 for the packet identifier, while the remaining length is under
+    /// 128.
+    async fn publish_bytes(
+        svc: &MqttService,
+        handle: &Arc<MqttClientHandle>,
+        len: usize,
+        qos: u8,
+    ) -> Result<PubackOutcome, MqttError> {
+        svc.publish_on_handle(
+            handle,
+            "t/x".to_string(),
+            vec![0u8; len],
+            PublishProps {
+                qos,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Requests the client submitted that its event loop has not sent.
+    fn queued_requests(eventloop: &mut rumqttc::EventLoop) -> usize {
+        eventloop.clean();
+        eventloop.pending_len()
+    }
+
+    /// A publish one byte over the broker's maximum is refused before it is
+    /// submitted, at QoS 0 and at QoS 1: no waiter is queued and the event
+    /// loop holds nothing, so the session is never handed a packet it would
+    /// fail on. One exactly at the maximum is submitted.
+    #[tokio::test]
+    async fn publish_over_the_broker_maximum_is_refused_before_submit() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        svc.add_client(handle.clone());
+        let mut eventloop = crate::test_support::install_unpolled_client(&handle, Some(18)).await;
+
+        let qos0 = publish_bytes(&svc, &handle, 11, 0).await;
+        assert_eq!(
+            qos0.err(),
+            Some(MqttError::PacketTooLarge {
+                client_slug: "home".to_string(),
+                packet_bytes: 19,
+                broker_max: 18,
+            })
+        );
+        let qos1 = publish_bytes(&svc, &handle, 9, 1).await;
+        assert_eq!(
+            qos1.err(),
+            Some(MqttError::PacketTooLarge {
+                client_slug: "home".to_string(),
+                packet_bytes: 19,
+                broker_max: 18,
+            }),
+            "the packet identifier counts at QoS 1",
+        );
+        assert!(handle.pending_publishes.lock().await.is_empty());
+        assert_eq!(queued_requests(&mut eventloop), 0);
+
+        let exact = publish_bytes(&svc, &handle, 10, 0).await;
+        assert!(matches!(exact, Ok(PubackOutcome::Success)), "{exact:?}");
+        assert_eq!(queued_requests(&mut eventloop), 1);
+    }
+
+    /// With no maximum advertised nothing is checked: the same publish the
+    /// test above refuses is submitted.
+    #[tokio::test]
+    async fn publish_with_no_broker_maximum_is_submitted() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        svc.add_client(handle.clone());
+        let mut eventloop = crate::test_support::install_unpolled_client(&handle, None).await;
+
+        let result = publish_bytes(&svc, &handle, 11, 0).await;
+        assert!(matches!(result, Ok(PubackOutcome::Success)), "{result:?}");
+        assert_eq!(queued_requests(&mut eventloop), 1);
     }
 
     #[tokio::test]

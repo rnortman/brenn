@@ -954,8 +954,11 @@ by reference (`docs/message-bus.md` §2.1.2a).
   blob.
 - **What the rule does not close.** A conversation induced — by text it read —
   to forward or save a blob it legitimately holds does so: the rule bounds
-  what it can name, not why it names it, and forwarding is a `BrennSend` under
-  every policy `BrennSend` already has. Two resets of the conversation's
+  what it can name, not why it names it. Forwarding onto a channel is a
+  `BrennSend` under every policy `BrennSend` already has; sending the bytes to
+  an MQTT broker is an `MqttSend` with `attachment`, under the app's
+  `mqtt_publish` grant and per-client ACL, the send budget and the client's
+  `outbound_payload_cap_bytes`. Two resets of the conversation's
   context are not seen by the host: a resume Claude Code answers with a fresh
   session, after which the read record still stands, and a slash command a
   user sends while a turn is running, where messages handed over before Claude

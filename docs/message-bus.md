@@ -357,7 +357,8 @@ names an attachment as **(message id, attachment name)**, and a message's
 body as (message id, body), and nothing it does with a blob puts the bytes
 through the model's context: `BrennSend`'s `attachments` forwards an
 attachment by reference (a hold on the same blob, no byte copied);
-`brenn-tool save` writes an attachment's or a body's bytes to a file in the
+`MqttSend`'s `attachment` publishes an attachment's bytes to a broker
+(§2.7.2); `brenn-tool save` writes an attachment's or a body's bytes to a file in the
 conversation's environment; `brenn-tool send` attaches a file of the
 conversation's own to a `BrennSend`, which seals a new blob the published
 message names. The two commands are described in `docs/agent-tool-cli.md`
@@ -1575,6 +1576,59 @@ restart admits — only text bodies retained — a 0.1.0 component may bind the
 channel and receives raw text messages whose `envelope-json` carries
 `transport` and whose body is not a wrapper. Deleting the channel's stored
 messages starts it clean in either direction.
+
+### 2.7.2 Publishing to MQTT: `MqttSend`
+
+`MqttSend` is a conversation's publish to an `mqtt:<client>:<topic>` address.
+A call gives its payload in exactly one of three forms:
+
+| Form | Arguments | Bytes published | MQTT 5 Content Type |
+|---|---|---|---|
+| text | `body`: a string | the string's UTF-8 bytes | none |
+| base64 | `body`: `{"binary_base64": …, "content_type"?: …}` | the decoded bytes | `content_type`, if given |
+| attachment | `attachment`: `{"message_id": …, "name": …}` | the blob's bytes | the blob's recorded content type |
+
+Text is for text. The base64 object is for bytes the conversation composes
+itself: it takes those two keys and no other, and `content_type` must be a
+string the bus accepts as a content type (§2.1.2). The attachment is for an
+attachment of a message the conversation was shown: it is named by
+(message id, attachment name) under the rule of §2.1.2a, refused with the
+same `reason` kinds as a `BrennSend` forward (`malformed_message_id`,
+`malformed_attachment_name`, `not_read`, `channel_not_readable`,
+`not_retained`, `no_such_attachment`, `tool_channel_attachment`), and its
+bytes never pass through the model's context. A call carrying both `body`
+and `attachment`, or neither, is an argument error.
+
+A file of the conversation's own reaches MQTT through a channel: the
+conversation sends it to a channel it may publish to with `brenn-tool send`
+(`docs/agent-tool-cli.md`), which answers with the new message's id, and
+names the attachment from that answer in `MqttSend`'s `attachment`.
+
+**The bound.** Each MQTT client publishes at most
+`outbound_payload_cap_bytes` (default 4 MiB, `docs/config-dsl.md`) per
+`MqttSend` call, measured on the bytes published: the string's UTF-8 length,
+the decoded length of a base64 body, the attachment's recorded size. A call
+over it is refused with `reason` `payload_too_large`. The bound is
+`MqttSend`'s alone: a component's `mqtt-publish` is held to
+`[messaging] max_body_bytes` and never to this key.
+
+**Order.** A call is checked in this order, and every refusal before the
+budget spends none: the arguments; the attachment's admission, which takes a
+hold on the blob and reads no byte; the app's `mqtt_publish` grant and
+per-client ACL, and the client's session; the bound; the read of the
+attachment's bytes; then the send budget and the publish. A denied or
+over-bound call reads no blob byte, and a denied call learns nothing of the
+client's bound. A source message evicted after admission does not affect the
+call: the hold keeps the bytes.
+
+**The broker's maximum packet size.** When the broker's CONNACK advertises a
+Maximum Packet Size, a publish whose packet would exceed it is refused before
+it is sent, for a conversation and a component alike; the session stays up.
+The check runs in the publish step, after the budget, so for a conversation
+it spends one unit. `MqttSend` answers an error naming the packet's size, the
+client and the broker's maximum; a component's `mqtt-publish` answers
+`invalid-payload` with a fixed text and no broker-derived number, the numbers
+going to the host log. A broker that advertises no maximum arms no check.
 
 ### 2.8 The reload pair
 

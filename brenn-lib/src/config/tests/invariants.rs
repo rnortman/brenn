@@ -113,6 +113,10 @@ fn default_functions_return_the_values_they_are_relied_on_for() {
         crate::mqtt::config::default_inbound_payload_cap(),
         4 * 1024 * 1024
     );
+    assert_eq!(
+        crate::mqtt::config::default_outbound_payload_cap(),
+        4 * 1024 * 1024
+    );
     assert_eq!(crate::mqtt::config::default_backoff_initial(), 1);
     assert_eq!(crate::mqtt::config::default_backoff_max(), 60);
     assert_eq!(crate::mqtt::config::default_subscription_qos(), 1);

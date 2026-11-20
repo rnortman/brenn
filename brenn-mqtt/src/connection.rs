@@ -8,6 +8,7 @@
 //! and the ingress-delivery paths.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use rumqttc::mqttbytes::QoS;
@@ -252,6 +253,12 @@ fn build_mqtt_options(broker: &MqttClientConfig, transport: Transport) -> MqttOp
     // Inbound payload cap — advertised to broker in CONNECT. Validated to fit
     // `u32` at config resolution, so no cast is needed here.
     opts.set_max_packet_size(Some(broker.identity.inbound_payload_cap_bytes));
+
+    // A publish is sent exactly as submitted: `publish_on_handle` checks the
+    // packet's size against the broker's maximum before submitting it, and an
+    // alias the event loop added afterwards would make the packet larger than
+    // the size checked.
+    opts.set_auto_topic_aliases(false);
 
     // TLS transport pre-built by the caller (once per supervisor lifetime).
     opts.set_transport(transport);
@@ -616,8 +623,9 @@ async fn supervisor_body(
         // `NotConnected` on the publish path rather than unbounded growth.
         let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
 
-        // Poll until ConnAck or error. `None` = stop requested.
-        let connack: Option<Result<bool, ConnectionError>> = loop {
+        // Poll until ConnAck or error. `None` = stop requested. `Ok` carries
+        // Session Present and the broker's Maximum Packet Size, if it sent one.
+        let connack: Option<Result<(bool, Option<u32>), ConnectionError>> = loop {
             tokio::select! {
                 biased;
                 _ = stop_requested(&mut stop_rx) => {
@@ -627,7 +635,9 @@ async fn supervisor_body(
                     match event {
                         Err(e) => break Some(Err(e)),
                         Ok(Event::Incoming(Incoming::ConnAck(ack))) => {
-                            break Some(Ok(ack.session_present));
+                            let max_packet_size =
+                                ack.properties.as_ref().and_then(|p| p.max_packet_size);
+                            break Some(Ok((ack.session_present, max_packet_size)));
                         }
                         Ok(_) => continue,
                     }
@@ -635,7 +645,7 @@ async fn supervisor_body(
             }
         };
 
-        let session_present = match connack {
+        let (session_present, broker_max_packet_size) = match connack {
             None => {
                 // Clean stop during connect handshake; no client installed yet.
                 if terminal_reason.is_none() {
@@ -725,9 +735,13 @@ async fn supervisor_body(
             .expect(DEFERRED_SUBSCRIBES_POISONED)
             .clear();
 
-        // Connected — install client in handle.
+        // The broker's maximum packet size is stored under the same lock,
+        // before the client is visible.
         {
             let mut client_guard = handle.client.lock().await;
+            handle
+                .broker_max_packet_size
+                .store(broker_max_packet_size.unwrap_or(0), Ordering::Relaxed);
             *client_guard = Some(client.clone());
         }
         {
@@ -1329,7 +1343,7 @@ async fn handle_event(
 /// A client that never connects, with room for `capacity` requests on each
 /// channel. Requests stay queued until the returned event loop is polled; with
 /// the event loop dropped, every send fails as on a closed channel.
-#[cfg(test)]
+#[cfg(any(test, feature = "testutils"))]
 pub(crate) fn unpolled_client(capacity: usize) -> (AsyncClient, rumqttc::EventLoop) {
     let opts = MqttOptions::new("test-unpolled", ("127.0.0.1", 1));
     AsyncClient::builder(opts).capacity(capacity).build()

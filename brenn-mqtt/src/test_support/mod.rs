@@ -20,8 +20,8 @@ pub use broker::{
     log_records_publish_to_subscriber, log_records_unsubscribe,
 };
 pub use client::{
-    await_puback, direct_publisher_acked, direct_publisher_acked_as, session_client_id,
-    wait_for_filter_acked, wait_for_health,
+    await_puback, direct_publisher_acked, direct_publisher_acked_as, install_unpolled_client,
+    session_client_id, wait_for_filter_acked, wait_for_health,
 };
 pub use poll::{POLL_INTERVAL, poll_until};
 

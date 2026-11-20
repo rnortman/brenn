@@ -5,6 +5,16 @@
 //! sequencing once so "both paths enforce identically" is a structural property,
 //! not a code-review discipline.
 //!
+//! The chain's order is fixed and load-bearing — "validate before budget": ACL,
+//! session lookup, budget, publish. It is exposed in two halves so a caller can
+//! check what only the session's configuration knows between them:
+//! [`authorize`] runs the ACL and the session lookup and returns an
+//! [`Authorized`], whose [`Authorized::publish`] runs the budget and the
+//! publish. [`Authorized`] has no other constructor, so a publish without the
+//! first two steps cannot be expressed, and the budget step is inside the
+//! publish half. [`enforce_and_publish`] runs both halves for a caller with
+//! nothing to check between them.
+//!
 //! What lives here: the authorization + rate-limit + publish *sequencing* and the
 //! per-failure-mode error mapping. What stays at each call site: JSON
 //! field extraction, cross-protocol address rejection, body decoding, QoS parsing,
@@ -13,11 +23,14 @@
 //! takes typed, pre-validated inputs and returns a typed [`MqttEgressError`] each
 //! caller maps to its own response format.
 
+use std::sync::Arc;
+
 use crate::service::{MqttService, PublishProps};
-use crate::state::PubackOutcome;
+use crate::state::{MqttClientHandle, PubackOutcome};
 use brenn_db::Db;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::mqtt::address::MqttAddress;
+use brenn_lib::mqtt::config::MqttClientIdentity;
 use brenn_lib::mqtt::error::MqttError;
 use brenn_messaging_store::db::{BudgetDecrement, decrement_send_budget};
 
@@ -85,36 +98,142 @@ pub enum MqttEgressError {
         /// The slug with no registered session.
         client: String,
     },
+    /// The encoded publish exceeds the Maximum Packet Size the broker
+    /// advertised for the session's current connection. Nothing was sent; the
+    /// budget step, if any, has run.
+    PacketTooLarge {
+        /// The size of the PUBLISH packet as it would be encoded.
+        packet_bytes: usize,
+        /// The broker's advertised maximum.
+        broker_max: u32,
+    },
 }
 
-/// Run the shared MQTT-egress enforcement chain and, if every gate passes,
-/// publish straight to the broker.
-///
-/// Order is fixed and load-bearing — the "validate before budget" invariant:
+/// Steps 1-2 of the chain passed for one address: the ACL allowed the client
+/// and the registry holds its session. Made only by [`authorize`], so a
+/// publish that skipped either step cannot be expressed.
+pub struct Authorized {
+    handle: Arc<MqttClientHandle>,
+    topic: String,
+}
+
+impl Authorized {
+    /// The configuration of the session this publish will use.
+    pub fn client(&self) -> &MqttClientIdentity {
+        &self.handle.config.identity
+    }
+
+    /// Steps 3-4: budget, then publish.
+    ///
+    /// 3. **Budget** — for [`SendBudget::Conversation`], decrement under the
+    ///    database lock; exhausted → [`MqttEgressError::BudgetExhausted`]. For
+    ///    [`SendBudget::None`] this step is skipped entirely (WASM's quota is
+    ///    enforced upstream).
+    /// 4. **Publish** — `svc.publish_on_handle(...)`, mapping the broker
+    ///    outcome to `Ok(())` / [`MqttEgressError::BrokerRejected`] /
+    ///    [`MqttEgressError::PacketTooLarge`] / [`MqttEgressError::Broker`].
+    ///
+    /// `payload` and `props.content_type` are already decoded; `props` passes
+    /// through to the broker unchanged.
+    pub async fn publish(
+        self,
+        svc: &MqttService,
+        payload: Vec<u8>,
+        props: PublishProps,
+        budget: SendBudget<'_>,
+    ) -> Result<(), MqttEgressError> {
+        // 3. Budget — last gate before the publish. The DB lock is held only for
+        //    the synchronous decrement and dropped before the publish await
+        //    below, so the calling future stays `Send` and the single DB mutex
+        //    is never held across the broker round-trip (see `SendBudget` doc).
+        if let SendBudget::Conversation {
+            db,
+            conversation_id,
+            default_budget,
+        } = budget
+        {
+            let exhausted = {
+                let conn = db.lock().await;
+                matches!(
+                    decrement_send_budget(&conn, conversation_id, default_budget),
+                    BudgetDecrement::Exhausted
+                )
+            };
+            if exhausted {
+                return Err(MqttEgressError::BudgetExhausted);
+            }
+        }
+
+        // 4. Publish straight to the broker (synchronous; QoS ≥ 1 awaits the
+        //    ack). No store-and-forward — the broker outcome propagates inline.
+        match svc
+            .publish_on_handle(&self.handle, self.topic, payload, props)
+            .await
+        {
+            Ok(PubackOutcome::Success) => Ok(()),
+            Ok(PubackOutcome::BrokerRejected { reason }) => {
+                Err(MqttEgressError::BrokerRejected { reason })
+            }
+            Err(MqttError::PacketTooLarge {
+                packet_bytes,
+                broker_max,
+                ..
+            }) => Err(MqttEgressError::PacketTooLarge {
+                packet_bytes,
+                broker_max,
+            }),
+            Err(e) => Err(MqttEgressError::Broker(e)),
+        }
+    }
+}
+
+/// Steps 1-2 of the chain: ACL, then session lookup.
 ///
 /// 1. **ACL** — `policy.allows_mqtt_publish(client)` composes the layer-1
-///    `MqttPublish` grant check and the layer-2 per-client matcher, so no separate
-///    grant gate is needed here. A deny returns [`MqttEgressError::AclDenied`]
-///    *before* any session lookup or budget decrement.
+///    `MqttPublish` grant check and the layer-2 per-client matcher, so no
+///    separate grant gate is needed here. A deny returns
+///    [`MqttEgressError::AclDenied`] *before* any session lookup.
 /// 2. **Session lookup** — `svc.get_client(client)`. A miss after an ACL pass
 ///    returns [`MqttEgressError::ClientNotRegistered`]: the registry shrinks at
 ///    a reload that stops a client, and a caller holding an older authority
 ///    snapshot can still name it. Whether that is a runtime outcome or a broken
 ///    invariant depends on how the caller obtained its policy, so the decision
 ///    is the caller's.
-/// 3. **Budget** — for [`SendBudget::Conversation`], decrement under the supplied
-///    connection; exhausted → [`MqttEgressError::BudgetExhausted`]. For
-///    [`SendBudget::None`] this step is skipped entirely (WASM's quota is enforced
-///    upstream).
-/// 4. **Publish** — `svc.publish_on_handle(...)`, mapping the broker outcome to
-///    `Ok(())` / [`MqttEgressError::BrokerRejected`] / [`MqttEgressError::Broker`].
 ///
-/// Preconditions: `addr` is an already-parsed, already-wildcard-
-/// validated [`MqttAddress`] (the caller owns `parse_topic_name`); `payload` and
-/// `props.content_type` are already decoded. `props` passes through to the
-/// broker unchanged. ACL-deny logging
-/// belongs to the caller, which has the caller-identifying context — this
-/// function does not log.
+/// `addr` is an already-parsed, already-wildcard-validated [`MqttAddress`]
+/// (the caller owns `parse_topic_name`). ACL-deny logging belongs to the
+/// caller, which has the caller-identifying context — this function does not
+/// log.
+pub fn authorize(
+    svc: &MqttService,
+    policy: &AppPolicy,
+    addr: &MqttAddress,
+) -> Result<Authorized, MqttEgressError> {
+    // Deny-by-default: an empty matcher list denies all clients (`.any` over
+    // empty = false).
+    if !policy.allows_mqtt_publish(&addr.client) {
+        return Err(MqttEgressError::AclDenied {
+            client: addr.client.clone(),
+        });
+    }
+
+    // A reload's commit stops a client's session after it swaps the authority
+    // that named it, so a caller whose ACL snapshot was taken before that swap
+    // can pass the gate above and find no session here.
+    let Some(handle) = svc.get_client(&addr.client) else {
+        return Err(MqttEgressError::ClientNotRegistered {
+            client: addr.client.clone(),
+        });
+    };
+
+    Ok(Authorized {
+        handle,
+        topic: addr.topic.clone(),
+    })
+}
+
+/// Run the whole chain — [`authorize`], then [`Authorized::publish`] — for a
+/// caller with nothing to check between the two halves.
 pub async fn enforce_and_publish(
     svc: &MqttService,
     policy: &AppPolicy,
@@ -123,62 +242,9 @@ pub async fn enforce_and_publish(
     props: PublishProps,
     budget: SendBudget<'_>,
 ) -> Result<(), MqttEgressError> {
-    // 1. ACL (layer-1 grant + layer-2 per-client matcher). Deny-by-default: an
-    //    empty matcher list denies all clients (`.any` over empty = false).
-    if !policy.allows_mqtt_publish(&addr.client) {
-        return Err(MqttEgressError::AclDenied {
-            client: addr.client.clone(),
-        });
-    }
-
-    // 2. Session lookup — replaces connector resolution. The client slug selects
-    //    the session. A reload's commit stops a client's session after it swaps
-    //    the authority that named it, so a caller whose ACL snapshot was taken
-    //    before that swap can pass the gate above and find no session here. That
-    //    is a runtime outcome for such a caller and an invariant break for one
-    //    reading its policy and the registry under one snapshot; the error
-    //    carries the fact and the caller decides.
-    let Some(handle) = svc.get_client(&addr.client) else {
-        return Err(MqttEgressError::ClientNotRegistered {
-            client: addr.client.clone(),
-        });
-    };
-
-    // 3. Budget — last gate before the publish. Skipped entirely for the WASM
-    //    caller (its per-activation quota is enforced upstream). The
-    //    DB lock is held only for the synchronous decrement and dropped before the
-    //    publish await below, so the calling future stays `Send` and the single DB
-    //    mutex is never held across the broker round-trip (see `SendBudget` doc).
-    if let SendBudget::Conversation {
-        db,
-        conversation_id,
-        default_budget,
-    } = budget
-    {
-        let exhausted = {
-            let conn = db.lock().await;
-            matches!(
-                decrement_send_budget(&conn, conversation_id, default_budget),
-                BudgetDecrement::Exhausted
-            )
-        };
-        if exhausted {
-            return Err(MqttEgressError::BudgetExhausted);
-        }
-    }
-
-    // 4. Publish straight to the broker (synchronous; QoS ≥ 1 awaits the ack). No
-    //    store-and-forward — the broker outcome propagates inline.
-    match svc
-        .publish_on_handle(&handle, addr.topic.clone(), payload, props)
+    authorize(svc, policy, addr)?
+        .publish(svc, payload, props, budget)
         .await
-    {
-        Ok(PubackOutcome::Success) => Ok(()),
-        Ok(PubackOutcome::BrokerRejected { reason }) => {
-            Err(MqttEgressError::BrokerRejected { reason })
-        }
-        Err(e) => Err(MqttEgressError::Broker(e)),
-    }
 }
 
 #[cfg(test)]
@@ -484,6 +550,126 @@ mod tests {
         assert!(
             matches!(denied, Err(MqttEgressError::AclDenied { .. })),
             "None-budget must still enforce the ACL, got {denied:?}"
+        );
+    }
+
+    /// `authorize` runs steps 1-2 alone: it denies an unlisted client, misses
+    /// an unregistered one, and for an allowed, registered client hands back
+    /// the session's configuration without touching any budget.
+    #[tokio::test]
+    async fn authorize_runs_acl_then_session_lookup() {
+        let svc = service_with_client("home").await;
+        let policy = policy_allowing(&["home", "gone"]);
+
+        assert!(matches!(
+            authorize(&svc, &policy, &addr("office", "cmd/light")),
+            Err(MqttEgressError::AclDenied { ref client }) if client == "office"
+        ));
+        assert!(matches!(
+            authorize(&svc, &policy, &addr("gone", "cmd/light")),
+            Err(MqttEgressError::ClientNotRegistered { ref client }) if client == "gone"
+        ));
+        let authorized = match authorize(&svc, &policy, &addr("home", "cmd/light")) {
+            Ok(a) => a,
+            Err(e) => panic!("expected Authorized, got {e:?}"),
+        };
+        assert_eq!(authorized.client().slug, "home");
+    }
+
+    /// `Authorized::publish` runs steps 3-4: the budget is spent, then the
+    /// broker layer is reached.
+    #[tokio::test]
+    async fn authorized_publish_spends_the_budget_and_reaches_the_broker() {
+        let svc = service_with_client("home").await;
+        let policy = policy_allowing(&["home"]);
+        let db = init_db_memory();
+        {
+            let conn = db.lock().await;
+            ensure_user_and_conv(&conn, 1);
+        }
+
+        let authorized = match authorize(&svc, &policy, &addr("home", "cmd/light")) {
+            Ok(a) => a,
+            Err(e) => panic!("expected Authorized, got {e:?}"),
+        };
+        let result = authorized
+            .publish(
+                &svc,
+                b"on".to_vec(),
+                PublishProps {
+                    qos: 1,
+                    ..Default::default()
+                },
+                SendBudget::Conversation {
+                    db: &db,
+                    conversation_id: 1,
+                    default_budget: 5,
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(MqttEgressError::Broker(_))),
+            "got {result:?}"
+        );
+        assert_eq!(
+            brenn_messaging_store::db::read_send_budget(
+                &db.lock().await as &rusqlite::Connection,
+                1
+            ),
+            Some(4),
+        );
+    }
+
+    /// A publish over the broker's advertised maximum is its own variant
+    /// carrying both numbers, not a `Broker` error, and it comes after the
+    /// budget step.
+    #[tokio::test]
+    async fn packet_over_the_broker_maximum_maps_to_packet_too_large() {
+        let svc = service_with_client("home").await;
+        let handle = svc.get_client("home").expect("registered above");
+        let _eventloop = crate::test_support::install_unpolled_client(&handle, Some(16)).await;
+        let policy = policy_allowing(&["home"]);
+        let db = init_db_memory();
+        {
+            let conn = db.lock().await;
+            ensure_user_and_conv(&conn, 1);
+        }
+
+        let result = enforce_and_publish(
+            &svc,
+            &policy,
+            &addr("home", "cmd/light"),
+            vec![0u8; 64],
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
+            SendBudget::Conversation {
+                db: &db,
+                conversation_id: 1,
+                default_budget: 5,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MqttEgressError::PacketTooLarge {
+                    packet_bytes: 80,
+                    broker_max: 16,
+                })
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(
+            brenn_messaging_store::db::read_send_budget(
+                &db.lock().await as &rusqlite::Connection,
+                1
+            ),
+            Some(4),
+            "the broker's limit is checked in the publish step, after the budget",
         );
     }
 }

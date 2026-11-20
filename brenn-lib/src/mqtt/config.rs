@@ -55,6 +55,9 @@ pub struct MqttClientConfigRaw {
     pub keepalive_secs: Option<u32>,
     /// Maximum inbound payload size in bytes. Default: 4 MiB.
     pub inbound_payload_cap_bytes: usize,
+    /// Maximum payload an `MqttSend` call publishes through this client, in
+    /// bytes. Default: 4 MiB.
+    pub outbound_payload_cap_bytes: usize,
     /// Optional Last-Will configuration.
     pub last_will: Option<LastWillRaw>,
     /// Reconnect backoff initial delay in seconds. Default: 1.
@@ -90,6 +93,7 @@ impl MqttClientConfigRaw {
             tls_version_min: default_tls_version_min(),
             keepalive_secs: None,
             inbound_payload_cap_bytes: default_inbound_payload_cap(),
+            outbound_payload_cap_bytes: default_outbound_payload_cap(),
             last_will: None,
             reconnect_backoff_initial_secs: default_backoff_initial(),
             reconnect_backoff_max_secs: default_backoff_max(),
@@ -109,7 +113,11 @@ pub(crate) fn default_tls_version_min() -> String {
 }
 
 pub(crate) fn default_inbound_payload_cap() -> usize {
-    4 * 1024 * 1024 // 4 MiB
+    4 * 1024 * 1024
+}
+
+pub(crate) fn default_outbound_payload_cap() -> usize {
+    4 * 1024 * 1024
 }
 
 pub(crate) fn default_backoff_initial() -> u32 {
@@ -206,6 +214,8 @@ pub struct MqttClientIdentity {
     pub tls_version_min: TlsVersionMin,
     pub keepalive_secs: Option<u32>,
     pub inbound_payload_cap_bytes: u32,
+    /// The most bytes an `MqttSend` call publishes through this client.
+    pub outbound_payload_cap_bytes: u32,
     pub last_will: Option<LastWillRaw>,
     pub reconnect_backoff_initial_secs: u32,
     pub reconnect_backoff_max_secs: u32,
@@ -415,6 +425,22 @@ fn parse_broker_port(slug: &str, url: &str, port_str: &str) -> u16 {
     port
 }
 
+/// A payload cap as the `u32` the client carries. `0` is refused: inbound it
+/// breaks the connection opaquely, outbound it refuses every `MqttSend`. A
+/// value over `u32::MAX` is refused rather than truncated.
+fn payload_cap_u32(slug: &str, key: &str, value: usize) -> u32 {
+    assert!(
+        value != 0,
+        "config: [[mqtt_client]] {slug:?} {key} must be greater than 0",
+    );
+    value.try_into().unwrap_or_else(|_| {
+        panic!(
+            "config: [[mqtt_client]] {slug:?} {key} {value} exceeds the u32 limit of {}",
+            u32::MAX,
+        )
+    })
+}
+
 /// Resolve the non-secret half of every `[[mqtt_client]]` raw entry into a
 /// validated, indexed map, reading nothing off the host.
 ///
@@ -430,6 +456,7 @@ fn parse_broker_port(slug: &str, url: &str, port_str: &str) -> u16 {
 /// - A malformed broker address: empty host, path/userinfo, unbracketed IPv6,
 ///   invalid or non-numeric port, or port `0` (see [`parse_broker_host_port`]).
 /// - `inbound_payload_cap_bytes` of `0` or greater than `u32::MAX`.
+/// - `outbound_payload_cap_bytes` of `0` or greater than `u32::MAX`.
 /// - Invalid client slug charset.
 /// - Duplicate client slugs.
 /// - Invalid `tls_version_min` value (must be `"1.2"` or `"1.3"`).
@@ -467,25 +494,16 @@ pub fn resolve_client_identities(
         // structured fields so no connect-time re-parse exists.
         let (host, port) = parse_broker_host_port(&raw.slug, &raw.url);
 
-        // Payload cap: reject 0 (breaks the connection opaquely) and values that
-        // would truncate on the `u32` the CONNECT packet carries.
-        assert!(
-            raw.inbound_payload_cap_bytes != 0,
-            "config: [[mqtt_client]] {:?} inbound_payload_cap_bytes must be greater than 0",
-            raw.slug,
+        let inbound_payload_cap_bytes = payload_cap_u32(
+            &raw.slug,
+            "inbound_payload_cap_bytes",
+            raw.inbound_payload_cap_bytes,
         );
-        let inbound_payload_cap_bytes: u32 = raw
-            .inbound_payload_cap_bytes
-            .try_into()
-            .unwrap_or_else(|_| {
-                panic!(
-                    "config: [[mqtt_client]] {:?} inbound_payload_cap_bytes {} exceeds the u32 \
-                     limit of {}",
-                    raw.slug,
-                    raw.inbound_payload_cap_bytes,
-                    u32::MAX,
-                )
-            });
+        let outbound_payload_cap_bytes = payload_cap_u32(
+            &raw.slug,
+            "outbound_payload_cap_bytes",
+            raw.outbound_payload_cap_bytes,
+        );
 
         // TLS version.
         let tls_version_min = match raw.tls_version_min.as_str() {
@@ -525,6 +543,7 @@ pub fn resolve_client_identities(
                 tls_version_min,
                 keepalive_secs: raw.keepalive_secs,
                 inbound_payload_cap_bytes,
+                outbound_payload_cap_bytes,
                 last_will: raw.last_will.clone(),
                 reconnect_backoff_initial_secs: raw.reconnect_backoff_initial_secs,
                 reconnect_backoff_max_secs: raw.reconnect_backoff_max_secs,
@@ -835,6 +854,7 @@ mod tests {
             tls_version_min: "1.2".to_string(),
             keepalive_secs: None,
             inbound_payload_cap_bytes: default_inbound_payload_cap(),
+            outbound_payload_cap_bytes: default_outbound_payload_cap(),
             last_will: None,
             reconnect_backoff_initial_secs: 1,
             reconnect_backoff_max_secs: 60,
@@ -1178,6 +1198,37 @@ mod tests {
         let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
         broker.inbound_payload_cap_bytes = u32::MAX as usize + 1;
         resolve_clients(&[broker]);
+    }
+
+    #[test]
+    fn outbound_payload_cap_defaults_to_4_mib() {
+        let brokers = clients_map();
+        assert_eq!(brokers["ha"].outbound_payload_cap_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn outbound_payload_cap_explicit_value_carried() {
+        let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
+        broker.outbound_payload_cap_bytes = 65536;
+        let brokers = resolve_client_identities(&[broker]);
+        assert_eq!(brokers["ha"].outbound_payload_cap_bytes, 65536);
+    }
+
+    #[test]
+    #[should_panic(expected = "outbound_payload_cap_bytes must be greater than 0")]
+    fn zero_outbound_payload_cap_panics() {
+        let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
+        broker.outbound_payload_cap_bytes = 0;
+        resolve_client_identities(&[broker]);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[should_panic(expected = "outbound_payload_cap_bytes 4294967296 exceeds the u32 limit")]
+    fn outbound_payload_cap_over_u32_max_panics() {
+        let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
+        broker.outbound_payload_cap_bytes = u32::MAX as usize + 1;
+        resolve_client_identities(&[broker]);
     }
 
     fn clients_map() -> IndexMap<String, MqttClientIdentity> {

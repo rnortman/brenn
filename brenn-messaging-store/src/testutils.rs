@@ -47,6 +47,17 @@ pub fn holds_file(dir: &std::path::Path, id: &brenn_envelope::BlobId) -> bool {
     dir.join(id.as_str()).exists()
 }
 
+/// Cut the blob `id`'s file in the store directory `dir` to zero bytes behind
+/// the store's back, so a read of any of its bytes panics.
+pub fn empty_file(dir: &std::path::Path, id: &brenn_envelope::BlobId) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(id.as_str()))
+        .expect("the blob's file")
+        .set_len(0)
+        .expect("truncating the blob's file");
+}
+
 /// The name of every entry in the store directory `dir`, sorted: the store's
 /// own records and one file per blob.
 pub fn blob_files(dir: &std::path::Path) -> Vec<String> {

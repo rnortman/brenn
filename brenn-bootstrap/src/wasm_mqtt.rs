@@ -15,6 +15,10 @@ use brenn_mqtt::MqttService;
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::security::{DenialKind, DenialOrigin, SecurityEventType, signal_publish_denial};
 
+/// What a guest is told of a publish larger than the broker's maximum packet
+/// size: no broker-derived number.
+const PACKET_TOO_LARGE_TEXT: &str = "the packet exceeds the broker's maximum packet size";
+
 /// Build the synchronous MQTT-egress callback for a WASM consumer holding the
 /// `Mqtt` grant.
 ///
@@ -148,6 +152,25 @@ pub(crate) fn make_wasm_mqtt_publish_fn(
                 }
                 Err(MqttEgressError::BrokerRejected { reason }) => {
                     brenn_wasm::MqttPublishOutcome::BrokerRejected(reason)
+                }
+                Err(MqttEgressError::PacketTooLarge {
+                    packet_bytes,
+                    broker_max,
+                }) => {
+                    // The guest gets a fixed text: the broker's maximum is
+                    // broker-derived detail it was never granted. The numbers
+                    // land host-side. `invalid-payload` tells it not to retry.
+                    let safe_client = sanitize_untrusted_str(&client, MAX_LOGGED_UNTRUSTED_BYTES);
+                    tracing::warn!(
+                        slug = %slug,
+                        client = %safe_client,
+                        packet_bytes,
+                        broker_max,
+                        "wasm mqtt-publish: packet exceeds the broker's maximum packet size"
+                    );
+                    brenn_wasm::MqttPublishOutcome::InvalidPayload(
+                        PACKET_TOO_LARGE_TEXT.to_string(),
+                    )
                 }
                 // Structurally impossible on this path, unlike the LLM one: a
                 // consumer whose ACL names a client is retired — task joined —
@@ -291,6 +314,60 @@ mod tests {
             }
             other => panic!("expected Broker, got {other:?}"),
         }
+    }
+
+    /// A publish larger than the broker's advertised maximum is
+    /// `InvalidPayload` with the fixed text: the guest learns that it will
+    /// never fit and nothing of the broker's numbers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn packet_over_the_broker_maximum_maps_to_invalid_payload() {
+        let svc = service_with_client("home").await;
+        let handle = svc.get_client("home").expect("registered above");
+        let _eventloop = brenn_mqtt::test_support::install_unpolled_client(&handle, Some(8)).await;
+        let f = make_wasm_mqtt_publish_fn(
+            policy_allowing(&["home"]),
+            "slug".to_string(),
+            svc,
+            noop_dispatcher(),
+        );
+        let out = call(&f, "home", "cmd/light").await;
+        match out {
+            MqttPublishOutcome::InvalidPayload(text) => assert_eq!(text, PACKET_TOO_LARGE_TEXT),
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
+    }
+
+    /// `outbound_payload_cap_bytes` bounds `MqttSend` alone: a component
+    /// publish larger than it is submitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_outbound_bound_is_not_on_the_component_path() {
+        let svc = MqttService::new();
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let mut config = brenn_server::test_support::mqtt::test_client_config("home");
+        config.identity.outbound_payload_cap_bytes = 8;
+        let handle = MqttClientHandle::new(Arc::new(config), vec![], tx);
+        let _eventloop = brenn_mqtt::test_support::install_unpolled_client(&handle, None).await;
+        svc.add_client(handle);
+        let f = make_wasm_mqtt_publish_fn(
+            policy_allowing(&["home"]),
+            "slug".to_string(),
+            svc,
+            noop_dispatcher(),
+        );
+        let out = tokio::task::spawn_blocking(move || {
+            f(
+                "home".to_string(),
+                "cmd/light".to_string(),
+                vec![0x5a; 64],
+                brenn_wasm::MqttPublishProps::default(),
+            )
+        })
+        .await
+        .expect("spawn_blocking join failed");
+        assert!(
+            matches!(out, MqttPublishOutcome::Ok),
+            "expected Ok, got {out:?}"
+        );
     }
 
     /// An ACL-denied WASM egress publish emits one deduped phone alert —

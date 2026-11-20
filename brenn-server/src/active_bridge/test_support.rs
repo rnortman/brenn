@@ -20,6 +20,12 @@ use super::cc_event_loop::cc_event_loop;
 use super::compaction::{CompactionPhase, ContextUsage};
 use super::{ActiveBridge, ActiveBridges};
 
+/// The conversation's send-budget row, `None` when no send has touched it.
+pub(crate) async fn send_budget_row(bridge: &ActiveBridge) -> Option<u32> {
+    let conn = bridge.db.lock().await;
+    brenn_messaging_store::db::read_send_budget(&conn, bridge.conversation_id)
+}
+
 /// A one-model `model_usage_since_last_result` map stating `cost`.
 pub(in crate::active_bridge) fn stated_cost_map(
     cost: f64,
