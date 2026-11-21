@@ -4,6 +4,14 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-11-21
+
+Bytes move as blobs end to end: Gmail bodies, draft attachments and calendar
+writes travel as attachments, provider components build call bodies as blobs,
+guest fuel follows the bytes a component is handed, and `MqttSend` publishes
+attachments by reference. Several breaking changes for component authors and
+operators; read the bold entries below.
+
 - **`MqttSend` payloads are bounded per client, at 4 MiB unless the
   deployment says otherwise.** A new `mqtt_client` key,
   `outbound_payload_cap_bytes` (default 4194304), caps the bytes one
