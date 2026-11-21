@@ -30,7 +30,7 @@
 /// `brenn:tools/api-request` until the collection after that row leaves its
 /// window; nothing is built for a refused call. Size `blob_budget_bytes` and
 /// `max_blob_bytes` as the guide says. Measured on the real host, the
-/// costliest build at the file bound completes on about 0.22 of its fuel
+/// costliest build at the file bound completes on about 0.11 of its fuel
 /// grant, inside the 19/28 margin a component's bounds are held to.
 ///
 /// The body's bound, 20,000 bytes, is kept by choice: the body rides the

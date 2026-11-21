@@ -184,6 +184,30 @@ rust_test(
     deps = _TEST_DEPS,
 )
 
+# `wasm_dispatch_tests::google_gmail_body_e2e::measure_body_bound`, which
+# finds, for every shape `GmailBody`'s bound tests hold at the bound, the
+# least fuel grant and the least guest memory the call completes in, and
+# prints them with the costliest shape by each. Run by hand with
+# `bazel test --test_output=all`.
+rust_test(
+    name = "gmail_body_bound_measure",
+    size = "enormous",
+    args = [
+        "--ignored",
+        "--exact",
+        "wasm_dispatch_tests::google_gmail_body_e2e::measure_body_bound",
+        "--nocapture",
+    ],
+    crate = ":brenn-server",
+    crate_features = _TEST_FEATURES,
+    data = _TEST_DATA,
+    edition = "2024",
+    proc_macro_deps = _TEST_PROC_MACRO_DEPS,
+    rustc_env = _TEST_RUSTC_ENV,
+    tags = ["manual"],
+    deps = _TEST_DEPS,
+)
+
 # Its own suite because `//surface:dist` is downstream of every surface crate,
 # the wasm-bindgen CLI and the transpiler. On the unit-test target above, a
 # surface edit would rerun that target's ~2,500 tests; here it reruns one.

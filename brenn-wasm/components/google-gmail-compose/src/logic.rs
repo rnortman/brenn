@@ -86,9 +86,9 @@ const FILES_MAX: usize = 5;
 /// under 65 536: one built message is under 14 414 490 bytes, and the kit's
 /// `BUILD_BUDGET` of four in one activation write under 57 657 960 bytes of
 /// the host's 64 MiB an activation. Measured on the real host, a build costs
-/// about 28 fuel a file byte of the 128 the host grants one, and the
+/// about 28 fuel a file byte of the 256 the host grants one, and the
 /// costliest activation building drafts at this bound, two replies, completes
-/// on about 0.22 of its production grant, inside the 19/28 margin.
+/// on about 0.11 of its production grant, inside the 19/28 margin.
 const FILES_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// The most characters a file's name holds: the name the caller attached it
 /// under, the file name the recipient sees.

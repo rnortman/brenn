@@ -1127,10 +1127,11 @@ const COSTLIEST_BUILD: Content = QUOTES;
 
 /// Two widest new drafts, each with files at the bound, arriving in one
 /// activation are both built and uploaded inside the margin. Measured by
-/// `measure_draft_builds`, the activation completes on about 602.5M of a
-/// 2,756.9M production grant, 0.219 of it, the file bytes costing about 28
-/// fuel each. A failure here is answered by measuring again and correcting
-/// this figure or the component's bounds, never by raising the share.
+/// `measure_draft_builds`, the activation completes on about 602.5M, the
+/// file bytes costing about 28 fuel each; at 256 fuel an attachment byte
+/// the host's rule grants it about 5,441.3M, so that is 0.111 of it. A
+/// failure here is answered by measuring again and correcting this figure
+/// or the component's bounds, never by raising the share.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_new_drafts_at_the_file_bound_upload_inside_the_margin() {
     let files: Vec<_> = (0..2).map(|i| bound_files(COSTLIEST_SPLIT, i)).collect();
@@ -1142,7 +1143,8 @@ async fn two_new_drafts_at_the_file_bound_upload_inside_the_margin() {
 /// margin; and the largest upload, with the whole frame the widest message
 /// may hold added, written [`BUILD_BUDGET`] times stays inside the host's
 /// write bound on one activation. Measured, the activation completes on
-/// about 606.3M of a 2,757.7M production grant, 0.220 of it.
+/// about 606.3M; at 256 fuel an attachment byte the host's rule grants it
+/// about 5,442.1M, so that is 0.111 of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_replies_at_the_file_bound_upload_inside_the_margin() {
     let files: Vec<_> = (0..2).map(|i| bound_files(COSTLIEST_SPLIT, i)).collect();

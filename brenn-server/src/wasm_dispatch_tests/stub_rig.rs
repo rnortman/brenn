@@ -503,6 +503,12 @@ impl StubRig {
             .put_for_testing(INFLIGHT_NS, key.as_bytes(), value);
     }
 
+    /// Whether the request `id` was answered and left nothing behind, as
+    /// [`assert_finished`](Self::assert_finished) asserts.
+    pub fn finished(&self, id: &str) -> bool {
+        self.inflight_keys().is_empty() && self.runtime.serving(&self.provider.slug, id).is_none()
+    }
+
     /// The request `id` was answered and left nothing behind.
     pub fn assert_finished(&self, id: &str) {
         assert!(

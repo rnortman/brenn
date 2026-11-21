@@ -1048,16 +1048,16 @@ by reference (`docs/message-bus.md` §2.1.2a).
   (`PROCESSOR_FUEL_PER_BODY_BYTE`); an instance that provides tools also gets
   256 per byte of the body of each request the host holds pending for it; the
   two together are capped at 4,294,967,296 (`PROCESSOR_MAX_BODY_FUEL`). An
-  instance granted `blobs` also gets 128 fuel per byte of attachment on the
+  instance granted `blobs` also gets 256 fuel per byte of attachment on the
   messages delivered new and on the requests the host holds pending for it,
-  capped at 8,589,934,592 (`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`,
+  capped at 17,179,869,184 (`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`,
   `PROCESSOR_MAX_ATTACHMENT_FUEL`). Window context adds nothing to either, and
   an instance without `blobs` gets no attachment fuel. The grant is computed
   before the guest runs, and nothing the guest does changes it.
 
   **The worst case one activation can be granted** is 10,000,000 for each
   envelope of its windows — at most 1,000 a port, and the number of ports is
-  the deployment's, with no ceiling — plus the two caps, 12,884,901,888
+  the deployment's, with no ceiling — plus the two caps, 21,474,836,480
   together. Neither cap depends on `[messaging] max_body_bytes`, which has no
   ceiling, or on how many requests a provider holds. A provider may be granted
   for its pending requests on every activation, used or not: for their bodies

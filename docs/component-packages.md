@@ -1150,7 +1150,7 @@ Four limits are the component's to design for:
   × `max_blob_bytes` (`docs/config-dsl.md`, "The OAuth tools").
 - **A request's bytes bring fuel while the host holds it.** A request's body,
   at 256 fuel a byte (`PROCESSOR_FUEL_PER_BODY_BYTE`), and, for a component
-  granted `blobs`, its attachments, at 128 a byte, bring fuel to the
+  granted `blobs`, its attachments, at 256 a byte, bring fuel to the
   activation that delivers the request and to every later activation of the
   provider while the host holds the request pending; an answer's bytes bring
   fuel to the activation that delivers it. The kit builds a body only for a

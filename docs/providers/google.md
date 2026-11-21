@@ -122,7 +122,7 @@ The clause that admits the call names the path's two ids as `*`:
 `GmailRead` answers a message's headers, its text decoded and cut, and its
 attachments listed. `GmailBody` is the route for the whole text, the HTML as
 sent and the HTML as text: it answers each as an attachment of its result,
-for a message whose answer from Gmail is at most 786,432 bytes. For the
+for a message whose answer from Gmail is at most 1,048,576 bytes. For the
 message as Google stores it, and for a message over that bound, ask for
 `format=raw` (the whole RFC 2822 message, base64url, in `raw`),
 `format=full` (the part tree, each part's `data` included unless the mask

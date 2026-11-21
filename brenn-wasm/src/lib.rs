@@ -1129,12 +1129,19 @@ pub const PROCESSOR_FUEL_MINIMUM: u64 = 50_000_000;
 /// a component granted `blobs`.
 ///
 /// An attachment is input the envelope count does not weigh, and a component
-/// that transforms a blob by range needs CPU in proportion to its size; it
-/// cannot learn its fuel or refuse by size before a trap. `GmailAttachment`'s
-/// base64url decode, read and written through the kit by range, was measured
-/// at about 79 fuel per byte of the encoded answer; 128 leaves it 1.6 times
-/// that. Forwarding a blob costs no fuel.
-pub const PROCESSOR_FUEL_PER_ATTACHMENT_BYTE: u64 = 128;
+/// that reads a blob needs CPU in proportion to its size; it cannot learn its
+/// fuel or refuse by size before a trap. The figure is sized on a component
+/// that holds an attachment whole and parses it in the guest. At 19/28 of the
+/// grant, the margin a component's bounds are held to, 256 leaves 173.7 a
+/// byte beyond the floor. Measured on the real host: `GmailBody`'s costliest
+/// test shape in fuel, an answer of many one-character HTML parts at its
+/// bound, completes on about 125 fuel per byte of the answer, floor included;
+/// `GmailAttachment`'s base64url decode, read and written through the kit by
+/// range, about 79 per byte of the encoded answer.
+/// A parse costlier than 173.7 a byte is covered only while the floor makes
+/// up the difference, so a component that parses an attachment measures its
+/// bound against the grant. Forwarding a blob costs no fuel.
+pub const PROCESSOR_FUEL_PER_ATTACHMENT_BYTE: u64 = 256;
 /// The most fuel attachment bytes add to one activation: the rate times the
 /// activation's blob write bound, so the most an activation gains is bounded
 /// whatever arrives. The epoch deadline stays the wall-clock bound.
@@ -1299,8 +1306,8 @@ pub fn processor_fuel(
     });
     envelopes.saturating_add(bodies).saturating_add(attachments)
 }
-// TODO(guest-memory-and-fuel-fixed-constants): decide whether the attachment
-// rate rises to what a parse costs.
+// TODO(guest-memory-and-fuel-fixed-constants): decide whether guest memory
+// rises.
 /// Maximum memory a guest may grow to (bytes). 16 MiB per activation.
 ///
 /// Cap excess is a deterministic trap: `trap_on_grow_failure(true)` is set on
@@ -8135,7 +8142,7 @@ mod activation_fuel_tests {
     #[test]
     fn attachment_fuel_is_capped() {
         let base = processor_fuel(1, 0, 0, None);
-        assert_eq!(PROCESSOR_MAX_ATTACHMENT_FUEL, 8_589_934_592);
+        assert_eq!(PROCESSOR_MAX_ATTACHMENT_FUEL, 17_179_869_184);
         let at_cap = PROCESSOR_MAX_ATTACHMENT_FUEL / PROCESSOR_FUEL_PER_ATTACHMENT_BYTE;
         assert_eq!(
             processor_fuel(1, 0, 0, Some(at_cap)),

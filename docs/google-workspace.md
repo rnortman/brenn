@@ -148,7 +148,7 @@ when those were the oversized headers; any other read of it is answered
 `GmailBody`. No cap setting closes that: that message's headers are not
 readable through these tools. Its body is: `GmailBody` asks for the message's
 answer as a blob, which the bus cap does not bound, and answers the body's
-forms whenever that answer is within its bound of 786,432 bytes. It is the
+forms whenever that answer is within its bound of 1,048,576 bytes. It is the
 sender's doing, not the operator's configuration, and mail is untrusted
 input.
 
@@ -172,11 +172,19 @@ window is up to Σ × `max_body_bytes`, since the cap bounds each whole request:
 and the host fails its new requests and alerts. That weight is the operator's to size (`docs/config-dsl.md`, the
 `provide` statement); nothing at load refuses it.
 `GmailBody` holds a message's answer and its forms in the guest while it
-works, up to 8.19 MiB for an answer at its bound of 786,432 bytes, and that
-peak and the windows' weight share the 16 MiB: a `gmail-read` result window
-sized near the guest's memory traps a body answer the tool would otherwise
-take. A trap on that answer fails no request, so the caller waits out the
-request's ceiling (240 s) before it is answered.
+works, up to 8.69 MiB for an answer at its bound of 1,048,576 bytes, and that
+peak and the windows share the 16 MiB, leaving the windows about 7.3 MiB
+of guest memory beside a body answer. That is guest memory, not raw window
+bytes: a window's results take more than their size once the component
+parses them. A full `gmail-read` result window at this section's settings,
+up to 12 MiB, is past that room, so an activation that receives a body
+answer beside a `gmail-read` result window weighing more than about 7.3 MiB
+traps. A trap on that answer fails no request, so the caller waits out the
+request's ceiling (240 s) before it is answered. The window's weight is the
+lever: a lower `retain_depth` on `brenn:tool-results/gmail-read`, which must
+still hold 2 × Σ, or a lower `max_body_bytes`, which bounds each result and
+every other answer on the bus; or the deployment accepts a trapped body
+answer under a full window.
 `GmailDraft` holds about 2.2 MiB in the guest while it builds a draft's
 message — one 1 MiB piece of a file, its base64, and the write buffer —
 whatever the files' size, beside `gmail-compose`'s windows of 6 MiB and
@@ -437,16 +445,16 @@ can hold — `max_blob_bytes` for each attachment the row carries — or lower
   producer in the deployment is then refused until the window turns over.
   `GmailBody` leaves its message's encoded answer there the same way. The
   answer is fetched whole before the tool checks it against its bound, so a
-  message it answers leaves at most 786,432 bytes, and a message it refuses
+  message it answers leaves at most 1,048,576 bytes, and a message it refuses
   as over that bound leaves its whole answer, up to `max_blob_bytes`, as an
   attachment answer does.
 - *A provided tool's attachment.* The decoded file rests on its caller's
   inbox for that inbox's window: an app's `brenn:app-tool-results/<app-slug>`,
   or a calling component's `brenn:tool-results/<slug>`. Every success of
   `GmailAttachment` is such an attachment, and so is each of the up to three
-  forms a `GmailBody` success answers, each at most 1,769,472 bytes (2.25 ×
+  forms a `GmailBody` success answers, each at most 2,359,296 bytes (2.25 ×
   its bound: a part's bytes are three quarters of its encoded size, and a byte
-  can decode to three), on one row: together at most 5,308,416 bytes. A
+  can decode to three), on one row: together at most 7,077,888 bytes. A
   component granted either tool
   needs `blobs` to open what it is answered. Granted to a component without
   `blobs`, the tool leaves up to that component's result-inbox depth × the
@@ -456,7 +464,7 @@ can hold — `max_blob_bytes` for each attachment the row carries — or lower
 For a `gmail-read` instance, set `blob_budget_bytes` for 32 × 4/3 × the
 largest attachment you mean to serve, plus what its callers' inboxes hold:
 each inbox's depth × the larger of the largest attachment and, when the
-caller is granted `GmailBody`, a success's 5,308,416 bytes of forms.
+caller is granted `GmailBody`, a success's 7,077,888 bytes of forms.
 `GmailBody` adds nothing to the first term: every answer it leaves, a refused
 one included, is at most `max_blob_bytes`, as an attachment answer is. The
 alternative is to lower `max_blob_bytes`, which lowers the largest attachment the tool returns
@@ -666,7 +674,7 @@ Gmail's preview, `text` null and `text_omitted` saying why.
 attachments of its result named by the `forms` asked: `text` (`GmailRead`'s
 text uncut), `html` (the message's HTML as sent, decoded to UTF-8) and
 `rendered` (that HTML as text), each with its `size`, or `absent` saying why
-there is none. A message whose answer from Gmail is over 786,432 bytes is
+there is none. A message whose answer from Gmail is over 1,048,576 bytes is
 refused naming that bound; a caller granted `api-request` reads it with
 `format=raw` (`docs/providers/google.md`). Header values,
 attachment names and MIME types are bounded in bytes and a cut header is

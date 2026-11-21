@@ -169,13 +169,21 @@ const OCTET_STREAM: &str = "application/octet-stream";
 /// The largest answer from Gmail `GmailBody` reads, in bytes of the JSON as
 /// it arrives: the whole answer is held in the guest, parsed, and turned
 /// into its forms there, so the bound is what fits the guest's fuel and
-/// memory. Checked on the answer's blob before a byte of it is read. Fuel
-/// sets it: it is set so that the costliest message a sender can write
-/// leaves at least five percent of 1/1.4 of the activation's fuel floor
-/// unspent.
+/// memory. Checked on the answer's blob before a byte of it is read. Memory
+/// sets it: it is the largest multiple of 128 KiB at which every answer the
+/// bound's tests build completes in three quarters of the guest's memory,
+/// peaking at no more than 8.69 MiB. What fails one step higher is a shape
+/// those tests build by hand, not a message known to arrive: an answer of
+/// about 69,000 parts, each only `{"mimeType":"x"}`, needs nearly all 16 MiB.
+/// Whether Gmail sends an answer of that shape is not established; a part
+/// that also carries a `partId`, `filename`, `headers` or `body` is longer,
+/// so fewer fit under the bound. Fuel at the bound is about 125 a byte of
+/// answer for the costliest of those shapes in fuel, an answer of many
+/// one-character HTML parts, against the 216.9 that 1/1.4 of the
+/// activation's floor and attachment grant gives at that size.
 // TODO(gmail-body-forms-above-bound): answer the forms of a message whose
 // answer is over this bound.
-pub const BODY_ANSWER_MAX: u64 = 768 * 1024;
+pub const BODY_ANSWER_MAX: u64 = 1024 * 1024;
 /// The routes a message over `GmailBody`'s bound still has.
 const BODY_ROUTES: &str = "GmailRead answers its text cut, and a caller granted api-request \
                            reads the whole message with `format=raw` and `response_attachment` \

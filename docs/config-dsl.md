@@ -1434,8 +1434,8 @@ component GmailTools {
   max(50,000,000, 10,000,000 × the envelopes of its windows), plus 256 a byte
   of body on its new messages and, for a provider, on the requests the host
   holds pending for it, up to 4,294,967,296, plus, for an instance granted
-  `blobs`, 128 a byte of attachment on its new messages and its pending
-  requests, up to 8,589,934,592. None of it is a setting, and neither is
+  `blobs`, 256 a byte of attachment on its new messages and its pending
+  requests, up to 17,179,869,184. None of it is a setting, and neither is
   guest memory. A guest cannot learn a limit at run time, so a component's
   bounds are compiled in against these figures: a setting raised would lift
   no bound, and one lowered would put a shipped component under its measured

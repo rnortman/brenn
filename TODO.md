@@ -117,9 +117,8 @@ measured before a request's body bytes brought fuel and while a late answer
 to an ended request was still decoded, when two settles at 50 addresses of
 320 characters and 20 lines of 1,000 cost 62.2M fuel with no description,
 and has not been measured since. Lifting any of the three waits on a
-measurement of the widest event at the raised caps under the margin, on the
-kit's in-flight row storing only what a settle needs, or on
-`guest-memory-and-fuel-fixed-constants`. Done = the description bounded by
+measurement of the widest event at the raised caps under the margin, or on
+the kit's in-flight row storing only what a settle needs. Done = the description bounded by
 Google's own limit or by the instance's blob limits, and the attendee and
 recurrence caps measured and raised to what the margin holds, each with a
 real-host test at the bound; or a recorded decision that they stay. The
@@ -205,20 +204,40 @@ the figures in `docs/component-packages.md`. The comment is at
 ## `gmail-body-forms-above-bound`
 
 The Gmail body tool reads `messages.get`'s answer inside the guest and
-refuses a message whose answer is over its bound (786432 bytes), which fuel
-sets under the host's fixed guest limits for the costliest message a sender
-can write: a message of minimal HTML parts naming 2,400 distinct unknown
-charsets in turn spends about 127 fuel per answer byte against the 136.8
-that 1/1.4 of the activation's fuel floor grants at that size, and the bound
-is set where at least five percent of that grant is left unspent, while its
-peak memory is at most 8.2 MiB of the 12 MiB margin. A larger message is
-reachable only as `format=raw` through `api-request` by a caller granted it.
-Lifting the bound waits on a read that holds neither the answer nor a form
+refuses a message whose answer is over its bound (1048576 bytes). Guest
+memory sets the bound under the host's fixed guest limits, and what holds it
+there is a shape the tool's bound tests build by hand, not a message known to
+arrive: an answer that is one multipart of tens of thousands of parts, each
+only `{"mimeType":"x"}`. That shape peaks at 8.69 MiB of the 12 MiB memory
+margin at the bound, the largest peak of the shapes the tests build, and
+needs 15.88 MiB one 128 KiB step above it, at about 69,000 parts. The tests'
+shapes are not a search of the inputs the reader accepts, so 15.88 MiB is
+what that shape needs at that size and not a ceiling on what an input can
+need. Four of the shapes, whose parts carry nothing but a `mimeType`, peak at
+exactly 8.69 MiB at the bound with from about 33,000 to about 61,700 parts
+each, and the step to 15.88 MiB comes as "bare parts" passes 65,536 parts;
+the reader collects a multipart's parts into a list that doubles its room as
+it grows, and at 1152 KiB the memory test traps while that list grows, asking
+for 16,646,144 bytes; which allocation sets the 8.69 MiB peak at the bound is
+not measured. Whether Gmail sends an answer of that shape is not established:
+Gmail's part format also has `partId`, `filename`, `headers` and `body`, a
+part carrying any of them is longer, so fewer fit under the bound, and no
+answer from Gmail was examined for which of them it always carries.
+Real messages are therefore not known to need that memory: one step above the
+bound the same measurement found an answer of parts that each carry a
+one-character body at 6.88 MiB, and one of mail's HTML at 4.31 MiB. At the
+bound the costliest of the tests' shapes in fuel, an answer of many
+one-character HTML parts, spends about 125 fuel per answer byte against the
+216.9 that 1/1.4 of the activation's floor and attachment grant gives at that
+size. A larger message is reachable only as `format=raw` through
+`api-request` by a caller granted it. Lifting the bound while the reader
+accepts that shape waits on a read that holds neither the answer nor a form
 whole — a streaming reader of the part tree and an HTML-to-text conversion
-that works by piece — or on `guest-memory-and-fuel-fixed-constants`. Done = the tool answers the forms of
-any message whose answer fits `max_blob_bytes`, with a real-host test, or a
-recorded decision that the bound stays. The comment sits at `BODY_ANSWER_MAX`
-in `brenn-wasm/components/google-gmail-read/src/logic.rs`.
+that works by piece — or on `guest-memory-and-fuel-fixed-constants`. Done =
+the tool answers the forms of any message whose answer fits `max_blob_bytes`,
+with a real-host test, or a recorded decision that the bound stays. The
+comment sits at `BODY_ANSWER_MAX` in
+`brenn-wasm/components/google-gmail-read/src/logic.rs`.
 
 ## `gmail-body-part-by-reference-unread`
 
@@ -250,24 +269,31 @@ call in `brenn-wasm/components/google-gmail-compose/src/logic.rs`.
 
 ## `guest-memory-and-fuel-fixed-constants`
 
-The attachment rate, 128 fuel a byte (`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`),
-was sized for a transform by range (a base64 decode, about 79 a byte). A
-component that parses an attachment inside the guest spends more: the
-out-of-tree Fastmail bundle's file listing parses its multi-status at about
-200 fuel a byte on average at 1 MiB and reads at most 192 KiB, bound by fuel
-alone where memory holds more than five times as much; the same bundle's body
-tool refuses an answer over 2 MiB, met fuel before memory for HTML-only mail,
-and had its HTML renderer rewritten to fit the rate; and `GmailBody`'s Gmail
-read refuses an answer over 768 KiB, set by fuel under the test margin, its
-costliest message spending about 127 fuel per answer byte where memory peaks
-under 8.2 MiB. So each sets a bound of its own that fuel fixes before memory
-does. Guest memory is 16 MiB (`PROCESSOR_MAX_MEMORY_BYTES`). Both are
-constants by a decision recorded beside them and in `docs/config-dsl.md`;
-what is undecided is whether the attachment rate rises to what a parse costs,
-with the worst-case grant and the posture redone against it, and those bounds
-re-measured. Done = the rate raised with at least one in-tree bound lifted by
-it under test, or a recorded decision that 128 stays. The comment sits at
-`PROCESSOR_MAX_MEMORY_BYTES` in `brenn-wasm/src/lib.rs`.
+Guest memory is 16 MiB (`PROCESSOR_MAX_MEMORY_BYTES`), a constant by a
+decision recorded beside the fuel constants and in `docs/config-dsl.md`.
+`GmailBody`, which holds Gmail's answer whole and parses it in the guest, now
+meets memory before fuel: the attachment rate is 256 fuel a byte
+(`PROCESSOR_FUEL_PER_ATTACHMENT_BYTE`), raised from 128 once in-guest parses
+were measured, its costliest test shape in fuel, an answer of many
+one-character HTML parts, spends about 125 fuel per answer byte, and its
+bound, 1048576 bytes, is set by memory: a peak of 8.69 MiB of the 12 MiB its
+test allows, and 15.88 MiB one 128 KiB step higher. The shape that holds the
+bound there is one its tests build by hand, an answer of tens of thousands of
+parts each only `{"mimeType":"x"}`, not a message known to arrive; whether
+Gmail sends such an answer is not established, so real messages are not
+known to need more guest memory than they have
+(`gmail-body-forms-above-bound` has the figures). The out-of-tree Fastmail
+bundle's file listing parses at about 200 fuel a byte on average at 1 MiB,
+which by that average the new rate covers under the margin that bundle's test
+holds, and its costliest listing is unmeasured at the new rate; the same
+bundle's body tool refuses an answer over 2 MiB on memory. What is undecided
+is whether guest memory rises, with what rests on it redone: the body fuel
+cap is the body rate times this figure, a store may hold 16 memories of it,
+and the windows an operator may size against it are described in
+`docs/config-dsl.md`. Done = guest memory raised with at least one in-tree
+bound lifted by it under test, or a recorded decision beside the constant
+that 16 MiB stays for good. The comment sits at `PROCESSOR_MAX_MEMORY_BYTES`
+in `brenn-wasm/src/lib.rs`.
 
 ## `kit-sweep-decodes-expired-backlog-rows-unbudgeted`
 

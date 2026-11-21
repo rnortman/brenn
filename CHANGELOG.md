@@ -75,6 +75,17 @@ All notable changes to Brenn are documented here.
   to about 14.4 MB), so review `blob_budget_bytes`.
 - Bumped wasmtime from 48.0.8 to 48.0.10, clearing RUSTSEC-2026-0566
   through RUSTSEC-2026-0573.
+- **Components granted `blobs` get twice the fuel per attachment byte: 256,
+  up from 128.** Fuel is the per-activation instruction budget a WebAssembly
+  component runs on; the attachment share now covers a component that parses
+  a whole attachment in memory, not only one that reads it in ranges. The
+  attachment cap doubles with it, to 17,179,869,184. No activation's grant
+  fell, so every bound measured before still holds, and none of this is a
+  setting. A component that loops while holding large attachments can burn
+  up to twice the fuel it could before; the 30-second wall-clock deadline is
+  unchanged and still bounds it.
+  - **For component authors:** a size bound that the attachment fuel set can
+    be measured again, upward. `GmailBody`'s bound rises on it (below).
 - **A guest's fuel follows the bytes it is handed.** Fuel is the per-activation
   instruction budget a WebAssembly component runs on. Every component is now
   granted 256 fuel per byte of body on the messages an activation delivers
@@ -82,9 +93,10 @@ All notable changes to Brenn are documented here.
   each request the host holds pending for it, in every activation and not
   only the one the request arrived in; the two together are capped at
   4,294,967,296. A component granted `blobs` that provides tools is also
-  granted the attachment rate, 128 a byte, for the attachments of the
-  requests the host holds pending for it, within the existing attachment cap
-  of 8,589,934,592. The floor, the per-envelope figure and guest memory are
+  granted the attachment rate, 256 a byte, for the attachments of the
+  requests the host holds pending for it, within the attachment cap of
+  17,179,869,184 (both raised in this release; see the attachment rate's own
+  entry). The floor, the per-envelope figure and guest memory are
   unchanged, and none of them is a setting: a guest cannot learn its limits,
   so a component's bounds are compiled in against these constants. No
   activation's grant fell, so a bound measured against the old grant still
@@ -184,20 +196,26 @@ All notable changes to Brenn are documented here.
   `id` and `forms`, one to three of `text` (`GmailRead`'s text, uncut),
   `html` (the message's HTML as sent, decoded to UTF-8) and `rendered` (that
   HTML read as text), and answers each as an attachment of its result. It
-  reads messages up to 786,432 bytes of Gmail's answer, about ten times
-  `GmailRead`'s 60,000 characters, and refuses a larger one naming that
+  reads messages up to 1,048,576 bytes of Gmail's answer, more than
+  seventeen times `GmailRead`'s 60,000 characters, and refuses a larger one naming that
   bound and the `format=raw` route.
   - **For operators:** grant it with `tool gmail-body {}`. The class needs no
     new capability or clause (`blobs` and `messages.get` are already
     granted). Its Σ `max_concurrency` is 14, so the `retain_depth = 32` the
     guide sets on `brenn:tool-results/gmail-read` still holds it. Each call
-    leaves Gmail's answer on that inbox for its window: at most 786,432
+    leaves Gmail's answer on that inbox for its window: at most 1,048,576
     bytes when the tool answers, and up to `max_blob_bytes` when it refuses
     a message over its bound, since the answer is fetched before it is
-    checked. A success also leaves up to three forms of at most 1,769,472
-    bytes each, together at most 5,308,416 bytes, on one row of the
+    checked. A success also leaves up to three forms of at most 2,359,296
+    bytes each, together at most 7,077,888 bytes, on one row of the
     caller's inbox; `docs/google-workspace.md` says how that fits the blob
-    pool and the guest's memory (the tool peaks at about 8.2 MiB).
+    pool and the guest's memory (the tool peaks at about 8.69 MiB). A
+    deployment sizing `blob_budget_bytes` from a caller inbox's depth × a
+    success's forms sizes it for the figure here, and a body answer leaves
+    the `gmail-read` windows about 7.3 MiB of the guest's 16 MiB, less than
+    the 12 MiB a full result window can weigh at the guide's settings: a body
+    answer beside a result window heavier than that traps, and its caller
+    waits out the 240 s ceiling.
   - `GmailRead`'s `text_omitted`, and its `internal` when even the message's
     structure cannot be read, now end "…; GmailBody answers the body as
     files", and `GmailAttachment`'s refusal of a part carried inside the

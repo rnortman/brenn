@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use super::google_gmail_attachment_e2e::{file_of, handed, serve_message};
 use super::google_workspace_rig::{self as workspace, APP, Clauses, GMAIL_READ, RigOptions};
+use super::kit_body_fuel_measure::{least_under, measure_all, narrow};
 use super::provider_rig::fuel;
 use super::stub_rig::{StubRig, file_bytes, production_blob_limits};
 use super::*;
@@ -22,7 +23,7 @@ const MESSAGES: &str = "/gmail/v1/users/me/messages";
 /// The instance's result inbox, where `api-request`'s answers rest.
 const PROVIDER_RESULTS: &str = "brenn:tool-results/gmail-read";
 /// `GmailBody`'s bound: the largest answer from Gmail it reads, in bytes.
-const BODY_ANSWER_MAX: usize = 768 * 1024;
+const BODY_ANSWER_MAX: usize = 1024 * 1024;
 /// The content types of the forms.
 const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
 const TEXT_HTML: &str = "text/html; charset=utf-8";
@@ -210,9 +211,9 @@ fn html_parts(n: usize) -> Expected {
     }
 }
 
-/// A message a sender can write, built of `n` repetitions of one unit, and
-/// what it answers: its forms, or `None` when its decoding notes alone are
-/// over the result ceiling.
+/// A `messages.get` answer built by hand of `n` repetitions of one unit, and
+/// what the tool answers for it: its forms, or `None` when its decoding notes
+/// alone are over the result ceiling.
 struct Shape {
     name: &'static str,
     payload: fn(usize) -> Value,
@@ -945,8 +946,8 @@ async fn each_shape_at_the_bound_answers_its_forms() {
 ///
 /// `BODY_ANSWER_MAX` is set where every shape leaves at least five percent
 /// of this test's grant unspent. When it was set, the costliest shape was
-/// "distinct charsets under the ceiling", which left 7.4 percent of the
-/// grant.
+/// "HTML parts", which left 42.2 percent of the grant. The figure is
+/// `measure_body_bound`'s.
 ///
 /// Fuel per byte moves with the guest's compiler, `serde_json`, the provider
 /// kit and the allocator, so this test can fail after a change that never
@@ -960,7 +961,11 @@ async fn each_shape_at_the_bound_answers_inside_the_fuel_margin() {
 }
 
 /// Every shape at the bound answers what is expected of it in three
-/// quarters of the guest's memory.
+/// quarters of the guest's memory. Measured by `measure_body_bound`, the
+/// largest peak at the bound is at most 8.69 MiB, of the shapes whose parts
+/// carry nothing but a `mimeType`; one 128 KiB step higher, "bare parts"
+/// needs 15.88 MiB. Those shapes are inputs the reader accepts, built by
+/// hand; whether Gmail sends one is not established.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_shape_at_the_bound_answers_inside_the_memory_margin() {
     every_shape_answers_at(
@@ -1021,4 +1026,151 @@ async fn a_body_answer_and_an_attachment_answer_complete_in_one_activation() {
     r.assert_finished(&read_request);
     let expected = (shape.expected)(n).expect("the shape answers its forms");
     assert_shape(shape.name, &output, &expected, BODY_ANSWER_MAX);
+}
+
+/// One `GmailBody` call for all three forms of `shape` filled to an answer
+/// of `len` bytes, on a rig whose provider activations all run under
+/// `limits`: whether it answered as the shape expects, an output or its
+/// refusal on the result ceiling.
+///
+/// Each activation runs to its end inside the `serve` that starts it, so
+/// whether it completed is read from the rig once that returns: the first
+/// completed when its read of the message is owed to the executor, the
+/// last when the request is finished. A trap on the body answer fails no
+/// request and leaves its in-flight row, so the caller is awaited only
+/// once the request is finished and its answer already given.
+async fn completes(shape: &Shape, len: usize, limits: Option<ActivationLimits>) -> bool {
+    let (answer, n) = filled("m1", len, shape.payload);
+    let r = workspace::rig_built(
+        &GMAIL_READ,
+        CLAUSES,
+        RigOptions {
+            limits,
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    r.answer(&message_path("m1"), answer);
+    let call = r.call_for_alice_with(
+        "GmailBody",
+        json!({ "id": "m1", "forms": ["text", "html", "rendered"] }),
+        HeldAttachments::none(),
+    );
+    let id = r.requested_id().await;
+    r.serve().await;
+    let issued = !brenn_messaging::testutils::owed_everywhere(&r.messenger, &r.executor_sub())
+        .await
+        .is_empty();
+    if issued {
+        r.run_nested().await;
+        r.serve().await;
+    }
+    if !issued || !r.finished(&id) {
+        call.abort();
+        return false;
+    }
+    match (call.await, (shape.expected)(n)) {
+        (Ok(Ok(_)), Some(_)) => true,
+        (Ok(Err(ToolError::Internal(detail))), None) if detail.contains("result ceiling") => true,
+        (answer, _) => {
+            println!(
+                "{}: unexpected answer under {limits:?}: {answer:?}",
+                shape.name
+            );
+            false
+        }
+    }
+}
+
+/// The size of a mebibyte, for the figures printed.
+const MIB: f64 = 1024.0 * 1024.0;
+
+/// `shape` at an answer of [`BODY_ANSWER_MAX`] bytes, printed as it is
+/// found: the least fuel grant it completes on, to
+/// [`PRECISION`](super::kit_body_fuel_measure::PRECISION), or `None` where
+/// it does not complete on [`fuel_floor`]; and the least guest memory it
+/// completes in under the production fuel, to a page, or `None` where the
+/// production memory does not hold it.
+async fn measure_shape(shape: &'static Shape) -> (&'static Shape, Option<u64>, Option<u64>) {
+    let len = BODY_ANSWER_MAX;
+    let floor = fuel_floor(len);
+    let grant = floor * 5 / 7;
+    let least_fuel = if completes(shape, len, fuel(floor)).await {
+        Some(least_under(floor, |g| completes(shape, len, fuel(g))).await)
+    } else {
+        None
+    };
+    const PAGE: u64 = 64 * 1024;
+    let most = brenn_wasm::PROCESSOR_MAX_MEMORY_BYTES as u64;
+    let least_memory = if completes(shape, len, None).await {
+        Some(
+            narrow(0, most, PAGE, &|bytes| async move {
+                let limits = Some(ActivationLimits::Memory(bytes as usize));
+                (completes(shape, len, limits).await, 0)
+            })
+            .await,
+        )
+    } else {
+        None
+    };
+    let fuel = least_fuel.map_or("does not complete on the fuel floor".to_string(), |f| {
+        format!(
+            "fuel {f}, {:.1} a byte, {:.4} of the fuel margin test's grant",
+            f as f64 / len as f64,
+            f as f64 / grant as f64
+        )
+    });
+    let memory = least_memory.map_or(
+        "does not complete in the production memory".to_string(),
+        |m| format!("memory {m} bytes, {:.2} MiB", m as f64 / MIB),
+    );
+    println!("{}: {fuel}; {memory}", shape.name);
+    (shape, least_fuel, least_memory)
+}
+
+/// The measured shapes run this many at a time.
+const MEASURED_AT_ONCE: usize = 11;
+
+/// Every shape at the bound, asked for all three forms: the least fuel grant
+/// the call completes on, that grant a byte of answer and as a share of
+/// [`each_shape_at_the_bound_answers_inside_the_fuel_margin`]'s grant, and
+/// the least guest memory it completes in; then every shape that does not
+/// complete on the fuel floor or in the production memory, the costliest
+/// shape among the rest by each measure, the share of that test's grant the
+/// costliest leaves unspent, and [`MEMORY_MARGIN`]. Each figure is the
+/// least limit under which every provider activation of the call completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+#[ignore = "a measurement: run by hand"]
+async fn measure_body_bound() {
+    let len = BODY_ANSWER_MAX;
+    let grant = fuel_floor(len) * 5 / 7;
+    println!("bound {len} bytes; the fuel margin test's grant {grant}");
+    let results = measure_all(SHAPES.iter().collect(), MEASURED_AT_ONCE, measure_shape).await;
+    for (shape, f, m) in &results {
+        if f.is_none() {
+            println!("does not complete on the fuel floor: {}", shape.name);
+        }
+        if m.is_none() {
+            println!("does not complete in the production memory: {}", shape.name);
+        }
+    }
+    if let Some((shape, Some(f), _)) = results.iter().max_by_key(|(_, f, _)| *f) {
+        println!(
+            "costliest in fuel: {}, {f}, {:.1} a byte, leaving {:.4} of the test's grant",
+            shape.name,
+            *f as f64 / len as f64,
+            1.0 - *f as f64 / grant as f64
+        );
+    }
+    if let Some((shape, _, Some(m))) = results.iter().max_by_key(|(_, _, m)| *m) {
+        println!(
+            "costliest in memory: {}, {m} bytes, {:.2} MiB",
+            shape.name,
+            *m as f64 / MIB
+        );
+    }
+    println!(
+        "memory margin: {MEMORY_MARGIN} bytes, {:.2} MiB",
+        MEMORY_MARGIN as f64 / MIB
+    );
 }
