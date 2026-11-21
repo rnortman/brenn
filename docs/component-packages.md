@@ -612,6 +612,20 @@ while the request is pending. A component served by
 `brenn-provider-kit-guest`'s `serve_with_blobs` imports `open-request`, whether
 or not its tools take attachments, so it needs a brenn that serves it.
 
+Another cut of this kind in force now, in the provider kit: **a nested call
+names its tool.** `Call { step, api }` is `Call { step, request }`, where
+`request` is a `Nested`: `Nested::Api(ApiCall)` for `api-request`, or
+`Nested::Tool(ToolCall { tool, args })` for any other tool the instance is
+granted. `Call::api(step, api)` builds an `api-request` step and
+`Call::tool(step, tool, args)` the other kind. `InFlight.target` is an
+`Outstanding` — `Api(Target)` or `Tool(name)` — and the `read_api_*` readers
+still take a `&Target`, which a step gets with `state.target.api()?`. A
+hand-written `Host`'s `call` takes `&Nested`; `MemoryHost`'s `NestedCall`
+records it as `request`, with `api()` for an `api-request` call's arguments.
+Rows change shape, so a row written before the cut does not parse after it;
+no request survives the restart an upgrade is, and the kit deletes the rows
+of a request no longer pending without reading them.
+
 Another cut of this kind in force now: **`MessageEnvelope.body` is a
 `MessageBody`**, bytes with an optional content type, re-exported from
 `brenn-guest` with `BodyError` and `is_text_content_type`.
@@ -983,8 +997,9 @@ its types never cross the boundary.
 
 ### A tool provider on the kit
 
-A component that serves `provide`d tools by nested `api-request` calls can
-take its activation loop from brenn's provider kit. It lists, beside the three
+A component that serves `provide`d tools by nested calls — `api-request`, or
+another tool its instance is granted — can take its activation loop from
+brenn's provider kit. It lists, beside the three
 guest labels above,
 
 ```
@@ -1098,6 +1113,15 @@ stays inside the host's 64 live handles as long as one step does.
 
 Every blob error converts to an `internal` `Failure` naming the bound, so a
 step with nothing better to say writes `?`.
+
+**Calling another tool.** A step that returns `Call::tool(step, tool, args)`
+calls `tool`, which the instance's grants must name, with `args` as they are;
+`one-click-unsubscribe` is the tool this is for. The call is budgeted,
+backlogged and stored as an `api-request` call is, carries no attachment, and
+its answer reaches `advance` as the tool's value or its typed error, which the
+step reads itself: the `read_api_*` readers read `api-request`'s envelope
+only, and `state.target.api()` fails `internal` for any other tool. A call the
+host refuses fails its request naming the tool and the `tool <name>` grant.
 
 The entry point is the grant. `serve` serves no blobs: every `Step` blob
 method answers `Unavailable`, an `internal` failure naming `serve_with_blobs`,

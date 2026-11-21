@@ -1,5 +1,6 @@
 //! A provider component's core: the parts a WASM component that serves
-//! `provide`d tools by issuing nested `api-request` calls needs. Everything
+//! `provide`d tools by issuing nested calls — `api-request`, or another tool
+//! the instance is granted — needs. Everything
 //! but [`google`] is provider-neutral: the text the model sees names the API
 //! by the display name the component passes.
 //!
@@ -14,8 +15,9 @@
 //! - [`row`]: the in-flight row a request keeps in the component's store
 //!   between the activation that issues a nested call and the one that
 //!   receives its answer, generic over the component's [`Tool`] enum.
-//! - [`call`]: the request's error answer, the nested call's arguments and
-//!   what a step decides next.
+//! - [`call`]: the request's error answer, the nested call — an
+//!   `api-request` call ([`ApiCall`]) or a call to another tool
+//!   ([`ToolCall`]) — and what a step decides next.
 //! - [`args`]: reading a tool's JSON arguments.
 //! - [`answer`]: reading `api-request`'s answer envelope — as JSON with
 //!   `read_api_result`, as a payload with its headers with
@@ -30,8 +32,8 @@
 //!   bound, and the assertions that hold the parser to them. It panics by
 //!   design: it serves host tests, never a component step.
 //! - `testutil` (behind the `testutils` feature): fixtures for a step's tests
-//!   — `api-request` answers, nested-call errors, Google error bodies and
-//!   error answers — and `MemoryHost`, an in-memory [`Host`] and [`Blobs`]
+//!   — `api-request` and `one-click-unsubscribe` answers, nested-call
+//!   errors, Google error bodies and error answers — and `MemoryHost`, an in-memory [`Host`] and [`Blobs`]
 //!   for a loop's tests.
 //!
 //! The crate is `std` plus `serde`/`serde_json` and `base64ct`, and names no
@@ -74,8 +76,8 @@ pub use blob::{
     Unavailable, WriteError, Writer,
 };
 pub use call::{
-    ANSWER_ATTACHMENT, ApiCall, BUILT_BODY_ATTACHMENT, Body, Call, ErrorKind, Failure, Next, Query,
-    QueryValue, Target, internal, query,
+    ANSWER_ATTACHMENT, ApiCall, BUILT_BODY_ATTACHMENT, Body, Call, ErrorKind, Failure, Nested,
+    Next, Outstanding, Query, QueryValue, Target, ToolCall, internal, query,
 };
 pub use row::{InFlight, Tool, no_such_step, stored};
 #[cfg(feature = "testutils")]

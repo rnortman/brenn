@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::activation::INFLIGHT_TTL_MS;
 use crate::blob::Attached;
-use crate::call::{Call, Failure, Target, internal};
+use crate::call::{Call, Failure, Outstanding, internal};
 
 /// A provided-tool enum as the spec scaffold generates it: each tool has a
 /// registry name, and a name maps back to at most one tool.
@@ -55,8 +55,8 @@ pub struct InFlight<T: Tool> {
     pub args: Value,
     /// What earlier steps learned that later steps need.
     pub derived: Map<String, Value>,
-    /// The nested call outstanding.
-    pub target: Target,
+    /// The nested call outstanding, as the messages about it name it.
+    pub target: Outstanding,
     pub issued_at_ms: u64,
     /// The attachments the request carries; left off a row when it carries
     /// none.
@@ -81,7 +81,7 @@ impl<T: Tool> InFlight<T> {
             step: call.step,
             args: args.clone(),
             derived,
-            target: call.api.target(),
+            target: call.request.target(),
             issued_at_ms: now_ms,
             attachments: Vec::new(),
         }
@@ -223,14 +223,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::call::{ApiCall, ErrorKind, Query};
+    use crate::call::{ApiCall, ErrorKind, Query, Target};
     use crate::fixture::Fixture;
     use crate::testutil::failure;
 
     fn call(step: u8, path: &str) -> Call {
-        Call {
+        Call::api(
             step,
-            api: ApiCall {
+            ApiCall {
                 provider: "google".to_string(),
                 account: None,
                 method: "GET".to_string(),
@@ -241,7 +241,7 @@ mod tests {
                 body: None,
                 response_attachment: None,
             },
-        }
+        )
     }
 
     fn state(args: Value) -> InFlight<Fixture> {
@@ -262,11 +262,11 @@ mod tests {
         assert_eq!(state.call_id(), format!("{}/1", "a".repeat(32)));
         assert_eq!(
             state.target,
-            Target {
+            Outstanding::Api(Target {
                 method: "GET".to_string(),
                 host: "api.example.com".to_string(),
                 path: "/v1/items/one".to_string(),
-            }
+            })
         );
         let bytes = state.encode();
         let wire: Value = serde_json::from_slice(&bytes).unwrap();
@@ -284,11 +284,29 @@ mod tests {
             format!(
                 "{{\"id\":\"{}\",\"received_at_ms\":900,\"tool\":\"fixture-lookup\",\"step\":1,\
                  \"args\":{{\"q\":\"x\"}},\
-                 \"derived\":{{}},\"target\":{{\"method\":\"GET\",\"host\":\"api.example.com\",\
-                 \"path\":\"/v1/items/one\"}},\"issued_at_ms\":1000}}",
+                 \"derived\":{{}},\"target\":{{\"api\":{{\"method\":\"GET\",\
+                 \"host\":\"api.example.com\",\"path\":\"/v1/items/one\"}}}},\
+                 \"issued_at_ms\":1000}}",
                 "a".repeat(32)
             )
         );
+    }
+
+    #[test]
+    fn a_row_for_a_call_to_another_tool_names_the_tool() {
+        let tool = Call::tool(
+            2,
+            "one-click-unsubscribe",
+            json!({ "url": "https://x.example" }),
+        );
+        let next = state(json!({ "q": "x" })).next(&tool, Map::new(), 2_000);
+        assert_eq!(
+            next.target,
+            Outstanding::Tool("one-click-unsubscribe".to_string())
+        );
+        let wire: Value = serde_json::from_slice(&next.encode()).unwrap();
+        assert_eq!(wire["target"], json!({ "tool": "one-click-unsubscribe" }));
+        assert_eq!(InFlight::decode(&next.encode()), Ok(next));
     }
 
     #[test]
@@ -330,7 +348,7 @@ mod tests {
             InFlight {
                 step: 2,
                 derived,
-                target: call(2, "/v1/items/two").api.target(),
+                target: call(2, "/v1/items/two").request.target(),
                 issued_at_ms: 2_000,
                 ..first
             }
@@ -387,7 +405,7 @@ mod tests {
         let mut extra = base.clone();
         extra["added_later"] = json!(1);
         let mut extra_in_target = base;
-        extra_in_target["target"]["port"] = json!(443);
+        extra_in_target["target"]["api"]["port"] = json!(443);
         for (wire, field) in [(extra, "added_later"), (extra_in_target, "port")] {
             let error =
                 InFlight::<Fixture>::decode(&serde_json::to_vec(&wire).unwrap()).unwrap_err();

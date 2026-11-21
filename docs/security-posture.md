@@ -2402,6 +2402,70 @@ directory, nor a placement check as an absolute; and that
 no text the feature ships — reference, changelog, operator guide, posture,
 module doc — states an absolute about an agent's view of the key.
 
+### 9f.1 `one-click-unsubscribe` — no credential, an address the caller names
+
+`one-click-unsubscribe` is B12's outward direction without a credential: the
+caller names the whole URL, and the backend sends the RFC 8058 one-click
+request to it. Its use is a mail component acting on a message's own
+`List-Unsubscribe` header, so the address is normally a third party's choice,
+passed on by the caller. It reaches the host machine's network egress (§3).
+
+**What the backend guarantees, whoever calls:**
+
+- The caller is a WASM component. A call from any other caller, an agent
+  holding the grant included, is refused `denied` before anything else in
+  the tool, whatever the permission mode. The call has already been
+  admitted, so it counts against the grant's rate limit.
+- The request is one `POST` of the fixed body `List-Unsubscribe=One-Click`,
+  `Content-Type: application/x-www-form-urlencoded` and a fixed `User-Agent`.
+  No credential, no cookie, nothing from the caller but the URL.
+- The URL is `https`, at most 2,048 bytes, with a host, no user info and no
+  port other than 443. Anything else is refused `invalid_args`.
+- The destination is public. An IP-literal host in a special-purpose range,
+  a name that never denotes a public host (a single label, or `localhost`,
+  `local`, `home.arpa`, `internal`, `lan`, `corp`, `intranet`, `private`,
+  `localdomain` or a name under one; the push endpoint validator refuses the
+  same names, through the same predicate) and a name that resolves only to
+  special-purpose addresses are refused `denied`
+  before anything is sent. A name with a public address is dialled at its
+  public addresses only, pinned for the call, so the address checked is the
+  address dialled; no proxy is used.
+- No redirect is followed and the response body is not read: the answer is
+  the status, or `unreachable` when no response came within 30 seconds, each
+  with the host as the backend parsed and dialled it, so a caller reports
+  the destination the request went to rather than its own reading of the
+  URL.
+- A call with no acting user is refused, as `api-request` lets such a caller
+  only read.
+- The log line names the caller, the acting user, the host and the status,
+  and for `unreachable` the cause (resolution, connection, TLS or timeout),
+  never the path or the query: they identify the recipient.
+
+**What it does not guarantee: where the URL came from.** The backend knows
+nothing of mail; a component that says it read the URL from a message's header
+is trusted on that. A deployer who grants the tool to an instance trusts that
+component with the choice of URL. The URL is also a channel out: a grantee can
+put what it knows in it, at the grant's `rate_limit`. Nothing bounds the
+content. A component's call has no approval step, so the grant is its
+authorization.
+
+**A refused destination is surfaced.** Each refusal writes one
+`security_event = true`, `event_type = ssrf_attempt` line attributed to the
+caller, with no `ip` field (there is no peer for fail2ban to ban), and raises
+a `Warning` phone alert (`signal_refused_destination`). It fires on every
+refused call, bounded by the grant's `rate_limit` and the alert dispatcher's
+own limit. It names the host and nothing else of the URL. Its text names the
+caller as the caller and says the host came in the caller's argument, which
+is often a third party's choice: a refusal is a hostile or broken link in a
+message more often than a hostile component. A name that does not resolve is
+`unreachable` and raises nothing.
+
+A finding here: a request that carries anything the caller chose beyond the
+URL; a redirect followed; a dial to an address that was not checked; a
+special-purpose destination reached; a path or a query in a log line or an
+alert; a refused destination that raises no alert; the tool executing for a
+caller that is not a component.
+
 ---
 
 ## 10. Rendering / XSS Boundary

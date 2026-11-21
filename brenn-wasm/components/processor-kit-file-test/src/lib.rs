@@ -153,15 +153,15 @@ fn api_call(settings: &Settings, method: &str, path: &str, body: Option<Body>) -
 }
 
 fn put(settings: &Settings, path: &str, step: u8) -> Call {
-    Call {
+    Call::api(
         step,
-        api: api_call(
+        api_call(
             settings,
             "PUT",
             path,
             Some(Body::Attachment(FILE.to_string())),
         ),
-    }
+    )
 }
 
 struct KitFiles;
@@ -187,30 +187,30 @@ impl Logic for KitFiles {
                     return Err(format!("attach the file to send as `{FILE}`"));
                 }
                 if args.head {
-                    Ok(Call {
-                        step: FIRST_STEP,
-                        api: api_call(settings, "HEAD", &args.path, None),
-                    })
+                    Ok(Call::api(
+                        FIRST_STEP,
+                        api_call(settings, "HEAD", &args.path, None),
+                    ))
                 } else {
                     Ok(put(settings, &args.path, FIRST_STEP))
                 }
             }
             Provided::KitBodyPut => {
                 let args = BodyArgs::parse(args)?;
-                Ok(Call {
-                    step: FIRST_STEP,
-                    api: api_call(settings, "PUT", &args.path, Some(Body::Built)),
-                })
+                Ok(Call::api(
+                    FIRST_STEP,
+                    api_call(settings, "PUT", &args.path, Some(Body::Built)),
+                ))
             }
             Provided::KitFileGet => {
                 let args = Args::parse(args)?;
                 if args.head {
                     return Err("`head` is an argument of KitFilePut".to_string());
                 }
-                Ok(Call {
-                    step: FIRST_STEP,
-                    api: api_call(settings, "GET", &args.path, None).answer_as_attachment(),
-                })
+                Ok(Call::api(
+                    FIRST_STEP,
+                    api_call(settings, "GET", &args.path, None).answer_as_attachment(),
+                ))
             }
         }
     }
@@ -277,7 +277,11 @@ fn body_put(
     outcome: Result<Value, NestedError>,
 ) -> Result<Next, Failure> {
     let args = stored(state, BodyArgs::parse)?;
-    let status = match read_api_payload(outcome, &state.target, API)? {
+    let status = match state
+        .target
+        .api()
+        .and_then(|target| read_api_payload(outcome, target, API))?
+    {
         PayloadAnswer::Payload(payload) => payload.status,
         PayloadAnswer::Relay(value) => return Ok(Next::Complete(value)),
         PayloadAnswer::Unreadable(why) => return Err(why.failure(API, None)),
@@ -299,7 +303,11 @@ fn put_answered(
     settings: &Settings,
 ) -> Result<Next, Failure> {
     let args = stored(state, Args::parse)?;
-    let status = match read_api_payload(outcome, &state.target, API)? {
+    let status = match state
+        .target
+        .api()
+        .and_then(|target| read_api_payload(outcome, target, API))?
+    {
         PayloadAnswer::Payload(payload) => payload.status,
         PayloadAnswer::Relay(value) => return Ok(Next::Complete(value)),
         PayloadAnswer::Unreadable(why) => return Err(why.failure(API, None)),
@@ -333,7 +341,11 @@ fn got(
     outcome: Result<Value, NestedError>,
     step: &mut Step<'_>,
 ) -> Result<Next, Failure> {
-    let (status, bytes, attachment) = match read_api_blob(outcome, &state.target, API)? {
+    let (status, bytes, attachment) = match state
+        .target
+        .api()
+        .and_then(|target| read_api_blob(outcome, target, API))?
+    {
         BlobAnswer::Blob {
             status,
             bytes,

@@ -355,66 +355,58 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
     match tool {
         Provided::Geocode => {
             let geocode = GeocodeArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: geocode_call(&geocode.query, settings),
-            })
+            Ok(Call::api(1, geocode_call(&geocode.query, settings)))
         }
         Provided::Weather => {
             let weather = WeatherArgs::parse(args)?;
             Ok(match &weather.at {
-                Where::Text(_) => Call {
-                    step: WEATHER_GEOCODE_STEP,
-                    api: geocode_call(&weather.at, settings),
-                },
-                Where::At(lat, lng) => Call {
-                    step: WEATHER_LOOKUP_STEP,
-                    api: weather_call(&weather, *lat, *lng, settings),
-                },
+                Where::Text(_) => {
+                    Call::api(WEATHER_GEOCODE_STEP, geocode_call(&weather.at, settings))
+                }
+                Where::At(lat, lng) => Call::api(
+                    WEATHER_LOOKUP_STEP,
+                    weather_call(&weather, *lat, *lng, settings),
+                ),
             })
         }
         Provided::Directions => {
             let directions = DirectionsArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: compute_routes_call(
+            Ok(Call::api(
+                1,
+                compute_routes_call(
                     &directions.route,
                     directions.when.as_ref(),
                     RouteRequest::Directions,
                     settings,
                 ),
-            })
+            ))
         }
         Provided::PlacesSearch => {
             let search = PlacesSearchArgs::parse(args)?;
             Ok(match &search.near {
-                Some(near @ Where::Text(_)) => Call {
-                    step: PLACES_GEOCODE_STEP,
-                    api: geocode_call(near, settings),
-                },
-                Some(Where::At(lat, lng)) => Call {
-                    step: PLACES_SEARCH_STEP,
-                    api: places_search_call(&search, Some((*lat, *lng)), settings),
-                },
-                None => Call {
-                    step: PLACES_SEARCH_STEP,
-                    api: places_search_call(&search, None, settings),
-                },
+                Some(near @ Where::Text(_)) => {
+                    Call::api(PLACES_GEOCODE_STEP, geocode_call(near, settings))
+                }
+                Some(Where::At(lat, lng)) => Call::api(
+                    PLACES_SEARCH_STEP,
+                    places_search_call(&search, Some((*lat, *lng)), settings),
+                ),
+                None => Call::api(
+                    PLACES_SEARCH_STEP,
+                    places_search_call(&search, None, settings),
+                ),
             })
         }
         Provided::PlaceDetails => {
             let details = PlaceDetailsArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: place_details_call(&details, settings),
-            })
+            Ok(Call::api(1, place_details_call(&details, settings)))
         }
         Provided::SearchAlongRoute => {
             let along = AlongRouteArgs::parse(args)?;
-            Ok(Call {
-                step: ALONG_ROUTE_ROUTE_STEP,
-                api: compute_routes_call(&along.route, None, RouteRequest::Polyline, settings),
-            })
+            Ok(Call::api(
+                ALONG_ROUTE_ROUTE_STEP,
+                compute_routes_call(&along.route, None, RouteRequest::Polyline, settings),
+            ))
         }
     }
 }
@@ -1110,7 +1102,11 @@ fn google_error(status: u64, body: &str) -> Failure {
 /// What the request does with its nested call's answer: complete, fail, or
 /// issue its next step.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-    let body = match read_api_result(outcome, &state.target, google::API_NAME) {
+    let body = match state
+        .target
+        .api()
+        .and_then(|target| read_api_result(outcome, target, google::API_NAME))
+    {
         Ok(Answer::Body(body)) => body,
         // Every step reads a JSON answer; none accepts an empty one.
         Ok(Answer::NoBody { status }) => {
@@ -1274,9 +1270,8 @@ fn weather_after_geocode(
             "in-flight row names weather's geocode step for a request given coordinates",
         ));
     };
-    after_geocode(body, place, |lat, lng| Call {
-        step: WEATHER_LOOKUP_STEP,
-        api: weather_call(args, lat, lng, settings),
+    after_geocode(body, place, |lat, lng| {
+        Call::api(WEATHER_LOOKUP_STEP, weather_call(args, lat, lng, settings))
     })
 }
 
@@ -1331,9 +1326,11 @@ fn places_after_geocode(
              geocode",
         ));
     };
-    after_geocode(body, near, |lat, lng| Call {
-        step: PLACES_SEARCH_STEP,
-        api: places_search_call(args, Some((lat, lng)), settings),
+    after_geocode(body, near, |lat, lng| {
+        Call::api(
+            PLACES_SEARCH_STEP,
+            places_search_call(args, Some((lat, lng)), settings),
+        )
     })
 }
 
@@ -1486,10 +1483,10 @@ fn search_along(args: &AlongRouteArgs, body: &Value, settings: &Settings) -> Res
     minutes(&mut summary, "duration_minutes", route.get("duration"))?;
     fallback(&mut summary, body)?;
     Ok(Next::Call {
-        call: Call {
-            step: ALONG_ROUTE_SEARCH_STEP,
-            api: along_route_search_call(args, polyline, settings),
-        },
+        call: Call::api(
+            ALONG_ROUTE_SEARCH_STEP,
+            along_route_search_call(args, polyline, settings),
+        ),
         derived: Args::from_iter([("route".to_string(), Value::Object(summary))]),
     })
 }
@@ -2103,7 +2100,9 @@ fn minutes(to: &mut Args, name: &str, duration: Option<&Value>) -> Result<(), Fa
 
 #[cfg(test)]
 mod tests {
-    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body, truncated};
+    use brenn_provider_kit::testutil::{
+        api_of, failure, google, http, nested, text_body, truncated,
+    };
     use brenn_provider_kit::{
         Bound, ToolBounds, check, hold_probes, hold_required, input_schema, probes,
     };
@@ -2247,7 +2246,7 @@ mod tests {
     fn geocode(args: Value) -> Result<ApiCall, String> {
         plan(Provided::Geocode, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -2321,7 +2320,7 @@ mod tests {
     fn geocode_passes_the_language() {
         let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
         let call = plan(Provided::Geocode, &json!({ "address": "Paris" }), &s).unwrap();
-        assert_eq!(call.api.query["languageCode"], one("fr"));
+        assert_eq!(api_of(&call).query["languageCode"], one("fr"));
     }
 
     #[test]
@@ -2715,32 +2714,32 @@ mod tests {
     fn weather_at_coordinates_is_one_lookup() {
         let call = weather(json!({ "kind": "current", "lat": 37.422, "lng": -122.0841 })).unwrap();
         assert_eq!(call.step, WEATHER_LOOKUP_STEP);
-        assert_eq!(call.api.provider, "maps");
-        assert_eq!(call.api.method, "GET");
-        assert_eq!(call.api.host, "weather.example.com");
-        assert_eq!(call.api.path, "/v1/currentConditions:lookup");
+        assert_eq!(api_of(&call).provider, "maps");
+        assert_eq!(api_of(&call).method, "GET");
+        assert_eq!(api_of(&call).host, "weather.example.com");
+        assert_eq!(api_of(&call).path, "/v1/currentConditions:lookup");
         assert_eq!(
-            call.api.query,
+            api_of(&call).query,
             params(&[
                 ("location.latitude", "37.422"),
                 ("location.longitude", "-122.0841"),
                 ("unitsSystem", "METRIC"),
             ])
         );
-        assert!(call.api.headers.is_empty());
-        assert_eq!(call.api.body, None);
+        assert!(api_of(&call).headers.is_empty());
+        assert_eq!(api_of(&call).body, None);
         // A coordinate place is not geocoded.
         let call = weather(json!({ "kind": "current", "place": "37.422,-122.0841" })).unwrap();
         assert_eq!(call.step, WEATHER_LOOKUP_STEP);
-        assert_eq!(call.api.query["location.latitude"], one("37.422"));
+        assert_eq!(api_of(&call).query["location.latitude"], one("37.422"));
     }
 
     #[test]
     fn weather_hourly_asks_for_one_page_of_the_horizon() {
         let call = weather(json!({ "kind": "hourly", "lat": 1, "lng": 2 })).unwrap();
-        assert_eq!(call.api.path, "/v1/forecast/hours:lookup");
+        assert_eq!(api_of(&call).path, "/v1/forecast/hours:lookup");
         assert_eq!(
-            call.api.query,
+            api_of(&call).query,
             params(&[
                 ("location.latitude", "1"),
                 ("location.longitude", "2"),
@@ -2757,31 +2756,31 @@ mod tests {
             &s,
         )
         .unwrap();
-        assert_eq!(call.api.query["hours"], one("240"));
-        assert_eq!(call.api.query["pageSize"], one("24"));
-        assert_eq!(call.api.query["pageToken"], one("tok"));
-        assert_eq!(call.api.query["unitsSystem"], one("IMPERIAL"));
-        assert_eq!(call.api.query["languageCode"], one("de"));
+        assert_eq!(api_of(&call).query["hours"], one("240"));
+        assert_eq!(api_of(&call).query["pageSize"], one("24"));
+        assert_eq!(api_of(&call).query["pageToken"], one("tok"));
+        assert_eq!(api_of(&call).query["unitsSystem"], one("IMPERIAL"));
+        assert_eq!(api_of(&call).query["languageCode"], one("de"));
     }
 
     #[test]
     fn weather_daily_is_one_page_of_days() {
         let call = weather(json!({ "kind": "daily", "lat": 1, "lng": 2 })).unwrap();
-        assert_eq!(call.api.path, "/v1/forecast/days:lookup");
-        assert_eq!(call.api.query["days"], one("5"));
-        assert_eq!(call.api.query["pageSize"], one("5"));
+        assert_eq!(api_of(&call).path, "/v1/forecast/days:lookup");
+        assert_eq!(api_of(&call).query["days"], one("5"));
+        assert_eq!(api_of(&call).query["pageSize"], one("5"));
         let call = weather(json!({ "kind": "daily", "lat": 1, "lng": 2, "days": 10 })).unwrap();
-        assert_eq!(call.api.query["days"], one("10"));
-        assert_eq!(call.api.query["pageSize"], one("10"));
-        assert!(!call.api.query.contains_key("pageToken"));
+        assert_eq!(api_of(&call).query["days"], one("10"));
+        assert_eq!(api_of(&call).query["pageSize"], one("10"));
+        assert!(!api_of(&call).query.contains_key("pageToken"));
     }
 
     #[test]
     fn weather_alerts_take_no_unit_system_and_page_at_the_cap() {
         let call = weather(json!({ "kind": "alerts", "lat": 1, "lng": 2, "page": "tok" })).unwrap();
-        assert_eq!(call.api.path, "/v1/publicAlerts:lookup");
+        assert_eq!(api_of(&call).path, "/v1/publicAlerts:lookup");
         assert_eq!(
-            call.api.query,
+            api_of(&call).query,
             params(&[
                 ("location.latitude", "1"),
                 ("location.longitude", "2"),
@@ -2796,11 +2795,14 @@ mod tests {
     fn weather_for_a_place_geocodes_first() {
         let call = weather(json!({ "kind": "current", "place": "Mountain View" })).unwrap();
         assert_eq!(call.step, WEATHER_GEOCODE_STEP);
-        assert_eq!(call.api.host, "geocode.example.com");
-        assert_eq!(call.api.path, "/v4/geocode/address");
-        assert_eq!(call.api.query, params(&[("addressQuery", "Mountain View")]));
+        assert_eq!(api_of(&call).host, "geocode.example.com");
+        assert_eq!(api_of(&call).path, "/v4/geocode/address");
         assert_eq!(
-            call.api.headers,
+            api_of(&call).query,
+            params(&[("addressQuery", "Mountain View")])
+        );
+        assert_eq!(
+            api_of(&call).headers,
             pairs(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
         );
     }
@@ -2874,7 +2876,7 @@ mod tests {
         );
         let page = "ü".repeat(PAGE_TOKEN_MAX_CHARS);
         let ok = json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": page });
-        assert_eq!(weather(ok).unwrap().api.query["pageToken"], one(&page));
+        assert_eq!(api_of(&weather(ok).unwrap()).query["pageToken"], one(&page));
         let over = json!({ "kind": "hourly", "lat": 1, "lng": 2, "page": format!("{page}t") });
         assert_eq!(
             weather(over).unwrap_err(),
@@ -2915,10 +2917,10 @@ mod tests {
             panic!("expected the lookup step");
         };
         assert_eq!(call.step, WEATHER_LOOKUP_STEP);
-        assert_eq!(call.api.host, "weather.example.com");
-        assert_eq!(call.api.path, "/v1/currentConditions:lookup");
-        assert_eq!(call.api.query["location.latitude"], one("37.39"));
-        assert_eq!(call.api.query["location.longitude"], one("-122.08"));
+        assert_eq!(api_of(&call).host, "weather.example.com");
+        assert_eq!(api_of(&call).path, "/v1/currentConditions:lookup");
+        assert_eq!(api_of(&call).query["location.latitude"], one("37.39"));
+        assert_eq!(api_of(&call).query["location.longitude"], one("-122.08"));
         let want = json!({ "lat": 37.39, "lng": -122.08, "place": "Mountain View, CA, USA" });
         assert_eq!(Value::Object(derived.clone()), want);
 
@@ -2930,7 +2932,7 @@ mod tests {
             (step2.tool, &step2.args, step2.step, step2.issued_at_ms),
             (Provided::Weather, &args, WEATHER_LOOKUP_STEP, 2_000)
         );
-        assert_eq!(step2.target, call.api.target());
+        assert_eq!(step2.target, call.request.target());
         let step2 = InFlight::decode(&step2.encode()).unwrap();
         let Next::Complete(answer) = advance(&step2, http(200, CURRENT_BODY), &settings()) else {
             panic!("expected an answer");
@@ -2971,10 +2973,10 @@ mod tests {
     #[test]
     fn weather_geocode_step_for_coordinates_is_internal() {
         let args = json!({ "kind": "current", "lat": 1, "lng": 2 });
-        let call = Call {
-            step: WEATHER_GEOCODE_STEP,
-            api: geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
-        };
+        let call = Call::api(
+            WEATHER_GEOCODE_STEP,
+            geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
+        );
         let state = weather_state(args, &call, Args::new());
         assert_eq!(
             advance(&state, http(200, MOUNTAIN_VIEW), &settings()),
@@ -2988,10 +2990,10 @@ mod tests {
     #[test]
     fn weather_lookup_without_its_geocoded_location_is_internal() {
         let args = json!({ "kind": "current", "place": "Mountain View" });
-        let call = Call {
-            step: WEATHER_LOOKUP_STEP,
-            api: weather_call(&WeatherArgs::parse(&args).unwrap(), 1.0, 2.0, &settings()),
-        };
+        let call = Call::api(
+            WEATHER_LOOKUP_STEP,
+            weather_call(&WeatherArgs::parse(&args).unwrap(), 1.0, 2.0, &settings()),
+        );
         let state = weather_state(args, &call, Args::new());
         assert_eq!(
             advance(&state, http(200, CURRENT_BODY), &settings()),
@@ -3352,7 +3354,7 @@ mod tests {
     fn directions(args: Value) -> Result<ApiCall, String> {
         plan(Provided::Directions, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -3444,7 +3446,7 @@ mod tests {
             &s,
         )
         .unwrap();
-        let body = posted(&call.api);
+        let body = posted(api_of(&call));
         assert_eq!(body["units"], "IMPERIAL");
         assert_eq!(body["languageCode"], "de");
     }
@@ -3978,17 +3980,17 @@ mod tests {
     fn places_search_without_near_posts_one_search() {
         let call = places_search(json!({ "query": "coffee" })).unwrap();
         assert_eq!(call.step, PLACES_SEARCH_STEP);
-        assert_eq!(call.api.provider, "maps");
-        assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.host, "places.example.com");
-        assert_eq!(call.api.path, "/v1/places:searchText");
-        assert!(call.api.query.is_empty());
+        assert_eq!(api_of(&call).provider, "maps");
+        assert_eq!(api_of(&call).method, "POST");
+        assert_eq!(api_of(&call).host, "places.example.com");
+        assert_eq!(api_of(&call).path, "/v1/places:searchText");
+        assert!(api_of(&call).query.is_empty());
         assert_eq!(
-            call.api.headers,
+            api_of(&call).headers,
             pairs(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
         );
         assert_eq!(
-            posted(&call.api),
+            posted(api_of(&call)),
             json!({ "textQuery": "coffee", "pageSize": 10 })
         );
     }
@@ -4022,7 +4024,7 @@ mod tests {
         .unwrap();
         assert_eq!(call.step, PLACES_SEARCH_STEP);
         assert_eq!(
-            posted(&call.api),
+            posted(api_of(&call)),
             json!({
                 "textQuery": "coffee",
                 "pageSize": 20,
@@ -4035,25 +4037,28 @@ mod tests {
         );
         // `open_now: false` is Google's default and is not sent.
         let call = places_search(json!({ "query": "coffee", "open_now": false })).unwrap();
-        assert!(posted(&call.api).get("openNow").is_none());
+        assert!(posted(api_of(&call)).get("openNow").is_none());
     }
 
     #[test]
     fn places_search_passes_the_language() {
         let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
         let call = plan(Provided::PlacesSearch, &json!({ "query": "café" }), &s).unwrap();
-        assert_eq!(posted(&call.api)["languageCode"], "fr");
+        assert_eq!(posted(api_of(&call))["languageCode"], "fr");
     }
 
     #[test]
     fn places_search_near_a_place_geocodes_first() {
         let call = places_search(json!({ "query": "coffee", "near": "Mountain View" })).unwrap();
         assert_eq!(call.step, PLACES_GEOCODE_STEP);
-        assert_eq!(call.api.host, "geocode.example.com");
-        assert_eq!(call.api.path, "/v4/geocode/address");
-        assert_eq!(call.api.query, params(&[("addressQuery", "Mountain View")]));
+        assert_eq!(api_of(&call).host, "geocode.example.com");
+        assert_eq!(api_of(&call).path, "/v4/geocode/address");
         assert_eq!(
-            call.api.headers,
+            api_of(&call).query,
+            params(&[("addressQuery", "Mountain View")])
+        );
+        assert_eq!(
+            api_of(&call).headers,
             pairs(&[("X-Goog-FieldMask", GEOCODE_FIELD_MASK)])
         );
     }
@@ -4068,11 +4073,11 @@ mod tests {
             panic!("expected the search step");
         };
         assert_eq!(call.step, PLACES_SEARCH_STEP);
-        assert_eq!(call.api.host, "places.example.com");
-        assert_eq!(call.api.path, "/v1/places:searchText");
+        assert_eq!(api_of(&call).host, "places.example.com");
+        assert_eq!(api_of(&call).path, "/v1/places:searchText");
         // No radius given: the default circle.
         assert_eq!(
-            posted(&call.api)["locationBias"],
+            posted(api_of(&call))["locationBias"],
             json!({ "circle": {
                 "center": { "latitude": 37.39, "longitude": -122.08 },
                 "radius": 5000,
@@ -4084,7 +4089,7 @@ mod tests {
         // The search's row carries the location through the store to the answer.
         let step2 = InFlight::decode(&state.next(&call, derived, 2_000).encode()).unwrap();
         assert_eq!(step2.call_id(), format!("{}/2", "a".repeat(32)));
-        assert_eq!(step2.target, call.api.target());
+        assert_eq!(step2.target, call.request.target());
         let Next::Complete(answer) = advance(&step2, http(200, "{}"), &settings()) else {
             panic!("expected an answer");
         };
@@ -4111,10 +4116,10 @@ mod tests {
     fn places_search_steps_without_their_state_are_internal() {
         // A geocode step for a request with nothing to geocode.
         let args = json!({ "query": "coffee", "near": "1,2" });
-        let call = Call {
-            step: PLACES_GEOCODE_STEP,
-            api: geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
-        };
+        let call = Call::api(
+            PLACES_GEOCODE_STEP,
+            geocode_call(&Where::Text("Mountain View".to_string()), &settings()),
+        );
         assert_eq!(
             advance(
                 &places_state(args, &call, Args::new()),
@@ -4130,10 +4135,10 @@ mod tests {
         // A search step for a place whose geocoded location was not carried.
         let args = json!({ "query": "coffee", "near": "Mountain View" });
         let search = PlacesSearchArgs::parse(&args).unwrap();
-        let call = Call {
-            step: PLACES_SEARCH_STEP,
-            api: places_search_call(&search, Some((1.0, 2.0)), &settings()),
-        };
+        let call = Call::api(
+            PLACES_SEARCH_STEP,
+            places_search_call(&search, Some((1.0, 2.0)), &settings()),
+        );
         assert_eq!(
             advance(
                 &places_state(args, &call, Args::new()),
@@ -4197,7 +4202,7 @@ mod tests {
         for radius in [1, 50_000] {
             let call = places_search(json!({ "query": "a", "near": "1,2", "radius": radius }));
             assert_eq!(
-                posted(&call.unwrap().api)["locationBias"]["circle"]["radius"],
+                posted(api_of(&call.unwrap()))["locationBias"]["circle"]["radius"],
                 radius
             );
         }
@@ -4338,7 +4343,7 @@ mod tests {
     fn place_details(args: Value) -> Result<ApiCall, String> {
         plan(Provided::PlaceDetails, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -4390,7 +4395,7 @@ mod tests {
     fn place_details_pass_the_language() {
         let s = Settings::from_lookup(lookup(&with(&[("language", "fr")]))).unwrap();
         let call = plan(Provided::PlaceDetails, &json!({ "id": "ChIJ1" }), &s).unwrap();
-        assert_eq!(call.api.query, params(&[("languageCode", "fr")]));
+        assert_eq!(api_of(&call).query, params(&[("languageCode", "fr")]));
     }
 
     #[test]
@@ -4589,19 +4594,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(call.step, ALONG_ROUTE_ROUTE_STEP);
-        assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.host, "routes.example.com");
-        assert_eq!(call.api.path, "/directions/v2:computeRoutes");
-        assert!(call.api.query.is_empty());
+        assert_eq!(api_of(&call).method, "POST");
+        assert_eq!(api_of(&call).host, "routes.example.com");
+        assert_eq!(api_of(&call).path, "/directions/v2:computeRoutes");
+        assert!(api_of(&call).query.is_empty());
         assert_eq!(
-            call.api.headers,
+            api_of(&call).headers,
             pairs(&[(
                 "X-Goog-FieldMask",
                 "routes.polyline.encodedPolyline,routes.distanceMeters,routes.duration,fallbackInfo"
             )])
         );
         assert_eq!(
-            posted(&call.api),
+            posted(api_of(&call)),
             json!({
                 "origin": { "location": { "latLng": { "latitude": 37.422, "longitude": -122.0841 } } },
                 "destination": { "placeId": "ChIJ2" },
@@ -4616,7 +4621,7 @@ mod tests {
             json!({ "origin": "a", "destination": "b", "query": "gas", "mode": "walk" }),
         )
         .unwrap();
-        let body = posted(&walk.api);
+        let body = posted(api_of(&walk));
         assert_eq!(body["travelMode"], "WALK");
         assert!(body.get("routingPreference").is_none());
     }
@@ -4707,15 +4712,15 @@ mod tests {
             panic!("expected the search step");
         };
         assert_eq!(call.step, ALONG_ROUTE_SEARCH_STEP);
-        assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.host, "places.example.com");
-        assert_eq!(call.api.path, "/v1/places:searchText");
+        assert_eq!(api_of(&call).method, "POST");
+        assert_eq!(api_of(&call).host, "places.example.com");
+        assert_eq!(api_of(&call).path, "/v1/places:searchText");
         assert_eq!(
-            call.api.headers,
+            api_of(&call).headers,
             pairs(&[("X-Goog-FieldMask", PLACES_SEARCH_FIELD_MASK)])
         );
         assert_eq!(
-            posted(&call.api),
+            posted(api_of(&call)),
             json!({
                 "textQuery": "gas",
                 "pageSize": 3,
@@ -4788,7 +4793,7 @@ mod tests {
         let api = along_route_search_call(&longest, &at_cap, &settings());
         assert!(serde_json::to_vec(&api).unwrap().len() < 64 * 1024);
         assert!(
-            posted(&call.api)["searchAlongRouteParameters"]["polyline"]["encodedPolyline"]
+            posted(api_of(&call))["searchAlongRouteParameters"]["polyline"]["encodedPolyline"]
                 == at_cap
         );
         let over = format!("{at_cap}a");
@@ -4879,14 +4884,10 @@ mod tests {
     #[test]
     fn search_along_route_search_without_its_route_is_internal() {
         let args = json!({ "origin": "a", "destination": "b", "query": "gas" });
-        let call = Call {
-            step: ALONG_ROUTE_SEARCH_STEP,
-            api: along_route_search_call(
-                &AlongRouteArgs::parse(&args).unwrap(),
-                "abc",
-                &settings(),
-            ),
-        };
+        let call = Call::api(
+            ALONG_ROUTE_SEARCH_STEP,
+            along_route_search_call(&AlongRouteArgs::parse(&args).unwrap(), "abc", &settings()),
+        );
         assert_eq!(
             advance(
                 &along_state(&args, &call, Args::new()),

@@ -163,31 +163,19 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
     match tool {
         Provided::CalendarList => {
             let list = CalendarListArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: calendar_list_call(&list, settings),
-            })
+            Ok(Call::api(1, calendar_list_call(&list, settings)))
         }
         Provided::CalendarEvents => {
             let events = EventsArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: events_list_call(&events, settings),
-            })
+            Ok(Call::api(1, events_list_call(&events, settings)))
         }
         Provided::CalendarEvent => {
             let event = EventArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: event_get_call(&event, settings),
-            })
+            Ok(Call::api(1, event_get_call(&event, settings)))
         }
         Provided::CalendarFreeBusy => {
             let free_busy = FreeBusyArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: free_busy_call(&free_busy, settings),
-            })
+            Ok(Call::api(1, free_busy_call(&free_busy, settings)))
         }
     }
 }
@@ -371,7 +359,11 @@ fn free_busy_call(args: &FreeBusyArgs, settings: &Settings) -> ApiCall {
 /// Every answer completed here is held to the result ceiling; a relayed
 /// credential answer is `api-request`'s own and is not.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
-    let body = match read_api_result(outcome, &state.target, google::API_NAME) {
+    let body = match state
+        .target
+        .api()
+        .and_then(|target| read_api_result(outcome, target, google::API_NAME))
+    {
         Ok(Answer::Body(body)) => body,
         Ok(Answer::NoBody { status }) => return settle(state.tool, no_body(state, status)),
         Ok(Answer::Relay(value)) => return Next::Complete(value),
@@ -658,7 +650,7 @@ mod tests {
         no_body_parts, wide,
     };
     use brenn_google_workspace::text::PAGE_MAX_BYTES;
-    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body};
+    use brenn_provider_kit::testutil::{api_of, failure, google, http, nested, text_body};
     use brenn_provider_kit::{
         Bound, ErrorKind, Probes, ToolBounds, check, hold_probes, hold_required, input_schema,
         probes, serialized_len,
@@ -765,7 +757,7 @@ mod tests {
     fn calendar_list(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarList, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -1028,7 +1020,7 @@ mod tests {
     fn events(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarEvents, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -1384,7 +1376,7 @@ mod tests {
     fn event(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarEvent, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -1809,7 +1801,7 @@ mod tests {
     fn free_busy(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarFreeBusy, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 

@@ -678,6 +678,51 @@ does not yet carry (`blob-budget-rule-sized-by-window` in `TODO.md`). When
 the pool is full every producer in the deployment is refused until a window
 turns over.
 
+#### The one-click-unsubscribe tool
+
+`one-click-unsubscribe` (MCP `mcp__brenn__OneClickUnsubscribe`) is always
+registered; it needs no provider. Called with `{ "url": "<https URL>" }`, it
+sends the RFC 8058 one-click unsubscribe request — a `POST` with the body
+`List-Unsubscribe=One-Click` and no credential or cookie — and answers
+`{ "status": <HTTP status>, "host": "<host>" }`, or `{ "error":
+"unreachable", "host": "<host>" }` when no response came within 30 seconds;
+`host` is the URL's host as Brenn parsed it, the one the request went to.
+The log line for `unreachable` carries its cause. No redirect is followed and the response
+body is not read. The URL must be `https`, at most 2,048 bytes, with no user
+info and no port other than 443 (`invalid_args` otherwise). A host that is
+not a public address — a special-purpose IP literal, a single label, a name
+equal to or under `localhost`, `local`, `home.arpa`, `internal`, `lan`,
+`corp`, `intranet`, `private` or `localdomain`, or a name that resolves only
+to special-purpose addresses — is refused `denied`, nothing is sent, and a
+`Warning` phone alert names the caller and the host. A call with no acting
+user is refused. A call from a caller that is not a WASM component is
+refused `denied`.
+
+It takes no ACL keys, so the grant has no `allow` clause. It acts as no
+user, so a WASM component may hold it:
+
+```
+component fastmail_mail_write {
+  tool one-click-unsubscribe {
+    rate_limit { burst = 5; sustained_per_minute = 10; }
+  }
+}
+```
+
+**An instance holding the grant can make Brenn send a fixed-body `POST` to
+any public `https` URL.** Brenn guarantees the request's shape; it cannot
+check where the URL came from. A component that unsubscribes from a message
+is trusted to pass that message's own header, and the URL itself can carry
+whatever the grantee puts in it. Grant it only to a component trusted with
+outbound data, and never without a `rate_limit`: the rate limit bounds both
+the requests and the refused-destination alerts.
+
+The tool is for components. A call from any other caller is refused
+`denied` before anything else in the tool, whatever the permission mode, so
+do not grant it to an agent: every call the agent made would be refused. A
+component's call has no approval step, so the grant is the authorization,
+and it goes only to a component trusted with outbound data.
+
 #### The device-location tool
 
 `device-location` (MCP `mcp__brenn__DeviceLocation`) is always registered;

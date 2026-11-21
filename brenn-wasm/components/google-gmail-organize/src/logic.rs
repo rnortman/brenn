@@ -112,10 +112,7 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
     match tool {
         Provided::GmailModifyLabels => {
             let modify = ModifyLabelsArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: batch_modify_call(&modify, settings),
-            })
+            Ok(Call::api(1, batch_modify_call(&modify, settings)))
         }
     }
 }
@@ -212,7 +209,11 @@ fn modify_labels_accepted(state: &InFlight) -> Result<Next, Failure> {
 /// Every answer completed here is held to the result ceiling; a relayed
 /// credential answer is `api-request`'s own and is not.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>) -> Next {
-    match read_api_result(outcome, &state.target, google::API_NAME) {
+    match state
+        .target
+        .api()
+        .and_then(|target| read_api_result(outcome, target, google::API_NAME))
+    {
         // Google's acceptance of a label change, whatever its body.
         Ok(Answer::Body(_)) => {}
         Ok(Answer::NoBody { .. }) => return settle(state.tool, no_body(state)),
@@ -299,7 +300,7 @@ mod tests {
     use brenn_google_workspace::testutil::{
         admits_characters, cut_read, description, escaped_widest, lookup,
     };
-    use brenn_provider_kit::testutil::{failure, google, http, nested, text_body};
+    use brenn_provider_kit::testutil::{api_of, failure, google, http, nested, text_body};
     use brenn_provider_kit::{
         Bound, ErrorKind, Probes, ToolBounds, check, hold_probes, hold_required, input_schema,
         internal, probes, query,
@@ -332,7 +333,7 @@ mod tests {
     fn modify(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailModifyLabels, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 

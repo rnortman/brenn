@@ -696,6 +696,9 @@ pub async fn run_server(
             api_key_table.clone(),
             api_request_blobs.clone(),
         ));
+        tools.push(brenn_oauth::tools::one_click_unsubscribe(
+            guard.alert_dispatcher.clone(),
+        ));
         tools.extend(device_location_tools);
         let registry = build_tool_registry(tools, &config.wasm_consumers, &apps, &provider_runtime);
         registry.validate_config(&apps);

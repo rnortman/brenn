@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use base64ct::{Base64, Encoding};
 use serde_json::{Value, json};
 
+use crate::activation::NESTED_TOOL;
 use crate::args::Args;
 use crate::call::{ErrorKind, Failure, Next, Target, internal};
 
@@ -32,13 +33,20 @@ pub fn cut(text: &str, max_bytes: usize) -> (String, bool) {
     (format!("{}…", &text[..at]), true)
 }
 
-/// The detail of a nested call that issued but could not be queued: Brenn's
-/// refusal text plus the one sentence of operator guidance.
-pub(crate) fn not_issued(refusal: &str) -> String {
-    format!(
-        "api-request could not be issued: {refusal}. If this names the clause, the instance's \
-         `tool api-request` grant must admit the method, host and path."
-    )
+/// The detail of a nested call to `tool` that issued but could not be
+/// queued: Brenn's refusal text plus the one sentence of operator guidance.
+pub(crate) fn not_issued(tool: &str, refusal: &str) -> String {
+    if tool == NESTED_TOOL {
+        format!(
+            "api-request could not be issued: {refusal}. If this names the clause, the \
+             instance's `tool api-request` grant must admit the method, host and path."
+        )
+    } else {
+        format!(
+            "{tool} could not be issued: {refusal}. If this names the grant, the instance needs \
+             a `tool {tool}` grant."
+        )
+    }
 }
 
 /// One line for the log: status, size and truncation, or the error kind.
@@ -1201,11 +1209,23 @@ mod tests {
 
     #[test]
     fn not_issued_carries_brenns_text_and_the_guidance() {
-        let detail = not_issued("call-async api-request: denied: no clause admits GET");
+        let detail = not_issued(
+            "api-request",
+            "call-async api-request: denied: no clause admits GET",
+        );
         assert!(detail.starts_with(
             "api-request could not be issued: call-async api-request: denied: no clause admits GET."
         ));
         assert!(detail.ends_with("must admit the method, host and path."));
+        assert_eq!(
+            not_issued(
+                "one-click-unsubscribe",
+                "call-async one-click-unsubscribe: denied: not granted"
+            ),
+            "one-click-unsubscribe could not be issued: call-async one-click-unsubscribe: \
+             denied: not granted. If this names the grant, the instance needs a \
+             `tool one-click-unsubscribe` grant."
+        );
     }
 
     #[test]

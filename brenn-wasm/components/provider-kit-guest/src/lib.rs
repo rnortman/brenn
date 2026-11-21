@@ -10,8 +10,8 @@
 //! activation wrote.
 //!
 //! The component's class needs the `provides`, `store` and `log` grants and a
-//! `tool-results` inbox; nested calls reach `api-request` on behalf of the
-//! request's user. A completion the host no longer holds is dropped.
+//! `tool-results` inbox; nested calls reach `api-request`, or the other tool a
+//! call names, on behalf of the request's user. A completion the host no longer holds is dropped.
 //!
 //! The entry point is the choice of grant. [`serve`] serves the loop no
 //! blobs: its [`Blobs`] answers `Unavailable` from every method and it
@@ -31,10 +31,9 @@ use brenn_guest::provides::{
 use brenn_guest::serde_json::Value;
 use brenn_guest::tools::ToolResult;
 use brenn_guest::{Activation, Attachment, Error, blobs, log, store};
-use brenn_provider_kit::activation::NESTED_TOOL;
 use brenn_provider_kit::{
-    ApiCall, Attached, Blob, BlobLimits, Blobs, CreateError, Delivered, ErrorKind, Host, Input,
-    Level, Logic, NestedError, OpenError, ReadError, Request, Rows, SealError, Unavailable,
+    Attached, Blob, BlobLimits, Blobs, CreateError, Delivered, ErrorKind, Host, Input, Level,
+    Logic, Nested, NestedError, OpenError, ReadError, Request, Rows, SealError, Unavailable,
     WriteError, Writer,
 };
 
@@ -125,7 +124,7 @@ trait Served: Blobs {
     fn call(
         &self,
         id: &PendingId,
-        call: &ApiCall,
+        call: &Nested,
         call_id: &str,
         body: Option<(&str, &Blob)>,
     ) -> Result<(), String>;
@@ -205,7 +204,7 @@ impl<B: Served> Host for GuestHost<'_, B> {
     fn call(
         &self,
         id: &str,
-        call: &ApiCall,
+        call: &Nested,
         call_id: &str,
         body: Option<(&str, &Blob)>,
     ) -> Result<(), String> {
@@ -282,15 +281,14 @@ impl Served for NoBlobs {
     fn call(
         &self,
         id: &PendingId,
-        call: &ApiCall,
+        call: &Nested,
         call_id: &str,
         body: Option<(&str, &Blob)>,
     ) -> Result<(), String> {
         if body.is_some() {
             return Err(brenn_provider_kit::Failure::from(Unavailable).detail);
         }
-        provides::call_async_for(id, NESTED_TOOL, call, call_id)
-            .map_err(|refused| refused.to_string())
+        call_async_for(id, call, call_id)
     }
 
     fn complete(
@@ -306,6 +304,16 @@ impl Served for NoBlobs {
         }
         drop_not_pending(provides::complete(id, value))
     }
+}
+
+/// `provides::call_async_for` of `call`'s arguments to its tool, with no
+/// attachment.
+fn call_async_for(id: &PendingId, call: &Nested, call_id: &str) -> Result<(), String> {
+    match call {
+        Nested::Api(api) => provides::call_async_for(id, call.tool(), api, call_id),
+        Nested::Tool(tool) => provides::call_async_for(id, call.tool(), &tool.args, call_id),
+    }
+    .map_err(|refused| refused.to_string())
 }
 
 /// One handle of a step's table.
@@ -465,16 +473,18 @@ impl Served for SdkBlobs<'_> {
     fn call(
         &self,
         id: &PendingId,
-        call: &ApiCall,
+        call: &Nested,
         call_id: &str,
         body: Option<(&str, &Blob)>,
     ) -> Result<(), String> {
         let Some(body) = body else {
-            return provides::call_async_for(id, NESTED_TOOL, call, call_id)
-                .map_err(|refused| refused.to_string());
+            return call_async_for(id, call, call_id);
+        };
+        let Nested::Api(api) = call else {
+            panic!("the kit gave a call to {} a body", call.tool());
         };
         self.with_blobs(&[body], |attachments| {
-            provides::call_async_for_with_attachments(id, NESTED_TOOL, call, call_id, attachments)
+            provides::call_async_for_with_attachments(id, call.tool(), api, call_id, attachments)
         })
         .map_err(|refused| Error::from(refused).to_string())
     }

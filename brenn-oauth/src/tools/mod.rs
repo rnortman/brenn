@@ -1,5 +1,6 @@
-//! The registry tools that act through [`crate::OAuthService`], and
-//! `api-request`, which also sends the deployment's API keys.
+//! The registry tools that act through [`crate::OAuthService`];
+//! `api-request`, which also sends the deployment's API keys; and
+//! `one-click-unsubscribe`, which sends no credential at all.
 
 pub mod accounts;
 pub mod api_request;
@@ -7,6 +8,7 @@ pub mod api_request;
 mod api_request_blob_tests;
 pub mod connect;
 pub mod disconnect;
+pub mod one_click_unsubscribe;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -14,6 +16,7 @@ use std::sync::{Arc, OnceLock};
 use brenn_lib::config::ApiKeyTable;
 use brenn_lib::tools::{AclClause, acl_admits};
 use brenn_messaging_store::blob::BlobStore;
+use brenn_obs::alerting::AlertDispatcher;
 use brenn_tool_registry::{AclDenied, RegisteredTool};
 
 use crate::OAuthService;
@@ -89,6 +92,15 @@ pub fn api_request(
     RegisteredTool::Async(Arc::new(api_request::ApiRequestTool::new(
         oauth, keys, blobs,
     )))
+}
+
+/// The `one-click-unsubscribe` tool, raising its refused-destination alerts
+/// through `alerts`. Registered in every process: it needs no configuration,
+/// and a tool nobody is granted does nothing.
+pub fn one_click_unsubscribe(alerts: AlertDispatcher) -> RegisteredTool {
+    RegisteredTool::Async(Arc::new(
+        one_click_unsubscribe::OneClickUnsubscribeTool::new(alerts),
+    ))
 }
 
 /// Whether `acl` admits `provider`, for a tool whose only ACL key is

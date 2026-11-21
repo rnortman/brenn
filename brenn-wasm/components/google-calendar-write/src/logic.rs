@@ -180,24 +180,18 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
     match tool {
         Provided::CalendarCreate => {
             let create = EventWriteArgs::parse_create(args)?;
-            Ok(Call {
-                step: 1,
-                api: event_insert_call(&create, settings),
-            })
+            Ok(Call::api(1, event_insert_call(&create, settings)))
         }
         Provided::CalendarUpdate => {
             let update = EventWriteArgs::parse_update(args)?;
-            Ok(Call {
-                step: 1,
-                api: event_patch_call(&update, settings),
-            })
+            Ok(Call::api(1, event_patch_call(&update, settings)))
         }
         Provided::CalendarDelete => {
             let delete = DeleteArgs::parse(args)?;
-            Ok(Call {
-                step: DELETE_READ_STEP,
-                api: delete_read_call(&delete, settings),
-            })
+            Ok(Call::api(
+                DELETE_READ_STEP,
+                delete_read_call(&delete, settings),
+            ))
         }
     }
 }
@@ -598,10 +592,7 @@ fn delete_checked(state: &InFlight, body: &Value, settings: &Settings) -> Result
         derived.insert("series".to_string(), json!(true));
     }
     Ok(Next::Call {
-        call: Call {
-            step: DELETE_STEP,
-            api: event_delete_call(&args, settings),
-        },
+        call: Call::api(DELETE_STEP, event_delete_call(&args, settings)),
         derived,
     })
 }
@@ -624,7 +615,11 @@ fn delete_accepted(state: &InFlight) -> Result<Next, Failure> {
 /// issue its next step. Every answer completed here is held to the result
 /// ceiling; a relayed credential answer is `api-request`'s own and is not.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-    let body = match read_api_result(outcome, &state.target, google::API_NAME) {
+    let body = match state
+        .target
+        .api()
+        .and_then(|target| read_api_result(outcome, target, google::API_NAME))
+    {
         Ok(Answer::Body(body)) => body,
         Ok(Answer::NoBody { status }) => return settle(no_body(state, status)),
         Ok(Answer::Relay(value)) => return Next::Complete(value),
@@ -727,7 +722,7 @@ mod tests {
         EVENT, EVENT_ID, admits_characters, calendar_id_probes, completed, cut_read, description,
         escaped_widest, event_with, follow, four_byte, lookup, no_body_parts,
     };
-    use brenn_provider_kit::testutil::{MemoryHost, failure, google, http, nested};
+    use brenn_provider_kit::testutil::{MemoryHost, api_of, failure, google, http, nested};
     use brenn_provider_kit::{
         Bound, Probes, QueryValue, ToolBounds, check, cut, hold_probes, hold_required,
         input_schema, internal, probes,
@@ -790,14 +785,14 @@ mod tests {
     fn create(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarCreate, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
     fn update(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarUpdate, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -854,7 +849,7 @@ mod tests {
     /// `application/json`, as JSON.
     fn sent(tool: Provided, args: &Value) -> Value {
         let queued = queued(tool, args);
-        assert_eq!(queued.call.api.body, Some(Body::Built));
+        assert_eq!(api_of(&queued.call).body, Some(Body::Built));
         let (content_type, bytes) = built(&queued).unwrap();
         assert_eq!(content_type, "application/json");
         serde_json::from_slice(&bytes).unwrap()
@@ -1405,7 +1400,7 @@ mod tests {
     fn delete(args: Value) -> Result<ApiCall, String> {
         plan(Provided::CalendarDelete, &args, &settings()).map(|call| {
             assert_eq!(call.step, DELETE_READ_STEP);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -1463,7 +1458,7 @@ mod tests {
         let (row, call) = delete_after_read(args, &delete_read(json!({})));
         assert_eq!(call.step, DELETE_STEP);
         assert_eq!(
-            call.api,
+            api_of(&call).clone(),
             ApiCall {
                 provider: "google".to_string(),
                 account: Some("alice@example.com".to_string()),
@@ -1491,10 +1486,13 @@ mod tests {
         // Whom Google notifies is always sent: nobody by default.
         let (_, call) = delete_after_read(json!({ "id": "e1" }), &delete_read(json!({})));
         assert_eq!(
-            call.api.query.get("sendUpdates"),
+            api_of(&call).query.get("sendUpdates"),
             Some(&QueryValue::One("none".to_string()))
         );
-        assert_eq!(call.api.path, "/calendar/v3/calendars/primary/events/e1");
+        assert_eq!(
+            api_of(&call).path,
+            "/calendar/v3/calendars/primary/events/e1"
+        );
     }
 
     #[test]
@@ -1579,7 +1577,7 @@ mod tests {
         // Deleted: a master with `series`, an occurrence without it.
         let (row, call) =
             delete_after_read(json!({ "id": "e1", "series": true }), &delete_read(master));
-        assert_eq!(call.api.method, "DELETE");
+        assert_eq!(api_of(&call).method, "DELETE");
         assert_eq!(
             answered(&row, http(204, "")),
             Next::Complete(json!({
@@ -1591,7 +1589,7 @@ mod tests {
             }))
         );
         let (row, call) = delete_after_read(json!({ "id": "e1" }), &delete_read(occurrence));
-        assert_eq!(call.api.method, "DELETE");
+        assert_eq!(api_of(&call).method, "DELETE");
         assert_eq!(
             answered(&row, http(204, "")),
             Next::Complete(json!({

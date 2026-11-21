@@ -89,7 +89,7 @@ pub fn follow<T: Tool>(state: &InFlight<T>, next: Next) -> (InFlight<T>, Call) {
     };
     let row = InFlight::decode(&state.next(&call, derived, 2_000).encode()).unwrap();
     assert_eq!(row.step, call.step);
-    assert_eq!(row.target, call.api.target());
+    assert_eq!(row.target, call.request.target());
     assert_eq!(row.issued_at_ms, 2_000);
     (row, call)
 }

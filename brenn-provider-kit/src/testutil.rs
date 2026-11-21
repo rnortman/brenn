@@ -1,7 +1,8 @@
 //! Test fixtures for a step's inputs and outputs: `api-request`'s answer
-//! envelope, a nested call's text body, a nested-call error, a Google error
-//! body and the error answer a step returns; and `MemoryHost`, an in-memory
-//! host and blob store for a loop's tests.
+//! envelope, `one-click-unsubscribe`'s answers, a nested call's text body, a
+//! nested-call error, a Google error body and the error answer a step
+//! returns; and `MemoryHost`, an in-memory host and blob store for a loop's
+//! tests.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +17,7 @@ use crate::blob::{
     Attached, Blob, BlobLimits, Blobs, CreateError, OpenError, ReadError, SealError, Unavailable,
     WriteError, Writer,
 };
-use crate::call::{ApiCall, Body, ErrorKind, Failure};
+use crate::call::{ApiCall, Body, Call, ErrorKind, Failure, Nested};
 
 /// A nested call that failed with `kind` and `detail`.
 pub fn nested(kind: &str, detail: &str) -> Result<Value, NestedError> {
@@ -114,6 +115,35 @@ pub fn store_full() -> Result<Value, NestedError> {
     Ok(json!({ "error": "blob_store_full", "status": 200, "headers": {} }))
 }
 
+/// `one-click-unsubscribe`'s answer when the endpoint at `host` answered HTTP
+/// `status`.
+pub fn unsubscribe_status(host: &str, status: u64) -> Result<Value, NestedError> {
+    Ok(json!({ "status": status, "host": host }))
+}
+
+/// `one-click-unsubscribe`'s answer when no response came from `host`.
+pub fn unsubscribe_unreachable(host: &str) -> Result<Value, NestedError> {
+    Ok(json!({ "error": "unreachable", "host": host }))
+}
+
+/// The `api-request` arguments of `request`.
+///
+/// # Panics
+/// When `request` reaches another tool.
+fn api_or_panic(request: &Nested) -> &ApiCall {
+    request
+        .api()
+        .unwrap_or_else(|| panic!("the call reaches `{}`, not api-request", request.tool()))
+}
+
+/// The `api-request` arguments of `call`.
+///
+/// # Panics
+/// When `call` reaches another tool.
+pub fn api_of(call: &Call) -> &ApiCall {
+    api_or_panic(&call.request)
+}
+
 /// The text body of a nested call.
 ///
 /// # Panics
@@ -152,12 +182,22 @@ pub fn failure(kind: ErrorKind, detail: &str) -> Failure {
 pub struct NestedCall {
     /// The pending id the call serves.
     pub id: String,
-    pub call: ApiCall,
+    pub request: Nested,
     pub call_id: String,
     /// The attachment the call carried as its body: its name and bytes.
     pub body: Option<(String, Vec<u8>)>,
     /// The content type of the body's blob.
     pub body_content_type: Option<String>,
+}
+
+impl NestedCall {
+    /// The `api-request` arguments the call carried.
+    ///
+    /// # Panics
+    /// When the call reached another tool.
+    pub fn api(&self) -> &ApiCall {
+        api_or_panic(&self.request)
+    }
 }
 
 /// One attachment of a completion: its name, content type and bytes.
@@ -703,10 +743,15 @@ impl Host for MemoryHost {
     fn call(
         &self,
         id: &str,
-        call: &ApiCall,
+        call: &Nested,
         call_id: &str,
         body: Option<(&str, &Blob)>,
     ) -> Result<(), String> {
+        assert!(
+            body.is_none() || call.api().is_some(),
+            "a call to {} carries a body",
+            call.tool()
+        );
         let mut refuse = self.refuse.borrow_mut();
         if let Some((count, text)) = refuse.as_mut() {
             let text = text.clone();
@@ -720,7 +765,7 @@ impl Host for MemoryHost {
         let body = body.map(|(name, blob)| (name.to_string(), self.sealed_at(blob)));
         self.calls.borrow_mut().push(NestedCall {
             id: id.to_string(),
-            call: call.clone(),
+            request: call.clone(),
             call_id: call_id.to_string(),
             body_content_type: body.as_ref().map(|(_, sealed)| sealed.content_type.clone()),
             body: body.map(|(name, sealed)| (name, sealed.bytes.to_vec())),

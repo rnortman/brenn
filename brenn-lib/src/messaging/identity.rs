@@ -568,6 +568,12 @@ impl ParticipantId {
         })
     }
 
+    /// Whether this is a WASM component's identity (`wasm:<slug>`). Never
+    /// panics, so it serves where any kind can appear, as a tool's caller.
+    pub fn is_wasm(&self) -> bool {
+        self.0.starts_with("wasm:")
+    }
+
     /// Returns `true` if `s` is already a structured `ParticipantId` (i.e. uses the
     /// `app:`, `conversation:`, or `wasm:` scheme). Used by the startup
     /// sender-invariant check to detect any pre-migration rows without
@@ -785,6 +791,21 @@ mod tests {
     #[should_panic(expected = "not a wasm identity")]
     fn as_wasm_slug_panics_on_app_kind() {
         ParticipantId::for_app("my-app", "https://example.com").as_wasm_slug();
+    }
+
+    #[test]
+    fn is_wasm_answers_for_every_kind_without_panicking() {
+        assert!(ParticipantId::for_wasm("mail-write").is_wasm());
+        for other in [
+            ParticipantId::for_app("my-app", "https://example.com"),
+            ParticipantId::for_conversation(42),
+            ParticipantId::for_surface("deskbar"),
+            ParticipantId::for_surface_component("deskbar", "panel"),
+            ParticipantId::for_remote("peer"),
+            ParticipantId::for_system("tool-executor"),
+        ] {
+            assert!(!other.is_wasm(), "{}", other.as_str());
+        }
     }
 
     #[test]

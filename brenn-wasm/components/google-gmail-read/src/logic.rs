@@ -253,45 +253,27 @@ pub fn plan(tool: Provided, args: &Value, settings: &Settings) -> Result<Call, S
     match tool {
         Provided::GmailLabels => {
             let labels = LabelsArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: labels_call(&labels, settings),
-            })
+            Ok(Call::api(1, labels_call(&labels, settings)))
         }
         Provided::GmailSearch => {
             let search = SearchArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: search_list_call(&search, settings),
-            })
+            Ok(Call::api(1, search_list_call(&search, settings)))
         }
         Provided::GmailRead => {
             let read = ReadArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: read_call(&read, None, settings),
-            })
+            Ok(Call::api(1, read_call(&read, None, settings)))
         }
         Provided::GmailThread => {
             let thread = ThreadArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: thread_call(&thread, THREAD_HEADERS, settings),
-            })
+            Ok(Call::api(1, thread_call(&thread, THREAD_HEADERS, settings)))
         }
         Provided::GmailAttachment => {
             let attachment = AttachmentArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: part_tree_call(&attachment, settings),
-            })
+            Ok(Call::api(1, part_tree_call(&attachment, settings)))
         }
         Provided::GmailBody => {
             let body = BodyArgs::parse(args)?;
-            Ok(Call {
-                step: 1,
-                api: body_call(&body, settings),
-            })
+            Ok(Call::api(1, body_call(&body, settings)))
         }
     }
 }
@@ -753,7 +735,11 @@ pub fn advance(
         (Provided::GmailBody, 1) => return body_read(state, outcome, step),
         _ => {}
     }
-    let body = match read_api_result(outcome, &state.target, google::API_NAME) {
+    let body = match state
+        .target
+        .api()
+        .and_then(|target| read_api_result(outcome, target, google::API_NAME))
+    {
         Ok(Answer::Body(body)) => body,
         Ok(Answer::NoBody { status }) => return settle(state.tool, no_body(state, status)),
         Ok(Answer::Relay(value)) => return Next::Complete(value),
@@ -817,17 +803,17 @@ fn unreadable(state: &InFlight, why: Unreadable, settings: &Settings) -> Next {
                 search_message(state, Read::Unreadable(why), settings)
             }
             (Provided::GmailRead, 1) => stored(state, ReadArgs::parse).map(|args| Next::Call {
-                call: Call {
-                    step: STRUCTURE_STEP,
-                    api: read_call(&args, Some(&structure_fields()), settings),
-                },
+                call: Call::api(
+                    STRUCTURE_STEP,
+                    read_call(&args, Some(&structure_fields()), settings),
+                ),
                 derived: why.to_derived(),
             }),
             (Provided::GmailThread, 1) => stored(state, ThreadArgs::parse).map(|args| Next::Call {
-                call: Call {
-                    step: THREAD_NARROW_STEP,
-                    api: thread_call(&args, THREAD_NARROW_HEADERS, settings),
-                },
+                call: Call::api(
+                    THREAD_NARROW_STEP,
+                    thread_call(&args, THREAD_NARROW_HEADERS, settings),
+                ),
                 derived: why.to_derived(),
             }),
             (Provided::GmailRead, STRUCTURE_STEP) => {
@@ -952,10 +938,7 @@ fn part_located(state: &InFlight, body: &Value, settings: &Settings) -> Result<N
         ("size".to_string(), json!(size)),
     ]);
     Ok(Next::Call {
-        call: Call {
-            step: FETCH_STEP,
-            api: attachment_call(&args, attachment_id, settings),
-        },
+        call: Call::api(FETCH_STEP, attachment_call(&args, attachment_id, settings)),
         derived,
     })
 }
@@ -1004,7 +987,11 @@ fn attachment_fetched(
     outcome: Result<Value, NestedError>,
     step: &mut Step<'_>,
 ) -> Next {
-    let answer = match read_api_blob(outcome, &state.target, google::API_NAME) {
+    let answer = match state
+        .target
+        .api()
+        .and_then(|target| read_api_blob(outcome, target, google::API_NAME))
+    {
         Ok(BlobAnswer::Blob { attachment, .. }) => attachment,
         Ok(BlobAnswer::Relay(value)) => return Next::Complete(value),
         Ok(BlobAnswer::Unreadable(why)) => {
@@ -1118,7 +1105,11 @@ fn decode_attachment(state: &InFlight, answer: &str, step: &mut Step<'_>) -> Res
 /// turned into the forms asked for; a typed refusal of `api-request`'s,
 /// Google's error or an unreadable answer fails the request.
 fn body_read(state: &InFlight, outcome: Result<Value, NestedError>, step: &mut Step<'_>) -> Next {
-    let answer = match read_api_blob(outcome, &state.target, google::API_NAME) {
+    let answer = match state
+        .target
+        .api()
+        .and_then(|target| read_api_blob(outcome, target, google::API_NAME))
+    {
         Ok(BlobAnswer::Blob { attachment, .. }) => attachment,
         Ok(BlobAnswer::Relay(value)) => return Next::Complete(value),
         Ok(BlobAnswer::Unreadable(why)) => {
@@ -1630,10 +1621,10 @@ fn search_listed(state: &InFlight, body: &Value, settings: &Settings) -> Result<
     let Some(Value::String(first)) = ids.first() else {
         return Ok(Next::Complete(search_answer(derived)));
     };
-    let call = Call {
-        step: SEARCH_FIRST_GET,
-        api: message_metadata_call(first, args.account.as_deref(), settings),
-    };
+    let call = Call::api(
+        SEARCH_FIRST_GET,
+        message_metadata_call(first, args.account.as_deref(), settings),
+    );
     derived.insert("ids".to_string(), Value::Array(ids));
     derived.insert("lines".to_string(), Value::Array(Vec::new()));
     derived.insert("unavailable".to_string(), Value::Array(Vec::new()));
@@ -1676,10 +1667,10 @@ fn search_message(state: &InFlight, read: Read, settings: &Settings) -> Result<N
     derived.insert(key.to_string(), Value::Array(list));
     match next_id {
         Some(Value::String(next)) => Ok(Next::Call {
-            call: Call {
-                step: state.step + 1,
-                api: message_metadata_call(&next, args.account.as_deref(), settings),
-            },
+            call: Call::api(
+                state.step + 1,
+                message_metadata_call(&next, args.account.as_deref(), settings),
+            ),
             derived,
         }),
         Some(_) => Err(internal(
@@ -2014,10 +2005,7 @@ fn finish(answer: Value, account: Option<&str>, settings: &Settings) -> Result<N
         return Ok(Next::Complete(answer));
     }
     Ok(Next::Call {
-        call: Call {
-            step: LABELS_STEP,
-            api: label_names_call(account, settings),
-        },
+        call: Call::api(LABELS_STEP, label_names_call(account, settings)),
         derived: Args::from_iter([("answer".to_string(), answer)]),
     })
 }
@@ -2145,8 +2133,8 @@ mod tests {
     };
     use brenn_google_workspace::text::PAGE_MAX_BYTES;
     use brenn_provider_kit::testutil::{
-        Answered, Completion, MemoryHost, binary, blob_answer, failure, google, http, nested,
-        store_full, too_large, truncated,
+        Answered, Completion, MemoryHost, api_of, binary, blob_answer, failure, google, http,
+        nested, store_full, too_large, truncated,
     };
     use brenn_provider_kit::{
         Bound, Delivered, Input, Probes, Request, ToolBounds, WriteError, check, hold_probes,
@@ -2172,7 +2160,7 @@ mod tests {
     fn labels(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailLabels, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -2460,7 +2448,7 @@ mod tests {
     fn search(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailSearch, &args, &settings()).map(|call| {
             assert_eq!(call.step, 1);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -2633,7 +2621,7 @@ mod tests {
         let (state, call) = follow(&state, answered(&state, http(200, &list)));
         assert_eq!(call.step, 2);
         assert_eq!(
-            call.api,
+            api_of(&call).clone(),
             message_metadata_call("m1", Some("alice@example.com"), &settings())
         );
         let (state, call) = follow(
@@ -2641,7 +2629,7 @@ mod tests {
             answered(&state, http(200, &metadata("m1", &["INBOX", "UNREAD"]))),
         );
         assert_eq!(
-            (call.step, call.api.path.as_str()),
+            (call.step, api_of(&call).path.as_str()),
             (3, "/gmail/v1/users/me/messages/m2")
         );
         let (state, call) = follow(
@@ -2649,13 +2637,13 @@ mod tests {
             answered(&state, http(200, &metadata("m2", &["Label_7", "INBOX"]))),
         );
         assert_eq!(
-            (call.step, call.api.path.as_str()),
+            (call.step, api_of(&call).path.as_str()),
             (4, "/gmail/v1/users/me/messages/m3")
         );
         let (state, call) = follow(&state, answered(&state, http(200, &metadata("m3", &[]))));
         assert_eq!(call.step, 100);
         assert_eq!(
-            call.api,
+            api_of(&call).clone(),
             ApiCall {
                 provider: "google".to_string(),
                 account: Some("alice@example.com".to_string()),
@@ -2723,7 +2711,7 @@ mod tests {
         let (state, _) = follow(&state, answered(&state, http(200, &list)));
         let gone = google(404, "NOT_FOUND", "Requested entity was not found.");
         let (state, call) = follow(&state, answered(&state, http(404, &gone)));
-        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m2");
+        assert_eq!(api_of(&call).path, "/gmail/v1/users/me/messages/m2");
         let (state, _) = follow(&state, answered(&state, http(200, &metadata("m2", &[]))));
         assert_eq!(
             answered(&state, http(404, &gone)),
@@ -2759,7 +2747,7 @@ mod tests {
             let list = listing(&["m1", "m2"], json!({ "nextPageToken": "next-1" }));
             let (state, _) = follow(&state, answered(&state, http(200, &list)));
             let (state, call) = follow(&state, answered(&state, outcome));
-            assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m2");
+            assert_eq!(api_of(&call).path, "/gmail/v1/users/me/messages/m2");
             assert_eq!(
                 answered(&state, http(200, &metadata("m2", &[]))),
                 Next::Complete(json!({
@@ -2809,7 +2797,7 @@ mod tests {
             let (mut state, mut call) = follow(&state, answered(&state, http(200, &list)));
             for (i, id) in ids[..24].iter().enumerate() {
                 assert_eq!(
-                    (call.step, call.api.path.as_str()),
+                    (call.step, api_of(&call).path.as_str()),
                     (
                         2 + i as u8,
                         format!("/gmail/v1/users/me/messages/{id}").as_str()
@@ -2818,7 +2806,7 @@ mod tests {
                 (state, call) = follow(&state, answered(&state, http(200, &metadata(id, &[]))));
             }
             assert_eq!(
-                (call.step, call.api.path.as_str()),
+                (call.step, api_of(&call).path.as_str()),
                 (26, "/gmail/v1/users/me/messages/m25")
             );
             let Next::Complete(answer) = answered(&state, last) else {
@@ -3243,10 +3231,7 @@ mod tests {
 
     fn naming_state(derived: Args) -> InFlight {
         let state = search_state(json!({ "q": "lunch" }));
-        let call = Call {
-            step: LABELS_STEP,
-            api: label_names_call(None, &settings()),
-        };
+        let call = Call::api(LABELS_STEP, label_names_call(None, &settings()));
         state.next(&call, derived, 2_000)
     }
 
@@ -3356,7 +3341,7 @@ mod tests {
         .unwrap();
         assert_eq!(call.step, 1);
         assert_eq!(
-            serde_json::to_value(&call.api).unwrap(),
+            serde_json::to_value(api_of(&call)).unwrap(),
             json!({
                 "provider": "google",
                 "account": "alice@example.com",
@@ -3737,13 +3722,13 @@ mod tests {
         let state = read_state(json!({ "id": "m1" }));
         let (row, call) = follow(&state, answered(&state, cut_read(json!(300000))));
         assert_eq!(call.step, STRUCTURE_STEP);
-        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m1");
+        assert_eq!(api_of(&call).path, "/gmail/v1/users/me/messages/m1");
         assert_eq!(
-            call.api.query["format"],
+            api_of(&call).query["format"],
             QueryValue::One("full".to_string())
         );
         assert_eq!(
-            call.api.query["fields"],
+            api_of(&call).query["fields"],
             QueryValue::One(
                 "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(partId,\
                  mimeType,filename,headers,body(size,attachmentId),parts(partId,mimeType,\
@@ -3796,7 +3781,7 @@ mod tests {
         let (row, call) = follow(&state, answered(&state, nested("internal", refusal)));
         assert_eq!(call.step, STRUCTURE_STEP);
         assert_eq!(
-            call.api.query["fields"],
+            api_of(&call).query["fields"],
             QueryValue::One(structure_fields())
         );
         let answer = completed(answered(&row, http(200, STRUCTURE)));
@@ -3894,7 +3879,7 @@ mod tests {
         .unwrap();
         assert_eq!(call.step, 1);
         assert_eq!(
-            serde_json::to_value(&call.api).unwrap(),
+            serde_json::to_value(api_of(&call)).unwrap(),
             json!({
                 "provider": "google",
                 "account": "alice@example.com",
@@ -3941,7 +3926,7 @@ mod tests {
         let state = thread_state(json!({ "id": "t1", "account": "alice@example.com" }));
         let (row, call) = follow(&state, answered(&state, http(200, THREAD)));
         assert_eq!(call.step, LABELS_STEP);
-        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(api_of(&call).account.as_deref(), Some("alice@example.com"));
         let names = r#"{ "labels": [{ "id": "Label_7", "name": "Projects" }] }"#;
         assert_eq!(
             completed(answered(&row, http(200, names))),
@@ -4141,7 +4126,7 @@ mod tests {
             let (row, call) = follow(&state, answered(&state, outcome));
             assert_eq!(call.step, THREAD_NARROW_STEP);
             assert_eq!(
-                serde_json::to_value(&call.api).unwrap(),
+                serde_json::to_value(api_of(&call)).unwrap(),
                 json!({
                     "provider": "google",
                     "account": "alice@example.com",
@@ -4167,7 +4152,10 @@ mod tests {
             });
             let (named_row, names_call) = follow(&row, answered(&row, http(200, &narrow)));
             assert_eq!(names_call.step, LABELS_STEP);
-            assert_eq!(names_call.api.account.as_deref(), Some("alice@example.com"));
+            assert_eq!(
+                api_of(&names_call).account.as_deref(),
+                Some("alice@example.com")
+            );
             let names = r#"{ "labels": [{ "id": "Label_7", "name": "Projects" }] }"#;
             let answer = completed(answered(&named_row, http(200, names)));
             assert_eq!(answer["recipients_omitted"], json!(why));
@@ -4329,18 +4317,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(call.step, 1);
-        assert_eq!(call.api.method, "GET");
-        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m1");
+        assert_eq!(api_of(&call).method, "GET");
+        assert_eq!(api_of(&call).path, "/gmail/v1/users/me/messages/m1");
         assert_eq!(
-            call.api.query,
+            api_of(&call).query,
             query([
                 ("format", "full".to_string()),
                 ("fields", part_tree_fields()),
                 ("prettyPrint", "false".to_string()),
             ])
         );
-        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
-        assert_eq!(call.api.response_attachment, None);
+        assert_eq!(api_of(&call).account.as_deref(), Some("alice@example.com"));
+        assert_eq!(api_of(&call).response_attachment, None);
     }
 
     #[test]
@@ -4349,14 +4337,14 @@ mod tests {
             panic!("the part was not fetched");
         };
         assert_eq!(call.step, FETCH_STEP);
-        assert_eq!(call.api.method, "GET");
+        assert_eq!(api_of(&call).method, "GET");
         assert_eq!(
-            call.api.path,
+            api_of(&call).path,
             "/gmail/v1/users/me/messages/m1/attachments/ANGjdJ8"
         );
-        assert_eq!(call.api.query, fields_free_query());
-        assert_eq!(call.api.body, None);
-        assert_eq!(call.api.response_attachment.as_deref(), Some("body"));
+        assert_eq!(api_of(&call).query, fields_free_query());
+        assert_eq!(api_of(&call).body, None);
+        assert_eq!(api_of(&call).response_attachment.as_deref(), Some("body"));
         assert_eq!(
             Value::Object(derived),
             json!({ "filename": "report.pdf", "mime_type": "application/pdf", "size": 3 })
@@ -4525,7 +4513,7 @@ mod tests {
         )
         .unwrap();
         let fetch = host.take_calls().remove(0);
-        assert_eq!(fetch.call.response_attachment.as_deref(), Some("body"));
+        assert_eq!(fetch.api().response_attachment.as_deref(), Some("body"));
         let size = encoded.len() as u64;
         let answer = host.seed_result(&fetch.call_id, "body", "application/json", encoded);
         host.activate::<GmailReads>(
@@ -4810,7 +4798,7 @@ mod tests {
         )
         .unwrap();
         let read = host.take_calls().remove(0);
-        assert_eq!(read.call.response_attachment.as_deref(), Some("body"));
+        assert_eq!(read.api().response_attachment.as_deref(), Some("body"));
         let size = encoded.len() as u64;
         let answer = host.seed_result(&read.call_id, "body", "application/json", encoded);
         host.activate::<GmailReads>(
@@ -4868,18 +4856,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(call.step, 1);
-        assert_eq!(call.api.method, "GET");
-        assert_eq!(call.api.path, "/gmail/v1/users/me/messages/m1");
+        assert_eq!(api_of(&call).method, "GET");
+        assert_eq!(api_of(&call).path, "/gmail/v1/users/me/messages/m1");
         assert_eq!(
-            call.api.query,
+            api_of(&call).query,
             query([
                 ("format", "full".to_string()),
                 ("prettyPrint", "false".to_string()),
             ])
         );
-        assert_eq!(call.api.body, None);
-        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
-        assert_eq!(call.api.response_attachment.as_deref(), Some("body"));
+        assert_eq!(api_of(&call).body, None);
+        assert_eq!(api_of(&call).account.as_deref(), Some("alice@example.com"));
+        assert_eq!(api_of(&call).response_attachment.as_deref(), Some("body"));
     }
 
     #[test]
@@ -5772,7 +5760,7 @@ mod tests {
                         assert!(step < SEARCH_LAST_GET, "{step}");
                         assert_eq!(call.step, step + 1);
                         assert_eq!(
-                            call.api.path,
+                            api_of(&call).path,
                             format!("/gmail/v1/users/me/messages/{}", ids[index + 1])
                         );
                         assert_eq!(derived["unavailable"], entry);

@@ -174,14 +174,11 @@ pub fn plan(
             files(attachments)?;
             let account = draft.account.as_deref();
             Ok(match &draft.reply_to_id {
-                Some(id) => Call {
-                    step: DRAFT_ORIGINAL_STEP,
-                    api: draft_original_call(id, account, settings),
-                },
-                None => Call {
-                    step: DRAFT_CREATE_STEP,
-                    api: upload_call(account, false, settings),
-                },
+                Some(id) => Call::api(
+                    DRAFT_ORIGINAL_STEP,
+                    draft_original_call(id, account, settings),
+                ),
+                None => Call::api(DRAFT_CREATE_STEP, upload_call(account, false, settings)),
             })
         }
     }
@@ -497,10 +494,10 @@ fn draft_reply(state: &InFlight, body: &Value, settings: &Settings) -> Result<Ne
         );
     }
     Ok(Next::Call {
-        call: Call {
-            step: DRAFT_CREATE_STEP,
-            api: upload_call(args.account.as_deref(), true, settings),
-        },
+        call: Call::api(
+            DRAFT_CREATE_STEP,
+            upload_call(args.account.as_deref(), true, settings),
+        ),
         derived,
     })
 }
@@ -578,7 +575,11 @@ fn compact_draft(body: &Value, derived: &Args) -> Result<Value, Failure> {
 /// issue its next step. Every answer completed here is held to the result
 /// ceiling; a relayed credential answer is `api-request`'s own and is not.
 pub fn advance(state: &InFlight, outcome: Result<Value, NestedError>, settings: &Settings) -> Next {
-    let body = match read_api_result(outcome, &state.target, google::API_NAME) {
+    let body = match state
+        .target
+        .api()
+        .and_then(|target| read_api_result(outcome, target, google::API_NAME))
+    {
         Ok(Answer::Body(body)) => body,
         Ok(Answer::NoBody { status }) => return settle(state.tool, no_body(state, status)),
         Ok(Answer::Relay(value)) => return Next::Complete(value),
@@ -678,7 +679,9 @@ mod tests {
         admits_characters, cut_read, description, escaped_widest, follow, four_byte, lookup,
         no_body_parts, wide,
     };
-    use brenn_provider_kit::testutil::{Answered, MemoryHost, failure, google, http, nested};
+    use brenn_provider_kit::testutil::{
+        Answered, MemoryHost, api_of, failure, google, http, nested,
+    };
     use brenn_provider_kit::{
         BUILD_BUDGET, Bound, Delivered, Input, Probes, QueryValue, Request, ToolBounds, WriteError,
         check, hold_probes, hold_required, input_schema, internal, probes,
@@ -711,7 +714,7 @@ mod tests {
     fn draft(args: Value) -> Result<ApiCall, String> {
         plan(Provided::GmailDraft, &args, &[], &settings()).map(|call| {
             assert_eq!(call.step, DRAFT_CREATE_STEP);
-            call.api
+            api_of(&call).clone()
         })
     }
 
@@ -764,7 +767,11 @@ mod tests {
         assert_eq!(call.step, DRAFT_CREATE_STEP);
         let (thread, message) = uploaded(&built(&state.args, &derived, &call, &[]));
         assert_eq!(thread.as_deref(), Some("t1"));
-        (call.api, String::from_utf8(message).unwrap(), derived)
+        (
+            api_of(&call).clone(),
+            String::from_utf8(message).unwrap(),
+            derived,
+        )
     }
 
     /// A file the request attaches: its name, content type and bytes.
@@ -829,7 +836,7 @@ mod tests {
         assert_eq!(call.step, DRAFT_CREATE_STEP);
         let (thread, message) = uploaded(&built(&args, &Args::new(), &call, files));
         assert_eq!(thread, None, "a new draft names no thread");
-        (call.api, String::from_utf8(message).unwrap())
+        (api_of(&call).clone(), String::from_utf8(message).unwrap())
     }
 
     const RELATED_OPEN: &str =
@@ -1080,7 +1087,7 @@ mod tests {
             QueryValue::One("false".to_string()),
         );
         assert_eq!(
-            read.api,
+            api_of(&read).clone(),
             ApiCall {
                 provider: "google".to_string(),
                 account: Some("alice@example.com".to_string()),
@@ -1102,14 +1109,14 @@ mod tests {
             panic!("a reply uploads after its read");
         };
         assert_eq!(call.step, DRAFT_CREATE_STEP);
-        assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.path, DRAFTS_UPLOAD_PATH);
-        assert_eq!(call.api.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(api_of(&call).method, "POST");
+        assert_eq!(api_of(&call).path, DRAFTS_UPLOAD_PATH);
+        assert_eq!(api_of(&call).account.as_deref(), Some("alice@example.com"));
         assert_eq!(
-            call.api.query.get("uploadType"),
+            api_of(&call).query.get("uploadType"),
             Some(&QueryValue::One("multipart".to_string()))
         );
-        assert_eq!(call.api.body, Some(Body::Built));
+        assert_eq!(api_of(&call).body, Some(Body::Built));
         assert_eq!(
             derived,
             json!({
@@ -1459,13 +1466,16 @@ mod tests {
             );
         }
         let state = reply_state(json!({}));
-        assert_eq!(state.target.method, "GET");
-        assert_eq!(state.target.path, format!("{MESSAGES_PATH}/m0"));
-        let (row, call) = follow(&state, answered(&state, original(&[])));
-        assert_eq!(call.api.method, "POST");
-        assert_eq!(call.api.path, DRAFTS_UPLOAD_PATH);
+        assert_eq!(state.target.api().unwrap().method, "GET");
         assert_eq!(
-            call.api.query.keys().collect::<Vec<_>>(),
+            state.target.api().unwrap().path,
+            format!("{MESSAGES_PATH}/m0")
+        );
+        let (row, call) = follow(&state, answered(&state, original(&[])));
+        assert_eq!(api_of(&call).method, "POST");
+        assert_eq!(api_of(&call).path, DRAFTS_UPLOAD_PATH);
+        assert_eq!(
+            api_of(&call).query.keys().collect::<Vec<_>>(),
             ["prettyPrint", "uploadType"]
         );
         // Every answer to the `POST` completes or fails; none issues a call.
@@ -2134,7 +2144,7 @@ mod tests {
         assert_eq!(drained.len(), 1);
         let upload = &drained[0];
         assert_eq!(upload.id, ids[BUILD_BUDGET]);
-        assert_eq!(upload.call.path, DRAFTS_UPLOAD_PATH);
+        assert_eq!(upload.api().path, DRAFTS_UPLOAD_PATH);
         let (_, body) = upload.body.clone().expect("the upload carries its body");
         let (thread, message) = uploaded(&(upload.body_content_type.clone().unwrap(), body));
         assert_eq!(thread.as_deref(), Some("t1"));
@@ -2303,10 +2313,7 @@ mod tests {
                 file(&name, &content_type, bytes(1_000 + i, i))
             })
             .collect();
-        let call = Call {
-            step: DRAFT_CREATE_STEP,
-            api: upload_call(None, true, &settings()),
-        };
+        let call = Call::api(DRAFT_CREATE_STEP, upload_call(None, true, &settings()));
         let upload = built(&args, &derived, &call, &files);
         let text = String::from_utf8(upload.1.clone()).unwrap();
         for line in text.split("\r\n") {
@@ -2401,10 +2408,7 @@ mod tests {
         // A reply's upload whose row lacks the thread is not one this build
         // wrote.
         let queued = Queued {
-            call: Call {
-                step: DRAFT_CREATE_STEP,
-                api: upload_call(None, true, &settings()),
-            },
+            call: Call::api(DRAFT_CREATE_STEP, upload_call(None, true, &settings())),
             ..queued
         };
         assert_eq!(
@@ -2432,10 +2436,7 @@ mod tests {
             tool: Provided::GmailDraft,
             args: state.args.clone(),
             derived: derived.clone(),
-            call: Call {
-                step: DRAFT_CREATE_STEP,
-                api: upload_call(None, true, &settings()),
-            },
+            call: Call::api(DRAFT_CREATE_STEP, upload_call(None, true, &settings())),
             received_at_ms: 0,
             queued_at_ms: 0,
             attachments: Vec::new(),

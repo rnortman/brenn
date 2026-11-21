@@ -16,9 +16,10 @@
 //! against the IPv4 rules. **Teredo** (`2001::/32`) and **6to4** (`2002::/16`) are
 //! blocked outright because they tunnel arbitrary IPv4 addresses inside IPv6 literals.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use brenn_lib::pwa_push::config::EndpointPolicy;
+use brenn_lib::special_address::{is_special_purpose, is_special_use_name};
 use url::Host;
 
 /// Reason an endpoint URL was rejected.
@@ -111,15 +112,10 @@ pub fn validate_endpoint(
     // Rules 4 & 5: host-based checks.
     match &host {
         Host::Ipv4(v4) => {
-            check_ipv4(*v4)?;
+            reject_special(IpAddr::V4(*v4))?;
         }
         Host::Ipv6(v6) => {
-            // IPv4-mapped IPv6 (::ffff:a.b.c.d): unwrap and re-check as IPv4.
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                check_ipv4(v4)?;
-            } else {
-                check_ipv6(*v6)?;
-            }
+            reject_special(IpAddr::V6(*v6))?;
         }
         Host::Domain(name) => {
             check_domain(name)?;
@@ -148,175 +144,26 @@ pub fn validate_endpoint(
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Reject IPv4 addresses in any IANA special-purpose range.
-///
-/// Uses both the explicit CIDR table (for ranges not yet stabilised as
-/// `std::net::Ipv4Addr` predicates) and every stable std predicate.
-fn check_ipv4(addr: Ipv4Addr) -> Result<(), RejectReason> {
-    // Stable std predicates.
-    if addr.is_unspecified()
-        || addr.is_loopback()
-        || addr.is_private()
-        || addr.is_link_local()
-        || addr.is_multicast()
-        || addr.is_broadcast()
-        || addr.is_documentation()
-    {
-        return Err(RejectReason::PrivateHost);
+/// Reject an IP literal in any IANA special-purpose range, IPv4-mapped IPv6
+/// judged as its IPv4 address.
+fn reject_special(addr: IpAddr) -> Result<(), RejectReason> {
+    if is_special_purpose(addr) {
+        Err(RejectReason::PrivateHost)
+    } else {
+        Ok(())
     }
-
-    // Explicit CIDR table for ranges not yet covered by stable predicates:
-    // (mask, network_bits) — reject if `addr_u32 & mask == network_bits`.
-    //
-    // Sources: IANA IPv4 Special-Purpose Address Registry (RFC 6890 umbrella).
-    //
-    // Ranges already covered by std predicates above (loopback 127/8,
-    // private 10/8 + 172.16/12 + 192.168/16, link-local 169.254/16,
-    // multicast 224/4, broadcast, documentation) are omitted here.
-    //
-    // Ranges not yet stabilised as predicates:
-    //  - "this network":       0.0.0.0/8     (is_unspecified covers 0.0.0.0/32 only)
-    //  - CGNAT shared:         100.64.0.0/10 (is_shared — unstable)
-    //  - IETF protocol assign: 192.0.0.0/24  (partial overlap with documentation)
-    //  - Benchmarking:         198.18.0.0/15 (is_benchmarking — unstable)
-    //  - Reserved class E:     240.0.0.0/4   (is_reserved — unstable)
-    //
-    // All documentation ranges are caught by is_documentation() (stable since
-    // Rust 1.67): 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24.
-    static IPV4_CIDR_TABLE: &[(u32, u32)] = &[
-        // (mask, network_bits) — reject if `addr_u32 & mask == network_bits`.
-        // "this network": 0.0.0.0/8 (RFC 1122); is_unspecified() covers only
-        // 0.0.0.0/32 — the /8 block here is deliberate to cover the full range.
-        (0xFF00_0000, 0x0000_0000),
-        // CGNAT shared address space: 100.64.0.0/10
-        (0xFFC0_0000, 0x6440_0000),
-        // IETF protocol assignments: 192.0.0.0/24
-        (0xFFFF_FF00, 0xC000_0000),
-        // Benchmarking: 198.18.0.0/15
-        (0xFFFE_0000, 0xC612_0000),
-        // Reserved (class E): 240.0.0.0/4
-        (0xF000_0000, 0xF000_0000),
-    ];
-
-    let addr_u32 = u32::from(addr);
-    for &(mask, net) in IPV4_CIDR_TABLE {
-        if addr_u32 & mask == net {
-            return Err(RejectReason::PrivateHost);
-        }
-    }
-
-    Ok(())
 }
 
-/// Reject IPv6 addresses in any IANA special-purpose range.
+/// Reject a DNS name that never denotes a public host.
 ///
-/// IPv4-mapped addresses (`::ffff:0:0/96`) are handled by the caller via
-/// `to_ipv4_mapped()` before this function is reached — this function must
-/// not be called with a mapped address.
-fn check_ipv6(addr: Ipv6Addr) -> Result<(), RejectReason> {
-    // Stable std predicates.
-    if addr.is_unspecified() || addr.is_loopback() || addr.is_multicast() {
-        return Err(RejectReason::PrivateHost);
-    }
-
-    // Explicit CIDR table for IPv6 special-purpose ranges.
-    // Each entry: (128-bit prefix as u128, prefix_len in bits).
-    // Reject if `addr_u128 >> (128 - prefix_len) == prefix_bits`.
-    //
-    // Sources: IANA IPv6 Special-Purpose Address Registry (RFC 6890 et al.).
-    //
-    // Ranges already covered by stable predicates (unspecified ::/128,
-    // loopback ::1/128, multicast ff00::/8) are omitted.
-    static IPV6_CIDR_TABLE: &[(u128, u32)] = &[
-        // NAT64 translation: 64:ff9b::/96
-        (0x0064_ff9b_0000_0000_0000_0000_0000_0000u128, 96),
-        // NAT64 translation local-use: 64:ff9b:1::/48
-        (0x0064_ff9b_0001_0000_0000_0000_0000_0000u128, 48),
-        // Discard-only: 100::/64
-        (0x0100_0000_0000_0000_0000_0000_0000_0000u128, 64),
-        // IETF protocol assignments: 2001::/23 covers 2001:0000:: – 2001:01ff::
-        // This catches Teredo (2001::/32) and benchmarking (2001:2::/48).
-        (0x2001_0000_0000_0000_0000_0000_0000_0000u128, 23),
-        // Documentation: 2001:db8::/32 (NOT inside 2001::/23; must be explicit)
-        (0x2001_0db8_0000_0000_0000_0000_0000_0000u128, 32),
-        // 6to4: 2002::/16
-        (0x2002_0000_0000_0000_0000_0000_0000_0000u128, 16),
-        // Documentation: 3fff::/20
-        (0x3fff_0000_0000_0000_0000_0000_0000_0000u128, 20),
-        // Unique-local: fc00::/7
-        (0xfc00_0000_0000_0000_0000_0000_0000_0000u128, 7),
-        // Link-local unicast: fe80::/10
-        (0xfe80_0000_0000_0000_0000_0000_0000_0000u128, 10),
-    ];
-
-    let addr_u128 = u128::from(addr);
-    for &(prefix, prefix_len) in IPV6_CIDR_TABLE {
-        let shift = 128u32.saturating_sub(prefix_len);
-        if addr_u128 >> shift == prefix >> shift {
-            return Err(RejectReason::PrivateHost);
-        }
-    }
-
-    Ok(())
-}
-
-/// Reject local-domain DNS names: `localhost` (case-insensitive exact),
-/// any name ending in `.localhost`, `local` (bare mDNS TLD), or any name
-/// ending in `.local`.
-///
-/// Note: this check runs **before** the allowlist. A host in the allowlist
-/// that ends in `.local` or equals `localhost` is still rejected here.
-/// In practice this is not a problem because `.local` is an mDNS-reserved
-/// TLD (RFC 6762) and `localhost` is reserved by RFC 6761 — neither can
-/// appear as a legitimate push service hostname.
+/// This runs **before** the allowlist, so a listed host under such a name is
+/// still rejected; no push service lives under one.
 fn check_domain(name: &str) -> Result<(), RejectReason> {
-    // WHATWG URL (used by the url crate) normalizes host to ASCII via IDNA,
-    // so the domain is already ASCII. Use ASCII-aware case-insensitive
-    // comparisons to avoid heap-allocating a lowercased String on every call.
-    //
-    // Strip a trailing dot first: `localhost.` has a dot and passes the
-    // single-label guard, but ends_with_label misses it because the boundary
-    // check requires the byte *before* the suffix to be '.'. Trimming one
-    // trailing dot (the FQDN-absolute form, not meaningful for push endpoints)
-    // collapses the bypass to the forms already covered below.
-    let name = name.trim_end_matches('.');
-
-    let ends_with_label = |suffix: &str| -> bool {
-        name.len() > suffix.len()
-            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-            && name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
-    };
-
-    // Single-label hostnames (no dot) are never valid push endpoint FQDNs.
-    // This blocks `ip6-localhost`, `ip6-loopback`, `intranet`, and any other
-    // bare hostname that could resolve to a private address via /etc/hosts.
-    if !name.contains('.') {
-        return Err(RejectReason::PrivateHost);
+    if is_special_use_name(name) {
+        Err(RejectReason::PrivateHost)
+    } else {
+        Ok(())
     }
-
-    // Block known private / local TLDs and specific hostnames.
-    //
-    // NOTE: `ends_with_label` only matches `*.suffix` (requires a dot before
-    // the suffix). It does NOT match the bare name `suffix` itself (e.g., bare
-    // "local" or "localhost"). That case is handled by the single-label guard
-    // above, which rejects any name without a dot. The two guards are
-    // complementary: single-label guard covers exact matches; ends_with_label
-    // covers subdomain matches. If the single-label guard were ever removed,
-    // bare blocked TLDs would slip through.
-    if ends_with_label("localhost")
-        || ends_with_label("local")
-        || ends_with_label("home.arpa")
-        || ends_with_label("lan")
-        || ends_with_label("internal")
-        || ends_with_label("corp")
-        || ends_with_label("intranet")
-        || ends_with_label("private")
-        || ends_with_label("localdomain")
-    {
-        return Err(RejectReason::PrivateHost);
-    }
-
-    Ok(())
 }
 
 /// Allowlist check.

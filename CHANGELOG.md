@@ -4,6 +4,50 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **A new tool, `one-click-unsubscribe`, sends the RFC 8058 one-click
+  unsubscribe request.** Called with an `https` URL, it sends one `POST` with
+  the body `List-Unsubscribe=One-Click` and no credential or cookie, follows no
+  redirect, reads no response body, and answers the status, or `unreachable`
+  when nothing answered within 30 seconds, each with the host it parsed and
+  dialled. A URL whose host is not a public
+  address — a special-purpose IP literal, a reserved name, or a name that
+  resolves only to special-purpose addresses — is refused `denied` and nothing
+  is sent. The tool is always registered, takes no `allow` clause and is for
+  WASM components: a call from any other caller is refused `denied`.
+  - **For operators:** an instance holding the grant can make Brenn send a
+    fixed-body `POST` to any public `https` URL of up to 2,048 bytes; Brenn
+    cannot check where the URL came from, and the URL can carry whatever the
+    grantee puts in it. Grant it only to a component trusted with outbound
+    data, and always with a `rate_limit`. A component's call has no approval
+    step, so the grant is the authorization. Each refused destination writes a
+    `ssrf_attempt` security line attributed to the caller (no `ip`, so
+    fail2ban ignores it) and raises a `Warning` phone alert naming the caller
+    and the host; the host usually comes from a message a third party sent.
+    An `unreachable` call's log line carries the cause: resolution,
+    connection, TLS or timeout.
+- **A provider component can call a tool other than `api-request`.** A
+  provider built on `brenn-provider-kit` returns `Call::tool(step, tool, args)`
+  to call any tool its instance is granted, such as `one-click-unsubscribe`;
+  the call is issued, backlogged and answered as an `api-request` call is, and
+  the step reads the tool's answer value itself. Such a call carries no
+  attachment. A refused call's failure names the tool and the grant it needs.
+  - **BREAKING for authors using `brenn-provider-kit`:** `Call.api` is
+    `Call.request`, a `Nested` — `Nested::Api(ApiCall)` or
+    `Nested::Tool(ToolCall { tool, args })`; `Call::api(step, api)` builds the
+    old shape. `InFlight.target` is an `Outstanding` —
+    `Outstanding::Api(Target)` or `Outstanding::Tool(name)` — and a step hands
+    the `read_api_*` readers `state.target.api()?`, which fails `internal` for
+    a call to another tool. `Host::call` takes `&Nested`. In `testutil`,
+    `NestedCall.call` is `NestedCall.request`, read as an `api-request` call
+    with `NestedCall::api()`; `api_of(&call)` reads a `Call`'s; and
+    `unsubscribe_status(host, status)` and `unsubscribe_unreachable(host)` fake
+    `one-click-unsubscribe`'s answers. A backlog or in-flight row written
+    before the cut does not parse after it, and none is read: no request
+    survives the restart an upgrade is, and the kit deletes the rows of a
+    request no longer pending unread. When every call an activation could issue was
+    refused, the backlog's failure now reads "the host refused every call …"
+    where it read "api-request refused every call …".
+
 ## [0.37.0] — 2026-11-21
 
 Bytes move as blobs end to end: Gmail bodies, draft attachments and calendar

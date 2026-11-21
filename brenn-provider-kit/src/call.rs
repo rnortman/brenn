@@ -1,11 +1,13 @@
-//! A request's error answer, a nested `api-request` call's arguments, and what
-//! a request does next.
+//! A request's error answer, a nested call's arguments — an `api-request`
+//! call or a call to another tool — and what a request does next.
 
 use std::collections::BTreeMap;
 
 use base64ct::{Base64, Encoding};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::activation::NESTED_TOOL;
 
 /// The error kinds a request is answered with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,12 +223,103 @@ impl ApiCall {
     }
 }
 
-/// A nested call to issue: the request's step it is, and its arguments.
+/// A call to a tool other than `api-request` that the instance is granted:
+/// the tool's registry name and its arguments, sent as they are. It carries
+/// no attachment and asks for none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCall {
+    pub tool: String,
+    pub args: Value,
+}
+
+/// What a nested call asks of which tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Nested {
+    /// An `api-request` call.
+    Api(ApiCall),
+    /// A call to another tool the instance is granted.
+    Tool(ToolCall),
+}
+
+impl Nested {
+    /// The registry name of the tool the call reaches.
+    pub fn tool(&self) -> &str {
+        match self {
+            Nested::Api(_) => NESTED_TOOL,
+            Nested::Tool(call) => &call.tool,
+        }
+    }
+
+    /// The `api-request` call's arguments; `None` for a call to another tool.
+    pub fn api(&self) -> Option<&ApiCall> {
+        match self {
+            Nested::Api(api) => Some(api),
+            Nested::Tool(_) => None,
+        }
+    }
+
+    /// What the messages about this call name it by.
+    pub fn target(&self) -> Outstanding {
+        match self {
+            Nested::Api(api) => Outstanding::Api(api.target()),
+            Nested::Tool(call) => Outstanding::Tool(call.tool.clone()),
+        }
+    }
+}
+
+/// The nested call a request has outstanding, for the messages that name it:
+/// an `api-request` call's method, host and path, or another tool's name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Outstanding {
+    Api(Target),
+    Tool(String),
+}
+
+impl Outstanding {
+    /// The `api-request` call's target, which the `read_api_*` readers take;
+    /// `internal` when the outstanding call reached another tool, whose
+    /// answer is not `api-request`'s envelope.
+    pub fn api(&self) -> Result<&Target, Failure> {
+        match self {
+            Outstanding::Api(target) => Ok(target),
+            Outstanding::Tool(tool) => Err(internal(format!(
+                "the outstanding call reached `{tool}`, whose answer is not api-request's"
+            ))),
+        }
+    }
+}
+
+/// A nested call to issue: the request's step it is, and what it asks of
+/// which tool.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Call {
     pub step: u8,
-    pub api: ApiCall,
+    pub request: Nested,
+}
+
+impl Call {
+    /// Step `step` as the `api-request` call `api`.
+    pub fn api(step: u8, api: ApiCall) -> Call {
+        Call {
+            step,
+            request: Nested::Api(api),
+        }
+    }
+
+    /// Step `step` as a call to `tool` with `args`.
+    pub fn tool(step: u8, tool: impl Into<String>, args: Value) -> Call {
+        Call {
+            step,
+            request: Nested::Tool(ToolCall {
+                tool: tool.into(),
+                args,
+            }),
+        }
+    }
 }
 
 /// What a request does next after its nested call answered.
@@ -348,7 +441,7 @@ mod tests {
         let mut bytes = bare();
         bytes.body = Some(Body::Bytes(vec![0, 1, 2, 0xff]));
         for api in [bare(), full, bytes] {
-            let call = Call { step: 2, api };
+            let call = Call::api(2, api);
             let wire = serde_json::to_vec(&call).unwrap();
             assert_eq!(serde_json::from_slice::<Call>(&wire).unwrap(), call);
         }
@@ -397,7 +490,11 @@ mod tests {
 
     #[test]
     fn a_call_with_a_field_this_build_does_not_write_does_not_parse() {
-        let wire = json!({ "step": 1, "api": serde_json::to_value(bare()).unwrap(), "port": 1 });
+        let wire = json!({
+            "step": 1,
+            "request": { "api": serde_json::to_value(bare()).unwrap() },
+            "port": 1,
+        });
         assert!(serde_json::from_value::<Call>(wire).is_err());
         let mut api = serde_json::to_value(bare()).unwrap();
         api["port"] = json!(443);
@@ -420,10 +517,7 @@ mod tests {
                 "body_built": true,
             })
         );
-        let call = Call {
-            step: 3,
-            api: built,
-        };
+        let call = Call::api(3, built);
         let stored = serde_json::to_vec(&call).unwrap();
         assert_eq!(serde_json::from_slice::<Call>(&stored).unwrap(), call);
         for other in [
@@ -452,6 +546,72 @@ mod tests {
                 host: "maps.example.com".to_string(),
                 path: "/v1/places".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn a_stored_call_names_which_tool_it_reaches() {
+        assert_eq!(
+            serde_json::to_value(Call::api(1, bare())).unwrap(),
+            json!({
+                "step": 1,
+                "request": { "api": {
+                    "provider": "maps",
+                    "method": "GET",
+                    "host": "maps.example.com",
+                    "path": "/v1/places",
+                } },
+            })
+        );
+        let tool = Call::tool(
+            2,
+            "one-click-unsubscribe",
+            json!({ "url": "https://example.com/u" }),
+        );
+        let wire = serde_json::to_value(&tool).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "step": 2,
+                "request": { "tool": {
+                    "tool": "one-click-unsubscribe",
+                    "args": { "url": "https://example.com/u" },
+                } },
+            })
+        );
+        assert_eq!(serde_json::from_value::<Call>(wire).unwrap(), tool);
+        let mut extra = serde_json::to_value(&tool).unwrap();
+        extra["request"]["tool"]["attachment"] = json!("file");
+        assert!(serde_json::from_value::<Call>(extra).is_err());
+        let both = json!({
+            "step": 1,
+            "request": { "api": serde_json::to_value(bare()).unwrap(), "tool": {
+                "tool": "x", "args": {},
+            } },
+        });
+        assert!(serde_json::from_value::<Call>(both).is_err());
+    }
+
+    #[test]
+    fn a_nested_call_names_its_tool_and_its_target() {
+        let api = Nested::Api(bare());
+        assert_eq!(api.tool(), "api-request");
+        assert_eq!(api.api(), Some(&bare()));
+        assert_eq!(api.target(), Outstanding::Api(bare().target()));
+        assert_eq!(api.target().api(), Ok(&bare().target()));
+        let tool = Call::tool(1, "one-click-unsubscribe", json!({})).request;
+        assert_eq!(tool.tool(), "one-click-unsubscribe");
+        assert_eq!(tool.api(), None);
+        assert_eq!(
+            tool.target(),
+            Outstanding::Tool("one-click-unsubscribe".to_string())
+        );
+        assert_eq!(
+            tool.target().api(),
+            Err(internal(
+                "the outstanding call reached `one-click-unsubscribe`, whose answer is not \
+                 api-request's"
+            ))
         );
     }
 }

@@ -25,6 +25,10 @@ pub enum SecurityEventType {
     /// Also dispatched as a phone alert (see `log_and_alert_security_event`).
     /// The existing fail2ban jail matches on `security_event = true` then
     /// `event_type`; this variant is captured without regex changes.
+    ///
+    /// Also emitted by a tool that sends a request to an address its caller
+    /// names, when that address is not public (`signal_refused_destination`).
+    /// Those lines carry a `caller` and no `ip`: there is no peer to ban.
     SsrfAttempt,
     /// A replay-protection endpoint received a request from one `client_id`
     /// with ≥1024 non-expired nonces in its window — indicates abuse (spam-burst
@@ -359,6 +363,69 @@ pub fn signal_publish_denial(
     dispatcher.alert_once_per_process(AlertSeverity::Warning, title, &dedup_key, body);
 }
 
+/// Why a tool refused the destination its caller named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedDestination {
+    /// The host is an IP literal in a special-purpose range.
+    Literal,
+    /// The host is a name that never denotes a public host, as
+    /// `brenn_lib::special_address::is_special_use_name` decides.
+    ReservedName,
+    /// The host is a name that resolved only to special-purpose addresses.
+    NoPublicAddress,
+}
+
+impl RefusedDestination {
+    /// Short machine-readable code for the log line and the alert body.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Literal => "private_literal",
+            Self::ReservedName => "reserved_name",
+            Self::NoPublicAddress => "no_public_address",
+        }
+    }
+}
+
+impl fmt::Display for RefusedDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Emit the signal for a tool that refused to send to the host its caller
+/// named: one `security_event = true` line attributed to `caller` (no `ip`, so
+/// fail2ban never matches it) and a `Warning` phone alert, on every
+/// occurrence. `host` is the destination URL's host and nothing else of it; it
+/// came in the caller's argument, often from a third party, and is sanitized
+/// here before it reaches the log or the alert.
+pub fn signal_refused_destination(
+    dispatcher: &AlertDispatcher,
+    caller: &str,
+    tool: &str,
+    host: &str,
+    reason: RefusedDestination,
+) {
+    let event_type = SecurityEventType::SsrfAttempt;
+    let safe_host = sanitize_untrusted_str(host, MAX_LOGGED_UNTRUSTED_BYTES);
+    let detail = format!("tool={tool} host={safe_host} reason={reason}");
+    tracing::warn!(
+        security_event = true,
+        event_type = %event_type,
+        caller,
+        detail = %detail,
+        "tool security event"
+    );
+    let title = format!("Security: {event_type}");
+    let body = format!(
+        "{caller} called {tool} with a URL whose host is not a public address: \
+         host={safe_host} reason={reason}. Nothing was sent.\n\
+         The URL came in the caller's argument. A caller can pass on an address \
+         written by a third party, such as a link in a message it was asked to \
+         act on."
+    );
+    dispatcher.alert(AlertSeverity::Warning, title, body);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,5 +665,104 @@ mod tests {
                 "log detail should carry the truncated (sanitized) address"
             );
         }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn refused_destination_logs_one_caller_line_without_ip_and_alerts_warning() {
+        let (dispatcher, captured, handle) =
+            crate::alerting::make_capturing_alerter_with_severity();
+        signal_refused_destination(
+            &dispatcher,
+            "wasm:mail-write",
+            "one-click-unsubscribe",
+            "intranet.example.com",
+            RefusedDestination::NoPublicAddress,
+        );
+        drop(dispatcher);
+        handle.await.unwrap();
+        logs_assert(|lines: &[&str]| {
+            let ours: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("tool security event"))
+                .collect();
+            if ours.len() != 1 {
+                return Err(format!("expected one line, got {ours:?}"));
+            }
+            let line = ours[0];
+            for want in [
+                "security_event=true",
+                "event_type=ssrf_attempt",
+                "wasm:mail-write",
+                "tool=one-click-unsubscribe host=intranet.example.com reason=no_public_address",
+            ] {
+                if !line.contains(want) {
+                    return Err(format!("{want:?} missing from {line}"));
+                }
+            }
+            if line.contains(" ip=") {
+                return Err(format!("the line carries an ip field: {line}"));
+            }
+            Ok(())
+        });
+        let alerts = captured.lock().unwrap();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        let (severity, title, body) = &alerts[0];
+        assert!(matches!(severity, AlertSeverity::Warning), "{severity:?}");
+        assert_eq!(title, "Security: ssrf_attempt");
+        assert!(
+            body.starts_with(
+                "wasm:mail-write called one-click-unsubscribe with a URL whose host is not a \
+                 public address: host=intranet.example.com reason=no_public_address. \
+                 Nothing was sent."
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("The URL came in the caller's argument."),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_destination_alerts_on_every_occurrence() {
+        let (dispatcher, captured, handle) = crate::alerting::make_capturing_alerter();
+        for _ in 0..3 {
+            signal_refused_destination(
+                &dispatcher,
+                "wasm:mail-write",
+                "one-click-unsubscribe",
+                "10.0.0.1",
+                RefusedDestination::Literal,
+            );
+        }
+        drop(dispatcher);
+        handle.await.unwrap();
+        assert_eq!(captured.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn refused_destination_sanitizes_host_in_log_and_alert() {
+        let (dispatcher, captured, handle) = crate::alerting::make_capturing_alerter();
+        let hostile = format!("evil\n\r\texample{}", "A".repeat(1000));
+        signal_refused_destination(
+            &dispatcher,
+            "wasm:mail-write",
+            "one-click-unsubscribe",
+            &hostile,
+            RefusedDestination::ReservedName,
+        );
+        drop(dispatcher);
+        handle.await.unwrap();
+        let safe = sanitize_untrusted_str(&hostile, MAX_LOGGED_UNTRUSTED_BYTES);
+        let alerts = captured.lock().unwrap();
+        assert_eq!(alerts.len(), 1);
+        let (_title, body) = &alerts[0];
+        assert!(body.contains(&safe), "{body}");
+        assert!(!body.contains("evil\n"), "{body}");
+        assert!(logs_contain("tool security event"));
+        assert!(logs_contain(TRUNCATION_MARKER));
+        assert!(!logs_contain("evil\n"));
     }
 }

@@ -100,26 +100,27 @@ mod tests {
     use crate::call::{ApiCall, Body, Query, QueryValue, query};
     use crate::fixture::Fixture;
 
+    fn api() -> ApiCall {
+        ApiCall {
+            provider: "example".to_string(),
+            account: None,
+            method: "GET".to_string(),
+            host: "api.example.com".to_string(),
+            path: "/v1/items".to_string(),
+            query: Query::new(),
+            headers: BTreeMap::new(),
+            body: None,
+            response_attachment: None,
+        }
+    }
+
     fn queued(received_at_ms: u64, id: &str) -> Queued<Fixture> {
         Queued {
             id: id.to_string(),
             tool: Fixture::Search,
             args: json!({ "q": "x" }),
             derived: Map::from_iter([("seen".to_string(), json!(3))]),
-            call: Call {
-                step: 2,
-                api: ApiCall {
-                    provider: "example".to_string(),
-                    account: None,
-                    method: "GET".to_string(),
-                    host: "api.example.com".to_string(),
-                    path: "/v1/items".to_string(),
-                    query: Query::new(),
-                    headers: BTreeMap::new(),
-                    body: None,
-                    response_attachment: None,
-                },
-            },
+            call: Call::api(2, api()),
             received_at_ms,
             queued_at_ms: received_at_ms + 500,
             attachments: Vec::new(),
@@ -149,20 +150,30 @@ mod tests {
     #[test]
     fn a_queued_row_round_trips_with_its_whole_call() {
         let bare = queued(1_000, "a");
-        let mut full = queued(1_000, "b");
-        full.call.api.account = Some("alice@example.com".to_string());
-        full.call.api.query = query([("q", "cafe".to_string())]);
-        full.call.api.query.insert(
+        let mut api = api();
+        api.account = Some("alice@example.com".to_string());
+        api.query = query([("q", "cafe".to_string())]);
+        api.query.insert(
             "fields".to_string(),
             QueryValue::Many(vec!["id".to_string()]),
         );
-        full.call
-            .api
-            .headers
+        api.headers
             .insert("X-Field-Mask".to_string(), "id".to_string());
-        full.call.api.method = "POST".to_string();
-        full.call.api.body = Some(Body::Text("{\"a\":1}".to_string()));
-        for row in [bare, full] {
+        api.method = "POST".to_string();
+        api.body = Some(Body::Text("{\"a\":1}".to_string()));
+        let full = Queued {
+            call: Call::api(2, api),
+            ..queued(1_000, "b")
+        };
+        let tool = Queued {
+            call: Call::tool(
+                2,
+                "one-click-unsubscribe",
+                json!({ "url": "https://x.example" }),
+            ),
+            ..queued(1_000, "c")
+        };
+        for row in [bare, full, tool] {
             assert_eq!(Queued::decode(&row.encode()), Ok(row));
         }
     }
@@ -172,8 +183,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(queued(1_000, "a").encode()).unwrap(),
             "{\"id\":\"a\",\"tool\":\"fixture-search\",\"args\":{\"q\":\"x\"},\
-             \"derived\":{\"seen\":3},\"call\":{\"step\":2,\"api\":{\"provider\":\"example\",\
-             \"method\":\"GET\",\"host\":\"api.example.com\",\"path\":\"/v1/items\"}},\
+             \"derived\":{\"seen\":3},\"call\":{\"step\":2,\"request\":{\"api\":{\
+             \"provider\":\"example\",\"method\":\"GET\",\"host\":\"api.example.com\",\
+             \"path\":\"/v1/items\"}}},\
              \"received_at_ms\":1000,\"queued_at_ms\":1500}"
         );
     }
@@ -185,11 +197,15 @@ mod tests {
             size: 5,
             content_type: "text/plain".to_string(),
         };
-        let mut row = queued(1_000, "a");
-        row.call.api.method = "PUT".to_string();
-        row.call.api.body = Some(Body::Attachment("file".to_string()));
-        row.call.api.response_attachment = Some("body".to_string());
-        row.attachments = vec![file.clone()];
+        let mut api = api();
+        api.method = "PUT".to_string();
+        api.body = Some(Body::Attachment("file".to_string()));
+        api.response_attachment = Some("body".to_string());
+        let row = Queued {
+            call: Call::api(2, api),
+            attachments: vec![file.clone()],
+            ..queued(1_000, "a")
+        };
         let text = String::from_utf8(row.encode()).unwrap();
         assert!(text.contains("\"body_attachment\":\"file\""), "{text}");
         assert!(text.contains("\"response_attachment\":\"body\""), "{text}");
@@ -199,12 +215,16 @@ mod tests {
 
     #[test]
     fn a_queued_row_with_a_built_body_holds_no_body_and_round_trips() {
-        let mut row = queued(1_000, "a");
-        row.call.api.method = "PUT".to_string();
-        row.call.api.body = Some(Body::Built);
+        let mut api = api();
+        api.method = "PUT".to_string();
+        api.body = Some(Body::Built);
+        let row = Queued {
+            call: Call::api(2, api),
+            ..queued(1_000, "a")
+        };
         let wire: Value = serde_json::from_slice(&row.encode()).unwrap();
         assert_eq!(
-            wire["call"]["api"],
+            wire["call"]["request"]["api"],
             json!({
                 "provider": "example",
                 "method": "PUT",
@@ -214,7 +234,7 @@ mod tests {
             })
         );
         assert_eq!(Queued::decode(&row.encode()), Ok(row.clone()));
-        assert_eq!(row.in_flight(2_000).target, row.call.api.target());
+        assert_eq!(row.in_flight(2_000).target, row.call.request.target());
     }
 
     #[test]
@@ -225,7 +245,7 @@ mod tests {
         let mut in_call = base.clone();
         in_call["call"]["added_later"] = json!(1);
         let mut in_api = base;
-        in_api["call"]["api"]["added_later"] = json!(1);
+        in_api["call"]["request"]["api"]["added_later"] = json!(1);
         for wire in [top, in_call, in_api] {
             let error = Queued::<Fixture>::decode(&serde_json::to_vec(&wire).unwrap()).unwrap_err();
             assert!(
@@ -296,6 +316,6 @@ mod tests {
         assert_eq!(state.tool, Fixture::Search);
         assert_eq!(state.args, row.args);
         assert_eq!(state.derived, row.derived);
-        assert_eq!(state.target, row.call.api.target());
+        assert_eq!(state.target, row.call.request.target());
     }
 }

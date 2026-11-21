@@ -1,5 +1,5 @@
-//! A provider's activation loop: serving `provide`d tools by nested
-//! `api-request` calls, at most [`CALL_BUDGET`] of them per activation and at
+//! A provider's activation loop: serving `provide`d tools by nested calls —
+//! `api-request`, or another tool the instance is granted — at most [`CALL_BUDGET`] of them per activation and at
 //! most [`BUILD_BUDGET`] with a body the component builds, with the requests
 //! past either budget kept in a backlog that later activations drain as
 //! results free capacity.
@@ -48,7 +48,7 @@ use serde_json::{Map, Value};
 use crate::answer::{NestedError, not_issued, result_summary};
 use crate::backlog::{Queued, parse_key};
 use crate::blob::{Attached, Blob, Blobs, OpenError, Step};
-use crate::call::{ApiCall, BUILT_BODY_ATTACHMENT, Body, Call, ErrorKind, Failure, Next};
+use crate::call::{ApiCall, BUILT_BODY_ATTACHMENT, Body, Call, ErrorKind, Failure, Nested, Next};
 use crate::row::{InFlight, Tool, claim, issued_at_ms, owned_call_id, row_expired};
 
 /// The host's ceiling on a provided-tool call (`PROVIDED_TOOL_CEILING`). The
@@ -112,7 +112,7 @@ pub const INFLIGHT_NS: &str = "inflight";
 /// The store namespace of backlog entries, keyed by [`Queued::key`].
 pub const BACKLOG_NS: &str = "backlog";
 
-/// The tool every nested call reaches.
+/// The tool a [`Nested::Api`] call reaches.
 pub const NESTED_TOOL: &str = "api-request";
 
 /// A namespace's rows as `(key, value)` pairs.
@@ -137,14 +137,15 @@ pub trait Host: Blobs {
     /// Every row of `ns`, ascending by key.
     fn scan(&self, ns: &str) -> Result<Rows, Self::Error>;
 
-    /// Queue the nested `api-request` call `call` serving request `id`,
-    /// correlated by `call_id`, carrying `body` — the attachment named in the
-    /// call's `body_attachment` and its blob — when it has one; `Err` is the
-    /// host's refusal text (the call was not queued).
+    /// Queue the nested call `call` to its tool ([`Nested::tool`]) serving
+    /// request `id`, correlated by `call_id`, carrying `body` — the attachment
+    /// named in an `api-request` call's `body_attachment` and its blob — when
+    /// it has one; `Err` is the host's refusal text (the call was not queued).
+    /// A call to another tool never carries a body.
     fn call(
         &self,
         id: &str,
-        call: &ApiCall,
+        call: &Nested,
         call_id: &str,
         body: Option<(&str, &Blob)>,
     ) -> Result<(), String>;
@@ -327,8 +328,8 @@ struct Run<'a, H: Host, L: Logic> {
     queued: bool,
     /// Whether the drain stopped at an entry it could not issue.
     left_behind: bool,
-    /// The host's text for the latest refused call.
-    last_refusal: Option<String>,
+    /// The tool and the host's text for the latest refused call.
+    last_refusal: Option<(String, String)>,
     /// The detail of the latest failed build.
     last_build_failure: Option<String>,
 }
@@ -543,7 +544,7 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
             Some("the backlog holds an older entry this activation cannot issue".to_string())
         } else if self.attempted >= CALL_BUDGET {
             Some(format!("{CALL_BUDGET} calls attempted this activation"))
-        } else if entry.call.api.body == Some(Body::Built) && self.built >= BUILD_BUDGET {
+        } else if builds(&entry.call) && self.built >= BUILD_BUDGET {
             Some(format!("{BUILD_BUDGET} bodies built this activation"))
         } else {
             None
@@ -621,21 +622,25 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
     /// without an attempt. A built body goes as the call's attachment
     /// [`BUILT_BODY_ATTACHMENT`], named in its `body_attachment`.
     fn issue(&mut self, entry: Queued<L::Tool>) -> Result<(), H::Error> {
-        let (api, body) = match &entry.call.api.body {
-            Some(Body::Attachment(name)) => match self.open_body(&entry, name)? {
-                Ok(blob) => (Cow::Borrowed(&entry.call.api), Some((name.as_str(), blob))),
+        let api = entry.call.request.api();
+        let (request, body) = match api.map(|api| (api, &api.body)) {
+            Some((_, Some(Body::Attachment(name)))) => match self.open_body(&entry, name)? {
+                Ok(blob) => (
+                    Cow::Borrowed(&entry.call.request),
+                    Some((name.as_str(), blob)),
+                ),
                 Err(failure) => {
                     return self
                         .host
                         .complete_err(&entry.id, failure.kind, &failure.detail);
                 }
             },
-            Some(Body::Built) => match self.build(&entry) {
+            Some((api, Some(Body::Built))) => match self.build(&entry) {
                 Ok(blob) => (
-                    Cow::Owned(ApiCall {
+                    Cow::Owned(Nested::Api(ApiCall {
                         body: Some(Body::Attachment(BUILT_BODY_ATTACHMENT.to_string())),
-                        ..entry.call.api.clone()
-                    }),
+                        ..api.clone()
+                    })),
                     Some((BUILT_BODY_ATTACHMENT, blob)),
                 ),
                 Err(failure) => {
@@ -644,33 +649,30 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
                         .complete_err(&entry.id, failure.kind, &failure.detail);
                 }
             },
-            _ => (Cow::Borrowed(&entry.call.api), None),
+            _ => (Cow::Borrowed(&entry.call.request), None),
         };
         self.attempted += 1;
         let state = entry.in_flight(self.now_ms);
         let call_id = state.call_id();
-        let api = api.as_ref();
+        let request = request.as_ref();
         let body = body.as_ref().map(|(name, blob)| (*name, blob));
-        match self.host.call(&entry.id, api, &call_id, body) {
+        match self.host.call(&entry.id, request, &call_id, body) {
             Ok(()) => {
                 self.issued += 1;
+                let what = match request {
+                    Nested::Api(api) => format!("{} {}{}", api.method, api.host, api.path),
+                    Nested::Tool(call) => call.tool.clone(),
+                };
                 self.host.log(
                     Level::Info,
-                    format!(
-                        "{} step {} {} {}{}",
-                        state.tool.name(),
-                        state.step,
-                        api.method,
-                        api.host,
-                        api.path
-                    ),
+                    format!("{} step {} {what}", state.tool.name(), state.step),
                 );
                 self.host
                     .put(INFLIGHT_NS, call_id.as_bytes(), &state.encode())
             }
             Err(refusal) => {
-                let detail = not_issued(&refusal);
-                self.last_refusal = Some(refusal);
+                let detail = not_issued(request.tool(), &refusal);
+                self.last_refusal = Some((request.tool().to_string(), refusal));
                 self.host
                     .complete_err(&entry.id, ErrorKind::Internal, &detail)
             }
@@ -770,10 +772,10 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
     /// was refused, and otherwise the failed builds.
     fn refuse_backlog(&mut self) -> Result<(), H::Error> {
         let detail = match (&self.last_refusal, &self.last_build_failure) {
-            (Some(refusal), _) => format!(
-                "api-request refused every call this activation could issue and none is \
+            (Some((tool, refusal)), _) => format!(
+                "the host refused every call this activation could issue and none is \
                  outstanding; this request was not attempted. {}",
-                not_issued(refusal)
+                not_issued(tool, refusal)
             ),
             (None, Some(failure)) => format!(
                 "this provider could not build the body of any call this activation could \
@@ -825,6 +827,13 @@ impl<H: Host, L: Logic> Run<'_, H, L> {
     }
 }
 
+/// Whether `call`'s body is built by the component when it is issued.
+fn builds(call: &Call) -> bool {
+    call.request
+        .api()
+        .is_some_and(|api| matches!(api.body, Some(Body::Built)))
+}
+
 /// A backlog entry, parsed and checked against its key, or why it is not one.
 fn checked_row<T: Tool>(key: &[u8], bytes: &[u8]) -> Result<Queued<T>, String> {
     let entry = Queued::<T>::decode(bytes)?;
@@ -845,29 +854,33 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::call::{Outstanding, ToolCall};
     use crate::call::{Query, internal};
     use crate::fixture::Fixture;
-    use crate::testutil::{Answered, Completion, MemoryHost, NestedCall};
+    use crate::testutil::{
+        Answered, Completion, MemoryHost, NestedCall, unsubscribe_status, unsubscribe_unreachable,
+    };
 
     /// A two-step-or-more fixture provider: a request's first call reads
     /// `/v1/<tool>/<q>`; an answer carrying `"more": true` advances it one step.
     struct Steps;
 
-    fn call(step: u8, tool: Fixture, q: &str) -> Call {
-        Call {
-            step,
-            api: ApiCall {
-                provider: "example".to_string(),
-                account: None,
-                method: "GET".to_string(),
-                host: "api.example.com".to_string(),
-                path: format!("/v1/{}/{q}", tool.name()),
-                query: Query::new(),
-                headers: BTreeMap::new(),
-                body: None,
-                response_attachment: None,
-            },
+    fn get(tool: Fixture, q: &str) -> ApiCall {
+        ApiCall {
+            provider: "example".to_string(),
+            account: None,
+            method: "GET".to_string(),
+            host: "api.example.com".to_string(),
+            path: format!("/v1/{}/{q}", tool.name()),
+            query: Query::new(),
+            headers: BTreeMap::new(),
+            body: None,
+            response_attachment: None,
         }
+    }
+
+    fn call(step: u8, tool: Fixture, q: &str) -> Call {
+        Call::api(step, get(tool, q))
     }
 
     impl Logic for Steps {
@@ -1266,15 +1279,15 @@ mod tests {
         assert_eq!(answered.len(), 33);
         for (n, (answered_id, kind, detail)) in answered.iter().enumerate().take(32) {
             assert_eq!((*answered_id, *kind), (id(n).as_str(), ErrorKind::Internal));
-            assert_eq!(*detail, not_issued(REFUSAL));
+            assert_eq!(*detail, not_issued(NESTED_TOOL, REFUSAL));
         }
         assert_eq!(answered[32].0, id(32));
         assert_eq!(
             answered[32].2,
             format!(
-                "api-request refused every call this activation could issue and none is \
+                "the host refused every call this activation could issue and none is \
                  outstanding; this request was not attempted. {}",
-                not_issued(REFUSAL)
+                not_issued(NESTED_TOOL, REFUSAL)
             )
         );
     }
@@ -1564,7 +1577,7 @@ mod tests {
             outstanding.extend(host.take_calls());
             for completion in host.take_completions() {
                 if let Answered::Error(_, detail) = &completion.answer {
-                    guard_fired |= detail.starts_with("api-request refused every call");
+                    guard_fired |= detail.starts_with("the host refused every call");
                 }
                 *answered.entry(completion.id).or_default() += 1;
             }
@@ -1600,14 +1613,14 @@ mod tests {
         type Settings = ();
 
         fn plan(tool: Fixture, args: &Value, _: &Step<'_>, _: &()) -> Result<Call, String> {
-            let mut call = call(1, tool, "f");
+            let mut api = get(tool, "f");
             if args.get("put").is_some() {
-                call.api.method = "PUT".to_string();
-                call.api.body = Some(Body::Attachment("file".to_string()));
+                api.method = "PUT".to_string();
+                api.body = Some(Body::Attachment("file".to_string()));
             } else {
-                call.api = call.api.answer_as_attachment();
+                api = api.answer_as_attachment();
             }
-            Ok(call)
+            Ok(Call::api(1, api))
         }
 
         fn advance(
@@ -1617,7 +1630,7 @@ mod tests {
             _: &(),
         ) -> Next {
             let copied = (|| {
-                let answer = crate::answer::read_api_blob(outcome, &state.target, "Example")?;
+                let answer = crate::answer::read_api_blob(outcome, state.target.api()?, "Example")?;
                 let crate::answer::BlobAnswer::Blob { attachment, .. } = answer else {
                     return Ok(None);
                 };
@@ -1681,7 +1694,7 @@ mod tests {
         host.activate::<Files>(&(), input(2, requests(2..3), vec![]))
             .unwrap();
         let get = host.take_calls().remove(0);
-        assert_eq!(get.call.response_attachment.as_deref(), Some("body"));
+        assert_eq!(get.api().response_attachment.as_deref(), Some("body"));
         let answer = host.seed_result(&get.call_id, "body", "text/plain", bytes.clone());
         let delivered = Delivered {
             call_id: get.call_id.clone(),
@@ -1754,7 +1767,7 @@ mod tests {
             second[0].body,
             Some(("file".to_string(), files[CALL_BUDGET].1.clone()))
         );
-        assert_eq!(second[0].call.body, Some(Body::Attachment("file".into())));
+        assert_eq!(second[0].api().body, Some(Body::Attachment("file".into())));
         let row = host
             .rows(INFLIGHT_NS)
             .iter()
@@ -1921,7 +1934,7 @@ mod tests {
         host.activate::<Attacher>(&(), input(0, vec![request], vec![]))
             .unwrap();
         assert_eq!(
-            host.take_calls()[0].call.path,
+            host.take_calls()[0].api().path,
             "/v1/fixture-lookup/n2".to_string()
         );
         let row = InFlight::<Fixture>::decode(&host.rows(INFLIGHT_NS)[0].1).unwrap();
@@ -2003,10 +2016,10 @@ mod tests {
     const BUILT_TYPE: &str = "application/x-built";
 
     fn built_put(step: u8, tool: Fixture) -> Call {
-        let mut call = call(step, tool, "built");
-        call.api.method = "PUT".to_string();
-        call.api.body = Some(Body::Built);
-        call
+        let mut api = get(tool, "built");
+        api.method = "PUT".to_string();
+        api.body = Some(Body::Built);
+        Call::api(step, api)
     }
 
     impl Logic for Builder {
@@ -2100,14 +2113,14 @@ mod tests {
         assert_eq!(call.body, built_body("ababab"));
         assert_eq!(call.body_content_type.as_deref(), Some(BUILT_TYPE));
         assert_eq!(
-            call.call.body,
+            call.api().body,
             Some(Body::Attachment(BUILT_BODY_ATTACHMENT.to_string()))
         );
-        let sent = serde_json::to_value(&call.call).unwrap();
+        let sent = serde_json::to_value(call.api()).unwrap();
         assert_eq!(sent["body_attachment"], json!(BUILT_BODY_ATTACHMENT));
         assert!(sent.get("body_built").is_none(), "{sent}");
         let row = InFlight::<Fixture>::decode(&host.rows(INFLIGHT_NS)[0].1).unwrap();
-        assert_eq!(row.target, built_put(1, Fixture::Lookup).api.target());
+        assert_eq!(row.target, built_put(1, Fixture::Lookup).request.target());
         assert!(host.rows(BACKLOG_NS).is_empty());
         assert_eq!(host.peak_handles(), 1);
     }
@@ -2153,9 +2166,12 @@ mod tests {
         assert_eq!(backlog_ids(&host), [id(BUILD_BUDGET)]);
         let row = &host.rows(BACKLOG_NS)[0].1;
         let wire: Value = serde_json::from_slice(row).unwrap();
-        assert_eq!(wire["call"]["api"]["body_built"], json!(true));
+        assert_eq!(wire["call"]["request"]["api"]["body_built"], json!(true));
         for field in ["body", "body_base64", "body_attachment"] {
-            assert!(wire["call"]["api"].get(field).is_none(), "{wire}");
+            assert!(
+                wire["call"]["request"]["api"].get(field).is_none(),
+                "{wire}"
+            );
         }
         assert!(logged(
             &host,
@@ -2413,9 +2429,9 @@ mod tests {
         assert!(host.rows(BACKLOG_NS).is_empty());
         assert!(host.rows(INFLIGHT_NS).is_empty());
         assert_eq!(host.peak_handles(), 1);
-        let refused = not_issued(REFUSAL);
+        let refused = not_issued(NESTED_TOOL, REFUSAL);
         let guard = format!(
-            "api-request refused every call this activation could issue and none is \
+            "the host refused every call this activation could issue and none is \
              outstanding; this request was not attempted. {refused}"
         );
         let mut expected = vec![(id(0), "refused to build".to_string())];
@@ -2729,5 +2745,215 @@ mod tests {
         }
         assert!(host.rows(BACKLOG_NS).is_empty());
         assert!(host.take_completions().is_empty());
+    }
+
+    const UNSUBSCRIBE: &str = "one-click-unsubscribe";
+
+    /// A provider whose `fixture-search` calls `one-click-unsubscribe` at
+    /// once, and whose `fixture-lookup` reads over `api-request` first and
+    /// then calls it; the tool's answer completes the request as it came.
+    struct Unsubscribes;
+
+    fn unsubscribe(step: u8, q: &str) -> Call {
+        Call::tool(
+            step,
+            UNSUBSCRIBE,
+            json!({ "url": format!("https://lists.example.com/u/{q}") }),
+        )
+    }
+
+    impl Logic for Unsubscribes {
+        type Tool = Fixture;
+        type Settings = ();
+
+        fn plan(tool: Fixture, args: &Value, _: &Step<'_>, _: &()) -> Result<Call, String> {
+            let q = args.get("q").and_then(Value::as_str).unwrap_or("x");
+            Ok(match tool {
+                Fixture::Search => unsubscribe(1, q),
+                Fixture::Lookup => call(1, tool, q),
+            })
+        }
+
+        fn advance(
+            state: &InFlight<Fixture>,
+            outcome: Result<Value, NestedError>,
+            _: &mut Step<'_>,
+            _: &(),
+        ) -> Next {
+            match (&state.target, outcome) {
+                (Outstanding::Api(_), Ok(_)) => Next::Call {
+                    call: unsubscribe(state.step + 1, "after"),
+                    derived: Map::new(),
+                },
+                (Outstanding::Tool(tool), Ok(value)) => {
+                    Next::Complete(json!({ "tool": tool, "answer": value }))
+                }
+                (_, Err(error)) => Next::Fail(internal(error.detail)),
+            }
+        }
+    }
+
+    fn unsubscribe_requests(range: std::ops::Range<usize>) -> Vec<Request> {
+        range
+            .map(|n| Request {
+                id: id(n),
+                tool: "fixture-search".to_string(),
+                args: json!({ "q": format!("q{n}") }),
+                attachments: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn answered(call: &NestedCall, outcome: Result<Value, NestedError>) -> Delivered {
+        Delivered {
+            call_id: call.call_id.clone(),
+            serving: Some(call.id.clone()),
+            outcome,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn run_unsubscribes(host: &MemoryHost, input: Input) -> Result<(), String> {
+        host.activate::<Unsubscribes>(&(), input)
+    }
+
+    #[test]
+    fn a_call_to_another_tool_is_issued_under_its_name_and_answered() {
+        let host = MemoryHost::new();
+        run_unsubscribes(&host, input(1_000, unsubscribe_requests(0..1), vec![])).unwrap();
+        let calls = host.take_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].request,
+            Nested::Tool(ToolCall {
+                tool: UNSUBSCRIBE.to_string(),
+                args: json!({ "url": "https://lists.example.com/u/q0" }),
+            })
+        );
+        assert_eq!(calls[0].request.tool(), UNSUBSCRIBE);
+        assert_eq!(calls[0].body, None);
+        let row = InFlight::<Fixture>::decode(&host.rows(INFLIGHT_NS)[0].1).unwrap();
+        assert_eq!(row.target, Outstanding::Tool(UNSUBSCRIBE.to_string()));
+        assert!(
+            host.take_log()
+                .contains(&(Level::Info, format!("fixture-search step 1 {UNSUBSCRIBE}"))),
+        );
+
+        run_unsubscribes(
+            &host,
+            input(
+                2_000,
+                vec![],
+                vec![answered(
+                    &calls[0],
+                    unsubscribe_status("lists.example.com", 302),
+                )],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            host.take_completions(),
+            [Completion {
+                id: id(0),
+                answer: Answered::Value(
+                    json!({ "tool": UNSUBSCRIBE, "answer": { "status": 302, "host": "lists.example.com" } })
+                ),
+                attachments: Vec::new(),
+            }]
+        );
+        assert!(host.rows(INFLIGHT_NS).is_empty());
+    }
+
+    #[test]
+    fn an_api_request_step_advances_to_a_call_to_another_tool() {
+        let host = MemoryHost::new();
+        let mut lookup = unsubscribe_requests(0..1);
+        lookup[0].tool = "fixture-lookup".to_string();
+        run_unsubscribes(&host, input(1_000, lookup, vec![])).unwrap();
+        let first = host.take_calls();
+        assert_eq!(first[0].api().path, "/v1/fixture-lookup/q0");
+        run_unsubscribes(
+            &host,
+            input(
+                2_000,
+                vec![],
+                vec![answered(&first[0], Ok(json!({ "status": 200 })))],
+            ),
+        )
+        .unwrap();
+        let second = host.take_calls();
+        assert_eq!(second[0].request.tool(), UNSUBSCRIBE);
+        assert_eq!(second[0].call_id, format!("{}/2", id(0)));
+        run_unsubscribes(
+            &host,
+            input(
+                3_000,
+                vec![],
+                vec![answered(
+                    &second[0],
+                    unsubscribe_unreachable("lists.example.com"),
+                )],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            host.take_completions()[0].answer,
+            Answered::Value(json!({
+                "tool": UNSUBSCRIBE,
+                "answer": { "error": "unreachable", "host": "lists.example.com" }
+            }))
+        );
+    }
+
+    #[test]
+    fn calls_to_another_tool_past_the_budget_are_backlogged_and_drained() {
+        let host = MemoryHost::new();
+        run_unsubscribes(&host, input(1_000, unsubscribe_requests(0..33), vec![])).unwrap();
+        let first = host.take_calls();
+        assert_eq!(first.len(), CALL_BUDGET);
+        assert_eq!(backlog_ids(&host), [id(32)]);
+        let queued = Queued::<Fixture>::decode(&host.rows(BACKLOG_NS)[0].1).unwrap();
+        assert_eq!(queued.call, unsubscribe(1, "q32"));
+        run_unsubscribes(
+            &host,
+            input(
+                2_000,
+                vec![],
+                vec![answered(
+                    &first[0],
+                    unsubscribe_status("lists.example.com", 200),
+                )],
+            ),
+        )
+        .unwrap();
+        let drained = host.take_calls();
+        assert_eq!(ids(&drained), [id(32)]);
+        assert_eq!(drained[0].request, unsubscribe(1, "q32").request);
+        assert!(host.rows(BACKLOG_NS).is_empty());
+    }
+
+    #[test]
+    fn a_refused_call_to_another_tool_names_the_tool_and_its_grant() {
+        let host = MemoryHost::new();
+        let refusal = "call-async one-click-unsubscribe: denied: not granted";
+        host.refuse_all(refusal);
+        run_unsubscribes(&host, input(1_000, unsubscribe_requests(0..33), vec![])).unwrap();
+        let answered = host.take_completions();
+        let answered = errors(&answered);
+        let refused = format!(
+            "{UNSUBSCRIBE} could not be issued: {refusal}. If this names the grant, the \
+             instance needs a `tool {UNSUBSCRIBE}` grant."
+        );
+        assert_eq!(
+            answered[0],
+            (id(0).as_str(), ErrorKind::Internal, refused.as_str())
+        );
+        assert_eq!(
+            answered[32].2,
+            format!(
+                "the host refused every call this activation could issue and none is \
+                 outstanding; this request was not attempted. {refused}"
+            )
+        );
     }
 }
