@@ -236,8 +236,9 @@ async fn build(
         policy
             .acls
             .mqtt_publish
-            .push(brenn_lib::access::acl::MqttClientMatcher {
+            .push(brenn_lib::access::acl::MqttPubMatcher {
                 client: MQTT_CLIENT.to_string(),
+                topic_filter: "#".to_string(),
             });
     }
     let mut apps = indexmap::IndexMap::new();

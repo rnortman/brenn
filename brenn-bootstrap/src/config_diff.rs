@@ -457,8 +457,8 @@ webhook {handle} {{
             plane(
                 "publish",
                 [
-                    r#"client "mqtt:home""#.to_owned(),
-                    format!(r#"client "mqtt:{client}""#),
+                    r#"topic_filter "mqtt:home:#""#.to_owned(),
+                    r#"topic_filter "mqtt:home:lights/+/set""#.to_owned(),
                 ],
             ),
             plane(
@@ -547,9 +547,12 @@ new alice: Assistant();
         // also change its declaration block, and the configs would compare
         // unequal on that alone whatever the sort did to the ACL plane.
         type VaryOneEntry = fn(&mut AppAclRaw);
-        let cases: [(&str, VaryOneEntry); 3] = [
+        let cases: [(&str, VaryOneEntry); 4] = [
             ("an MQTT client", |acl| {
                 acl.mqtt_publish[1].client = "garage".to_string();
+            }),
+            ("an MQTT publish filter", |acl| {
+                acl.mqtt_publish[1].topic_filter = "lights/+/get".to_string();
             }),
             ("an MQTT topic filter", |acl| {
                 acl.mqtt_subscribe[1].topic_filter = "sensors/+/pressure".to_string();
@@ -625,8 +628,8 @@ new sink: Sink {{
         exact "ephemeral:alice-out",
         exact "local:alice-loop",
         exact "local:alice-tick",
-        client "mqtt:home",
-        client "mqtt:shed"
+        topic_filter "mqtt:home:#",
+        topic_filter "mqtt:shed:#"
     ];
 
     in inbound <- inbox {{ push_depth = 1; retain_depth = 2; }}
@@ -701,6 +704,11 @@ new sink: Sink {{
         };
         let (equal, _) = diff(varied, consumer_with_acls(), "a.brenn", "b.brenn");
         assert!(!equal, "a consumer's webhook endpoint is authority");
+
+        let mut varied = consumer_with_acls();
+        varied.wasm_consumers[0].mqtt_publish_acl[1].topic_filter = "sensors/#".to_string();
+        let (equal, _) = diff(varied, consumer_with_acls(), "a.brenn", "b.brenn");
+        assert!(!equal, "a consumer's publish filter is authority");
     }
 
     /// One surface with two entries on each of the four ACL planes the surfaces

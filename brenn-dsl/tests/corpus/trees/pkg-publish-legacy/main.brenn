@@ -1,0 +1,13 @@
+// The deployment states the topics the bundle's client-only publish entry may
+// reach, in the ceiling of the stamp.
+
+use @bridge::*;
+
+mqtt_client bob_hub {
+    url = "mqtts://hub.example.com:8883";
+}
+
+new demo: Bridge() {
+    grants = [mqtt];
+    acl publish [topic_filter "mqtt:bob_hub:alice/+/set"];
+}

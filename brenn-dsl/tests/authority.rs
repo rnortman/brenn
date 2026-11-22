@@ -13,7 +13,8 @@ use brenn_dsl::fixture_text::processor_header;
 use fltk_serde_core::Spanned;
 use support::{
     PACKAGED, at, derive_errors, derive_errors_tree, derive_refusal, derive_refusals,
-    derive_refusals_tree, derived, derived_tree, durable, messages, nondurable, packaged,
+    derive_refusals_tree, derive_tree, derived, derived_tree, durable, messages, nondurable,
+    packaged,
 };
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
@@ -179,7 +180,7 @@ fn a_consumer_holds_every_family_the_runtime_keeps_a_list_for() {
                 "        prefix \"brenn:alice.out.\",\n",
                 "        prefix \"ephemeral:alice.out.\",\n",
                 "        prefix \"local:alice/out/\",\n",
-                "        client \"mqtt:bob_hub\"\n",
+                "        topic_filter \"mqtt:bob_hub:#\"\n",
                 "    ];\n",
             ),
         ),
@@ -225,7 +226,7 @@ fn an_agent_holds_every_family_but_confined_subscribe() {
                 "        prefix \"brenn:alice.out.\",\n",
                 "        prefix \"ephemeral:alice.out.\",\n",
                 "        prefix \"local:alice/\",\n",
-                "        client \"mqtt:bob_hub\"\n",
+                "        topic_filter \"mqtt:bob_hub:#\"\n",
                 "    ];\n",
             ),
         ),
@@ -278,7 +279,7 @@ fn a_surface_holds_no_ingress_authority() {
             "        topic_filter \"mqtt:bob_hub:alice/status\",\n",
             "        endpoint \"webhook:alice-inbox\"\n",
             "    ];\n",
-            "    acl publish [client \"mqtt:bob_hub\"];\n",
+            "    acl publish [topic_filter \"mqtt:bob_hub:#\"];\n",
         )),
     ));
     let named: Vec<&str> = refusals
@@ -392,7 +393,7 @@ fn each_family_admits_only_the_kind_its_entries_are_written_with() {
         (
             "    acl publish [endpoint \"mqtt:bob_hub\"];\n",
             "`endpoint` is not how an entry in `mqtt_publish` is written; that family \
-             takes `client`",
+             takes `topic_filter`",
         ),
         (
             "    acl subscribe [client \"webhook:alice-inbox\"];\n",
@@ -521,32 +522,136 @@ fn a_topic_filter_keeps_every_separator_after_the_client() {
     assert_eq!(entry.topic_filter.value(), "alice/a:b/#");
 }
 
+/// A publish entry states the topics it admits, as a subscribe entry does:
+/// several per client, each its own `(client, filter)` pair, and a budget tail
+/// on one of them tunes the client's one sink.
 #[test]
-fn publishing_to_mqtt_is_scoped_to_a_client_and_nothing_narrower() {
+fn a_publish_entry_names_a_client_and_a_filter() {
+    let config = derived(&format!(
+        "{}{}{}",
+        INGRESS,
+        consumer(
+            "mqtt",
+            concat!(
+                "    acl publish [\n",
+                "        topic_filter \"mqtt:bob_hub:alice/+/set\",\n",
+                "        topic_filter \"mqtt:bob_hub:alice/cmd\" { publish_capacity = 4 }\n",
+                "    ];\n",
+            ),
+        ),
+        agent_with(
+            "publish",
+            "    acl publish [topic_filter \"mqtt:bob_hub:alice/a:b/#\"];\n"
+        ),
+    ));
+    let entries: Vec<(&str, &str, Option<f64>)> = config.consumers[0]
+        .acl
+        .mqtt_publish
+        .iter()
+        .map(|entry| {
+            (
+                entry.client.value().as_str(),
+                entry.topic_filter.value().as_str(),
+                entry.publish_capacity,
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("bob_hub", "alice/+/set", None),
+            ("bob_hub", "alice/cmd", Some(4.0)),
+        ]
+    );
+    let agent_entry = &config.agents[0].acl.mqtt_publish[0];
+    assert_eq!(agent_entry.client.value(), "bob_hub");
+    assert_eq!(agent_entry.topic_filter.value(), "alice/a:b/#");
+}
+
+/// A client alone is not a publish entry: the refusal writes the filter that
+/// keeps the old reach and says what it leaves out.
+#[test]
+fn a_client_only_publish_entry_is_refused_with_its_replacement() {
+    assert_eq!(
+        derive_refusal(&format!(
+            "{}{}",
+            INGRESS,
+            agent("    acl publish [client \"mqtt:bob_hub\"];\n"),
+        )),
+        "`client \"mqtt:bob_hub\"` names a client and no topics: a publish entry is written \
+         `topic_filter \"mqtt:bob_hub:<filter>\"`, one entry per filter. `topic_filter \
+         \"mqtt:bob_hub:#\"` admits every topic except those whose first level starts with `$`"
+    );
+}
+
+/// The same refusal stands in every text a deployment authors: a principal's
+/// body and a stamp's ceiling.
+#[test]
+fn a_client_only_publish_entry_is_refused_in_a_principal_and_a_stamp_ceiling() {
+    let expected = "`client \"mqtt:bob_hub\"` names a client and no topics: a publish entry \
+         is written `topic_filter \"mqtt:bob_hub:<filter>\"`, one entry per filter. \
+         `topic_filter \"mqtt:bob_hub:#\"` admits every topic except those whose first level \
+         starts with `$`";
+    let refusals = derive_refusals(&format!(
+        "{INGRESS}principal ops {{\n    grants = [mqtt];\n    \
+         acl publish [client \"mqtt:bob_hub\"];\n}}\n"
+    ));
+    assert!(refusals.iter().any(|r| r == expected), "{refusals:?}");
+    let refusals = derive_refusals(&packaged_bridge(
+        " { grants = [mqtt]; acl subscribe [topic_filter \"mqtt:bob_hub:house/#\"]; \
+         acl publish [client \"mqtt:bob_hub\"]; }",
+    ));
+    assert!(refusals.iter().any(|r| r == expected), "{refusals:?}");
+}
+
+/// A `client` matcher that names topics too is pointed at the same filter
+/// written as a `topic_filter` entry.
+#[test]
+fn a_client_matcher_naming_topics_is_pointed_at_the_topic_filter_form() {
     assert_eq!(
         derive_refusal(&format!(
             "{}{}",
             INGRESS,
             agent("    acl publish [client \"mqtt:bob_hub:alice/status\"];\n"),
         )),
-        "`mqtt:bob_hub:alice/status` names more than a client; publishing is scoped to \
-         the client and has no topic dimension to narrow"
+        "`client \"mqtt:bob_hub:alice/status\"` names topics under client `bob_hub`, and a \
+         publish entry states its topics as a filter: write `topic_filter \
+         \"mqtt:bob_hub:alice/status\"`"
+    );
+    assert_eq!(
+        derive_refusal(&agent("    acl publish [client \"mqtt:\"];\n")),
+        "`client \"mqtt:\"` names no client; a publish entry is written `topic_filter \
+         \"mqtt:<client>:<filter>\"`"
     );
 }
 
+/// Both halves of a publish entry are required.
 #[test]
-fn an_outbound_mqtt_entry_names_a_client() {
-    assert_eq!(
-        derive_refusal(&agent("    acl publish [client \"mqtt:\"];\n")),
-        "`mqtt:` names no client; an outbound mqtt entry is written `mqtt:<client>`"
-    );
+fn a_publish_entry_names_both_a_client_and_a_filter() {
+    for (statement, expected) in [
+        (
+            "    acl publish [topic_filter \"mqtt:bob_hub\"];\n",
+            "`mqtt:bob_hub` names a client and no filter; a topic_filter entry is written \
+             `mqtt:<client>:<filter>`",
+        ),
+        (
+            "    acl publish [topic_filter \"mqtt:bob_hub:\"];\n",
+            "`mqtt:bob_hub:` leaves half of the entry empty; a topic_filter entry names both \
+             the client that connects and the filter it admits for publishing",
+        ),
+    ] {
+        assert_eq!(
+            derive_refusal(&format!("{}{}", INGRESS, agent(statement))),
+            expected
+        );
+    }
 }
 
 #[test]
 fn every_mqtt_entry_names_a_declared_client() {
     for statement in [
         "    acl subscribe [topic_filter \"mqtt:charlie_hub:alice/status\"];\n",
-        "    acl publish [client \"mqtt:charlie_hub\"];\n",
+        "    acl publish [topic_filter \"mqtt:charlie_hub:#\"];\n",
     ] {
         assert_eq!(
             derive_refusal(&format!("{}{}", INGRESS, agent(statement))),
@@ -1535,7 +1640,7 @@ fn an_agents_plane_words_expand_into_its_own_spellings() {
                 "        prefix \"brenn:alice.out.\",\n",
                 "        prefix \"ephemeral:alice.out.\",\n",
                 "        prefix \"local:alice/\",\n",
-                "        client \"mqtt:bob_hub\"\n",
+                "        topic_filter \"mqtt:bob_hub:#\"\n",
                 "    ];\n",
             ),
         ),
@@ -1844,7 +1949,7 @@ fn a_consumer_that_publishes_to_a_broker_grants_mqtt() {
         derive_refusal(&format!(
             "{}{}",
             INGRESS,
-            relay_with("", "    acl publish [client \"mqtt:bob_hub\"];\n"),
+            relay_with("", "    acl publish [topic_filter \"mqtt:bob_hub:#\"];\n"),
         )),
         "consumer `alice_relay` holds an `mqtt_publish` entry and grants no `mqtt`: the \
          broker interface is what `mqtt` gives it"
@@ -2048,7 +2153,7 @@ fn an_entry_no_plane_word_admits_points_at_the_entry() {
             format!(
                 "{}{}",
                 INGRESS,
-                relay_with("", "    acl publish [client \"mqtt:bob_hub\"];\n"),
+                relay_with("", "    acl publish [topic_filter \"mqtt:bob_hub:#\"];\n"),
             ),
             "mqtt:bob_hub",
             "holds an `mqtt_publish` entry",
@@ -2901,7 +3006,7 @@ fn a_client_entry_carries_the_sinks_budget() {
         INGRESS,
         consumer(
             "mqtt",
-            "    acl publish [client \"mqtt:bob_hub\" { publish_per_activation = 2.0, \
+            "    acl publish [topic_filter \"mqtt:bob_hub:#\" { publish_per_activation = 2.0, \
              publish_capacity = 4 }];\n",
         ),
     ));
@@ -2916,7 +3021,10 @@ fn a_client_entry_with_no_tail_takes_the_default_budget() {
     let config = derived(&format!(
         "{}{}",
         INGRESS,
-        consumer("mqtt", "    acl publish [client \"mqtt:bob_hub\"];\n"),
+        consumer(
+            "mqtt",
+            "    acl publish [topic_filter \"mqtt:bob_hub:#\"];\n"
+        ),
     ));
     let sink = &config.consumers[0].acl.mqtt_publish[0];
     assert_eq!(sink.publish_per_activation, None);
@@ -2931,7 +3039,7 @@ fn a_budget_key_the_sink_has_no_knob_for_is_refused_by_name() {
             INGRESS,
             consumer(
                 "mqtt",
-                "    acl publish [client \"mqtt:bob_hub\" { publish_burst = 2 }];\n",
+                "    acl publish [topic_filter \"mqtt:bob_hub:#\" { publish_burst = 2 }];\n",
             ),
         )),
         "`publish_burst` is not part of an `mqtt_publish` entry: the sink it mints takes \
@@ -2947,7 +3055,7 @@ fn a_budget_that_is_not_a_number_is_refused() {
             INGRESS,
             consumer(
                 "mqtt",
-                "    acl publish [client \"mqtt:bob_hub\" { publish_capacity = \"lots\" }];\n",
+                "    acl publish [topic_filter \"mqtt:bob_hub:#\" { publish_capacity = \"lots\" }];\n",
             ),
         )),
         "publish_capacity is a string, and a budget is a number of tokens"
@@ -2964,7 +3072,7 @@ fn a_budget_on_a_principal_that_holds_no_sink_is_refused() {
             INGRESS,
             agent_with(
                 "publish",
-                "    acl publish [client \"mqtt:bob_hub\" { publish_capacity = 2 }];\n",
+                "    acl publish [topic_filter \"mqtt:bob_hub:#\" { publish_capacity = 2 }];\n",
             ),
         )),
         "`publish_capacity` is not part of agent `alice`'s `mqtt_publish` entry: an egress \
@@ -2983,8 +3091,8 @@ fn one_client_holds_one_budget() {
                 "mqtt",
                 concat!(
                     "    acl publish [\n",
-                    "        client \"mqtt:bob_hub\" { publish_capacity = 2 },\n",
-                    "        client \"mqtt:bob_hub\" { publish_capacity = 4 }\n",
+                    "        topic_filter \"mqtt:bob_hub:alice/+/set\" { publish_capacity = 2 },\n",
+                    "        topic_filter \"mqtt:bob_hub:alice/cmd\" { publish_capacity = 4 }\n",
                     "    ];\n",
                 ),
             ),
@@ -4358,9 +4466,9 @@ fn the_exact_arm_of_a_reach_suggestion_is_followable() {
 // ── mqtt reach in a ceiling ──────────────────────────────────────────────────
 //
 // The reach that leaves the machine. Both transport families compare by
-// equality — a client for a sink, a client and a filter for a subscription —
-// so a ceiling names the same spelling the arrangement wrote and nothing about
-// a wildcard is arithmetic.
+// equality — a client and a filter, on either plane — so a ceiling names the
+// same spelling the arrangement wrote and nothing about a wildcard is
+// arithmetic.
 
 /// A packaged bridge holding both mqtt planes: a subscription over a wildcard
 /// filter and a sink with a budget of its own.
@@ -4372,7 +4480,7 @@ fn packaged_bridge(body: &str) -> String {
          \x20   new consume: Sink {{\n\
          \x20       grants = [mqtt];\n\
          \x20       acl subscribe [exact source, topic_filter \"mqtt:bob_hub:house/#\"];\n\
-         \x20       acl publish [client \"mqtt:bob_hub\" {{ publish_capacity = 4 }}];\n\
+         \x20       acl publish [topic_filter \"mqtt:bob_hub:#\" {{ publish_capacity = 4 }}];\n\
          \x20       in messages <- source;\n\
          \x20   }}\n\
          }}\n{PACKAGED}\
@@ -4390,7 +4498,7 @@ fn packaged_bridge(body: &str) -> String {
 fn a_ceiling_covers_conferred_mqtt_reach() {
     let config = derived(&packaged_bridge(
         " { grants = [mqtt]; acl subscribe [topic_filter \"mqtt:bob_hub:house/#\"]; \
-         acl publish [client \"mqtt:bob_hub\"]; }",
+         acl publish [topic_filter \"mqtt:bob_hub:#\"]; }",
     ));
     assert_eq!(config.resolved.stamps.len(), 1);
     assert_eq!(config.consumers[0].acl.mqtt_publish.len(), 1);
@@ -4404,7 +4512,7 @@ fn a_ceiling_covers_conferred_mqtt_reach() {
 fn a_ceiling_whose_topic_filter_differs_is_refused() {
     let refusal = derive_refusal(&packaged_bridge(
         " { grants = [mqtt]; acl subscribe [topic_filter \"mqtt:bob_hub:house/lamp\"]; \
-         acl publish [client \"mqtt:bob_hub\"]; }",
+         acl publish [topic_filter \"mqtt:bob_hub:#\"]; }",
     ));
     assert_eq!(
         refusal,
@@ -4413,6 +4521,449 @@ fn a_ceiling_whose_topic_filter_differs_is_refused() {
          consents to none of it — add `acl subscribe [topic_filter \"mqtt:bob_hub:house/#\"];` \
          to the stamp if that reach is wanted"
     );
+}
+
+/// A ceiling names a publish filter for a filter, not for a budget: the
+/// sink's budget is the arrangement's own.
+#[test]
+fn a_ceiling_publish_line_takes_no_budget() {
+    let refusals = derive_refusals(&packaged_bridge(
+        " { grants = [mqtt]; acl subscribe [topic_filter \"mqtt:bob_hub:house/#\"]; \
+         acl publish [topic_filter \"mqtt:bob_hub:#\" { publish_capacity = 4 }]; }",
+    ));
+    assert!(
+        refusals.iter().any(|r| r
+            == "`publish_capacity` is an egress budget, and a ceiling caps reach rather than \
+                budgets: a publish budget is the arrangement's own, written on its entry"),
+        "{refusals:?}"
+    );
+}
+
+/// A publish filter the ceiling does not name exactly is refused, and the
+/// refusal writes the line the deployment adds.
+#[test]
+fn a_ceiling_whose_publish_filter_differs_is_refused() {
+    let refusal = derive_refusal(&packaged_bridge(
+        " { grants = [mqtt]; acl subscribe [topic_filter \"mqtt:bob_hub:house/#\"]; \
+         acl publish [topic_filter \"mqtt:bob_hub:house/#\"]; }",
+    ));
+    assert_eq!(
+        refusal,
+        "`acl publish [topic_filter \"mqtt:bob_hub:#\"]` on `demo.consume` reaches beyond \
+         what `Bridge` from `@fixtures` declares or was handed, and the stamp `demo` consents \
+         to none of it — add `acl publish [topic_filter \"mqtt:bob_hub:#\"];` to the stamp if \
+         that reach is wanted"
+    );
+}
+
+// ── a client-only publish entry in packaged text ─────────────────────────────
+//
+// Deployment text refuses `client "mqtt:<c>"` on the publish plane. Packaged
+// text keeps compiling with it, and reads it as every publish entry for `<c>`
+// that the authority it sits under holds: the topics are the deployment's to
+// state, so the arrangement can only come to what the ceiling already says.
+
+/// A second declared client, so a ceiling can state topics for a client other
+/// than the one the arrangement asks for.
+const CAROL_HUB: &str =
+    "mqtt_client carol_hub {\n    url = \"mqtts://carol.example.com:8883\";\n}\n";
+
+/// A packaged bridge whose one publish statement is the case's, stamped with
+/// the case's body.
+fn legacy_bridge(publish: &str, body: &str) -> String {
+    format!(
+        "{PACKAGED}component Sink {{ {} in messages; }}\n\
+         \n\
+         assembly Bridge(source: Channel) {{\n\
+         \x20   new consume: Sink {{\n\
+         \x20       grants = [mqtt];\n\
+         \x20       acl publish [{publish}];\n\
+         \x20       in messages <- source;\n\
+         \x20   }}\n\
+         }}\n{PACKAGED}\
+         {INGRESS}{CAROL_HUB}\
+         channel bar at \"ephemeral:bar\" {{ push_depth = 4; retain_depth = 16; }}\n\
+         new demo: Bridge(source = bar){body}\n",
+        processor_header("mqtt"),
+    )
+}
+
+/// Every publish entry an authority holds, as `(client, filter, capacity)`.
+fn publish_entries(acl: &DAclSet) -> Vec<(&str, &str, Option<f64>)> {
+    acl.mqtt_publish
+        .iter()
+        .map(|entry| {
+            (
+                entry.client.value().as_str(),
+                entry.topic_filter.value().as_str(),
+                entry.publish_capacity,
+            )
+        })
+        .collect()
+}
+
+/// The refusal for a client-only entry its authority states no topics for.
+fn no_topics(asker: &str, client: &str, above: &str) -> String {
+    format!(
+        "`acl publish [client \"mqtt:{client}\"]` {asker} asks to publish through client \
+         `{client}`, and {above} states no topics for that client: a packaged arrangement \
+         publishes to the topics the deployment stamps it with, so write them — \
+         `acl publish [topic_filter \"mqtt:{client}:<filter>\"];`"
+    )
+}
+
+/// The instance holds exactly the ceiling's filters for the client it named,
+/// none for another client, and the budget tail it wrote on the first of them.
+#[test]
+fn a_packaged_client_only_publish_entry_holds_the_ceilings_filters() {
+    let config = derived(&legacy_bridge(
+        "client \"mqtt:bob_hub\" { publish_capacity = 4 }",
+        " { grants = [mqtt]; acl publish [topic_filter \"mqtt:bob_hub:alice/+/set\", \
+         topic_filter \"mqtt:carol_hub:alice/x\", topic_filter \"mqtt:bob_hub:alice/cmd\"]; }",
+    ));
+    assert_eq!(
+        publish_entries(&config.consumers[0].acl),
+        [
+            ("bob_hub", "alice/+/set", Some(4.0)),
+            ("bob_hub", "alice/cmd", None),
+        ]
+    );
+}
+
+/// A ceiling with no topics for the client is refused at the author's
+/// statement, with the stamp as the related site and the line to write.
+#[test]
+fn a_packaged_client_only_publish_entry_with_no_ceiling_topics_is_refused() {
+    let source = legacy_bridge("client \"mqtt:bob_hub\"", " { grants = [mqtt]; }");
+    let errors = derive_errors(&source);
+    let expected = no_topics("on `demo.consume`", "bob_hub", "the stamp `demo`");
+    let refusal = errors
+        .iter()
+        .find(|error| error.message == expected)
+        .unwrap_or_else(|| panic!("{:?}", messages(&errors)));
+    assert_eq!(refusal.line_col(), at(&source, "mqtt:bob_hub\"]"));
+    let related: Vec<&str> = refusal
+        .related
+        .iter()
+        .map(|(note, _)| note.as_str())
+        .collect();
+    assert_eq!(related, ["stamped here"]);
+}
+
+/// Topics for another client are no topics for this one.
+#[test]
+fn a_packaged_client_only_publish_entry_under_another_clients_topics_is_refused() {
+    let refusals = derive_refusals(&legacy_bridge(
+        "client \"mqtt:bob_hub\"",
+        " { grants = [mqtt]; acl publish [topic_filter \"mqtt:carol_hub:alice/x\"]; }",
+    ));
+    let expected = no_topics("on `demo.consume`", "bob_hub", "the stamp `demo`");
+    assert!(refusals.contains(&expected), "{refusals:?}");
+}
+
+/// The legacy reading is for a client alone: a `client` matcher naming topics
+/// is refused in packaged text as it is in deployment text.
+#[test]
+fn a_packaged_client_matcher_naming_topics_is_refused_as_in_deployment_text() {
+    let refusals = derive_refusals(&legacy_bridge(
+        "client \"mqtt:bob_hub:alice/x\"",
+        " { grants = [mqtt]; acl publish [topic_filter \"mqtt:bob_hub:alice/x\"]; }",
+    ));
+    assert!(
+        refusals.iter().any(|r| r
+            == "`client \"mqtt:bob_hub:alice/x\"` names topics under client `bob_hub`, and a \
+                publish entry states its topics as a filter: write `topic_filter \
+                \"mqtt:bob_hub:alice/x\"`"),
+        "{refusals:?}"
+    );
+}
+
+/// The legacy form beside a new-form entry equal to a ceiling filter: both
+/// resolve, and the filter held twice is one reach. A budget on both is two
+/// budgets for one client.
+#[test]
+fn a_packaged_legacy_entry_beside_a_new_form_entry() {
+    let body = " { grants = [mqtt]; acl publish [topic_filter \"mqtt:bob_hub:alice/+/set\", \
+                topic_filter \"mqtt:bob_hub:alice/cmd\"]; }";
+    let config = derived(&legacy_bridge(
+        "client \"mqtt:bob_hub\", topic_filter \"mqtt:bob_hub:alice/cmd\" { publish_capacity = 4 }",
+        body,
+    ));
+    assert_eq!(
+        publish_entries(&config.consumers[0].acl),
+        [
+            ("bob_hub", "alice/+/set", None),
+            ("bob_hub", "alice/cmd", None),
+            ("bob_hub", "alice/cmd", Some(4.0)),
+        ]
+    );
+    let refusals = derive_refusals(&legacy_bridge(
+        "client \"mqtt:bob_hub\" { publish_capacity = 2 }, \
+         topic_filter \"mqtt:bob_hub:alice/cmd\" { publish_capacity = 4 }",
+        body,
+    ));
+    assert!(
+        refusals.iter().any(|r| r.ends_with(
+            "states an egress budget for client `bob_hub` twice: one client is one sink, and \
+             one sink holds one budget"
+        )),
+        "{refusals:?}"
+    );
+}
+
+/// A stamp whose own ceiling text was refused states no topics for anything;
+/// the refusal of that text is the one message, and the legacy entry under it
+/// adds none.
+#[test]
+fn a_packaged_legacy_entry_under_a_refused_ceiling_adds_no_refusal() {
+    let refusals = derive_refusals(&legacy_bridge(
+        "client \"mqtt:bob_hub\"",
+        " { grants = [mqtt, chrome]; acl publish [topic_filter \"mqtt:bob_hub:alice/x\"]; }",
+    ));
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].starts_with("`chrome` is not a grant word"),
+        "{refusals:?}"
+    );
+}
+
+/// A packaged `grant` aimed at a deployment agent takes the same reading: the
+/// agent gains the stamp ceiling's filters for that client, and no more.
+#[test]
+fn a_packaged_client_only_publish_grant_holds_the_ceilings_filters() {
+    let source = |body: &str| {
+        format!(
+            "{PACKAGED}assembly Loop(target: Agent) {{\n\
+             \x20   grant target publish client \"mqtt:bob_hub\";\n\
+             }}\n{PACKAGED}\
+             {INGRESS}\
+             agent Assistant() {{ name = \"Assistant\"; grants = [publish]; }}\n\
+             new alice: Assistant();\n\
+             new demo: Loop(target = alice){body};\n"
+        )
+    };
+    let config = derived(&source(
+        " { acl publish [topic_filter \"mqtt:bob_hub:alice/x\"]; }",
+    ));
+    assert_eq!(
+        publish_entries(&config.agents[0].acl),
+        [("bob_hub", "alice/x", None)]
+    );
+    let refusals = derive_refusals(&source(""));
+    let expected = no_topics("on `alice`", "bob_hub", "the stamp `demo`");
+    assert!(refusals.contains(&expected), "{refusals:?}");
+}
+
+/// An agent holds no sink of its own, so a budget tail on a packaged
+/// client-only entry aimed at it is refused as on any agent entry.
+#[test]
+fn a_budget_on_a_packaged_client_only_publish_grant_to_an_agent_is_refused() {
+    let refusals = derive_refusals(&format!(
+        "{PACKAGED}assembly Loop(target: Agent) {{\n\
+         \x20   grant target publish client \"mqtt:bob_hub\" {{ publish_capacity = 4 }};\n\
+         }}\n{PACKAGED}\
+         {INGRESS}\
+         agent Assistant() {{ name = \"Assistant\"; grants = [publish]; }}\n\
+         new alice: Assistant();\n\
+         new demo: Loop(target = alice) {{ acl publish [topic_filter \"mqtt:bob_hub:alice/x\"]; }};\n"
+    ));
+    assert_eq!(
+        refusals,
+        [
+            "`publish_capacity` is not part of agent `alice`'s `mqtt_publish` entry: an egress \
+          budget tunes the sink a component holds, and this entity publishes through a \
+          host that budgets its own"
+        ],
+    );
+}
+
+/// A client-only entry naming a client nothing declares is refused for that
+/// alone; the authority's topics are not consulted.
+#[test]
+fn a_packaged_client_only_publish_entry_naming_an_undeclared_client_is_refused() {
+    let refusals = derive_refusals(&legacy_bridge(
+        "client \"mqtt:charlie_hub\"",
+        " { grants = [mqtt]; }",
+    ));
+    assert_eq!(
+        refusals,
+        [
+            "no `mqtt_client` is named `charlie_hub`, so nothing connects on this entry's \
+          behalf; an mqtt address names a client this configuration declares"
+        ],
+    );
+}
+
+/// The packaged module of the next cases: a bridge whose publish statement is
+/// the legacy form, and a holder that stamps it in packaged text.
+const LEGACY_BRIDGE_MODULE: &str = "\
+component Sink { abi = processor; requires = [mqtt]; }
+
+assembly Bridge() {
+    new consume: Sink { grants = [mqtt]; acl publish [client \"mqtt:bob_hub\"]; }
+}
+";
+
+/// A tree assembly stamping a packaged one is the packaged boundary: the
+/// tree's own text is deployment text and refuses the form, and the packaged
+/// arrangement it stamps reads it against the stamp's ceiling.
+#[test]
+fn a_tree_assembly_stamping_a_packaged_one_reads_only_the_packaged_text() {
+    let config = derived_tree(&[
+        (
+            "",
+            &format!(
+                "use @bridge::*;\n\n{INGRESS}\
+                 assembly Site() {{\n\
+                 \x20   new bridge: Bridge() {{ grants = [mqtt]; \
+                 acl publish [topic_filter \"mqtt:bob_hub:alice/x\"]; }}\n\
+                 }}\n\
+                 new site: Site();\n"
+            ),
+        ),
+        ("@bridge", LEGACY_BRIDGE_MODULE),
+    ]);
+    assert_eq!(
+        publish_entries(&config.consumers[0].acl),
+        [("bob_hub", "alice/x", None)]
+    );
+    let refusals = derive_refusals_tree(&[(
+        "",
+        &format!(
+            "{PACKAGED}component Sink {{ {} }}\n{PACKAGED}\
+             {INGRESS}\
+             assembly Site() {{\n\
+             \x20   new consume: Sink {{ grants = [mqtt]; acl publish [client \"mqtt:bob_hub\"]; }}\n\
+             }}\n\
+             new site: Site();\n",
+            processor_header("mqtt"),
+        ),
+    )]);
+    assert!(
+        refusals
+            .iter()
+            .any(|r| r.starts_with("`client \"mqtt:bob_hub\"` names a client and no topics")),
+        "{refusals:?}"
+    );
+}
+
+/// A packaged assembly stamping a packaged one with a ceiling of its own: the
+/// nested stamp is recorded, and the instance reads the nested ceiling — the
+/// author's text, so a refusal says the line is the author's.
+#[test]
+fn a_packaged_assembly_stamping_a_packaged_one_reads_the_nested_ceiling() {
+    let holder = |nested: &str| {
+        format!(
+            "use @bridge::*;\n\n\
+             assembly Holder() {{\n\
+             \x20   new inner: Bridge(){nested};\n\
+             }}\n"
+        )
+    };
+    let root = format!(
+        "use @holder::*;\n\n{INGRESS}{CAROL_HUB}\
+         new demo: Holder() {{ grants = [mqtt]; acl publish [topic_filter \
+         \"mqtt:bob_hub:alice/x\", topic_filter \"mqtt:bob_hub:alice/y\", topic_filter \
+         \"mqtt:carol_hub:alice/z\"]; }}\n"
+    );
+    let config = derived_tree(&[
+        ("", &root),
+        (
+            "@holder",
+            &holder(" { acl publish [topic_filter \"mqtt:bob_hub:alice/y\"]; }"),
+        ),
+        ("@bridge", LEGACY_BRIDGE_MODULE),
+    ]);
+    assert_eq!(config.resolved.stamps.len(), 2);
+    assert_eq!(
+        publish_entries(&config.consumers[0].acl),
+        [("bob_hub", "alice/y", None)]
+    );
+    let refusals = derive_refusals_tree(&[
+        ("", &root),
+        (
+            "@holder",
+            &holder(" { acl publish [topic_filter \"mqtt:carol_hub:alice/z\"]; }"),
+        ),
+        ("@bridge", LEGACY_BRIDGE_MODULE),
+    ]);
+    let expected = format!(
+        "{} — and that line is the author's: this stamp is the arrangement's own text",
+        no_topics(
+            "on `demo.inner.consume`",
+            "bob_hub",
+            "the stamp `demo.inner`"
+        )
+    );
+    assert!(refusals.contains(&expected), "{refusals:?}");
+}
+
+/// A client-only publish line in a stamp body written in packaged text stands
+/// for what that stamp inherits for the client: the enclosing ceiling's
+/// entries, or a handed principal's.
+#[test]
+fn a_packaged_stamp_body_reads_a_client_only_line_against_what_it_inherits() {
+    let nested = " { acl publish [client \"mqtt:bob_hub\"]; }";
+    let holder = format!(
+        "use @bridge::*;\n\n\
+         assembly Holder() {{\n\
+         \x20   new inner: Bridge(){nested};\n\
+         }}\n\
+         \n\
+         assembly Handed(ops: Principal) {{\n\
+         \x20   new inner: Bridge() under ops{nested};\n\
+         }}\n"
+    );
+    let tree = |root: &str| {
+        derive_tree(&[
+            ("", root),
+            ("@holder", holder.as_str()),
+            ("@bridge", LEGACY_BRIDGE_MODULE),
+        ])
+    };
+    // Under an enclosing ceiling holding two clients, the line narrows the
+    // publish family to the one it names.
+    let config = tree(&format!(
+        "use @holder::*;\n\n{INGRESS}{CAROL_HUB}\
+         new demo: Holder() {{ grants = [mqtt]; acl publish [topic_filter \
+         \"mqtt:bob_hub:alice/x\", topic_filter \"mqtt:carol_hub:alice/z\"]; }}\n"
+    ))
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    assert_eq!(
+        publish_entries(&config.consumers[0].acl),
+        [("bob_hub", "alice/x", None)]
+    );
+    // Under a handed principal holding the same two.
+    let config = tree(&format!(
+        "use @holder::*;\n\n{INGRESS}{CAROL_HUB}\
+         principal ops {{ grants = [mqtt]; acl publish [topic_filter \
+         \"mqtt:bob_hub:alice/x\", topic_filter \"mqtt:carol_hub:alice/z\"]; }}\n\
+         new demo: Handed(ops = ops) {{ grants = [mqtt]; acl publish [topic_filter \
+         \"mqtt:bob_hub:alice/x\", topic_filter \"mqtt:carol_hub:alice/z\"]; }}\n"
+    ))
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    assert_eq!(
+        publish_entries(&config.consumers[0].acl),
+        [("bob_hub", "alice/x", None)]
+    );
+    // A principal with no topics for the client: refused, naming the principal.
+    let refusals = match tree(&format!(
+        "use @holder::*;\n\n{INGRESS}{CAROL_HUB}\
+         principal ops {{ grants = [mqtt]; acl publish [topic_filter \
+         \"mqtt:carol_hub:alice/z\"]; }}\n\
+         new demo: Handed(ops = ops) {{ grants = [mqtt]; acl publish [topic_filter \
+         \"mqtt:bob_hub:alice/x\", topic_filter \"mqtt:carol_hub:alice/z\"]; }}\n"
+    )) {
+        Ok(_) => panic!("expected a refusal"),
+        Err(errors) => errors,
+    };
+    let refusals = messages(&refusals);
+    let expected = no_topics(
+        "in the ceiling on the stamp `demo.inner`",
+        "bob_hub",
+        "`ops`",
+    );
+    assert!(refusals.contains(&expected.as_str()), "{refusals:?}");
 }
 
 // ── a refusal in consent text stops there ────────────────────────────────────

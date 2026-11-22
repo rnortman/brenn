@@ -31,8 +31,8 @@ use serde::de::DeserializeOwned;
 use serde::de::value::StrDeserializer;
 
 use brenn_dsl::derived::{
-    DAclSet, DAuthority, DMatcher, DMqttClient, DMqttSub, DRemoteAuthority, DRemoteSubEntry,
-    DWebhook, DerivedConfig,
+    DAclSet, DAuthority, DMatcher, DMqttPub, DMqttSub, DRemoteAuthority, DRemoteSubEntry, DWebhook,
+    DerivedConfig,
 };
 use brenn_dsl::diag::{Diagnostic, duplicate_statement, or_list};
 use brenn_dsl::model::{
@@ -49,7 +49,7 @@ use brenn_dsl::resolved::{
 use brenn_dsl::{Span, Spanned};
 
 use crate::access::raw::{
-    AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
+    AppAclRaw, ChannelMatcherRaw, MqttPubMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
 };
 use crate::messaging::config::{
     BACKEND_FATAL_NOISE_REFUSAL, ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw,
@@ -3352,7 +3352,7 @@ fn consumer(
         publish_acl: channel_matchers(&authority.acl.brenn_publish),
         ephemeral_publish_acl: channel_matchers(&authority.acl.ephemeral_publish),
         local_publish_acl: channel_matchers(&authority.acl.local_publish),
-        mqtt_publish_acl: mqtt_client_matchers(&authority.acl.mqtt_publish),
+        mqtt_publish_acl: mqtt_pub_matchers(&authority.acl.mqtt_publish),
         mqtt_subscribe_acl: mqtt_sub_matchers(&authority.acl.mqtt_subscribe),
         webhook_acl: webhook_matchers(&authority.acl.webhook),
         config: body.config("config", errors),
@@ -4468,7 +4468,7 @@ fn app_acl(acl: &DAclSet, label: &str) -> AppAclRaw {
     );
     AppAclRaw {
         mqtt_subscribe: mqtt_sub_matchers(&acl.mqtt_subscribe),
-        mqtt_publish: mqtt_client_matchers(&acl.mqtt_publish),
+        mqtt_publish: mqtt_pub_matchers(&acl.mqtt_publish),
         brenn_subscribe: channel_matchers(&acl.brenn_subscribe),
         brenn_publish: channel_matchers(&acl.brenn_publish),
         ephemeral_publish: channel_matchers(&acl.ephemeral_publish),
@@ -4489,12 +4489,13 @@ fn mqtt_sub_matchers(entries: &[DMqttSub]) -> Vec<MqttSubMatcherRaw> {
         .collect()
 }
 
-/// Outbound MQTT matchers. Publish is client-scoped only.
-fn mqtt_client_matchers(entries: &[DMqttClient]) -> Vec<MqttClientMatcherRaw> {
+/// Outbound MQTT matchers: each entry carries both a client and a topic filter.
+fn mqtt_pub_matchers(entries: &[DMqttPub]) -> Vec<MqttPubMatcherRaw> {
     entries
         .iter()
-        .map(|entry| MqttClientMatcherRaw {
+        .map(|entry| MqttPubMatcherRaw {
             client: entry.client.value().clone(),
+            topic_filter: entry.topic_filter.value().clone(),
         })
         .collect()
 }
@@ -4504,7 +4505,7 @@ fn mqtt_client_matchers(entries: &[DMqttClient]) -> Vec<MqttClientMatcherRaw> {
 /// The entry that authorizes a client is what mints its sink, so the override
 /// rides that entry rather than a table of its own; an entry with no budget
 /// leaves the sink on the runtime's default and produces no block here.
-fn mqtt_outputs(entries: &[DMqttClient]) -> Vec<WasmConsumerMqttOutputRaw> {
+fn mqtt_outputs(entries: &[DMqttPub]) -> Vec<WasmConsumerMqttOutputRaw> {
     entries
         .iter()
         .filter(|entry| entry.publish_per_activation.is_some() || entry.publish_capacity.is_some())

@@ -189,7 +189,7 @@ tool runs, with the refusal below. A tool without the argument takes no
 attachments; passing it is `invalid_args`.
 
 **Publishing an attachment to MQTT.** `MqttSend` takes one attachment in
-place of `body`: its `attachment` argument is a single reference,
+place of `body` or `body_base64`: its `attachment` argument is a single reference,
 `{"message_id": "<uuid>", "name": "<attachment name>"}`, under the rule
 above, and the attachment's bytes are published with its content type as the
 MQTT Content Type.
@@ -199,7 +199,8 @@ brenn-tool call MqttSend --str to=mqtt:home:cam/snapshot \
     --set 'attachment={"message_id": "0b6a5c2e-7d1f-4e8a-9c3b-2f4d6e8a10e4", "name": "snap.png"}'
 ```
 
-A call gives exactly one of `body` and `attachment`. To publish a file of
+A call gives exactly one of `body`, `body_base64` and `attachment`, and no
+`content_type` beside an attachment. To publish a file of
 your own, `send` it to a channel first and name the attachment from that
 send's answer. `docs/message-bus.md` §2.7.2 has the whole contract.
 

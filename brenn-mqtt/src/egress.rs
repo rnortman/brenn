@@ -69,13 +69,16 @@ pub enum SendBudget<'a> {
 /// implement a user-facing `Display`.
 #[derive(Debug)]
 pub enum MqttEgressError {
-    /// Grant absent OR client not in the `mqtt_publish` ACL. A single variant for
-    /// enforcement; a caller wanting to distinguish "no grant at all" from "grant
-    /// held but client unlisted" (for diagnostics / message selection) does its own
-    /// cheap `has_grant(MqttPublish)` check.
+    /// Grant absent OR no `mqtt_publish` matcher admits the topic on the client.
+    /// A single variant for enforcement; a caller wanting to distinguish "no grant
+    /// at all" from "grant held but topic unlisted" (for diagnostics / message
+    /// selection) does its own cheap `has_grant(MqttPublish)` check.
     AclDenied {
         /// The denied target client slug.
         client: String,
+        /// The denied concrete topic (guest- or model-supplied; sanitize before
+        /// logging or echoing).
+        topic: String,
     },
     /// The conversation budget hit zero (only reachable for
     /// [`SendBudget::Conversation`]).
@@ -191,9 +194,9 @@ impl Authorized {
 
 /// Steps 1-2 of the chain: ACL, then session lookup.
 ///
-/// 1. **ACL** — `policy.allows_mqtt_publish(client)` composes the layer-1
-///    `MqttPublish` grant check and the layer-2 per-client matcher, so no
-///    separate grant gate is needed here. A deny returns
+/// 1. **ACL** — `policy.allows_mqtt_publish(client, topic)` composes the
+///    layer-1 `MqttPublish` grant check and the layer-2 `(client, topic_filter)`
+///    matchers, so no separate grant gate is needed here. A deny returns
 ///    [`MqttEgressError::AclDenied`] *before* any session lookup.
 /// 2. **Session lookup** — `svc.get_client(client)`. A miss after an ACL pass
 ///    returns [`MqttEgressError::ClientNotRegistered`]: the registry shrinks at
@@ -211,11 +214,12 @@ pub fn authorize(
     policy: &AppPolicy,
     addr: &MqttAddress,
 ) -> Result<Authorized, MqttEgressError> {
-    // Deny-by-default: an empty matcher list denies all clients (`.any` over
+    // Deny-by-default: an empty matcher list denies every topic (`.any` over
     // empty = false).
-    if !policy.allows_mqtt_publish(&addr.client) {
+    if !policy.allows_mqtt_publish(&addr.client, &addr.topic) {
         return Err(MqttEgressError::AclDenied {
             client: addr.client.clone(),
+            topic: addr.topic.clone(),
         });
     }
 
@@ -255,17 +259,18 @@ mod tests {
     use crate::state::MqttClientHandle;
     use brenn_envelope::grants::AppCapability;
     use brenn_lib::access::AppPolicy;
-    use brenn_lib::access::acl::MqttClientMatcher;
+    use brenn_lib::access::acl::MqttPubMatcher;
     use brenn_messaging_store::db::init_db_memory;
     use brenn_messaging_store::testutils::ensure_user_and_conv;
 
-    /// A policy granting `MqttPublish` with a `mqtt_publish` matcher for each of
-    /// `clients`.
+    /// A policy granting `MqttPublish` with a `mqtt_publish` matcher of filter
+    /// `cmd/#` for each of `clients`.
     fn policy_allowing(clients: &[&str]) -> AppPolicy {
         let mut p = AppPolicy::with_grants(&[AppCapability::MqttPublish]);
         for c in clients {
-            p.acls.mqtt_publish.push(MqttClientMatcher {
+            p.acls.mqtt_publish.push(MqttPubMatcher {
                 client: (*c).to_string(),
+                topic_filter: "cmd/#".to_string(),
             });
         }
         p
@@ -320,7 +325,11 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(MqttEgressError::AclDenied { ref client }) if client == "office"),
+            matches!(
+                result,
+                Err(MqttEgressError::AclDenied { ref client, ref topic })
+                    if client == "office" && topic == "cmd/light"
+            ),
             "expected AclDenied for office, got {result:?}"
         );
         // No budget row was created — the decrement was never reached.
@@ -565,7 +574,14 @@ mod tests {
 
         assert!(matches!(
             authorize(&svc, &policy, &addr("office", "cmd/light")),
-            Err(MqttEgressError::AclDenied { ref client }) if client == "office"
+            Err(MqttEgressError::AclDenied { ref client, .. }) if client == "office"
+        ));
+        // A listed client, but a topic outside its filter, is denied before the
+        // session lookup and names the topic.
+        assert!(matches!(
+            authorize(&svc, &policy, &addr("gone", "status/light")),
+            Err(MqttEgressError::AclDenied { ref client, ref topic })
+                if client == "gone" && topic == "status/light"
         ));
         assert!(matches!(
             authorize(&svc, &policy, &addr("gone", "cmd/light")),

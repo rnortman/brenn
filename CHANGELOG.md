@@ -4,6 +4,29 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **BREAKING for operators:** MQTT publish ACLs are per topic. Until now, an
+  app or component allowed to publish through a broker client could publish to
+  every topic on it; it is now limited to the topics its ACL names. A publish entry
+  that named a client, `acl publish [client "mqtt:<c>"]`, no longer loads; it
+  is written `acl publish [topic_filter "mqtt:<c>:<filter>"]`, one entry per
+  filter, and a budget tail moves onto any one of a client's entries (it still
+  tunes the client's one sink). `topic_filter "mqtt:<c>:#"` reproduces the old
+  reach except topics whose first level starts with `$`, which are written out
+  (for example `topic_filter "mqtt:<c>:$SYS/#"`). A stamp ceiling's `client`
+  publish line is rewritten the same way. A packaged arrangement whose bundle
+  still writes the client-only form keeps compiling, and now holds the topics
+  its stamp's ceiling states for that client — a stamp whose ceiling states
+  none is refused with the line to add. Applies to agents (`MqttSend`) and
+  components (`mqtt-publish`) alike; a refused topic is the existing
+  `not-permitted`, and its denial names the topic.
+- **BREAKING for MqttSend callers:** `MqttSend` can send JSON, and raw bytes
+  move to their own argument. `body: { binary_base64, content_type }` becomes
+  the top-level arguments `body_base64` and `content_type`; the old object is
+  refused with a message naming them, never published. An object or array
+  `body` is now published as its JSON text (a serialization of the value, not
+  the caller's spelling); a string `body` is still published verbatim, and a
+  number, boolean or null `body` is refused. `content_type` also types a
+  `body`, and is refused beside an `attachment`, which publishes its own.
 - **An MQTT publish now waits at most 10 seconds, and a component is no longer
   trapped for a slow broker.** A conversation's `MqttSend` and a component's
   `mqtt-publish` both give up on a broker that has not acknowledged within 10

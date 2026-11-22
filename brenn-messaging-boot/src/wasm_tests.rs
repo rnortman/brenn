@@ -1804,12 +1804,13 @@ fn wasm_publish_knobs_explicit_convert_to_millitokens() {
 
 #[test]
 fn wasm_mqtt_sink_defaults_from_publish_acl() {
-    use brenn_lib::access::raw::MqttClientMatcherRaw;
+    use brenn_lib::access::raw::MqttPubMatcherRaw;
     let (dir, _) = make_brenn_dir("brenn:mqtt-default-sink");
     let mut raw = budget_consumer("mqtt-default-sink");
     raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
-    raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
+    raw.mqtt_publish_acl = vec![MqttPubMatcherRaw {
         client: "home".to_string(),
+        topic_filter: "#".to_string(),
     }];
     let resolved = resolve_wasm_consumers(
         &[raw],
@@ -1829,14 +1830,49 @@ fn wasm_mqtt_sink_defaults_from_publish_acl() {
 }
 
 #[test]
+fn several_publish_entries_for_one_client_seed_one_sink() {
+    use brenn_lib::access::raw::MqttPubMatcherRaw;
+    let (dir, _) = make_brenn_dir("brenn:mqtt-one-sink");
+    let mut raw = budget_consumer("mqtt-one-sink");
+    raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
+    raw.mqtt_publish_acl = ["lights/+/set", "blinds/cmd"]
+        .into_iter()
+        .map(|filter| MqttPubMatcherRaw {
+            client: "home".to_string(),
+            topic_filter: filter.to_string(),
+        })
+        .collect();
+    let resolved = resolve_wasm_consumers(
+        &[raw],
+        &dir,
+        "64MiB",
+        &declared_clients(&["home"]),
+        &no_auto(),
+    );
+    assert_eq!(
+        resolved[0].mqtt_sinks.len(),
+        1,
+        "one client is one sink however many filters it is held for",
+    );
+    assert!(resolved[0].mqtt_sinks.contains_key("home"));
+    assert!(resolved[0].policy.allows_mqtt_publish("home", "blinds/cmd"));
+    assert!(
+        !resolved[0]
+            .policy
+            .allows_mqtt_publish("home", "blinds/status")
+    );
+}
+
+#[test]
 fn wasm_mqtt_output_override_honored() {
-    use brenn_lib::access::raw::MqttClientMatcherRaw;
+    use brenn_lib::access::raw::MqttPubMatcherRaw;
     use brenn_lib::messaging::config::WasmConsumerMqttOutputRaw;
     let (dir, _) = make_brenn_dir("brenn:mqtt-override");
     let mut raw = budget_consumer("mqtt-override");
     raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
-    raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
+    raw.mqtt_publish_acl = vec![MqttPubMatcherRaw {
         client: "home".to_string(),
+        topic_filter: "#".to_string(),
     }];
     raw.mqtt_outputs = vec![WasmConsumerMqttOutputRaw {
         client: "home".to_string(),
@@ -1969,13 +2005,14 @@ fn wasm_dead_sink_pull_only_amplification_does_not_rescue() {
 #[test]
 #[should_panic(expected = "not covered by mqtt_publish_acl")]
 fn wasm_mqtt_output_unlisted_client_panics() {
-    use brenn_lib::access::raw::MqttClientMatcherRaw;
+    use brenn_lib::access::raw::MqttPubMatcherRaw;
     use brenn_lib::messaging::config::WasmConsumerMqttOutputRaw;
     let (dir, _) = make_brenn_dir("brenn:mqtt-unlisted");
     let mut raw = budget_consumer("mqtt-unlisted");
     raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
-    raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
+    raw.mqtt_publish_acl = vec![MqttPubMatcherRaw {
         client: "home".to_string(),
+        topic_filter: "#".to_string(),
     }];
     raw.mqtt_outputs = vec![WasmConsumerMqttOutputRaw {
         client: "away".to_string(),
@@ -1994,13 +2031,14 @@ fn wasm_mqtt_output_unlisted_client_panics() {
 #[test]
 #[should_panic(expected = "duplicate [[mqtt_output]] block")]
 fn wasm_mqtt_output_duplicate_client_panics() {
-    use brenn_lib::access::raw::MqttClientMatcherRaw;
+    use brenn_lib::access::raw::MqttPubMatcherRaw;
     use brenn_lib::messaging::config::WasmConsumerMqttOutputRaw;
     let (dir, _) = make_brenn_dir("brenn:mqtt-dup");
     let mut raw = budget_consumer("mqtt-dup");
     raw.grants = vec![ComponentGrant::Ports, ComponentGrant::Mqtt];
-    raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
+    raw.mqtt_publish_acl = vec![MqttPubMatcherRaw {
         client: "home".to_string(),
+        topic_filter: "#".to_string(),
     }];
     raw.mqtt_outputs = vec![
         WasmConsumerMqttOutputRaw {

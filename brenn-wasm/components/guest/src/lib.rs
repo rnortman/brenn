@@ -2093,7 +2093,8 @@ pub mod mqtt {
     //! Direct MQTT publishing.
     //!
     //! **Requires grant:** `"mqtt"` in `[[wasm_consumer]]` grants, and an
-    //! `mqtt_publish` ACL listing every client this component may reach. If the
+    //! `mqtt_publish` ACL whose entries — a client and a topic filter each —
+    //! admit every topic this component publishes to. If the
     //! grant is absent the host does not link the `brenn:processor/mqtt`
     //! interface and any import of it causes a load-time panic.
     //!

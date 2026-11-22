@@ -603,6 +603,45 @@ fn reach_beyond_a_ceiling_is_refused_in_the_authors_module() {
     assert_eq!(filename(&errors[0].related[0].1), "main.brenn");
 }
 
+/// A real module file writing the client-only publish entry: with the
+/// stamp's ceiling stating a filter for the client, the instance holds that
+/// filter and the author's budget; with none, the refusal is in the module and
+/// the stamp in the root is the related site.
+#[test]
+fn a_packaged_client_only_publish_entry_reads_the_stamps_ceiling() {
+    let output = compile(&inputs(
+        "pkg-publish-legacy",
+        &[modules("pkg-publish-legacy")],
+    ))
+    .unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
+    let held: Vec<(&str, &str, Option<f64>)> = output.consumers[0]
+        .acl
+        .mqtt_publish
+        .iter()
+        .map(|entry| {
+            (
+                entry.client.value().as_str(),
+                entry.topic_filter.value().as_str(),
+                entry.publish_capacity,
+            )
+        })
+        .collect();
+    assert_eq!(held, [("bob_hub", "alice/+/set", Some(4.0))]);
+
+    let errors = errors_with("pkg-publish-legacy-bare", &[modules("pkg-publish-legacy")]);
+    assert_eq!(errors.len(), 1, "{:?}", messages(&errors));
+    assert_eq!(
+        errors[0].message,
+        "`acl publish [client \"mqtt:bob_hub\"]` on `demo.consume` asks to publish through \
+         client `bob_hub`, and the stamp `demo` states no topics for that client: a packaged \
+         arrangement publishes to the topics the deployment stamps it with, so write them — \
+         `acl publish [topic_filter \"mqtt:bob_hub:<filter>\"];`"
+    );
+    assert_eq!(filename(&errors[0].span), "bridge.brenn");
+    assert_eq!(errors[0].related[0].0, "stamped here");
+    assert_eq!(filename(&errors[0].related[0].1), "main.brenn");
+}
+
 /// Two packaged modules deep, the inner `new` writing nothing: it records no
 /// stamp, so the one ceiling in the root covers both arrangements' words.
 #[test]

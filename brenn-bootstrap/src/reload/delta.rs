@@ -1531,6 +1531,35 @@ mod tests {
         }
     }
 
+    /// An edit that only narrows a consumer's publish filter changes the
+    /// consumer: its resolved policy is what the rebuilt publisher decides by.
+    #[test]
+    fn an_edit_to_only_a_publish_filter_makes_the_consumer_changed() {
+        let with_filter = |filter: &str| {
+            let mut config = base();
+            config
+                .mqtt_clients
+                .push(brenn_messaging_boot::test_fixtures::minimal_mqtt_client(
+                    "ha",
+                ));
+            let mut publisher = consumer("sifter", &["brenn:work"]);
+            publisher
+                .grants
+                .push(brenn_lib::messaging::ComponentGrant::Mqtt);
+            publisher.mqtt_publish_acl = vec![brenn_lib::access::raw::MqttPubMatcherRaw {
+                client: "ha".to_string(),
+                topic_filter: filter.to_string(),
+            }];
+            config.wasm_consumers = vec![publisher];
+            config
+        };
+        let delta = delta_between(&with_filter("a/#"), &with_filter("a/x/set"), "aa", "aa");
+        assert_eq!(delta.consumers_changed, vec!["sifter".to_string()]);
+        assert!(delta.channels_changed.is_empty());
+        assert!(delta.channels_added.is_empty());
+        assert!(delta.channels_removed.is_empty());
+    }
+
     /// A `link` is one of the convergible blocks, and the entry it mints is
     /// nobody's declaration — so the delta has to see it like any other entry.
     /// A link edit that minted nothing visible would land as `unchanged` with

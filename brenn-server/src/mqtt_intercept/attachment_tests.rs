@@ -144,8 +144,43 @@ async fn an_attachment_of_zero_bytes_publishes_an_empty_payload() {
     assert!(p.payload.is_empty());
 }
 
+const MORE_THAN_ONE: &str = "more than one payload argument is given: give exactly one of \
+                             `body`, `body_base64` and `attachment`";
+
 #[tokio::test]
-async fn body_and_attachment_together_are_rejected() {
+async fn two_payload_arguments_are_rejected() {
+    let f = fixture_with_mqtt(1024).await;
+    let source = snapshot(&f, SRC, b"pixels").await;
+    f.read(SRC).await;
+
+    for input in [
+        json!({ "to": TO, "body": "hi", "attachment": reference(source, "snap.png") }),
+        json!({ "to": TO, "body_base64": "AAEC", "attachment": reference(source, "snap.png") }),
+        json!({ "to": TO, "body": "hi", "body_base64": "AAEC" }),
+        json!({
+            "to": TO,
+            "body": "hi",
+            "body_base64": "AAEC",
+            "attachment": reference(source, "snap.png"),
+        }),
+    ] {
+        let text = rejected(&f, call(&f, input.clone()).await).await;
+        assert_eq!(text, MORE_THAN_ONE, "{input}");
+    }
+}
+
+#[tokio::test]
+async fn no_payload_argument_is_rejected() {
+    let f = fixture_with_mqtt(1024).await;
+    let text = rejected(&f, call(&f, json!({ "to": TO })).await).await;
+    assert_eq!(
+        text,
+        "missing payload: give exactly one of `body`, `body_base64` and `attachment`"
+    );
+}
+
+#[tokio::test]
+async fn content_type_with_an_attachment_is_rejected() {
     let f = fixture_with_mqtt(1024).await;
     let source = snapshot(&f, SRC, b"pixels").await;
     f.read(SRC).await;
@@ -154,24 +189,19 @@ async fn body_and_attachment_together_are_rejected() {
         &f,
         call(
             &f,
-            json!({ "to": TO, "body": "hi", "attachment": reference(source, "snap.png") }),
+            json!({
+                "to": TO,
+                "attachment": reference(source, "snap.png"),
+                "content_type": "image/png",
+            }),
         )
         .await,
     )
     .await;
     assert_eq!(
         text,
-        "both `body` and `attachment` are given; give exactly one"
-    );
-}
-
-#[tokio::test]
-async fn neither_body_nor_attachment_is_rejected() {
-    let f = fixture_with_mqtt(1024).await;
-    let text = rejected(&f, call(&f, json!({ "to": TO })).await).await;
-    assert_eq!(
-        text,
-        "missing payload: give exactly one of `body` and `attachment`"
+        "`content_type` is given with `attachment`: an attachment publishes its own recorded \
+         content type; drop `content_type`"
     );
 }
 
@@ -347,8 +377,10 @@ async fn an_acl_denial_with_an_oversize_attachment_answers_the_denial() {
         .await,
         Some(ToolOutcome::Err(json!({
             "ok": false,
-            "error": "MQTT publish to client `office` is not allowed for this app: \
-                      add an \"mqtt_publish\" ACL matcher for that client",
+            "error": "MQTT publish to `mqtt:office:cam/snapshot` is not allowed for this app: \
+                      no `acl publish` entry admits that topic on client `office`; the \
+                      operator adds `topic_filter \"mqtt:office:<filter>\"` to the app's \
+                      `acl publish`",
         })))
     );
     assert_eq!(send_budget_row(&f.bridge).await, None);

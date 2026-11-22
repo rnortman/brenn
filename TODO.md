@@ -5350,6 +5350,18 @@ Done = the default path uses the bus rule, or `docs/message-bus.md` says why it 
 site: `classify_inbound`.
 
 
+## `mqtt-publish-client-only-packaged-form`
+
+Retire the client-only MQTT publish entry (`acl publish [client
+"mqtt:<client>"]`) from packaged-module DSL text. Deployment-authored text
+refuses it; a bundle's `assembly` body may still write it, read as a request
+bounded by the stamp's ceiling filters, because bundles cannot be re-released
+in lockstep with the host. Done when the packaged path refuses the form with
+the replacement spelled out and the legacy reading is deleted; a deliberate
+break of the packaged-DSL contract (`docs/component-packages.md`, *Contract
+evolution*), to be made once out-of-tree bundles have moved to the
+topic-filter form.
+
 ## `quality-resolved-channel-literal-fallout-recurs-per-field`
 
 Tests build `ChannelEntry` and `ResolvedChannel` by full struct literal at about a hundred sites

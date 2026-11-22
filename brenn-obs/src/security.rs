@@ -584,7 +584,7 @@ mod tests {
             SecurityEventType::MqttPublishDenied,
             DenialOrigin::Component { slug: "office" },
             DenialKind::AclDenied,
-            "mqtt:office",
+            "mqtt:office:lights/hall/set",
         );
         drop(dispatcher);
         handle.await.unwrap();
@@ -600,7 +600,7 @@ mod tests {
             "component body must carry no conversation clause: {body}"
         );
         assert!(
-            body.contains("kind=acl_denied address=mqtt:office"),
+            body.contains("kind=acl_denied address=mqtt:office:lights/hall/set"),
             "detail schema: {body}"
         );
     }

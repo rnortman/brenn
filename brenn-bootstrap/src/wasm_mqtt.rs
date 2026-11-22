@@ -96,7 +96,6 @@ impl brenn_wasm::MqttPublisher for WasmMqttPublisher {
             client: target.client,
             topic: target.topic,
         };
-        let client = &addr.client;
         // `block_on` is safe only on a blocking-pool thread; see
         // `make_wasm_mqtt_publish_fn`'s doc.
         //
@@ -125,17 +124,17 @@ impl brenn_wasm::MqttPublisher for WasmMqttPublisher {
         ));
         match result {
             Ok(()) => brenn_wasm::MqttPublishOutcome::Ok,
-            Err(MqttEgressError::AclDenied { .. }) => {
+            Err(MqttEgressError::AclDenied { client, topic }) => {
                 // An ACL denial is a security event, not a guest-input error.
                 // `kind` is always `acl_denied`: without the `Mqtt` grant this
-                // callback is never linked. `client` is guest-derived and must
-                // be sanitized by `signal_publish_denial`.
+                // callback is never linked. `client` and `topic` are
+                // guest-derived and are sanitized by `signal_publish_denial`.
                 signal_publish_denial(
                     alerts,
                     SecurityEventType::MqttPublishDenied,
                     DenialOrigin::Component { slug },
                     DenialKind::AclDenied,
-                    &format!("mqtt:{client}"),
+                    &format!("mqtt:{client}:{topic}"),
                 );
                 brenn_wasm::MqttPublishOutcome::NotPermitted
             }
@@ -159,7 +158,7 @@ impl brenn_wasm::MqttPublisher for WasmMqttPublisher {
                 // `Display` carries broker-derived external text, so it is
                 // sanitized per the log-integrity posture even though it is
                 // not guest-supplied; `client` is guest-supplied.
-                let safe_client = sanitize_untrusted_str(client, MAX_LOGGED_UNTRUSTED_BYTES);
+                let safe_client = sanitize_untrusted_str(&addr.client, MAX_LOGGED_UNTRUSTED_BYTES);
                 tracing::warn!(
                     slug = %slug,
                     client = %safe_client,
@@ -178,7 +177,7 @@ impl brenn_wasm::MqttPublisher for WasmMqttPublisher {
                 // The guest gets a fixed text: the broker's maximum is
                 // broker-derived detail it was never granted. The numbers
                 // land host-side. `invalid-payload` tells it not to retry.
-                let safe_client = sanitize_untrusted_str(client, MAX_LOGGED_UNTRUSTED_BYTES);
+                let safe_client = sanitize_untrusted_str(&addr.client, MAX_LOGGED_UNTRUSTED_BYTES);
                 tracing::warn!(
                     slug = %slug,
                     client = %safe_client,
@@ -209,7 +208,7 @@ impl brenn_wasm::MqttPublisher for WasmMqttPublisher {
 mod tests {
     use super::*;
     use brenn_envelope::grants::AppCapability;
-    use brenn_lib::access::acl::{AclSet, MqttClientMatcher};
+    use brenn_lib::access::acl::{AclSet, MqttPubMatcher};
     use brenn_lib::access::{AppPolicy, GrantSet};
     use brenn_mqtt::state::MqttClientHandle;
     use brenn_obs::alerting::{make_capturing_alerter, noop_alert_dispatcher};
@@ -222,17 +221,25 @@ mod tests {
         noop_alert_dispatcher().0
     }
 
-    /// A policy granting `MqttPublish` with a `mqtt_publish` matcher for each of
-    /// `clients`. Hand-rolled literal-field construction because
-    /// `AppPolicy::with_grants` is `#[cfg(test)]`-gated inside `brenn-lib` and so
-    /// invisible to the `brenn` crate.
+    /// A policy granting `MqttPublish` with a `#` `mqtt_publish` matcher for each
+    /// of `clients`.
     fn policy_allowing(clients: &[&str]) -> AppPolicy {
+        let matchers: Vec<(&str, &str)> = clients.iter().map(|c| (*c, "#")).collect();
+        policy_with_filters(&matchers)
+    }
+
+    /// A policy granting `MqttPublish` with one `mqtt_publish` matcher per
+    /// `(client, topic_filter)` pair. Hand-rolled literal-field construction
+    /// because `AppPolicy::with_grants` is `#[cfg(test)]`-gated inside
+    /// `brenn-lib` and so invisible to the `brenn` crate.
+    fn policy_with_filters(matchers: &[(&str, &str)]) -> AppPolicy {
         let mut grants = GrantSet::default();
         grants.insert(AppCapability::MqttPublish);
         let mut acls = AclSet::default();
-        for c in clients {
-            acls.mqtt_publish.push(MqttClientMatcher {
-                client: (*c).to_string(),
+        for (client, topic_filter) in matchers {
+            acls.mqtt_publish.push(MqttPubMatcher {
+                client: (*client).to_string(),
+                topic_filter: (*topic_filter).to_string(),
             });
         }
         AppPolicy {
@@ -472,9 +479,73 @@ mod tests {
         );
         assert_eq!(alerts[0].0, "Security: mqtt_publish_denied");
         assert!(
-            alerts[0].1.contains("kind=acl_denied") && alerts[0].1.contains("address=mqtt:office"),
+            alerts[0].1.contains("kind=acl_denied")
+                && alerts[0].1.contains("address=mqtt:office:cmd/light"),
             "alert body must carry the sanitized kind + address: {}",
             alerts[0].1
         );
+    }
+
+    /// The publish ACL decides by topic: through the real publisher, a topic the
+    /// filter admits reaches the broker layer, and one outside it — or the same
+    /// topic on another client — is `NotPermitted`, with the refused topic in the
+    /// denial signal. `mqtt-publish` and `mqtt-publish-expiring` both reach this
+    /// publisher through one host path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_acl_decides_by_topic() {
+        let (dispatcher, captured, handle) = make_capturing_alerter();
+        let svc = service_with_client("home").await;
+        let f = make_wasm_mqtt_publish_fn(
+            policy_with_filters(&[("home", "a/+/set")]),
+            "slug".to_string(),
+            svc,
+            dispatcher.clone(),
+        );
+        assert!(matches!(
+            call(&f, "home", "a/x/set").await,
+            MqttPublishOutcome::Broker(_)
+        ));
+        assert!(matches!(
+            call(&f, "home", "a/x/get").await,
+            MqttPublishOutcome::NotPermitted
+        ));
+        assert!(matches!(
+            call(&f, "office", "a/x/set").await,
+            MqttPublishOutcome::NotPermitted
+        ));
+
+        drop(f);
+        drop(dispatcher);
+        handle.await.expect("alert drainer join");
+        let alerts = captured.lock().unwrap();
+        // The phone alert is deduped per (origin, slug, kind): the first
+        // refusal is the one it carries.
+        assert_eq!(alerts.len(), 1, "one deduped alert: {alerts:?}");
+        assert!(
+            alerts[0].1.contains("address=mqtt:home:a/x/get"),
+            "alert body must name the refused topic: {}",
+            alerts[0].1
+        );
+    }
+
+    /// An entry of `#` admits every topic except one whose first level starts
+    /// with `$`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hash_entry_refuses_a_dollar_topic() {
+        let svc = service_with_client("home").await;
+        let f = make_wasm_mqtt_publish_fn(
+            policy_allowing(&["home"]),
+            "slug".to_string(),
+            svc,
+            noop_dispatcher(),
+        );
+        assert!(matches!(
+            call(&f, "home", "a/b").await,
+            MqttPublishOutcome::Broker(_)
+        ));
+        assert!(matches!(
+            call(&f, "home", "$SYS/x").await,
+            MqttPublishOutcome::NotPermitted
+        ));
     }
 }

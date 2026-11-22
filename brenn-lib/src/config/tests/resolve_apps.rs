@@ -322,8 +322,9 @@ fn acl_naming_an_unknown_mqtt_client_panics() {
     config.apps[0]
         .acl
         .mqtt_publish
-        .push(crate::access::raw::MqttClientMatcherRaw {
+        .push(crate::access::raw::MqttPubMatcherRaw {
             client: "ha".to_string(),
+            topic_filter: "#".to_string(),
         });
     // The supplied identity map is empty: no `[[mqtt_client]]` named `ha`.
     let _ = candidate_apps(&config);

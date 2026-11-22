@@ -795,7 +795,7 @@ new sync: GitSyncConsumer {
     { key: "out", label: "binds an output port", line: "out out -> demo_out;" },
     { key: "pub", label: "states a publish entry", line: 'acl publish [prefix "brenn:demo.out."];' },
     { key: "tool", label: "has a tool statement", line: 'tool git-repo-pull { allow { repo = "notes"; } }' },
-    { key: "mqttpub", label: "has an mqtt_publish entry", line: 'acl publish [client "mqtt:broker"];' },
+    { key: "mqttpub", label: "has an mqtt_publish entry", line: 'acl publish [topic_filter "mqtt:broker:alice/#"];' },
     { key: "store", label: "states a store_path", line: 'store_path = "/home/alice/state/demo.db";' },
     { key: "config", label: "states a config map", line: "config = { … };" },
     { key: "alert", label: "enclosing surface grants alert", surfaceOnly: true },

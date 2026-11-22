@@ -1,0 +1,15 @@
+// A bundle that still writes the client-only publish entry. Packaged text keeps
+// compiling with it; the topics are whatever the stamp's ceiling states for
+// that client.
+
+component Sink {
+    abi = processor;
+    requires = [mqtt];
+}
+
+assembly Bridge() {
+    new consume: Sink {
+        grants = [mqtt];
+        acl publish [client "mqtt:bob_hub" { publish_capacity = 4 }];
+    }
+}

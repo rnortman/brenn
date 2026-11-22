@@ -93,7 +93,7 @@ pub struct DAclSet {
     pub local_subscribe: Vec<DMatcher>,
     pub local_publish: Vec<DMatcher>,
     pub mqtt_subscribe: Vec<DMqttSub>,
-    pub mqtt_publish: Vec<DMqttClient>,
+    pub mqtt_publish: Vec<DMqttPub>,
     pub webhook: Vec<DWebhook>,
 }
 
@@ -132,15 +132,17 @@ pub struct DMqttSub {
     pub topic_filter: Spanned<String>,
 }
 
-/// One outbound MQTT entry. Publish is client-scoped: there is no topic
-/// dimension to narrow.
+/// One outbound MQTT entry: a topic filter, scoped to the client that carries
+/// it. A publish is admitted when its concrete topic matches the filter.
 ///
-/// The two budgets are the egress sink's, and the entry that mints the sink is
-/// where they are written: an entry with neither takes the runtime's default
-/// budget, which is why they are `Option` rather than a resolved pair.
+/// The two budgets are the client's egress sink's, written on any one of that
+/// client's entries: an arrangement whose entries carry neither takes the
+/// runtime's default budget, which is why they are `Option` rather than a
+/// resolved pair.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DMqttClient {
+pub struct DMqttPub {
     pub client: Spanned<String>,
+    pub topic_filter: Spanned<String>,
     pub publish_per_activation: Option<f64>,
     pub publish_capacity: Option<f64>,
 }

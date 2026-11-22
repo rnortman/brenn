@@ -16,9 +16,9 @@
 pub struct AclSet {
     /// MQTT subscribe allowlist: `(client, topic-filter)` pairs.
     pub mqtt_subscribe: Vec<MqttSubMatcher>,
-    /// MQTT publish allowlist: client-slug only (publish targets a concrete
-    /// topic, not a filter — there are no topic-level publish ACLs).
-    pub mqtt_publish: Vec<MqttClientMatcher>,
+    /// MQTT publish allowlist: `(client, topic-filter)` pairs, each matched
+    /// against the concrete topic a publish names.
+    pub mqtt_publish: Vec<MqttPubMatcher>,
     /// `brenn:` subscribe allowlist.
     pub brenn_subscribe: Vec<ChannelMatcher>,
     /// `brenn:` publish allowlist.
@@ -56,12 +56,15 @@ pub struct MqttSubMatcher {
     pub topic_filter: String,
 }
 
-/// MQTT publish matcher: client-slug only. Publish is client-scoped; there is
-/// no topic dimension on the publish side.
+/// MQTT publish matcher: a `(client, topic_filter)` pair. A publish names a
+/// concrete topic, which `mqtt::address::mqtt_topic_matches` tests against the
+/// filter at enforcement time, `$` first-level rule included.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MqttClientMatcher {
+pub struct MqttPubMatcher {
     /// MQTT client slug this matcher scopes to.
     pub client: String,
+    /// Allowed MQTT topic filter (validated at resolution time).
+    pub topic_filter: String,
 }
 
 /// `brenn:` channel matcher. Starts with `Exact` + `Prefix` only; full globs are
@@ -176,8 +179,9 @@ mod tests {
             client: "home".to_string(),
             topic_filter: "sensors/#".to_string(),
         });
-        acl.mqtt_publish.push(MqttClientMatcher {
+        acl.mqtt_publish.push(MqttPubMatcher {
             client: "home".to_string(),
+            topic_filter: "lights/+/set".to_string(),
         });
         acl.webhook.push(WebhookMatcher {
             endpoint: "webhook-slug".to_string(),
@@ -193,6 +197,7 @@ mod tests {
         assert_eq!(acl.mqtt_subscribe[0].client, "home");
         assert_eq!(acl.mqtt_subscribe[0].topic_filter, "sensors/#");
         assert_eq!(acl.mqtt_publish[0].client, "home");
+        assert_eq!(acl.mqtt_publish[0].topic_filter, "lights/+/set");
         assert_eq!(acl.webhook[0].endpoint, "webhook-slug");
         assert_eq!(
             acl.ephemeral_subscribe[0],

@@ -26,6 +26,7 @@ use brenn_envelope::grants::AppCapability;
 
 use crate::access::acl::AclSet;
 use crate::messaging::ChannelScheme;
+use crate::mqtt::address::mqtt_topic_matches;
 use crate::tools::ResolvedToolGrant;
 
 /// The unified, app-kind-independent record of "what an app may do": a layer-1
@@ -280,13 +281,22 @@ impl AppPolicy {
             && Self::acl_covers(&self.acls.local_publish, channel)
     }
 
-    /// May this app publish to MQTT `client`? Requires the `MqttPublish` grant
-    /// **and** a `mqtt_publish` matcher for the client. Client-scoped only — there
-    /// is no topic dimension on the publish side (`MqttClientMatcher` carries no
-    /// topic).
-    pub fn allows_mqtt_publish(&self, client: &str) -> bool {
+    /// May this app publish to the concrete MQTT topic `topic` through `client`?
+    /// Requires the `MqttPublish` grant **and** a `mqtt_publish` matcher for the
+    /// client whose topic filter matches `topic`. One decision for conversations
+    /// and components alike.
+    ///
+    /// `topic` is a topic *name*, wildcard-free; the caller parses it. Matching is
+    /// [`mqtt_topic_matches`], so an entry of `#` or `+/…` admits no topic whose
+    /// first level starts with `$`: such a topic is admitted only by a filter that
+    /// spells its first level.
+    pub fn allows_mqtt_publish(&self, client: &str, topic: &str) -> bool {
         self.grants.has(AppCapability::MqttPublish)
-            && self.acls.mqtt_publish.iter().any(|m| m.client == client)
+            && self
+                .acls
+                .mqtt_publish
+                .iter()
+                .any(|m| m.client == client && mqtt_topic_matches(&m.topic_filter, topic))
     }
 
     /// May `self` (any subscriber — static or dynamic) access this channel — hold
@@ -367,7 +377,7 @@ impl GrantSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::acl::{ChannelMatcher, MqttClientMatcher, MqttSubMatcher, WebhookMatcher};
+    use crate::access::acl::{ChannelMatcher, MqttPubMatcher, MqttSubMatcher, WebhookMatcher};
 
     #[test]
     fn empty_grant_set_denies_everything() {
@@ -993,24 +1003,85 @@ mod tests {
         assert!(!granted.allows_brenn_publish("status.ready.extra"));
     }
 
+    fn pub_matcher(client: &str, topic_filter: &str) -> MqttPubMatcher {
+        MqttPubMatcher {
+            client: client.to_string(),
+            topic_filter: topic_filter.to_string(),
+        }
+    }
+
     #[test]
     fn mqtt_publish_requires_grant_and_matcher() {
         let acls = AclSet {
-            mqtt_publish: vec![MqttClientMatcher {
-                client: "home".to_string(),
-            }],
+            mqtt_publish: vec![pub_matcher("home", "a/+/set")],
             ..AclSet::default()
         };
-        // Listed client, but missing the MqttPublish grant ⇒ deny.
+        // Listed client and topic, but missing the MqttPublish grant ⇒ deny.
         let no_grant = policy(&[AppCapability::MqttSubscribe], acls.clone());
-        assert!(!no_grant.allows_mqtt_publish("home"));
+        assert!(!no_grant.allows_mqtt_publish("home", "a/x/set"));
         // Grant held but empty publish list ⇒ deny-by-default.
         let no_matcher = policy(&[AppCapability::MqttPublish], AclSet::default());
-        assert!(!no_matcher.allows_mqtt_publish("home"));
-        // Grant + listed client ⇒ allow; unlisted client ⇒ deny (client-scoped,
-        // no topic dimension).
+        assert!(!no_matcher.allows_mqtt_publish("home", "a/x/set"));
+        // Grant + a matcher whose filter matches the topic ⇒ allow.
         let granted = policy(&[AppCapability::MqttPublish], acls);
-        assert!(granted.allows_mqtt_publish("home"));
-        assert!(!granted.allows_mqtt_publish("office"));
+        assert!(granted.allows_mqtt_publish("home", "a/x/set"));
+        // Same client, topic outside the filter ⇒ deny.
+        assert!(!granted.allows_mqtt_publish("home", "a/x/get"));
+        assert!(!granted.allows_mqtt_publish("home", "a/x/set/more"));
+        // Topic the filter would admit, but on another client ⇒ deny.
+        assert!(!granted.allows_mqtt_publish("office", "a/x/set"));
+    }
+
+    #[test]
+    fn mqtt_publish_multi_level_wildcard_skips_dollar_topics() {
+        let hash = policy(
+            &[AppCapability::MqttPublish],
+            AclSet {
+                mqtt_publish: vec![pub_matcher("home", "#")],
+                ..AclSet::default()
+            },
+        );
+        assert!(hash.allows_mqtt_publish("home", "a/b"));
+        assert!(!hash.allows_mqtt_publish("home", "$SYS/x"));
+
+        let plus = policy(
+            &[AppCapability::MqttPublish],
+            AclSet {
+                mqtt_publish: vec![pub_matcher("home", "+/x")],
+                ..AclSet::default()
+            },
+        );
+        assert!(plus.allows_mqtt_publish("home", "a/x"));
+        assert!(!plus.allows_mqtt_publish("home", "$SYS/x"));
+
+        let sys = policy(
+            &[AppCapability::MqttPublish],
+            AclSet {
+                mqtt_publish: vec![pub_matcher("home", "$SYS/#")],
+                ..AclSet::default()
+            },
+        );
+        assert!(sys.allows_mqtt_publish("home", "$SYS/x"));
+        assert!(!sys.allows_mqtt_publish("home", "a/b"));
+    }
+
+    #[test]
+    fn mqtt_publish_entries_for_one_client_are_a_union() {
+        let granted = policy(
+            &[AppCapability::MqttPublish],
+            AclSet {
+                mqtt_publish: vec![
+                    pub_matcher("home", "lights/+/set"),
+                    pub_matcher("home", "blinds/cmd"),
+                    pub_matcher("office", "door/open"),
+                ],
+                ..AclSet::default()
+            },
+        );
+        assert!(granted.allows_mqtt_publish("home", "lights/hall/set"));
+        assert!(granted.allows_mqtt_publish("home", "blinds/cmd"));
+        assert!(!granted.allows_mqtt_publish("home", "door/open"));
+        assert!(granted.allows_mqtt_publish("office", "door/open"));
+        assert!(!granted.allows_mqtt_publish("office", "blinds/cmd"));
     }
 }

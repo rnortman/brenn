@@ -26,16 +26,16 @@ pub enum MqttError {
     WrongProtocol { address: String },
     /// Wildcard (`+` or `#`) in a publish address.
     WildcardNotAllowed { address: String },
-    /// Payload base64 is malformed.
+    /// `body_base64` is not a string, or not valid base64.
     BadBase64 { detail: String },
-    /// Payload shape is unrecognised (not string, not `{binary_base64, ...}`).
+    /// `body` is a number, boolean or null.
     BadBodyShape,
-    /// The object body's `content_type` is not a string, or is a string the
-    /// bus's content-type rule refuses.
+    /// `content_type` is not a string, or is a string the bus's content-type
+    /// rule refuses.
     BadBodyContentType { detail: String },
-    /// The object body carries a key other than `binary_base64` and
-    /// `content_type`.
-    UnknownBodyKey { key: String },
+    /// `body` is an object with a top-level `binary_base64` key: the retired
+    /// binary form, refused rather than published as JSON.
+    RetiredBinaryBody,
     /// The MQTT address string is syntactically invalid.
     AddressInvalid { address: String, detail: String },
     /// The publish, encoded, is larger than the Maximum Packet Size the
@@ -112,24 +112,25 @@ impl fmt::Display for MqttError {
                 )
             }
             MqttError::BadBase64 { detail } => {
-                write!(f, "invalid binary_base64 in body: {detail}")
+                write!(f, "invalid `body_base64` argument: {detail}")
             }
             MqttError::BadBodyShape => {
                 write!(
                     f,
-                    "invalid `body` argument: must be a string or \
-                     {{ binary_base64: string, content_type?: string }}; \
-                     to publish an attachment of a message, give `attachment` instead of `body`",
+                    "invalid `body` argument: must be a string, an object or an array; a number, \
+                     boolean or null is given as its JSON text in a string",
                 )
             }
             MqttError::BadBodyContentType { detail } => {
-                write!(f, "invalid `content_type` in body: {detail}")
+                write!(f, "invalid `content_type` argument: {detail}")
             }
-            MqttError::UnknownBodyKey { key } => {
+            MqttError::RetiredBinaryBody => {
                 write!(
                     f,
-                    "unknown key `{key}` in body: the object form takes `binary_base64` and \
-                     `content_type` only",
+                    "`body` is an object with a `binary_base64` key: bytes are given in the \
+                     top-level `body_base64` argument, with `content_type` beside it. An object \
+                     `body` is published as JSON text; a JSON payload that itself has a \
+                     top-level `binary_base64` key is given as its text in `body_base64`",
                 )
             }
             MqttError::AddressInvalid { address, detail } => {

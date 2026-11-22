@@ -155,6 +155,29 @@ arrangement grew a grant word or an `acl` line turns the next `config-check`
 into a refusal naming the word and the stamp — authority a bundle grows is
 authority the deployment re-consents to, before any host is touched.
 
+**A packaged MQTT publish entry that names only a client takes its topics from
+the ceiling.** Deployment text writes a publish entry as `topic_filter
+"mqtt:<client>:<filter>"` and refuses `client "mqtt:<client>"`. Packaged text
+may still write the client-only form, because a bundle is not re-released in
+lockstep with the host. There it stands for every publish entry for that client
+the authority it sits under holds: for an entity's `acl publish` statement or a
+`grant … publish client …` inside the arrangement, the ceiling of the stamp it
+was expanded inside; for an `acl publish` line in the body of a stamp the author
+wrote, what that stamp inherits. The instance holds exactly those filters, and a
+budget tail on the author's entry stays with the client's sink. A ceiling with
+no topics for the client refuses the entry with the line to write:
+
+```
+`acl publish [client "mqtt:bob_hub"]` on `demo.consume` asks to publish through
+client `bob_hub`, and the stamp `demo` states no topics for that client: a
+packaged arrangement publishes to the topics the deployment stamps it with, so
+write them — `acl publish [topic_filter "mqtt:bob_hub:<filter>"];`
+```
+
+A `topic_filter` publish entry in packaged text is ordinary conferred reach,
+compared with the ceiling's publish lines by equality of client and filter, as
+the subscribe side is.
+
 ### The mounts document
 
 A server reads a second document, named by `--mounts FILE`, that says which
@@ -2290,18 +2313,33 @@ which is what an assembly needs to wire its driver. It names a running entity,
 never a `principal` (*Principals*, below): a principal's authority is its own
 body, and a grant widens something that runs.
 
-A `client` entry on a top-level component's publish plane may carry a tail too,
-and it tunes the MQTT egress sink that entry mints:
+An MQTT publish entry is written the way a subscribe entry is: a `topic_filter`
+naming the client and the topics it admits, one entry per filter.
 
 ```
-acl publish [client "mqtt:broker" { publish_per_activation = 2.0, publish_capacity = 4.0 }];
+acl publish [
+  topic_filter "mqtt:broker:alice/+/set",
+  topic_filter "mqtt:broker:alice/cmd" { publish_per_activation = 2.0, publish_capacity = 4.0 }];
 ```
 
-Both keys are optional and both are token counts, spelled as the `out` binding
-spells the same two knobs; an entry with no tail leaves the sink on the
-runtime's default budget. One client is one sink, so two budgeted entries naming
-one client are refused, and only a top-level component holds a sink of its own —
-the tail on any other entity's `client` entry is refused too.
+A publish is admitted when some entry names its client and its filter matches
+the concrete topic, by the MQTT matching rules: `#` and a leading `+` match no
+topic whose first level starts with `$`, so `topic_filter "mqtt:broker:#"`
+admits every topic on `broker` except those, and a `$SYS/…` topic is written
+out (`topic_filter "mqtt:broker:$SYS/#"`). The filter's syntax is checked when
+the document is loaded. A `client "mqtt:<c>"` entry, which names a client and no
+topics, is refused in deployment text with the `topic_filter` line to write;
+packaged text is read differently (*Stamps*, above).
+
+The tail on a top-level component's publish entry tunes the MQTT egress sink
+for that entry's **client**, not for the filter it sits on: one client is one
+sink with one budget, however many filters name it. Both keys are optional and
+both are token counts, spelled as the `out` binding spells the same two knobs;
+a client none of whose entries carries a tail stays on the runtime's default
+budget. Two budgeted entries naming one client are refused, and only a
+top-level component holds a sink of its own — the tail on any other entity's
+publish entry is refused too, and so is a tail on a ceiling's publish line: a
+ceiling caps reach, and a budget is the arrangement's own.
 
 A component states no plane at all: its transport rights are read off its
 bindings and ACL entries. Two of its capability words therefore pair with
@@ -2644,6 +2682,15 @@ compiles a bundle's `modules/<name>.brenn` at boot against whatever compiler it
 happens to be running, so that subset only gains: a new class attribute arrives
 with a default, and no existing vocabulary in it changes meaning
 (`component-packages.md`, *Contract evolution*).
+
+One piece of that vocabulary has changed meaning, deliberately, and only
+narrower: `acl publish [client "mqtt:<c>"]` in packaged text used to reach every
+topic on `<c>` and now reaches the topics the stamp's ceiling states for `<c>`
+(*Stamps*, above). It still compiles and no bundle must be re-released for a
+host to boot; the one new refusal — a ceiling with no topics for that client —
+is answered in the deployer's own file. The ceiling line `client "mqtt:<c>"`
+is root-document vocabulary and is hard-cut: a stamp ceiling writes its publish
+reach as `topic_filter "mqtt:<c>:<filter>"`.
 
 ## Authoring conventions
 

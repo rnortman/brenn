@@ -481,9 +481,10 @@ interface mqtt {
     /// (`broker`) from a permanent denial (`not-permitted`): the former MAY be
     /// retried on a later activation, the latter never.
     variant mqtt-publish-error {
-        /// Grant/ACL denied for the target client — the consumer's
-        /// `mqtt_publish` ACL does not list this client (or the `mqtt` grant is
-        /// absent). Permanent for this config; do not retry.
+        /// Grant/ACL denied for the target — no entry of the consumer's
+        /// `mqtt_publish` ACL names this client with a topic filter matching
+        /// this topic (or the `mqtt` grant is absent). Permanent for this
+        /// config; do not retry.
         not-permitted,
         /// The MQTT service is not configured on this server (no `[[mqtt_client]]`
         /// is declared, so no session exists to publish through). Permanent for
@@ -525,7 +526,9 @@ interface mqtt {
     /// `client` is the `[[mqtt_client]]` slug (mirrors the LLM `MqttSend`
     /// tool's `<client>` address segment); `topic` is the topic under that
     /// client and MUST NOT contain wildcards. The consumer's `mqtt_publish` ACL
-    /// gates which clients are reachable. For QoS >= 1 the call awaits the
+    /// gates which topics on which clients are reachable: an entry names a
+    /// client and a topic filter, matched by the MQTT rules (`#` and a leading
+    /// `+` match no topic whose first level starts with `$`). For QoS >= 1 the call awaits the
     /// PUBACK for a bounded time set by the host, and fails with
     /// `broker("timed out")` past it.
     ///

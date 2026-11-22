@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brenn_envelope::grants::AppCapability;
-use brenn_lib::access::acl::{AclSet, MqttClientMatcher};
+use brenn_lib::access::acl::{AclSet, MqttPubMatcher};
 use brenn_lib::access::{AppPolicy, GrantSet};
 use brenn_lib::mqtt::address::MqttAddress;
 use brenn_lib::mqtt::config::TlsVersionMin;
@@ -44,8 +44,9 @@ fn wasm_egress_policy(client: &str) -> AppPolicy {
     let mut grants = GrantSet::default();
     grants.insert(AppCapability::MqttPublish);
     let mut acls = AclSet::default();
-    acls.mqtt_publish.push(MqttClientMatcher {
+    acls.mqtt_publish.push(MqttPubMatcher {
         client: client.to_string(),
+        topic_filter: "#".to_string(),
     });
     AppPolicy {
         grants,
@@ -785,7 +786,7 @@ async fn wasm_egress_acl_denied() {
     )
     .await;
     assert!(
-        matches!(result, Err(MqttEgressError::AclDenied { ref client }) if client == "testbroker-wasmacl"),
+        matches!(result, Err(MqttEgressError::AclDenied { ref client, .. }) if client == "testbroker-wasmacl"),
         "expected AclDenied for testbroker-wasmacl, got {result:?}"
     );
 }

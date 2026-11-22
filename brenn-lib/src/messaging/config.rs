@@ -657,19 +657,18 @@ pub struct WasmConsumerConfigRaw {
     /// shape as `ephemeral_publish_acl`, scoped to the `local:` scheme. Non-empty
     /// derives the `LocalPublish` capability; empty means deny-by-default.
     pub local_publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
-    /// Layer-2 MQTT publish ACL: per-client allowlist narrowing which
-    /// `[[mqtt_client]]` slugs this component's `mqtt-publish` host call may
-    /// target. Reuses the **same** `client`-keyed `MqttClientMatcherRaw`
-    /// matcher as the LLM `[[app.acl.mqtt_publish]]` block, resolving into
-    /// `AppPolicy.acls.mqtt_publish` exactly as the LLM side does; the guest
-    /// addresses MQTT egress by client slug and the ACL is the attenuation
-    /// boundary. Same flat top-level `Vec` authoring convention as
+    /// Layer-2 MQTT publish ACL: `(client, topic_filter)` allowlist narrowing
+    /// which topics on which `[[mqtt_client]]` slugs this component's
+    /// `mqtt-publish` host call may target. Reuses the **same**
+    /// `MqttPubMatcherRaw` matcher as the LLM `[[app.acl.mqtt_publish]]` block,
+    /// resolving into `AppPolicy.acls.mqtt_publish` exactly as the LLM side does;
+    /// the ACL is the attenuation boundary. Same flat top-level `Vec` authoring convention as
     /// `subscribe_acl`/`publish_acl` (the table-nesting asymmetry vs. the LLM
     /// `[app.acl.mqtt_publish]` sub-table is deliberate; both resolve into the
     /// same `AppPolicy`). A non-empty list derives no grant on its own — the
     /// `"mqtt"` grant must be authored explicitly in `grants`; an empty list
     /// means the consumer holds no MQTT-publish authorization (deny-by-default).
-    pub mqtt_publish_acl: Vec<crate::access::raw::MqttClientMatcherRaw>,
+    pub mqtt_publish_acl: Vec<crate::access::raw::MqttPubMatcherRaw>,
     /// Layer-2 MQTT *subscribe* ACL: `(client, topic_filter)` matchers narrowing
     /// which inbound `mqtt:` channels this component may hold a (static)
     /// subscription to. Reuses the **same** `MqttSubMatcherRaw` matcher as the LLM
@@ -6213,7 +6212,7 @@ new router: Router {
     grants = [ports, store, log, alert, config, mqtt];
     store_path = "/state/router.db";
 
-    acl publish [exact digests, client "mqtt:broker"];
+    acl publish [exact digests, topic_filter "mqtt:broker:#"];
 
     out digest -> digests {}
 }

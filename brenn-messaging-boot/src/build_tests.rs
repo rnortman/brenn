@@ -1279,7 +1279,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
 #[tokio::test]
 #[should_panic(expected = "no [[mqtt_client]] with that slug is declared")]
 async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
-    use brenn_lib::access::raw::MqttClientMatcherRaw;
+    use brenn_lib::access::raw::MqttPubMatcherRaw;
     use brenn_lib::messaging::config::WasmConsumerConfigRaw;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
@@ -1302,8 +1302,9 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
         ephemeral_publish_acl: vec![],
         local_subscribe_acl: vec![],
         local_publish_acl: vec![],
-        mqtt_publish_acl: vec![MqttClientMatcherRaw {
+        mqtt_publish_acl: vec![MqttPubMatcherRaw {
             client: "home".to_string(),
+            topic_filter: "#".to_string(),
         }],
         mqtt_subscribe_acl: vec![],
         webhook_acl: vec![],
@@ -1346,7 +1347,7 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
 #[tokio::test]
 #[should_panic(expected = "\"mqtt\" is not in grants")]
 async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
-    use brenn_lib::access::raw::MqttClientMatcherRaw;
+    use brenn_lib::access::raw::MqttPubMatcherRaw;
     use brenn_lib::messaging::config::WasmConsumerConfigRaw;
     use brenn_server::test_support::init_db_memory;
     use indexmap::IndexMap as IM;
@@ -1373,8 +1374,9 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
         ephemeral_publish_acl: vec![],
         local_subscribe_acl: vec![],
         local_publish_acl: vec![],
-        mqtt_publish_acl: vec![MqttClientMatcherRaw {
+        mqtt_publish_acl: vec![MqttPubMatcherRaw {
             client: "home".to_string(),
+            topic_filter: "#".to_string(),
         }],
         mqtt_subscribe_acl: vec![],
         webhook_acl: vec![],

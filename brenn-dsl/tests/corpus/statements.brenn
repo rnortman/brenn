@@ -198,7 +198,7 @@ new consume_demo: EchoStub {
 
     in inbound <- "webhook:push-alice" { push_depth = 50; noise = alarm; }
     out outbound -> relay;
-    acl publish [client "mqtt:broker" { publish_per_activation = 2.0, publish_capacity = 4.0 }];
+    acl publish [topic_filter "mqtt:broker:#" { publish_per_activation = 2.0, publish_capacity = 4.0 }];
 }
 
 new reserved_demo: Reserved {

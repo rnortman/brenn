@@ -2774,9 +2774,12 @@ impl ProcessorData {
         // attempt (not refunded on a broker/not-permitted outcome or a wait-budget
         // refusal): this path synchronously reaches the broker pipeline, so a guest
         // retry-looping on transient broker errors must burn budget or the loop is
-        // unbounded within the 512-call cap. A client with no bucket entry is by
-        // construction outside the ACL — the ACL/NoConnector handling in `publish`
-        // governs; no per-sink counting for it (exactly like an unbound bus port).
+        // unbounded within the 512-call cap. A topic the ACL refuses on a client the
+        // component holds is such an attempt, so it spends a token too, which also
+        // bounds the denial signals one activation raises on that client. A client
+        // with no bucket entry is by construction outside the ACL — the
+        // ACL/NoConnector handling in `publish` governs; no per-sink counting for it
+        // (exactly like an unbound bus port).
         let sink_key = SinkKey::MqttClient(target.client.clone());
         if self.gate.charge_sink_on_attempt(&sink_key).is_err() {
             *self.publish_suppressed_by_sink.entry(sink_key).or_insert(0) += 1;
@@ -2811,7 +2814,8 @@ impl ProcessorData {
                 warn!(
                     slug = %self.slug,
                     client = %display_client,
-                    "wasm mqtt-publish: not-permitted — client outside mqtt_publish ACL (or mqtt grant absent)"
+                    topic = %cap_guest_for_log(&topic),
+                    "wasm mqtt-publish: not-permitted — target outside the publish ACL (or mqtt grant absent)"
                 );
                 Err(MqttPublishWitError::NotPermitted)
             }

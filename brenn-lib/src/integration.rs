@@ -1506,12 +1506,18 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 concat!(
                     "Publish a message to an MQTT topic. Address format: `mqtt:<client>:<topic>`. ",
                     "Example: `mqtt:homeassistant:home/sensor/temperature`.\n\n",
-                    "Give the payload in exactly one of three forms. `body` as a string publishes ",
-                    "text, its UTF-8 bytes. `body` as `{ binary_base64: string, content_type?: string }` ",
-                    "publishes bytes you compose yourself, decoded, with `content_type` sent as the ",
-                    "MQTT Content Type. `attachment` as `{\"message_id\": …, \"name\": …}` publishes ",
+                    "Give the payload in exactly one of three arguments. `body` as a string ",
+                    "publishes the text, its UTF-8 bytes. JSON is given as `body`, as a value (an ",
+                    "object or an array) or as text, and is published as JSON; a value is published ",
+                    "as a serialization of it, not your spelling of it. A number, boolean or null is ",
+                    "given as its JSON text in a string. When the exact bytes matter, `body_base64` ",
+                    "carries them unchanged: the base64 of bytes you compose yourself, published ",
+                    "decoded. `content_type` with `body` or `body_base64` is sent as the MQTT ",
+                    "Content Type; none is sent otherwise. `attachment` as ",
+                    "`{\"message_id\": …, \"name\": …}` publishes ",
                     "an attachment of a message you were shown, by reference: its bytes never enter ",
-                    "this conversation, and its content type is sent as the MQTT Content Type. Give ",
+                    "this conversation, and its own content type is sent as the MQTT Content Type ",
+                    "(`content_type` is refused beside it). Give ",
                     "the `message_id` and the attachment's name exactly as the message showed them. ",
                     "The source message must still be retained on its channel and must have been ",
                     "shown to this conversation since its context was last reset; otherwise read it ",
@@ -1526,6 +1532,8 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 concat!(
                     "QoS 0: fire-and-forget (no broker ack). ",
                     "Wildcards (`+` or `#`) in the topic are rejected — use a concrete topic name. ",
+                    "The app publishes only to topics its `acl publish` entries admit; a refusal ",
+                    "names the topic. ",
                     "Cross-protocol misuse: `brenn:` addresses → BrennSend; `pwa_push:` → PwaPushSend. ",
                     "Returns `{ ok: true }` on success or `{ ok: false, error: \"...\" }` on failure. ",
                     "Counts against the per-conversation send budget."
@@ -1539,22 +1547,20 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                         "description": "MQTT address: mqtt:<client>:<topic>"
                     },
                     "body": {
-                        "description": "Message body: string (UTF-8) or { binary_base64, content_type? }",
-                        "oneOf": [
-                            { "type": "string" },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "binary_base64": { "type": "string" },
-                                    "content_type": { "type": "string" }
-                                },
-                                "required": ["binary_base64"]
-                            }
-                        ]
+                        "type": ["string", "object", "array"],
+                        "description": "Text (published as its UTF-8 bytes) or JSON (an object or array, published as JSON text)"
+                    },
+                    "body_base64": {
+                        "type": "string",
+                        "description": "Instead of `body`: base64 of the exact bytes to publish"
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": "MQTT Content Type sent with `body` or `body_base64`; refused with `attachment`"
                     },
                     "attachment": {
                         "type": "object",
-                        "description": "Instead of `body`: {\"message_id\": \"<uuid>\", \"name\": \"<attachment name>\"} naming an attachment of a message this conversation was shown; its bytes are published."
+                        "description": "Instead of `body` or `body_base64`: {\"message_id\": \"<uuid>\", \"name\": \"<attachment name>\"} naming an attachment of a message this conversation was shown; its bytes are published."
                     },
                     "qos": {
                         "type": "integer",
@@ -2822,9 +2828,11 @@ mod tests {
             Ok(())
         );
         for phrase in [
-            "exactly one of three forms",
+            "exactly one of three arguments",
             "`body` as a string",
-            "binary_base64",
+            "published as JSON",
+            "`body_base64`",
+            "`content_type`",
             "`attachment`",
             "by reference",
             "MessageChannelGet",
@@ -2832,8 +2840,69 @@ mod tests {
             "4 MiB",
             "payload_too_large",
             "spends no budget",
+            "`acl publish` entries admit",
+            "a refusal names the topic",
         ] {
             assert!(def.description.contains(phrase), "{phrase}");
+        }
+    }
+
+    fn mqtt_send_def() -> VirtualToolDef {
+        mqtt_virtual_tools(true)
+            .into_iter()
+            .find(|def| def.name == "MqttSend")
+            .unwrap()
+    }
+
+    #[test]
+    fn mqtt_send_types_every_payload_argument() {
+        let def = mqtt_send_def();
+        let props = &def.input_schema["properties"];
+        assert_eq!(
+            props["body"]["type"],
+            serde_json::json!(["string", "object", "array"])
+        );
+        assert_eq!(props["body_base64"]["type"], "string");
+        assert_eq!(props["content_type"]["type"], "string");
+        assert!(props["body"].get("oneOf").is_none());
+        assert!(!def.description.contains("binary_base64"));
+        for (name, prop) in props.as_object().unwrap() {
+            assert!(prop.get("type").is_some(), "{name} has no `type`");
+        }
+    }
+
+    #[test]
+    fn mqtt_send_admission_refuses_a_scalar_body_and_a_non_string_body_base64() {
+        let def = mqtt_send_def();
+        let check = |args: serde_json::Value| {
+            crate::tool_input::validate_tool_input("MqttSend", &def.input_schema, &args)
+        };
+        for body in [
+            serde_json::json!(42),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let err = check(serde_json::json!({ "to": "mqtt:c:t", "body": body }))
+                .expect_err("a scalar body is refused");
+            assert!(err.contains("'body'"), "{err}");
+        }
+        for b64 in [serde_json::json!(7), serde_json::json!({ "x": "AAEC" })] {
+            let err = check(serde_json::json!({ "to": "mqtt:c:t", "body_base64": b64 }))
+                .expect_err("a non-string body_base64 is refused");
+            assert!(err.contains("'body_base64'"), "{err}");
+        }
+        for body in [
+            serde_json::json!("on"),
+            serde_json::json!({ "action": "turn_on" }),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                check(
+                    serde_json::json!({ "to": "mqtt:c:t", "body": body, "content_type": "application/json" })
+                ),
+                Ok(())
+            );
         }
     }
 

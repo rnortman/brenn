@@ -2545,7 +2545,7 @@ async fn a_tool_grant_added_matches_a_fresh_boot() {
     let tree = Tree::holding(&document(BROKER));
     let granted = document(BROKER).replace(
         "acl publish [exact reload_requests, exact work];",
-        "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
+        "acl publish [exact reload_requests, exact work, topic_filter \"mqtt:ha:#\"];",
     );
 
     a_reload_matches_a_fresh_boot(

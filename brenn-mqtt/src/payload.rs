@@ -1,7 +1,7 @@
 //! MQTT payload classification and encoding helpers.
 //!
-//! Outbound: converts a `serde_json::Value` body from `MqttSend` into raw bytes
-//! + optional Content Type.
+//! Outbound: converts `MqttSend`'s `body` or `body_base64` argument, with its
+//! `content_type`, into raw bytes + optional Content Type.
 //!
 //! Inbound: `InboundPayload` carries the broker's bytes and Content Type;
 //! `classify_inbound` reads them for the default ingress shape.
@@ -70,64 +70,76 @@ pub struct OutboundPayload {
     pub content_type: Option<String>,
 }
 
-/// Decode `MqttSend.body` into `OutboundPayload`.
+/// The one inline payload argument an `MqttSend` call gives.
+#[derive(Debug, Clone, Copy)]
+pub enum OutboundArg<'a> {
+    /// `body`: a string, an object or an array.
+    Body(&'a Value),
+    /// `body_base64`: the base64 text of the bytes to publish.
+    Base64(&'a Value),
+}
+
+/// Decode an `MqttSend` inline payload argument and its `content_type` into
+/// `OutboundPayload`.
 ///
-/// Accepted forms:
-/// - `Value::String(s)` → UTF-8 bytes, no Content Type.
-/// - `Value::Object` with `binary_base64: string` and an optional
-///   `content_type: string` → base64-decoded bytes, Content Type forwarded.
-///   The object takes no other key, and `content_type` must pass the bus's
-///   content-type rule ([`brenn_envelope::body::check_content_type`]).
+/// - `body` as a string → its UTF-8 bytes, verbatim.
+/// - `body` as an object or array → its JSON text from `serde_json::to_vec`:
+///   compact, with no promise about key order or number spelling. An object
+///   with a top-level `binary_base64` key is refused whatever else it holds,
+///   so a caller of the retired binary object form never publishes base64
+///   text as JSON.
+/// - `body` as a number, boolean or null → refused.
+/// - `body_base64` → the decoded bytes.
 ///
-/// Returns `Err(MqttError)` on bad base64, an unknown key, a refused
-/// `content_type` or an unexpected shape.
-pub fn decode_outbound_body(body: &Value) -> Result<OutboundPayload, MqttError> {
-    match body {
-        Value::String(s) => Ok(OutboundPayload {
-            bytes: s.as_bytes().to_vec(),
-            content_type: None,
-        }),
-        Value::Object(map) => {
-            if let Some(key) = map
-                .keys()
-                .find(|k| !matches!(k.as_str(), "binary_base64" | "content_type"))
-            {
-                return Err(MqttError::UnknownBodyKey { key: key.clone() });
-            }
-
-            let b64 = map
-                .get("binary_base64")
-                .and_then(Value::as_str)
-                .ok_or(MqttError::BadBodyShape)?;
-
-            let bytes = Base64::decode_vec(b64).map_err(|e| MqttError::BadBase64 {
-                detail: e.to_string(),
-            })?;
-
-            let content_type = match map.get("content_type") {
-                None => None,
-                Some(Value::String(ct)) => {
-                    brenn_envelope::body::check_content_type(ct).map_err(|e| {
-                        MqttError::BadBodyContentType {
-                            detail: e.to_string(),
-                        }
-                    })?;
-                    Some(ct.clone())
-                }
-                Some(_) => {
-                    return Err(MqttError::BadBodyContentType {
-                        detail: "must be a string".to_string(),
-                    });
-                }
-            };
-
-            Ok(OutboundPayload {
-                bytes,
-                content_type,
-            })
+/// `content_type`, when given, must be a string the bus's content-type rule
+/// admits ([`brenn_envelope::body::check_content_type`]) and is forwarded as
+/// the MQTT 5 Content Type with either argument. None is added otherwise.
+pub fn decode_outbound(
+    arg: OutboundArg<'_>,
+    content_type: Option<&Value>,
+) -> Result<OutboundPayload, MqttError> {
+    let bytes = match arg {
+        OutboundArg::Body(Value::String(s)) => s.as_bytes().to_vec(),
+        OutboundArg::Body(Value::Object(map)) if map.contains_key("binary_base64") => {
+            return Err(MqttError::RetiredBinaryBody);
         }
-        _ => Err(MqttError::BadBodyShape),
-    }
+        OutboundArg::Body(value @ (Value::Object(_) | Value::Array(_))) => {
+            serde_json::to_vec(value).expect("a serde_json::Value serializes")
+        }
+        OutboundArg::Body(_) => return Err(MqttError::BadBodyShape),
+        OutboundArg::Base64(Value::String(b64)) => {
+            Base64::decode_vec(b64).map_err(|e| MqttError::BadBase64 {
+                detail: e.to_string(),
+            })?
+        }
+        OutboundArg::Base64(_) => {
+            return Err(MqttError::BadBase64 {
+                detail: "must be a string".to_string(),
+            });
+        }
+    };
+
+    let content_type = match content_type {
+        None => None,
+        Some(Value::String(ct)) => {
+            brenn_envelope::body::check_content_type(ct).map_err(|e| {
+                MqttError::BadBodyContentType {
+                    detail: e.to_string(),
+                }
+            })?;
+            Some(ct.clone())
+        }
+        Some(_) => {
+            return Err(MqttError::BadBodyContentType {
+                detail: "must be a string".to_string(),
+            });
+        }
+    };
+
+    Ok(OutboundPayload {
+        bytes,
+        content_type,
+    })
 }
 
 #[cfg(test)]
@@ -187,29 +199,93 @@ mod tests {
         assert_eq!(result, InboundClass::Binary);
     }
 
-    // --- decode_outbound_body ---
+    // --- decode_outbound ---
+
+    fn body(value: &Value) -> Result<OutboundPayload, MqttError> {
+        decode_outbound(OutboundArg::Body(value), None)
+    }
 
     #[test]
-    fn string_body_produces_utf8_bytes() {
-        let body = json!("hello");
-        let out = decode_outbound_body(&body).unwrap();
+    fn string_body_produces_its_utf8_bytes_verbatim() {
+        let out = body(&json!("hello")).unwrap();
         assert_eq!(out.bytes, b"hello");
         assert!(out.content_type.is_none());
     }
 
     #[test]
-    fn binary_base64_body_decoded_correctly() {
+    fn string_body_holding_json_text_keeps_its_spelling() {
+        let text = r#"{ "b": 1.50,  "a": true }"#;
+        let out = body(&json!(text)).unwrap();
+        assert_eq!(out.bytes, text.as_bytes());
+        assert!(out.content_type.is_none());
+    }
+
+    #[test]
+    fn object_body_publishes_json_text_of_the_same_value() {
+        let value = json!({ "action": "turn_on", "level": [1, 2] });
+        let out = body(&value).unwrap();
+        let parsed: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(parsed, value);
+        assert!(out.content_type.is_none());
+    }
+
+    #[test]
+    fn array_body_publishes_json_text_of_the_same_value() {
+        let value = json!([{ "a": 1 }, "two", null]);
+        let out = body(&value).unwrap();
+        let parsed: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(parsed, value);
+    }
+
+    #[test]
+    fn scalar_bodies_are_refused() {
+        for value in [json!(null), json!(42), json!(1.5), json!(true)] {
+            assert_eq!(
+                body(&value).unwrap_err(),
+                MqttError::BadBodyShape,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_retired_binary_object_is_refused_whatever_else_it_holds() {
+        for value in [
+            json!({ "binary_base64": "AAEC" }),
+            json!({ "binary_base64": "AAEC", "content_type": "image/png" }),
+            json!({ "binary_base64": 7, "other": "x" }),
+        ] {
+            assert_eq!(
+                body(&value).unwrap_err(),
+                MqttError::RetiredBinaryBody,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_binary_base64_key_is_ordinary_json() {
+        let value = json!({ "frame": { "binary_base64": "AAEC" } });
+        let out = body(&value).unwrap();
+        let parsed: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(parsed, value);
+    }
+
+    #[test]
+    fn body_base64_is_decoded() {
         // "AAEC" is base64 for [0x00, 0x01, 0x02].
-        let body = json!({ "binary_base64": "AAEC" });
-        let out = decode_outbound_body(&body).unwrap();
+        let out = decode_outbound(OutboundArg::Base64(&json!("AAEC")), None).unwrap();
         assert_eq!(out.bytes, &[0x00, 0x01, 0x02]);
         assert!(out.content_type.is_none());
     }
 
     #[test]
-    fn binary_base64_body_with_content_type() {
-        let body = json!({ "binary_base64": "AAEC", "content_type": "application/octet-stream" });
-        let out = decode_outbound_body(&body).unwrap();
+    fn body_base64_with_content_type() {
+        let out = decode_outbound(
+            OutboundArg::Base64(&json!("AAEC")),
+            Some(&json!("application/octet-stream")),
+        )
+        .unwrap();
         assert_eq!(out.bytes, &[0x00, 0x01, 0x02]);
         assert_eq!(
             out.content_type.as_deref(),
@@ -218,37 +294,43 @@ mod tests {
     }
 
     #[test]
+    fn body_with_content_type() {
+        let out = decode_outbound(
+            OutboundArg::Body(&json!({ "on": true })),
+            Some(&json!("application/json")),
+        )
+        .unwrap();
+        assert_eq!(out.bytes, br#"{"on":true}"#);
+        assert_eq!(out.content_type.as_deref(), Some("application/json"));
+    }
+
+    #[test]
     fn bad_base64_returns_error() {
-        let body = json!({ "binary_base64": "not-valid-base64!!!" });
-        let err = decode_outbound_body(&body).unwrap_err();
+        let err =
+            decode_outbound(OutboundArg::Base64(&json!("not-valid-base64!!!")), None).unwrap_err();
         assert!(matches!(err, MqttError::BadBase64 { .. }));
+        assert!(
+            err.to_string()
+                .starts_with("invalid `body_base64` argument: "),
+            "{err}"
+        );
     }
 
     #[test]
-    fn null_body_returns_bad_shape() {
-        let body = json!(null);
-        let err = decode_outbound_body(&body).unwrap_err();
-        assert!(matches!(err, MqttError::BadBodyShape));
-    }
-
-    #[test]
-    fn number_body_returns_bad_shape() {
-        let body = json!(42);
-        let err = decode_outbound_body(&body).unwrap_err();
-        assert!(matches!(err, MqttError::BadBodyShape));
-    }
-
-    #[test]
-    fn object_without_binary_base64_returns_bad_shape() {
-        let body = json!({ "content_type": "text/plain" });
-        let err = decode_outbound_body(&body).unwrap_err();
-        assert!(matches!(err, MqttError::BadBodyShape));
+    fn non_string_body_base64_is_refused() {
+        let err = decode_outbound(OutboundArg::Base64(&json!({ "x": 1 })), None).unwrap_err();
+        assert_eq!(
+            err,
+            MqttError::BadBase64 {
+                detail: "must be a string".to_string()
+            }
+        );
     }
 
     #[test]
     fn non_string_content_type_is_refused() {
-        let body = json!({ "binary_base64": "AAEC", "content_type": 7 });
-        let err = decode_outbound_body(&body).unwrap_err();
+        let err =
+            decode_outbound(OutboundArg::Base64(&json!("AAEC")), Some(&json!(7))).unwrap_err();
         assert_eq!(
             err,
             MqttError::BadBodyContentType {
@@ -257,39 +339,25 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "invalid `content_type` in body: must be a string"
+            "invalid `content_type` argument: must be a string"
         );
     }
 
     #[test]
     fn content_type_the_bus_refuses_is_refused() {
-        let body = json!({ "binary_base64": "AAEC", "content_type": "not a media type" });
-        let err = decode_outbound_body(&body).unwrap_err();
+        let err = decode_outbound(
+            OutboundArg::Body(&json!("on")),
+            Some(&json!("not a media type")),
+        )
+        .unwrap_err();
         let MqttError::BadBodyContentType { detail } = &err else {
             panic!("expected BadBodyContentType, got {err:?}");
         };
         assert!(detail.contains("\"not a media type\""), "{detail}");
         assert!(
             err.to_string()
-                .starts_with("invalid `content_type` in body: invalid content type"),
+                .starts_with("invalid `content_type` argument: invalid content type"),
             "{err}"
-        );
-    }
-
-    #[test]
-    fn unknown_body_key_is_refused_and_named() {
-        let body = json!({ "binary_base64": "AAEC", "contentType": "image/png" });
-        let err = decode_outbound_body(&body).unwrap_err();
-        assert_eq!(
-            err,
-            MqttError::UnknownBodyKey {
-                key: "contentType".to_string()
-            }
-        );
-        assert_eq!(
-            err.to_string(),
-            "unknown key `contentType` in body: the object form takes `binary_base64` and \
-             `content_type` only"
         );
     }
 }

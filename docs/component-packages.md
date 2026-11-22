@@ -66,6 +66,18 @@ design that makes the cut says so — but it is not a coordinated one, because
 bundles are authored on their own schedules and a host that cannot start until
 every third party has shipped is not deployable.
 
+One such change is in force in the DSL subset: **a client-only MQTT publish
+entry**. An `assembly` body writing `acl publish [client "mqtt:<c>"]` (or the
+`grant … publish client "mqtt:<c>"` form) still compiles, but it no longer
+reaches every topic on `<c>`: it yields the publish entries the stamp's ceiling
+states for `<c>`, and none if the ceiling states none — the stamp is then
+refused with the `topic_filter` line the deployer adds. The reach can only be
+equal or narrower than before, and a component already handles `not-permitted`.
+Bundle authors replace the form with `topic_filter "mqtt:<c>:<filter>"`, one
+entry per filter the arrangement publishes to; such an entry is conferred reach,
+and the deployer's ceiling names the same filter character for character. The
+legacy reading is to be removed once out-of-tree bundles have moved.
+
 So a runtime-record bump is **withheld, not fatal, under a bundle mount**. A
 surface kind whose record names a version this host does not read is not served:
 it is left out of the served kind set, alerted once, named as `withheld` in the

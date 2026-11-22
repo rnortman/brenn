@@ -12,9 +12,7 @@
 
 use indexmap::IndexMap;
 
-use crate::access::acl::{
-    AclSet, ChannelMatcher, MqttClientMatcher, MqttSubMatcher, WebhookMatcher,
-};
+use crate::access::acl::{AclSet, ChannelMatcher, MqttPubMatcher, MqttSubMatcher, WebhookMatcher};
 use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
 use crate::access::{AppPolicy, GrantSet};
 use crate::mqtt::config::MqttClientIdentity;
@@ -77,18 +75,9 @@ pub fn build_app_policy(
             .iter()
             .map(|m| {
                 validate_mqtt_client(app_slug, "mqtt_subscribe", &m.client, mqtt_clients);
-                crate::mqtt::address::validate_topic_filter_str(&m.topic_filter).unwrap_or_else(
-                    |e| {
-                        panic!(
-                            "app {app_slug:?}: mqtt_subscribe matcher has invalid topic filter \
-                             {:?}: {e}",
-                            m.topic_filter,
-                        )
-                    },
-                );
                 MqttSubMatcher {
                     client: m.client.clone(),
-                    topic_filter: m.topic_filter.clone(),
+                    topic_filter: validated_topic_filter(&owner, "mqtt_subscribe", &m.topic_filter),
                 }
             })
             .collect(),
@@ -97,8 +86,9 @@ pub fn build_app_policy(
             .iter()
             .map(|m| {
                 validate_mqtt_client(app_slug, "mqtt_publish", &m.client, mqtt_clients);
-                MqttClientMatcher {
+                MqttPubMatcher {
                     client: m.client.clone(),
+                    topic_filter: validated_topic_filter(&owner, "mqtt_publish", &m.topic_filter),
                 }
             })
             .collect(),
@@ -153,9 +143,18 @@ pub fn build_app_policy(
     }
 }
 
+/// An MQTT matcher's topic filter, validated: a malformed filter panics,
+/// naming `owner`, the matcher `list` and the filter.
+fn validated_topic_filter(owner: &str, list: &str, filter: &str) -> String {
+    crate::mqtt::address::validate_topic_filter_str(filter).unwrap_or_else(|e| {
+        panic!("{owner}: {list} matcher has invalid topic filter {filter:?}: {e}")
+    });
+    filter.to_string()
+}
+
 /// Build the resolved `AppPolicy` for a WASM component from its resolved
 /// `ComponentGrant` set and its authored `subscribe_acl`/`publish_acl` channel
-/// matchers + `mqtt_publish_acl` client matchers.
+/// matchers + `mqtt_publish_acl` `(client, topic_filter)` matchers.
 ///
 /// The grant layer maps each `ComponentGrant` onto its unified `AppCapability`
 /// (`Ports → MessagingPublish`, `Store → WasmStore`, `Log → WasmLog`,
@@ -165,7 +164,8 @@ pub fn build_app_policy(
 /// unified policy model spans both app kinds. WASM publishes to / subscribes from
 /// `brenn:` channels (`brenn_subscribe`/`brenn_publish`, validated identically to
 /// the LLM side via `resolve_channel`); with the `mqtt` grant, publishes MQTT
-/// (`mqtt_publish`, the same `client`-keyed `MqttClientMatcher` as the LLM side);
+/// (`mqtt_publish`, the same `(client, topic_filter)` `MqttPubMatcher` as the LLM
+/// side);
 /// and subscribes to inbound `mqtt:`/`webhook:`
 /// channels (`mqtt_subscribe`/`webhook`, the same matcher types the LLM side
 /// resolves into).
@@ -343,21 +343,25 @@ pub fn build_wasm_policy(
             .iter()
             .map(|m| resolve_channel(&owner, "local_subscribe_acl", m))
             .collect(),
-        // MQTT publish ACL: the same `client`-keyed `MqttClientMatcher` the LLM
-        // side resolves into. Charset-validate the client slug here; the
-        // configured-client cross-check is a boot validation where the resolved
-        // client set is in scope.
+        // MQTT publish ACL: the same `(client, topic_filter)` `MqttPubMatcher` the
+        // LLM side resolves into. Charset-validate the client slug and validate the
+        // topic filter here; the configured-client cross-check is a boot validation
+        // where the resolved client set is in scope.
         mqtt_publish: mqtt_publish_acl
             .iter()
             .map(|m| {
                 assert!(
                     crate::mqtt::config::is_valid_client_slug(&m.client),
-                    "wasm component {slug:?}: mqtt_publish_acl matcher has invalid client slug \
-                     {:?}",
+                    "{owner}: mqtt_publish_acl matcher has invalid client slug {:?}",
                     m.client,
                 );
-                MqttClientMatcher {
+                MqttPubMatcher {
                     client: m.client.clone(),
+                    topic_filter: validated_topic_filter(
+                        &owner,
+                        "mqtt_publish_acl",
+                        &m.topic_filter,
+                    ),
                 }
             })
             .collect(),
@@ -370,22 +374,16 @@ pub fn build_wasm_policy(
             .map(|m| {
                 assert!(
                     crate::mqtt::config::is_valid_client_slug(&m.client),
-                    "wasm component {slug:?}: mqtt_subscribe_acl matcher has invalid client slug \
-                     {:?}",
+                    "{owner}: mqtt_subscribe_acl matcher has invalid client slug {:?}",
                     m.client,
-                );
-                crate::mqtt::address::validate_topic_filter_str(&m.topic_filter).unwrap_or_else(
-                    |e| {
-                        panic!(
-                            "wasm component {slug:?}: mqtt_subscribe_acl matcher has invalid topic \
-                             filter {:?}: {e}",
-                            m.topic_filter,
-                        )
-                    },
                 );
                 MqttSubMatcher {
                     client: m.client.clone(),
-                    topic_filter: m.topic_filter.clone(),
+                    topic_filter: validated_topic_filter(
+                        &owner,
+                        "mqtt_subscribe_acl",
+                        &m.topic_filter,
+                    ),
                 }
             })
             .collect(),
@@ -633,7 +631,7 @@ fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelM
 mod tests {
     use super::*;
     use crate::access::raw::{
-        AttachAclsRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WasmAclsRaw, WebhookMatcherRaw,
+        AttachAclsRaw, MqttPubMatcherRaw, MqttSubMatcherRaw, WasmAclsRaw, WebhookMatcherRaw,
     };
 
     /// A minimal client identity for the given slug, for the matcher-client
@@ -663,8 +661,9 @@ mod tests {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             }],
-            mqtt_publish: vec![MqttClientMatcherRaw {
+            mqtt_publish: vec![MqttPubMatcherRaw {
                 client: "office".to_string(),
+                topic_filter: "lights/+/set".to_string(),
             }],
             brenn_subscribe: vec![
                 ChannelMatcherRaw::Prefix("alerts.".to_string()),
@@ -698,8 +697,9 @@ mod tests {
         );
         assert_eq!(
             policy.acls.mqtt_publish,
-            vec![MqttClientMatcher {
+            vec![MqttPubMatcher {
                 client: "office".to_string(),
+                topic_filter: "lights/+/set".to_string(),
             }]
         );
         assert_eq!(
@@ -883,8 +883,9 @@ mod tests {
     #[should_panic(expected = "invalid client slug")]
     fn invalid_mqtt_publish_client_slug_panics() {
         let acl = AppAclRaw {
-            mqtt_publish: vec![MqttClientMatcherRaw {
+            mqtt_publish: vec![MqttPubMatcherRaw {
                 client: "bad slug".to_string(),
+                topic_filter: "#".to_string(),
             }],
             ..AppAclRaw::default()
         };
@@ -895,8 +896,9 @@ mod tests {
     #[should_panic(expected = "unconfigured MQTT client")]
     fn mqtt_publish_matcher_names_unconfigured_client_panics() {
         let acl = AppAclRaw {
-            mqtt_publish: vec![MqttClientMatcherRaw {
+            mqtt_publish: vec![MqttPubMatcherRaw {
                 client: "nonexistent".to_string(),
+                topic_filter: "#".to_string(),
             }],
             ..AppAclRaw::default()
         };
@@ -1441,16 +1443,17 @@ mod tests {
     #[test]
     fn wasm_mqtt_publish_acl_resolves_to_mqtt_publish_list() {
         // A WASM consumer's `mqtt_publish_acl` resolves into the same
-        // `AppPolicy.acls.mqtt_publish` list, with the same `client`-keyed
-        // `MqttClientMatcher`, that the LLM `[[app.acl.mqtt_publish]]` block does.
-        // The matcher type and field are identical across both caller kinds — the load-bearing
-        // unification.
+        // `AppPolicy.acls.mqtt_publish` list, with the same `(client,
+        // topic_filter)` `MqttPubMatcher`, that the LLM `[[app.acl.mqtt_publish]]`
+        // block does.
         let mqtt_publish_acl = vec![
-            MqttClientMatcherRaw {
+            MqttPubMatcherRaw {
                 client: "home".to_string(),
+                topic_filter: "lights/+/set".to_string(),
             },
-            MqttClientMatcherRaw {
+            MqttPubMatcherRaw {
                 client: "office".to_string(),
+                topic_filter: "#".to_string(),
             },
         ];
         let policy = build_wasm_policy(
@@ -1464,19 +1467,51 @@ mod tests {
         assert_eq!(
             policy.acls.mqtt_publish,
             vec![
-                MqttClientMatcher {
+                MqttPubMatcher {
                     client: "home".to_string(),
+                    topic_filter: "lights/+/set".to_string(),
                 },
-                MqttClientMatcher {
+                MqttPubMatcher {
                     client: "office".to_string(),
+                    topic_filter: "#".to_string(),
                 },
             ]
         );
-        // The grant + a covering matcher authorize that client; deny-by-default
-        // holds for an unlisted one.
-        assert!(policy.allows_mqtt_publish("home"));
-        assert!(policy.allows_mqtt_publish("office"));
-        assert!(!policy.allows_mqtt_publish("garage"));
+        // The grant + a matcher whose filter matches the topic authorize it;
+        // deny-by-default holds for an unlisted topic or client.
+        assert!(policy.allows_mqtt_publish("home", "lights/hall/set"));
+        assert!(!policy.allows_mqtt_publish("home", "lights/hall/get"));
+        assert!(policy.allows_mqtt_publish("office", "anything/at/all"));
+        assert!(!policy.allows_mqtt_publish("garage", "lights/hall/set"));
+    }
+
+    #[test]
+    #[should_panic(expected = "mqtt_publish_acl matcher has invalid topic filter")]
+    fn wasm_mqtt_publish_acl_invalid_topic_filter_panics() {
+        build_wasm_policy(
+            "proc",
+            [ComponentGrant::Mqtt],
+            WasmAclsRaw {
+                mqtt_publish: &[MqttPubMatcherRaw {
+                    client: "home".to_string(),
+                    topic_filter: "lights/#/set".to_string(),
+                }],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "mqtt_publish matcher has invalid topic filter")]
+    fn invalid_mqtt_publish_topic_filter_panics() {
+        let acl = AppAclRaw {
+            mqtt_publish: vec![MqttPubMatcherRaw {
+                client: "home".to_string(),
+                topic_filter: "lights/#/set".to_string(),
+            }],
+            ..AppAclRaw::default()
+        };
+        build_app_policy("home", &[], &acl, &clients(&["home"]));
     }
 
     #[test]
@@ -1486,7 +1521,7 @@ mod tests {
         let policy = build_wasm_policy("proc", [ComponentGrant::Mqtt], WasmAclsRaw::default());
         assert!(policy.has_grant(AppCapability::MqttPublish));
         assert!(policy.acls.mqtt_publish.is_empty());
-        assert!(!policy.allows_mqtt_publish("home"));
+        assert!(!policy.allows_mqtt_publish("home", "a/b"));
     }
 
     #[test]
@@ -1498,8 +1533,9 @@ mod tests {
             "proc",
             [ComponentGrant::Mqtt],
             WasmAclsRaw {
-                mqtt_publish: &[MqttClientMatcherRaw {
+                mqtt_publish: &[MqttPubMatcherRaw {
                     client: "bad:slug".to_string(),
+                    topic_filter: "#".to_string(),
                 }],
                 ..Default::default()
             },

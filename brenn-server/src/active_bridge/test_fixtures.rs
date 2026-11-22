@@ -1594,7 +1594,7 @@ impl ActiveBridge {
     /// reaches the later validation it exercises.
     pub(crate) async fn test_new_with_mqtt_publish_acl() -> Arc<Self> {
         let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
-        let messenger = make_test_messenger_with_mqtt_publish(db.clone(), &["ha"]);
+        let messenger = make_test_messenger_with_mqtt_publish(db.clone(), &[("ha", "#")]);
         Self::inject_for_test_full(
             user_id,
             conversation_id,
@@ -1653,8 +1653,19 @@ impl ActiveBridge {
         allowed_clients: &[&str],
         session_clients: &[&str],
     ) -> Arc<Self> {
+        let matchers: Vec<(&str, &str)> = allowed_clients.iter().map(|c| (*c, "#")).collect();
+        Self::test_new_for_mqtt_publish_filters(&matchers, session_clients).await
+    }
+
+    /// Like [`Self::test_new_for_mqtt_publish_acl`], with the `mqtt_publish`
+    /// matchers given as `(client, topic_filter)` pairs rather than one `#`
+    /// matcher per client.
+    pub(crate) async fn test_new_for_mqtt_publish_filters(
+        matchers: &[(&str, &str)],
+        session_clients: &[&str],
+    ) -> Arc<Self> {
         let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
-        let messenger = make_test_messenger_with_mqtt_publish(db.clone(), allowed_clients);
+        let messenger = make_test_messenger_with_mqtt_publish(db.clone(), matchers);
 
         let mqtt_service = brenn_mqtt::MqttService::new();
         for client in session_clients {
@@ -1810,13 +1821,13 @@ async fn make_minimal_test_db_and_channel() -> (Db, broadcast::Sender<WsServerMe
 }
 
 /// Build a `Messenger` (empty directory) whose `"testapp"` policy grants
-/// `MqttPublish` and holds an `mqtt_publish` ACL matcher for each client in
-/// `clients`. Used by MQTT-publish intercept fixtures/tests so the
-/// per-client publish ACL check — which reaches the policy via
-/// `messenger.app_policy("testapp")` — resolves and passes for those clients.
+/// `MqttPublish` and holds one `mqtt_publish` ACL matcher per `(client,
+/// topic_filter)` pair in `matchers`. Used by MQTT-publish intercept
+/// fixtures/tests so the publish ACL check — which reaches the policy via
+/// `messenger.app_policy("testapp")` — resolves and passes for those topics.
 fn make_test_messenger_with_mqtt_publish(
     db: Db,
-    clients: &[&str],
+    matchers: &[(&str, &str)],
 ) -> Arc<brenn_messaging::Messenger> {
     let mut testapp_cfg =
         crate::test_support::app_config::default_test_app_config("testapp", "testapp");
@@ -1824,12 +1835,15 @@ fn make_test_messenger_with_mqtt_publish(
         .policy_mut()
         .grants
         .insert(brenn_envelope::grants::AppCapability::MqttPublish);
-    for client in clients {
-        testapp_cfg.policy_mut().acls.mqtt_publish.push(
-            brenn_lib::access::acl::MqttClientMatcher {
+    for (client, topic_filter) in matchers {
+        testapp_cfg
+            .policy_mut()
+            .acls
+            .mqtt_publish
+            .push(brenn_lib::access::acl::MqttPubMatcher {
                 client: (*client).to_string(),
-            },
-        );
+                topic_filter: (*topic_filter).to_string(),
+            });
     }
     let mut messenger_apps = indexmap::IndexMap::new();
     messenger_apps.insert("testapp".to_string(), testapp_cfg);

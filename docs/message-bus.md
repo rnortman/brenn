@@ -1580,24 +1580,37 @@ messages starts it clean in either direction.
 ### 2.7.2 Publishing to MQTT: `MqttSend`
 
 `MqttSend` is a conversation's publish to an `mqtt:<client>:<topic>` address.
-A call gives its payload in exactly one of three forms:
+A call gives its payload in exactly one of three arguments, `body`,
+`body_base64` and `attachment`, read in four forms:
 
 | Form | Arguments | Bytes published | MQTT 5 Content Type |
 |---|---|---|---|
-| text | `body`: a string | the string's UTF-8 bytes | none |
-| base64 | `body`: `{"binary_base64": …, "content_type"?: …}` | the decoded bytes | `content_type`, if given |
+| text | `body`: a string | the string's UTF-8 bytes, verbatim | `content_type`, if given |
+| JSON | `body`: an object or an array | the value's JSON text | `content_type`, if given |
+| base64 | `body_base64`: a string | the decoded bytes | `content_type`, if given |
 | attachment | `attachment`: `{"message_id": …, "name": …}` | the blob's bytes | the blob's recorded content type |
 
-Text is for text. The base64 object is for bytes the conversation composes
-itself: it takes those two keys and no other, and `content_type` must be a
-string the bus accepts as a content type (§2.1.2). The attachment is for an
+Text is published as given. A JSON value is published as its serialization
+(`serde_json`, compact), with no promise about key order or number spelling;
+neither form adds a Content Type, so the same JSON given as text and as a
+value differs at most in its spelling. A number, boolean or null `body` is refused at
+admission: its JSON text, as a string, says the same thing without being
+re-spelled. An object `body` with a top-level `binary_base64` key is refused
+whatever else it holds, naming `body_base64`, so a caller of the retired
+binary object form never sends base64 text to a device as JSON; a JSON
+payload that itself has such a key is given as its text in `body_base64`.
+`body_base64` is for exact bytes the conversation composes itself.
+`content_type` is a top-level argument beside `body` or `body_base64`, and
+must be a string the bus accepts as a content type (§2.1.2); no Content Type
+is sent when it is absent. The attachment is for an
 attachment of a message the conversation was shown: it is named by
 (message id, attachment name) under the rule of §2.1.2a, refused with the
 same `reason` kinds as a `BrennSend` forward (`malformed_message_id`,
 `malformed_attachment_name`, `not_read`, `channel_not_readable`,
 `not_retained`, `no_such_attachment`, `tool_channel_attachment`), and its
-bytes never pass through the model's context. A call carrying both `body`
-and `attachment`, or neither, is an argument error.
+bytes never pass through the model's context; `content_type` beside it is an
+argument error, since it publishes its own. A call carrying more than one of
+the three payload arguments, or none, is an argument error.
 
 A file of the conversation's own reaches MQTT through a channel: the
 conversation sends it to a channel it may publish to with `brenn-tool send`
@@ -1607,7 +1620,8 @@ names the attachment from that answer in `MqttSend`'s `attachment`.
 **The bound.** Each MQTT client publishes at most
 `outbound_payload_cap_bytes` (default 4 MiB, `docs/config-dsl.md`) per
 `MqttSend` call, measured on the bytes published: the string's UTF-8 length,
-the decoded length of a base64 body, the attachment's recorded size. A call
+the serialized length of a JSON value, the decoded length of `body_base64`,
+the attachment's recorded size. A call
 over it is refused with `reason` `payload_too_large`. The bound is
 `MqttSend`'s alone: a component's `mqtt-publish` is held to
 `[messaging] max_body_bytes` and never to this key.
@@ -1615,7 +1629,7 @@ over it is refused with `reason` `payload_too_large`. The bound is
 **Order.** A call is checked in this order, and every refusal before the
 budget spends none: the arguments; the attachment's admission, which takes a
 hold on the blob and reads no byte; the app's `mqtt_publish` grant and
-per-client ACL, and the client's session; the bound; the read of the
+per-topic ACL, and the client's session; the bound; the read of the
 attachment's bytes; then the send budget and the publish. A denied or
 over-bound call reads no blob byte, and a denied call learns nothing of the
 client's bound. A source message evicted after admission does not affect the

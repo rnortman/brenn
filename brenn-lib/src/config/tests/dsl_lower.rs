@@ -16,7 +16,7 @@ use brenn_dsl::{processor_needs, surface_any};
 use brenn_surface_schema::LogLevel;
 
 use crate::access::raw::{
-    AppAclRaw, ChannelMatcherRaw, MqttClientMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
+    AppAclRaw, ChannelMatcherRaw, MqttPubMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
 };
 use crate::config::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
 use crate::config::api_key_provider::{ApiKeyAccountRaw, ApiKeyProviderRaw, ApiKeySourceRaw};
@@ -2423,15 +2423,32 @@ fn an_mqtt_sink_override_is_lowered_per_budgeted_entry() {
             "    out echo -> feed;\n",
             "    acl publish [\n",
             "        exact feed,\n",
-            "        client \"mqtt:plain\",\n",
-            "        client \"mqtt:half\" {{ publish_per_activation = 2.5 }},\n",
-            "        client \"mqtt:full\" {{ publish_per_activation = 2, publish_capacity = 3.5 }}\n",
+            "        topic_filter \"mqtt:plain:#\",\n",
+            "        topic_filter \"mqtt:half:lights/+/set\",\n",
+            "        topic_filter \"mqtt:half:#\" {{ publish_per_activation = 2.5 }},\n",
+            "        topic_filter \"mqtt:full:#\" {{ publish_per_activation = 2, publish_capacity = 3.5 }}\n",
             "    ];\n",
             "}}\n",
         ),
         processor_needs!("ports, mqtt"),
     );
     let config = config_from_dsl(&document);
+    // Every entry is a matcher, filter and all; only a budgeted entry mints an
+    // output, so two entries for `half` still lower to one sink override.
+    let matchers: Vec<(&str, &str)> = config.wasm_consumers[0]
+        .mqtt_publish_acl
+        .iter()
+        .map(|m| (m.client.as_str(), m.topic_filter.as_str()))
+        .collect();
+    assert_eq!(
+        matchers,
+        [
+            ("plain", "#"),
+            ("half", "lights/+/set"),
+            ("half", "#"),
+            ("full", "#"),
+        ]
+    );
     assert_eq!(
         config.wasm_consumers[0].mqtt_outputs,
         vec![
@@ -3863,7 +3880,7 @@ new router: Router {
         exact status,
         prefix "local:router.out.",
         exact "local:router.acks",
-        client "mqtt:broker" { publish_per_activation = 2, publish_capacity = 3.5 }
+        topic_filter "mqtt:broker:#" { publish_per_activation = 2, publish_capacity = 3.5 }
     ];
 
     in inbound <- alerts {
@@ -4036,8 +4053,9 @@ new router: Router {
                     ChannelMatcherRaw::Prefix("router.out.".to_string()),
                     ChannelMatcherRaw::Exact("router.acks".to_string()),
                 ],
-                mqtt_publish_acl: vec![MqttClientMatcherRaw {
+                mqtt_publish_acl: vec![MqttPubMatcherRaw {
                     client: "broker".to_string(),
+                    topic_filter: "#".to_string(),
                 }],
                 mqtt_subscribe_acl: vec![MqttSubMatcherRaw {
                     client: "broker".to_string(),

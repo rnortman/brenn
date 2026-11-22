@@ -957,7 +957,7 @@ by reference (`docs/message-bus.md` §2.1.2a).
   what it can name, not why it names it. Forwarding onto a channel is a
   `BrennSend` under every policy `BrennSend` already has; sending the bytes to
   an MQTT broker is an `MqttSend` with `attachment`, under the app's
-  `mqtt_publish` grant and per-client ACL, the send budget and the client's
+  `mqtt_publish` grant and per-topic ACL, the send budget and the client's
   `outbound_payload_cap_bytes`. Two resets of the conversation's
   context are not seen by the host: a resume Claude Code answers with a fresh
   session, after which the read record still stands, and a slash command a
@@ -1402,7 +1402,7 @@ Unlike the peer call the wait is bounded. One call waits at most 10 s
 (10 s, `PROCESSOR_MQTT_WAIT_BUDGET`, compiled to be no larger than the
 per-call bound): a call starts only while the client's accumulated wait is
 under it, so one activation is stopped in publishes to one client for under
-20 s, times the number of clients in its `mqtt_publish` ACL. For that time it
+20 s, times the number of clients its `mqtt_publish` ACL names. For that time it
 holds one blocking-pool thread and serves none of its bound inputs. Both the
 wait budget and the per-client token bucket are keyed on the client the host
 parsed out of the `mqtt:<client>:<topic>` address — the session the call

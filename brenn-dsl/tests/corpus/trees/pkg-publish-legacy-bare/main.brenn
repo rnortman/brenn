@@ -1,0 +1,13 @@
+// The same bundle, compiled against `pkg-publish-legacy`'s modules, stamped
+// with a ceiling that states no topics. The refusal lands at the author's
+// entry in the module, with this stamp as the related site.
+
+use @bridge::*;
+
+mqtt_client bob_hub {
+    url = "mqtts://hub.example.com:8883";
+}
+
+new demo: Bridge() {
+    grants = [mqtt];
+}

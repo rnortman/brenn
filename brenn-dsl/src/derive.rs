@@ -56,7 +56,7 @@ use brenn_envelope::grants::{
 };
 
 use crate::derived::{
-    DAclSet, DAuthorities, DAuthority, DMatcher, DMqttClient, DMqttSub, DRemoteAuthority,
+    DAclSet, DAuthorities, DAuthority, DMatcher, DMqttPub, DMqttSub, DRemoteAuthority,
     DRemoteSubEntry, DWebhook, DerivedConfig,
 };
 use crate::diag::{Diagnostic, check_unique, or_list, two_site};
@@ -78,8 +78,13 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
     check_channel_model(&config, &mut errors);
     let channel_uuids = derive_channel_identity(&config, &mut errors);
     let refs = Refs::of(&config);
-    let (authorities, conferrals) = derive_authorities(&config, &refs, &mut errors);
-    check_ceilings(&config, &conferrals, &refs, &mut errors);
+    // Ceilings before entity authorities: a client-only publish entry in
+    // packaged text stands for the ceiling's entries for that client, so what
+    // an entity holds can depend on its stamp's ceiling. Nothing a ceiling is
+    // built from depends on what an entity holds.
+    let ceilings = compute_ceilings(&config, &refs, &mut errors);
+    let (authorities, conferrals) = derive_authorities(&config, &refs, &ceilings, &mut errors);
+    check_ceilings(&config, &ceilings, &conferrals, &mut errors);
     let surface_component_kinds = fold_component_kinds(&config, &mut errors);
     check_links(&config, &mut errors);
     check_doctypes(&config, &refs, &mut errors);
@@ -895,8 +900,7 @@ impl Family {
     /// Which matcher kind writes an entry in this list.
     fn admits(self, kind: MatcherKind) -> bool {
         match self {
-            Self::MqttSubscribe => kind == MatcherKind::TopicFilter,
-            Self::MqttPublish => kind == MatcherKind::Client,
+            Self::MqttSubscribe | Self::MqttPublish => kind == MatcherKind::TopicFilter,
             Self::Webhook => kind == MatcherKind::Endpoint,
             _ => matches!(kind, MatcherKind::Exact | MatcherKind::Prefix),
         }
@@ -905,8 +909,7 @@ impl Family {
     /// The kinds this list admits, for a diagnostic that has to say which.
     fn kinds(self) -> &'static str {
         match self {
-            Self::MqttSubscribe => "`topic_filter`",
-            Self::MqttPublish => "`client`",
+            Self::MqttSubscribe | Self::MqttPublish => "`topic_filter`",
             Self::Webhook => "`endpoint`",
             _ => "`exact` and `prefix`",
         }
@@ -983,7 +986,7 @@ enum DEntry {
     Chan(DMatcher),
     Ceiling(DRemoteSubEntry),
     MqttSub(DMqttSub),
-    MqttPub(DMqttClient),
+    MqttPub(DMqttPub),
     Webhook(DWebhook),
 }
 
@@ -1343,6 +1346,7 @@ impl Stated {
 fn derive_authorities(
     config: &ResolvedConfig,
     refs: &Refs<'_>,
+    ceilings: &Ceilings,
     errors: &mut Vec<Diagnostic>,
 ) -> (DAuthorities, Conferred) {
     let subjects = subjects(config);
@@ -1357,13 +1361,16 @@ fn derive_authorities(
         .collect();
     let mut stated: Vec<Stated> = subjects
         .iter()
-        .map(|subject| collect_statements(subject, refs, errors))
+        .map(|subject| {
+            let text = Text::of(config, ceilings, subject.stamp);
+            collect_statements(subject, &text, refs, errors)
+        })
         .collect();
 
     // Parallel to `config.grants`: what each grant filed. Not reachable
     // through the target's own row — a stamped arrangement may widen an entity
     // outside its subtree, and that entity has no row of its own.
-    let mut granted: Vec<Option<(Family, DEntry)>> = Vec::new();
+    let mut granted: Vec<Option<(Family, Vec<DEntry>)>> = Vec::new();
     for (position, grant) in config.grants.iter().enumerate() {
         let label = grant.target.dotted();
         let Some(&index) = slots.get(label.as_str()) else {
@@ -1373,11 +1380,13 @@ fn derive_authorities(
             unreachable!("resolution refuses a grant on a plane that is not a plane");
         };
         let held = &mut stated[index];
+        let text = Text::of(config, ceilings, grant.stamp);
         let entry = resolve_entry(
             &grant.m,
             plane,
             subjects[index].holder(),
             Origin::Grant(position),
+            &text,
             refs,
             errors,
             &mut held.refused,
@@ -1385,9 +1394,12 @@ fn derive_authorities(
         // A refused grant is a refused part of that entity's authority, so
         // agreement stops asking about the entity it was aimed at.
         match entry {
-            Some((family, entry)) => {
-                granted.push(Some((family, entry.clone())));
-                held.entries.push((family, entry, Origin::Grant(position)));
+            Some((family, entries)) => {
+                for entry in &entries {
+                    held.entries
+                        .push((family, entry.clone(), Origin::Grant(position)));
+                }
+                granted.push(Some((family, entries)));
             }
             None => {
                 granted.push(None);
@@ -1540,9 +1552,10 @@ fn check_placed_within_surfaces(
 struct Conferred {
     /// One row per authority-bearing entity with a recorded stamp.
     entities: Vec<Conferral>,
-    /// Parallel to [`ResolvedConfig::grants`]: the entry each grant filed, or
-    /// `None` where it was refused.
-    grants: Vec<Option<(Family, DEntry)>>,
+    /// Parallel to [`ResolvedConfig::grants`]: the entries each grant filed, or
+    /// `None` where it was refused. One entry, except for a client-only publish
+    /// grant in packaged text, which files one per ceiling entry it stands for.
+    grants: Vec<Option<(Family, Vec<DEntry>)>>,
 }
 
 /// What one stamped entity confers on the stamp it came out of.
@@ -1616,6 +1629,7 @@ fn acl_plane(acl: &RAcl, errors: &mut Vec<Diagnostic>) -> Option<Plane> {
 /// One entity's own `acl` statements, resolved into the entries they name.
 fn collect_statements(
     subject: &Subject<'_>,
+    text: &Text<'_>,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Stated {
@@ -1633,13 +1647,16 @@ fn collect_statements(
                 plane,
                 holder,
                 Origin::Statement,
+                text,
                 refs,
                 errors,
                 &mut stated.refused,
             );
             match entry {
-                Some((family, entry)) => {
-                    stated.entries.push((family, entry, Origin::Statement));
+                Some((family, entries)) => {
+                    for entry in entries {
+                        stated.entries.push((family, entry, Origin::Statement));
+                    }
                 }
                 None => stated.refused = true,
             }
@@ -1657,15 +1674,20 @@ fn collect_statements(
 /// `refused` is set when the matcher named an entry and something about it was
 /// still refused — an illegal tail key. A matcher refused outright says so by
 /// returning `None`, and the caller records that where it handles it.
+///
+/// One entry, except for a client-only publish entry in packaged text, which
+/// comes to one entry per filter the text's authority holds for that client.
+#[allow(clippy::too_many_arguments)]
 fn resolve_entry(
     matcher: &RMatcher,
     plane: Plane,
     holder: Holder<'_>,
     origin: Origin,
+    text: &Text<'_>,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
     refused: &mut bool,
-) -> Option<(Family, DEntry)> {
+) -> Option<(Family, Vec<DEntry>)> {
     let kind = *matcher.kind.value();
     let span = matcher.val.span().clone();
     let (family, bare) = matcher_family(matcher, plane, kind, refs, errors)?;
@@ -1673,7 +1695,15 @@ fn resolve_entry(
         errors.push(Diagnostic::at(no_such_family(family, holder), span.clone()));
         return None;
     }
-    if !family_admits(matcher, kind, family, errors) {
+    if let Some(legacy) = text.legacy_publish(family, kind, &bare) {
+        let budget = mqtt_sink_budget(matcher, holder, errors);
+        *refused |= budget.is_none();
+        let budget = budget.unwrap_or((None, None));
+        let asker = format!("on `{}`", holder.label);
+        let entries = legacy.entries(&bare, &asker, budget, &span, refs, errors)?;
+        return Some((family, entries));
+    }
+    if !family_admits(matcher, kind, family, &bare, errors) {
         return None;
     }
     let ceilings = holder.kind == EntityKind::Remote && family.carries_ceilings();
@@ -1697,8 +1727,10 @@ fn resolve_entry(
             let budget = mqtt_sink_budget(matcher, holder, errors);
             *refused |= budget.is_none();
             let (publish_per_activation, publish_capacity) = budget.unwrap_or((None, None));
-            DEntry::MqttPub(DMqttClient {
-                client: mqtt_client(&bare, &span, refs, errors)?,
+            let (client, topic_filter) = mqtt_filter_entry(family, &bare, &span, refs, errors)?;
+            DEntry::MqttPub(DMqttPub {
+                client,
+                topic_filter,
                 publish_per_activation,
                 publish_capacity,
             })
@@ -1717,7 +1749,166 @@ fn resolve_entry(
             plain_entry(family, kind, bare, &span, refs, errors)?
         }
     };
-    Some((family, entry))
+    Some((family, vec![entry]))
+}
+
+/// Who wrote the text a matcher sits in, as the publish plane's one
+/// text-dependent reading needs it.
+///
+/// A client-only publish entry is refused in deployment text and read in
+/// packaged text as a request for every publish entry the text's authority
+/// holds for that client. A bundle cannot be re-released in lockstep with the
+/// host, so packaged text keeps the spelling it was written in and the
+/// deployment's ceiling decides the topics.
+enum Text<'a> {
+    Deployment,
+    Packaged(Legacy<'a>),
+}
+
+/// What a client-only publish entry in packaged text stands for, and how its
+/// refusal names that.
+struct Legacy<'a> {
+    /// The authority whose publish entries the client-only entry stands for, or
+    /// `None` where that authority is not what the document states because its
+    /// own text was refused. The entry is then dropped with no message of its
+    /// own: the refusal already reported is the answer.
+    authority: Option<&'a Authority>,
+    /// How the refusal names that authority: ``the stamp `demo`​``, ``​`ui`​``.
+    above: String,
+    /// The "that line is the author's" suffix, where the line to write is in
+    /// packaged text.
+    owner: &'static str,
+    /// Where that authority is written, as the refusal's related site.
+    site: (String, Span),
+    /// For a stamp body in packaged text, how the refusal names where the
+    /// entry was written: ``in the ceiling on the stamp `inner`​``. `None` for
+    /// an entity's or a grant's text, whose refusal names the entity.
+    body: Option<String>,
+}
+
+/// The suffix a refusal carries when the line it asks for is packaged text.
+const AUTHORS_LINE: &str =
+    " — and that line is the author's: this stamp is the arrangement's own text";
+
+/// The suffix for a refusal whose line to write is `stamp`'s own text:
+/// [`AUTHORS_LINE`] when the stamp is written in packaged text, else empty.
+fn authors_line(stamp: &RStamp) -> &'static str {
+    if stamp.packaged_site {
+        AUTHORS_LINE
+    } else {
+        ""
+    }
+}
+
+impl<'a> Text<'a> {
+    /// The text of an entity or a grant expanded inside `stamp`, its nearest
+    /// recorded stamp.
+    ///
+    /// Packaged exactly when that stamp's assembly is declared in a packaged
+    /// module. A packaged module imports only packaged modules, so everything
+    /// expanded inside a packaged assembly is packaged text; the stamp at the
+    /// packaged boundary is always recorded, and a nested stamp that is not
+    /// recorded hands its entities to the nearest one that is, which is then
+    /// packaged too. The authority is that stamp's ceiling; its default reach
+    /// is channel entries only, so the ceiling alone holds its publish entries.
+    fn of(config: &ResolvedConfig, ceilings: &'a Ceilings, stamp: Option<StampId>) -> Text<'a> {
+        let Some(StampId(index)) = stamp else {
+            return Text::Deployment;
+        };
+        let recorded = &config.stamps[index];
+        if recorded.package.is_none() {
+            return Text::Deployment;
+        }
+        Text::Packaged(Legacy {
+            authority: (!ceilings.refused[index]).then(|| &ceilings.stamps[index]),
+            above: format!("the stamp `{}`", recorded.handle.dotted()),
+            owner: authors_line(recorded),
+            site: ("stamped here".to_string(), recorded.span.clone()),
+            body: None,
+        })
+    }
+
+    /// The legacy reading, when this matcher is a client-only publish entry in
+    /// packaged text.
+    ///
+    /// Only `mqtt:<client>` is read so: a `client` matcher naming topics, or
+    /// none, is refused as it is in deployment text.
+    // TODO(mqtt-publish-client-only-packaged-form): refuse the client-only form
+    // in packaged text too, and delete this reading.
+    fn legacy_publish(&self, family: Family, kind: MatcherKind, bare: &str) -> Option<&Legacy<'a>> {
+        match self {
+            Text::Packaged(legacy)
+                if family == Family::MqttPublish
+                    && kind == MatcherKind::Client
+                    && !bare.is_empty()
+                    && !bare.contains(':') =>
+            {
+                Some(legacy)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Legacy<'_> {
+    /// The entries a client-only publish entry for `client` comes to: one per
+    /// publish entry the authority holds for that client, each with the
+    /// author's span, the budget tail on the first.
+    ///
+    /// `asker` names what wrote it, as the refusal reads: ``on `demo.consume`​``.
+    fn entries(
+        &self,
+        client: &str,
+        asker: &str,
+        (publish_per_activation, publish_capacity): (Option<f64>, Option<f64>),
+        span: &Span,
+        refs: &Refs<'_>,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<Vec<DEntry>> {
+        if !refs.client(client, span, errors) {
+            return None;
+        }
+        let authority = self.authority?;
+        let filters: Vec<&str> = authority
+            .family(Family::MqttPublish)
+            .filter_map(|entry| match entry {
+                DEntry::MqttPub(held) if held.client.value() == client => {
+                    Some(held.topic_filter.value().as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        if filters.is_empty() {
+            let mut refusal = Diagnostic::at(
+                format!(
+                    "`acl publish [client \"mqtt:{client}\"]` {asker} asks to publish through \
+                     client `{client}`, and {} states no topics for that client: a packaged \
+                     arrangement publishes to the topics the deployment stamps it with, so \
+                     write them — `acl publish [topic_filter \"mqtt:{client}:<filter>\"];`{}",
+                    self.above, self.owner
+                ),
+                span.clone(),
+            );
+            refusal.related.push(self.site.clone());
+            errors.push(refusal);
+            return None;
+        }
+        Some(
+            filters
+                .into_iter()
+                .enumerate()
+                .map(|(position, filter)| {
+                    let first = position == 0;
+                    DEntry::MqttPub(DMqttPub {
+                        client: Spanned::new(client.to_string(), span.clone()),
+                        topic_filter: Spanned::new(filter.to_string(), span.clone()),
+                        publish_per_activation: publish_per_activation.filter(|_| first),
+                        publish_capacity: publish_capacity.filter(|_| first),
+                    })
+                })
+                .collect(),
+        )
+    }
 }
 
 /// One matcher's family entry, undecorated.
@@ -1736,12 +1927,22 @@ fn plain_entry(
     errors: &mut Vec<Diagnostic>,
 ) -> Option<DEntry> {
     Some(match family {
-        Family::MqttSubscribe => DEntry::MqttSub(mqtt_sub_entry(&bare, span, refs, errors)?),
-        Family::MqttPublish => DEntry::MqttPub(DMqttClient {
-            client: mqtt_client(&bare, span, refs, errors)?,
-            publish_per_activation: None,
-            publish_capacity: None,
-        }),
+        Family::MqttSubscribe => {
+            let (client, topic_filter) = mqtt_filter_entry(family, &bare, span, refs, errors)?;
+            DEntry::MqttSub(DMqttSub {
+                client,
+                topic_filter,
+            })
+        }
+        Family::MqttPublish => {
+            let (client, topic_filter) = mqtt_filter_entry(family, &bare, span, refs, errors)?;
+            DEntry::MqttPub(DMqttPub {
+                client,
+                topic_filter,
+                publish_per_activation: None,
+                publish_capacity: None,
+            })
+        }
         Family::Webhook => {
             if !refs.endpoint(&bare, span, errors) {
                 return None;
@@ -1782,14 +1983,26 @@ fn matcher_family(
 }
 
 /// That this family's entries are written the way this matcher writes them.
+///
+/// `bare` is what follows the matcher's scheme. A `client` matcher on the
+/// publish plane is the one wrong kind refused with a message of its own, which
+/// writes the `topic_filter` entry that replaces it.
 fn family_admits(
     matcher: &RMatcher,
     kind: MatcherKind,
     family: Family,
+    bare: &str,
     errors: &mut Vec<Diagnostic>,
 ) -> bool {
     if family.admits(kind) {
         return true;
+    }
+    if family == Family::MqttPublish && kind == MatcherKind::Client {
+        errors.push(Diagnostic::at(
+            client_only_publish(bare),
+            matcher.val.span().clone(),
+        ));
+        return false;
     }
     errors.push(Diagnostic::at(
         format!(
@@ -1905,16 +2118,21 @@ fn channel_matcher(
     }
 }
 
-/// `mqtt:<client>:<filter>`, dissected.
+/// `mqtt:<client>:<filter>`, dissected, for an entry on either mqtt plane.
 ///
 /// The client and the filter are separate dimensions of one entry, so both are
 /// required; what a legal topic filter looks like stays the runtime's.
-fn mqtt_sub_entry(
+fn mqtt_filter_entry(
+    family: Family,
     bare: &str,
     span: &Span,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
-) -> Option<DMqttSub> {
+) -> Option<(Spanned<String>, Spanned<String>)> {
+    let verb = match family.plane() {
+        Plane::Subscribe => "subscribes",
+        Plane::Publish => "admits for publishing",
+    };
     let Some((client, filter)) = bare.split_once(':') else {
         errors.push(Diagnostic::at(
             format!(
@@ -1929,7 +2147,7 @@ fn mqtt_sub_entry(
         errors.push(Diagnostic::at(
             format!(
                 "`mqtt:{bare}` leaves half of the entry empty; a topic_filter entry names \
-                 both the client that connects and the filter it subscribes"
+                 both the client that connects and the filter it {verb}"
             ),
             span.clone(),
         ));
@@ -1938,41 +2156,33 @@ fn mqtt_sub_entry(
     if !refs.client(client, span, errors) {
         return None;
     }
-    Some(DMqttSub {
-        client: Spanned::new(client.to_string(), span.clone()),
-        topic_filter: Spanned::new(filter.to_string(), span.clone()),
-    })
+    Some((
+        Spanned::new(client.to_string(), span.clone()),
+        Spanned::new(filter.to_string(), span.clone()),
+    ))
 }
 
-/// The client slug an outbound mqtt entry names.
-fn mqtt_client(
-    bare: &str,
-    span: &Span,
-    refs: &Refs<'_>,
-    errors: &mut Vec<Diagnostic>,
-) -> Option<Spanned<String>> {
-    if bare.is_empty() {
-        errors.push(Diagnostic::at(
-            "`mqtt:` names no client; an outbound mqtt entry is written `mqtt:<client>`"
-                .to_string(),
-            span.clone(),
-        ));
-        return None;
+/// The refusal for a `client` matcher on the publish plane, with the
+/// `topic_filter` entry that replaces it written out.
+///
+/// A publish entry states the topics it admits, so a client alone is not one: a
+/// deployment that held a whole client writes that reach as a filter, and the
+/// refusal says which filter reproduces it.
+fn client_only_publish(bare: &str) -> String {
+    match bare.split_once(':') {
+        _ if bare.is_empty() => "`client \"mqtt:\"` names no client; a publish entry is \
+             written `topic_filter \"mqtt:<client>:<filter>\"`"
+            .to_string(),
+        Some((client, filter)) => format!(
+            "`client \"mqtt:{bare}\"` names topics under client `{client}`, and a publish \
+             entry states its topics as a filter: write `topic_filter \"mqtt:{client}:{filter}\"`"
+        ),
+        None => format!(
+            "`client \"mqtt:{bare}\"` names a client and no topics: a publish entry is written \
+             `topic_filter \"mqtt:{bare}:<filter>\"`, one entry per filter. `topic_filter \
+             \"mqtt:{bare}:#\"` admits every topic except those whose first level starts with `$`"
+        ),
     }
-    if bare.contains(':') {
-        errors.push(Diagnostic::at(
-            format!(
-                "`mqtt:{bare}` names more than a client; publishing is scoped to the \
-                 client and has no topic dimension to narrow"
-            ),
-            span.clone(),
-        ));
-        return None;
-    }
-    if !refs.client(bare, span, errors) {
-        return None;
-    }
-    Some(Spanned::new(bare.to_string(), span.clone()))
 }
 
 const PUSH_DEPTH_KEY: &str = "push_depth";
@@ -2087,7 +2297,7 @@ const PUBLISH_CAPACITY_KEY: &str = "publish_capacity";
 /// non-client fields against this list.
 pub const MQTT_SINK_KEYS: [&str; 2] = [PUBLISH_PER_ACTIVATION_KEY, PUBLISH_CAPACITY_KEY];
 
-/// The egress budget an `mqtt_publish` entry overrides for the sink it mints.
+/// The egress budget an `mqtt_publish` entry overrides for its client's sink.
 ///
 /// Both keys are optional — an entry that states neither takes the runtime's
 /// default budget — and both are token counts, so an integer is the same number
@@ -2095,8 +2305,8 @@ pub const MQTT_SINK_KEYS: [&str; 2] = [PUBLISH_PER_ACTIVATION_KEY, PUBLISH_CAPAC
 /// its own; every other entity publishes through a host that budgets its
 /// egress elsewhere, and a tail there is refused.
 ///
-/// `None` says something in the tail was refused: the entry is still the client
-/// it names, but not the budget that was written.
+/// `None` says something in the tail was refused: the entry is still the
+/// client and filter it names, but not the budget that was written.
 fn mqtt_sink_budget(
     matcher: &RMatcher,
     holder: Holder<'_>,
@@ -2220,7 +2430,7 @@ enum EntryKey<'a> {
     Prefix(&'a str),
     Ceiling(&'a str),
     MqttSub(&'a str, &'a str),
-    MqttPub(&'a str),
+    MqttPub(&'a str, &'a str),
     Webhook(&'a str),
 }
 
@@ -2245,19 +2455,21 @@ impl DEntry {
             DEntry::MqttSub(entry) => {
                 EntryKey::MqttSub(entry.client.value(), entry.topic_filter.value())
             }
-            DEntry::MqttPub(entry) => EntryKey::MqttPub(entry.client.value()),
+            DEntry::MqttPub(entry) => {
+                EntryKey::MqttPub(entry.client.value(), entry.topic_filter.value())
+            }
             DEntry::Webhook(entry) => EntryKey::Webhook(entry.endpoint.value()),
         }
     }
 
-    /// What this entry is about: the bare channel name, the endpoint slug, the
-    /// topic filter or the client — what coverage compares by.
+    /// What this entry is about: the bare channel name, the endpoint slug or
+    /// the topic filter — what coverage compares by.
     fn name(&self) -> &str {
         match self {
             DEntry::Chan(matcher) => matcher.pattern(),
             DEntry::Ceiling(entry) => entry.m.pattern(),
             DEntry::MqttSub(entry) => entry.topic_filter.value(),
-            DEntry::MqttPub(entry) => entry.client.value(),
+            DEntry::MqttPub(entry) => entry.topic_filter.value(),
             DEntry::Webhook(entry) => entry.endpoint.value(),
         }
     }
@@ -2284,7 +2496,8 @@ impl DEntry {
     /// The subsumption half of attenuation. Exact under exact is equality;
     /// exact under prefix is the prefix reaching it; prefix under prefix is one
     /// prefix reaching the other; prefix under exact never holds, because a
-    /// family reaches addresses one address does not. The transport shapes
+    /// family reaches addresses one address does not. The transport shapes —
+    /// an mqtt `(client, topic_filter)` entry on either plane, and an endpoint —
     /// compare by equality: there is no arithmetic over a topic filter or an
     /// endpoint that says one covers another, so a wildcard ceiling is written
     /// as the same wildcard.
@@ -2312,7 +2525,8 @@ impl DEntry {
                     == (theirs.client.value(), theirs.topic_filter.value())
             }
             (DEntry::MqttPub(mine), DEntry::MqttPub(theirs)) => {
-                mine.client.value() == theirs.client.value()
+                (mine.client.value(), mine.topic_filter.value())
+                    == (theirs.client.value(), theirs.topic_filter.value())
             }
             (DEntry::Webhook(mine), DEntry::Webhook(theirs)) => {
                 mine.endpoint.value() == theirs.endpoint.value()
@@ -2810,7 +3024,13 @@ fn bound_entry(
     errors: &mut Vec<Diagnostic>,
 ) -> Option<DEntry> {
     Some(match family {
-        Family::MqttSubscribe => DEntry::MqttSub(mqtt_sub_entry(bare, span, refs, errors)?),
+        Family::MqttSubscribe => {
+            let (client, topic_filter) = mqtt_filter_entry(family, bare, span, refs, errors)?;
+            DEntry::MqttSub(DMqttSub {
+                client,
+                topic_filter,
+            })
+        }
         Family::Webhook => {
             if !refs.endpoint(bare, span, errors) {
                 return None;
@@ -3004,7 +3224,16 @@ impl Written {
 
 /// One ceiling body's two axes, resolved, with what is illegal in a ceiling
 /// refused.
-fn written_authority(body: Body<'_>, refs: &Refs<'_>, errors: &mut Vec<Diagnostic>) -> Written {
+///
+/// `text` is who wrote the body: a stamp body in packaged text reads a
+/// client-only publish line as the publish entries for that client the stamp
+/// inherits.
+fn written_authority(
+    body: Body<'_>,
+    text: &Text<'_>,
+    refs: &Refs<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Written {
     let mut written = Written {
         axes: Authority::default(),
         wrote_words: false,
@@ -3060,12 +3289,14 @@ fn written_authority(body: Body<'_>, refs: &Refs<'_>, errors: &mut Vec<Diagnosti
             continue;
         };
         for matcher in &acl.matchers {
-            match ceiling_entry(matcher, plane, refs, errors) {
-                Some((family, entry)) => {
+            match ceiling_entry(matcher, plane, text, refs, errors) {
+                Some((family, entries)) => {
                     if !written.families.iter().any(|(held, _)| *held == family) {
                         written.families.push((family, acl.plane.clone()));
                     }
-                    written.axes.reach.push((family, entry));
+                    for entry in entries {
+                        written.axes.reach.push((family, entry));
+                    }
                 }
                 None => written.refused = true,
             }
@@ -3085,9 +3316,10 @@ fn written_authority(body: Body<'_>, refs: &Refs<'_>, errors: &mut Vec<Diagnosti
 fn ceiling_entry(
     matcher: &RMatcher,
     plane: Plane,
+    text: &Text<'_>,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
-) -> Option<(Family, DEntry)> {
+) -> Option<(Family, Vec<DEntry>)> {
     let kind = *matcher.kind.value();
     let span = matcher.val.span().clone();
     let (family, bare) = matcher_family(matcher, plane, kind, refs, errors)?;
@@ -3102,40 +3334,79 @@ fn ceiling_entry(
         ));
         return None;
     }
-    if !family_admits(matcher, kind, family, errors) {
+    let legacy = text.legacy_publish(family, kind, &bare);
+    if legacy.is_none() && !family_admits(matcher, kind, family, &bare, errors) {
         return None;
     }
     let mut refused = false;
     for (key, value) in &matcher.tail {
-        errors.push(Diagnostic::at(
-            format!("`{key}` is a depth, and a ceiling caps reach rather than depth"),
-            value.span().clone(),
-        ));
+        let message = match family {
+            Family::MqttPublish if MQTT_SINK_KEYS.contains(&key.as_str()) => format!(
+                "`{key}` is an egress budget, and a ceiling caps reach rather than budgets: \
+                 a publish budget is the arrangement's own, written on its entry"
+            ),
+            _ => format!("`{key}` is a depth, and a ceiling caps reach rather than depth"),
+        };
+        errors.push(Diagnostic::at(message, value.span().clone()));
         refused = true;
     }
     if refused {
         return None;
     }
+    if let Some(legacy) = legacy {
+        let asker = legacy
+            .body
+            .as_deref()
+            .unwrap_or_else(|| unreachable!("a ceiling's text is a stamp body or deployment text"));
+        let entries = legacy.entries(&bare, asker, (None, None), &span, refs, errors)?;
+        return Some((family, entries));
+    }
     Some((
         family,
-        plain_entry(family, kind, bare, &span, refs, errors)?,
+        vec![plain_entry(family, kind, bare, &span, refs, errors)?],
     ))
+}
+
+/// Every ceiling in the document, as the authority pass and the fit checks read
+/// it.
+struct Ceilings {
+    /// Every declared principal's authority and chain.
+    delegated: Delegated,
+    /// What each principal's body wrote, by declaration index, where it is text
+    /// the dead-config rules are asked about.
+    principal_bodies: Vec<Option<Written>>,
+    /// Each recorded stamp's ceiling, by stamp index, without its default reach.
+    stamps: Vec<Authority>,
+    /// What each stamp's body wrote, kept past the ceiling it produced: the
+    /// dead-config rules are about the text, not about the authority the text
+    /// and its inheritance came to.
+    stamp_bodies: Vec<Written>,
+    /// A stamp whose own ceiling text was refused, or whose inherited authority
+    /// was, has no stated ceiling to hold its subtree against; the refusal
+    /// already reported is the answer, and a second one about its consequence
+    /// is noise.
+    refused: Vec<bool>,
+    /// A stamp whose ceiling text was refused for what it says — a widening, or
+    /// a narrowing of nothing — is still held to the fit rule against the
+    /// ceiling it wrote, but nothing more is said about that text: the
+    /// dead-config message would be a second message about one line.
+    reported: Vec<bool>,
 }
 
 /// Every ceiling in the document, and that each holds no more than the one it
 /// is under.
 ///
-/// Two halves of one relation. First every declared principal's authority,
-/// parents first — which the cycle refusal in resolution is what makes
-/// possible: a chain bottoms out at the operator, so a walk that defers a
-/// principal until its parent is built terminates. Then every recorded stamp's
-/// ceiling, and that what its arrangement confers fits under it.
-fn check_ceilings(
+/// First every declared principal's authority, parents first — which the cycle
+/// refusal in resolution is what makes possible: a chain bottoms out at the
+/// operator, so a walk that defers a principal until its parent is built
+/// terminates. Then every recorded stamp's ceiling. Reads only the document:
+/// nothing here depends on what an arrangement confers, which
+/// [`check_ceilings`] holds against these afterwards.
+fn compute_ceilings(
     config: &ResolvedConfig,
-    conferred: &Conferred,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
-) {
+) -> Ceilings {
     // Asserted rather than tolerated: every rule below is an authority gate, and
     // a pass that answered a chain it could not order by checking nothing would
     // compile a document with no ceiling enforced anywhere and no message saying
@@ -3182,6 +3453,7 @@ fn check_ceilings(
                 surfaces: principal.surfaces.as_deref(),
                 acls: &principal.acls,
             },
+            &Text::Deployment,
             refs,
             errors,
         );
@@ -3225,13 +3497,40 @@ fn check_ceilings(
         unstated,
         chains,
     };
+    let mut ceilings = Ceilings {
+        delegated,
+        principal_bodies: bodies,
+        stamps: Vec::new(),
+        stamp_bodies: Vec::new(),
+        refused: Vec::new(),
+        reported: Vec::new(),
+    };
+    stamp_ceilings(config, &mut ceilings, refs, errors);
+    ceilings
+}
+
+/// That what every stamp's arrangement confers fits under its ceiling, and that
+/// no ceiling or principal states what nothing under it asks for.
+fn check_ceilings(
+    config: &ResolvedConfig,
+    ceilings: &Ceilings,
+    conferred: &Conferred,
+    errors: &mut Vec<Diagnostic>,
+) {
     // Computed here rather than inside the stamp pass because both halves read
     // them: a stamp's ceiling is judged against its own subtree, and a
     // principal's text against the union of every subtree under it.
     let confers = confers(config, conferred);
     let defaults = default_reach(config);
-    check_stamps(config, &confers, &defaults, &delegated, refs, errors);
-    check_dead_principals(config, &confers, &defaults, &delegated, &bodies, errors);
+    check_stamps(config, ceilings, &confers, &defaults, errors);
+    check_dead_principals(
+        config,
+        &confers,
+        &defaults,
+        &ceilings.delegated,
+        &ceilings.principal_bodies,
+        errors,
+    );
 }
 
 /// One exact-keyed ceiling axis's dead-config rule.
@@ -3740,34 +4039,26 @@ impl Delegated {
     }
 }
 
-/// Every recorded stamp, its ceiling, and that what it stamps fits under it.
+/// Every recorded stamp's ceiling, into `ceilings`.
 ///
 /// Index order, which is walk order, which is parents before children: a stamp
 /// is recorded when its `new` is read and its arrangement is expanded after
 /// that, so an enclosing stamp always holds the lower index.
-fn check_stamps(
+fn stamp_ceilings(
     config: &ResolvedConfig,
-    confers: &HashMap<StampId, Confers>,
-    defaults: &HashMap<StampId, Vec<(Family, DEntry)>>,
-    delegated: &Delegated,
+    ceilings: &mut Ceilings,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
 ) {
     let root = Authority::default();
-    let mut ceilings: Vec<Authority> = Vec::new();
-    // What each stamp's body actually wrote, kept past the ceiling it produced:
-    // the dead-config rules are about the text, not about the authority the text
-    // and its inheritance came to.
-    let mut bodies: Vec<Written> = Vec::new();
-    // A stamp whose own ceiling text was refused has no stated ceiling to hold
-    // its subtree against; the refusal already reported is the answer, and a
-    // second one about its consequence is noise.
-    let mut refused: Vec<bool> = Vec::new();
-    // A stamp whose ceiling text was refused for what it says — a widening, or a
-    // narrowing of nothing — is still held to the fit rule against the ceiling
-    // it wrote, but nothing more is said about that text: the dead-config
-    // message would be a second message about one line.
-    let mut reported: Vec<bool> = Vec::new();
+    let Ceilings {
+        delegated,
+        stamps: ceilings,
+        stamp_bodies: bodies,
+        refused,
+        reported,
+        ..
+    } = ceilings;
     for (index, stamp) in config.stamps.iter().enumerate() {
         let enclosing = stamp.parent.map(|StampId(parent)| {
             assert!(parent < index, "a stamp is recorded before its arrangement");
@@ -3838,12 +4129,14 @@ fn check_stamps(
             // axis it does not write is empty.
             (None, None) => (&root, None),
         };
+        let text = stamp_text(config, stamp, &handed, enclosing, inherited, unstated);
         let written = written_authority(
             Body {
                 grants: stamp.grants.as_ref(),
                 surfaces: stamp.surfaces.as_deref(),
                 acls: &stamp.acls,
             },
+            &text,
             refs,
             errors,
         );
@@ -3865,21 +4158,82 @@ fn check_stamps(
         reported.push(body_refused);
         bodies.push(written);
     }
+}
+
+/// Who wrote a stamp's body, as its `acl` lines are read.
+///
+/// A body is packaged text exactly when the `new` is. Its authority is what the
+/// stamp inherits: the principal it is `under`, else the enclosing stamp's
+/// ceiling.
+fn stamp_text<'a>(
+    config: &ResolvedConfig,
+    stamp: &RStamp,
+    handed: &Option<(&Authority, String)>,
+    enclosing: Option<usize>,
+    inherited: &'a Authority,
+    unstated: bool,
+) -> Text<'a> {
+    if !stamp.packaged_site {
+        return Text::Deployment;
+    }
+    let (above, owner, site) = match (handed, enclosing) {
+        (Some((_, label)), _) => (
+            format!("`{label}`"),
+            "",
+            (
+                "the principal is chosen here".to_string(),
+                under_span(stamp),
+            ),
+        ),
+        (None, Some(parent)) => {
+            let outer = &config.stamps[parent];
+            (
+                format!("the ceiling on the stamp `{}`", outer.handle.dotted()),
+                authors_line(outer),
+                (
+                    "the enclosing ceiling is written here".to_string(),
+                    outer.span.clone(),
+                ),
+            )
+        }
+        (None, None) => unreachable!("a stamp in packaged text is expanded inside a recorded one"),
+    };
+    Text::Packaged(Legacy {
+        authority: (!unstated).then_some(inherited),
+        above,
+        owner,
+        site,
+        body: Some(format!(
+            "in the ceiling on the stamp `{}`",
+            stamp.handle.dotted()
+        )),
+    })
+}
+
+/// That what every recorded stamp's arrangement confers fits under its
+/// ceiling, and that its ceiling text caps something.
+fn check_stamps(
+    config: &ResolvedConfig,
+    ceilings: &Ceilings,
+    confers: &HashMap<StampId, Confers>,
+    defaults: &HashMap<StampId, Vec<(Family, DEntry)>>,
+    errors: &mut Vec<Diagnostic>,
+) {
     let nothing = Confers::default();
     for (index, stamp) in config.stamps.iter().enumerate() {
-        if refused[index] {
+        if ceilings.refused[index] {
             continue;
         }
         let default = defaults.get(&StampId(index)).cloned().unwrap_or_default();
-        let mut effective = ceilings[index].clone();
+        let mut effective = ceilings.stamps[index].clone();
         effective.reach.extend(default.iter().cloned());
         let held = confers.get(&StampId(index)).unwrap_or(&nothing);
-        check_fit(config, stamp, held, &effective, delegated, errors);
+        check_fit(config, stamp, held, &effective, &ceilings.delegated, errors);
         if stamp.is_mount() {
             check_mount_channels(config, stamp, StampId(index), &effective, errors);
         }
-        if !reported[index] {
-            check_dead_ceiling(stamp, &bodies[index], held, &default, errors);
+        if !ceilings.reported[index] {
+            check_dead_ceiling(stamp, &ceilings.stamp_bodies[index], held, &default, errors);
         }
     }
 }
@@ -4033,10 +4387,7 @@ fn check_dead_ceiling(
     // bundle imports and none of them can edit: without this the refusal reads
     // as consent the deployer left behind and sends them looking in their own
     // file for a line that is not there.
-    let owner = match stamp.packaged_site {
-        true => " — and that line is the author's: this stamp is the arrangement's own text",
-        false => "",
-    };
+    let owner = authors_line(stamp);
     check_dead_axis(
         DeadAxis {
             wrote_line: written.wrote_words,
@@ -4190,16 +4541,19 @@ fn confers(config: &ResolvedConfig, conferred: &Conferred) -> HashMap<StampId, C
                 .push(contribution.slug.span().clone());
         }
     }
-    for (grant, entry) in config.grants.iter().zip(&conferred.grants) {
-        let Some((family, entry)) = entry.as_ref().filter(|(family, _)| !family.confined()) else {
+    for (grant, entries) in config.grants.iter().zip(&conferred.grants) {
+        let Some((family, entries)) = entries.as_ref().filter(|(family, _)| !family.confined())
+        else {
             continue;
         };
         for stamp in ancestry(config, grant.stamp) {
-            confers.entry(stamp).or_default().reach.push((
-                *family,
-                entry.clone(),
-                grant.target.dotted(),
-            ));
+            for entry in entries {
+                confers.entry(stamp).or_default().reach.push((
+                    *family,
+                    entry.clone(),
+                    grant.target.dotted(),
+                ));
+            }
         }
     }
     confers
@@ -4309,10 +4663,7 @@ fn check_fit(
     // Whose file a refusal here belongs to. A stamp written in packaged text is
     // an author narrowing a nested arrangement, so an arrangement that exceeds
     // it is the author's to fix and no line the deployer writes can answer it.
-    let owner = match stamp.packaged_site {
-        true => " — and that line is the author's: this stamp is the arrangement's own text",
-        false => "",
-    };
+    let owner = authors_line(stamp);
     let all: Vec<&str> = confers.words.keys().map(String::as_str).collect();
     // TODO(ceiling-tool-resources): a word is the whole grain here. `tools` held
     // by a ceiling covers every registry tool and every `allow` resource a stamp
@@ -4416,8 +4767,12 @@ fn entry_line(family: Family, entry: &DEntry) -> String {
             ),
         ),
         DEntry::MqttPub(entry) => (
-            MatcherKind::Client,
-            format!("{prefix}{}", entry.client.value()),
+            MatcherKind::TopicFilter,
+            format!(
+                "{prefix}{}:{}",
+                entry.client.value(),
+                entry.topic_filter.value()
+            ),
         ),
         DEntry::Webhook(entry) => (
             MatcherKind::Endpoint,

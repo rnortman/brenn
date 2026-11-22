@@ -217,7 +217,8 @@ pub enum MatcherKind {
     TopicFilter,
     /// A webhook endpoint: `webhook:<slug>`.
     Endpoint,
-    /// An MQTT client, with no topic dimension: `mqtt:<client>`.
+    /// An MQTT client alone: `mqtt:<client>`. No family admits it; on the
+    /// publish plane it is refused with the `topic_filter` entry to write.
     Client,
 }
 

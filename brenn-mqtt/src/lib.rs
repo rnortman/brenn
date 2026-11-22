@@ -14,7 +14,7 @@
 //!
 //! # Module layout
 //!
-//! - `payload`    — `InboundPayload` / `OutboundPayload`; `classify_inbound` / `decode_outbound_body`.
+//! - `payload`    — `InboundPayload` / `OutboundPayload`; `classify_inbound` / `decode_outbound`.
 //! - `state`      — `MqttClientHandle`, `SupervisorState`, `IngressSubscription`.
 //! - `egress`     — shared capability/ACL/budget enforcement + broker publish (`enforce_and_publish`).
 //! - `service`    — `MqttService`, `MqttEventRouter` trait.
@@ -37,7 +37,7 @@ pub use connection::{
 };
 pub use egress::{MqttEgressError, SendBudget, enforce_and_publish};
 pub use payload::{
-    InboundClass, InboundPayload, OutboundPayload, classify_inbound, decode_outbound_body,
+    InboundClass, InboundPayload, OutboundArg, OutboundPayload, classify_inbound, decode_outbound,
 };
 pub use service::{
     IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService, PUBLISH_WAIT,

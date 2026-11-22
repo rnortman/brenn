@@ -21,8 +21,8 @@
 pub struct AppAclRaw {
     /// `[[app.acl.mqtt_subscribe]]` entries: `(client, topic_filter)` pairs.
     pub mqtt_subscribe: Vec<MqttSubMatcherRaw>,
-    /// `[[app.acl.mqtt_publish]]` entries: client-slug only.
-    pub mqtt_publish: Vec<MqttClientMatcherRaw>,
+    /// `[[app.acl.mqtt_publish]]` entries: `(client, topic_filter)` pairs.
+    pub mqtt_publish: Vec<MqttPubMatcherRaw>,
     /// `[[app.acl.brenn_subscribe]]` entries: channel matchers.
     pub brenn_subscribe: Vec<ChannelMatcherRaw>,
     /// `[[app.acl.brenn_publish]]` entries: channel matchers.
@@ -63,12 +63,14 @@ pub struct MqttSubMatcherRaw {
     pub topic_filter: String,
 }
 
-/// Raw MQTT publish matcher: `{ client = "..." }`. Publish is client-scoped
-/// only; there is no topic dimension.
+/// Raw MQTT publish matcher: `{ client = "...", topic_filter = "..." }`.
+/// Strings are validated and converted to `acl::MqttPubMatcher` at resolution.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MqttClientMatcherRaw {
+pub struct MqttPubMatcherRaw {
     /// MQTT client slug (validated at resolution time).
     pub client: String,
+    /// MQTT topic filter (validated at resolution time).
+    pub topic_filter: String,
 }
 
 /// Raw `brenn:` channel matcher. Carries an explicit kind: `exact` matches one
@@ -133,8 +135,8 @@ pub struct WasmAclsRaw<'a> {
     pub local_publish: &'a [ChannelMatcherRaw],
     /// `local:` subscribe matchers (non-empty derives the `LocalSubscribe` grant).
     pub local_subscribe: &'a [ChannelMatcherRaw],
-    /// MQTT publish matchers (client-scoped).
-    pub mqtt_publish: &'a [MqttClientMatcherRaw],
+    /// MQTT publish matchers: `(client, topic_filter)` pairs.
+    pub mqtt_publish: &'a [MqttPubMatcherRaw],
     /// MQTT subscribe matchers (non-empty derives the `MqttSubscribe` grant).
     pub mqtt_subscribe: &'a [MqttSubMatcherRaw],
     /// Inbound webhook matchers (non-empty derives the `Webhook` grant).
@@ -232,7 +234,7 @@ webhook push_alice {
     }
 
     /// An MQTT matcher is client-scoped: the client name leaves the pattern and
-    /// becomes the matcher's own field.
+    /// becomes the matcher's own field, beside the topic filter.
     #[test]
     fn mqtt_matchers_land_client_scoped() {
         let acl = alice_acl(
@@ -241,7 +243,7 @@ webhook push_alice {
     grants = [subscribe, publish];
 
     acl subscribe [topic_filter "mqtt:home:sensors/+/temp"];
-    acl publish [client "mqtt:office"];
+    acl publish [topic_filter "mqtt:office:lights/+/set"];
 
     subscribe "mqtt:home:sensors/+/temp" { push_depth = 1; retain_depth = 1; }
 "#,
@@ -256,8 +258,9 @@ webhook push_alice {
         );
         assert_eq!(
             acl.mqtt_publish,
-            vec![MqttClientMatcherRaw {
+            vec![MqttPubMatcherRaw {
                 client: "office".to_string(),
+                topic_filter: "lights/+/set".to_string(),
             }]
         );
     }

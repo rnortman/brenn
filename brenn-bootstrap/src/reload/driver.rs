@@ -4134,7 +4134,7 @@ new sifter: Demo {{
             let authorized_now = || {
                 apps.load()
                     .values()
-                    .any(|app| app.policy.allows_mqtt_publish(client))
+                    .any(|app| app.policy.allows_mqtt_publish(client, PROBE_TOPIC))
             };
             // The authority changes only at the swap. If both reads of it
             // agree, it held at the registry read; if they differ, the swap
@@ -4158,6 +4158,10 @@ new sifter: Demo {{
         })
         .await
     }
+
+    /// The topic `authority_probe` asks about, which every entry
+    /// `publishing_through` writes admits.
+    const PROBE_TOPIC: &str = "cmd/light";
 
     /// The two states `authority_probe` has to see for its silence to mean
     /// anything: the agent table before the swap and after it.
@@ -4198,14 +4202,75 @@ new sifter: Demo {{
         .await
     }
 
-    /// The `client "mqtt:<slug>"` clause on the reader's publish ACL — the
-    /// authority whose going-live the arriving client's registration is ordered
-    /// before.
+    /// The `topic_filter "mqtt:<slug>:#"` clause on the reader's publish ACL —
+    /// the authority whose going-live the arriving client's registration is
+    /// ordered before.
     fn publishing_through(document: &str, client: &str) -> String {
-        document.replace(
+        publishing_to(document, client, "#")
+    }
+
+    /// The `topic_filter "mqtt:<slug>:<filter>"` clause on the reader's publish
+    /// ACL.
+    fn publishing_to(document: &str, client: &str, filter: &str) -> String {
+        let replaced = document.replace(
             "acl publish [exact reload_requests, exact work];",
-            &format!("acl publish [exact reload_requests, exact work, client \"mqtt:{client}\"];"),
+            &format!(
+                "acl publish [exact reload_requests, exact work, \
+                 topic_filter \"mqtt:{client}:{filter}\"];"
+            ),
+        );
+        assert_ne!(
+            replaced, document,
+            "the reader's publish ACL is in the document"
+        );
+        replaced
+    }
+
+    /// A reload that only narrows a publish filter takes effect at the reader's
+    /// next publish: the swapped policy refuses the topic the old filter
+    /// admitted and the new one does not, and the agent is not respawned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_narrowed_publish_filter_refuses_the_removed_topic() {
+        let one = [("ha", 8883u16, None)];
+        let tree = Tree::holding(&publishing_to(
+            &document_with_clients(&one, &[("ha", "home/state")]),
+            "ha",
+            "a/#",
+        ));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
         )
+        .await;
+        let before = booted.messenger.app_table().load()[READER].clone();
+        assert!(before.policy.allows_mqtt_publish("ha", "a/y/set"));
+
+        tree.write(&publishing_to(
+            &document_with_clients(&one, &[("ha", "home/state")]),
+            "ha",
+            "a/x/set",
+        ));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        let after = booted.messenger.app_table().load()[READER].clone();
+        assert!(after.policy.allows_mqtt_publish("ha", "a/x/set"));
+        assert!(!after.policy.allows_mqtt_publish("ha", "a/y/set"));
+        assert_eq!(status.delta.agents_changed, vec![READER.to_string()]);
+        assert!(
+            status.delta.sessions_retired.is_empty()
+                && status.delta.sessions_retire_pending.is_empty(),
+            "a filter-only change retires no session: {:?}",
+            status.delta
+        );
+        booted.stop_mqtt();
     }
 
     /// Commit registers an arriving client before the swap that makes an
@@ -4243,7 +4308,7 @@ new sifter: Demo {{
         assert!(
             booted.messenger.app_table().load()[READER]
                 .policy
-                .allows_mqtt_publish("spare"),
+                .allows_mqtt_publish("spare", PROBE_TOPIC),
             "the authority the ordering is about never went live",
         );
         booted.stop_mqtt();
@@ -4273,7 +4338,7 @@ new sifter: Demo {{
         assert!(
             booted.messenger.app_table().load()[READER]
                 .policy
-                .allows_mqtt_publish("spare"),
+                .allows_mqtt_publish("spare", PROBE_TOPIC),
             "the authority the ordering is about was never live",
         );
 
@@ -7637,7 +7702,7 @@ new sifter: Sifter {{
 
         tree.write(&document(BROKER).replace(
             "acl publish [exact reload_requests, exact work];",
-            "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
+            "acl publish [exact reload_requests, exact work, topic_filter \"mqtt:ha:#\"];",
         ));
         booted.driver.reload(TriggerSource::Signal).await;
 
@@ -8347,7 +8412,7 @@ new sifter: Sifter {{
 
         tree.write(&document(BROKER).replace(
             "acl publish [exact reload_requests, exact work];",
-            "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
+            "acl publish [exact reload_requests, exact work, topic_filter \"mqtt:ha:#\"];",
         ));
         booted.driver.reload(TriggerSource::Signal).await;
         std::fs::set_permissions(&state_dir, original).expect("and ours to unlock");
@@ -8394,7 +8459,7 @@ new sifter: Sifter {{
 
         tree.write(&document(BROKER).replace(
             "acl publish [exact reload_requests, exact work];",
-            "acl publish [exact reload_requests, exact work, client \"mqtt:ha\"];",
+            "acl publish [exact reload_requests, exact work, topic_filter \"mqtt:ha:#\"];",
         ));
         let dynamic = booted.driver.dynamic_snapshot().await;
         let users = booted.driver.registered_users().await;
