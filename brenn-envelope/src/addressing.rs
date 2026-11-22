@@ -221,12 +221,18 @@ pub const CORE_VIRTUAL_TOOL_NAME_REFUSAL: &str =
 /// segment followed by a `.`/`/` boundary (`"tools/x"`, `"tools.x"`), so a
 /// sibling name like `"toolsmith"` is not falsely reserved.
 pub fn is_reserved_channel(address: &str) -> bool {
-    RESERVED_CHANNEL_SEGMENTS.iter().any(|seg| {
-        address == *seg
-            || address
-                .strip_prefix(seg)
-                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('/'))
-    })
+    RESERVED_CHANNEL_SEGMENTS
+        .iter()
+        .any(|seg| under_segment(address, seg))
+}
+
+/// Is `name` the reserved segment `seg` itself, or `seg` followed by a `.`/`/`
+/// boundary? The one boundary rule every reserved channel segment is held to.
+fn under_segment(name: &str, seg: &str) -> bool {
+    name == seg
+        || name
+            .strip_prefix(seg)
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('/'))
 }
 
 /// Is `name` (a scheme-stripped channel name) inside a tool namespace the
@@ -264,9 +270,71 @@ pub const AUTO_CHANNEL_SEGMENT: &str = "auto";
 ///
 /// Deliberately separate from [`is_reserved_channel`], which keys the
 /// System-principal publish-time well-formedness exemption and must not widen:
-/// an `auto.<cid>` name is charset-clean and needs no exemption.
+/// an `auto.<cid>` name is charset-clean and needs no exemption, and no
+/// principal publishes into the egress namespace by address.
 pub fn is_reserved_channel_name(name: &str) -> bool {
-    is_reserved_channel(name) || is_auto_channel_name(name)
+    is_reserved_channel(name) || is_auto_channel_name(name) || is_egress_segment_name(name)
+}
+
+// ---------------------------------------------------------------------------
+// Egress channels
+// ---------------------------------------------------------------------------
+
+/// Channel-name segment owned by the host's outbound transports: the host's
+/// admission commits a message bound for a transport off the bus to
+/// `brenn:egress/<transport>`. Nothing reads such a channel.
+pub const EGRESS_SEGMENT: &str = "egress";
+
+/// The namespace the host mints its outbound channels into. Only the host's
+/// admission writes a channel in it; no access policy, component output or
+/// surface output may name one as a publish target.
+pub const EGRESS_NAMESPACE: &str = "egress/";
+
+/// Bare name of the MQTT outbound channel, which every admitted publish to an
+/// `mqtt:<client>:<topic>` address is committed to.
+pub const MQTT_OUTBOUND_CHANNEL: &str = "egress/mqtt";
+
+/// Canonical address of [`MQTT_OUTBOUND_CHANNEL`].
+pub const MQTT_OUTBOUND_ADDRESS: &str = "brenn:egress/mqtt";
+
+/// Why no tuning of a system-minted family other than ingress takes
+/// `non_text`, so the config language and boot give the operator the same
+/// reason. Callers say first which tuning is refused.
+pub const NON_TEXT_FAMILY_REFUSAL: &str = "the tool and device-location families are written \
+     and read by host code that parses text, and the egress family is always non_text";
+
+/// Why no tuning outside the `mqtt:` family takes `untyped_content_type`, so
+/// the config language and boot give the operator the same reason. Callers say
+/// first which tuning is refused.
+pub const UNTYPED_CONTENT_TYPE_FAMILY_REFUSAL: &str = "a `webhook:` channel's body is typed by \
+     its endpoint, the tool and device-location families are text-only, and an egress \
+     channel's bodies are typed by their publishers";
+
+/// Is `name` (a scheme-stripped `brenn:` channel name) inside
+/// [`EGRESS_NAMESPACE`]?
+///
+/// The exact segment and its `.` form are reserved against declaration by
+/// [`is_reserved_channel_name`] but name no channel; only the `/` form does.
+pub fn in_the_egress_namespace(name: &str) -> bool {
+    name.starts_with(EGRESS_NAMESPACE)
+}
+
+/// Does `name` (a scheme-stripped channel name) fall under the egress
+/// segment: the segment itself, or the segment followed by a `.`/`/`
+/// boundary, so `egressive` is not reserved.
+pub fn is_egress_segment_name(name: &str) -> bool {
+    under_segment(name, EGRESS_SEGMENT)
+}
+
+/// Derive a deterministic UUIDv5 for an egress channel from its full
+/// canonical address (`brenn:egress/<transport>`).
+///
+/// Every plan mints the same entry, so every boot lands on the same row. The
+/// namespace seed (`"brenn.egress-channel"`) is distinct from every other
+/// family's, so the address space cannot collide with any other.
+pub fn egress_channel_uuid(address: &str) -> Uuid {
+    let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.egress-channel");
+    Uuid::new_v5(&ns, address.as_bytes())
 }
 
 /// Does `name` (a scheme-stripped channel name) fall in the `auto` namespace?
@@ -278,10 +346,7 @@ pub fn is_reserved_channel_name(name: &str) -> bool {
 /// attach a third party to an "anonymous" channel with no connection to show for
 /// it.
 pub fn is_auto_channel_name(name: &str) -> bool {
-    name == AUTO_CHANNEL_SEGMENT
-        || name
-            .strip_prefix(AUTO_CHANNEL_SEGMENT)
-            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('/'))
+    under_segment(name, AUTO_CHANNEL_SEGMENT)
 }
 
 /// Derive an auto channel's connection id from its canonical endpoint refs.
@@ -550,6 +615,28 @@ mod tests {
         // The tool-scoped predicate must not widen: it keys the publish-time
         // well-formedness exemption, which auto channels do not need.
         assert!(!is_reserved_channel("auto.abc"));
+    }
+
+    #[test]
+    fn egress_names_are_reserved_against_declaration() {
+        for name in ["egress", "egress.x", "egress/mqtt", "egress/other"] {
+            assert!(is_reserved_channel_name(name), "{name} must be reserved");
+            // The publish-time exemption predicate does not widen.
+            assert!(!is_reserved_channel(name), "{name} must not be exempt");
+        }
+        for name in ["egressive", "egress-x", "my.egress", ""] {
+            assert!(
+                !is_reserved_channel_name(name),
+                "{name} must not be reserved"
+            );
+        }
+        assert!(in_the_egress_namespace(MQTT_OUTBOUND_CHANNEL));
+        assert!(!in_the_egress_namespace("egress"));
+        assert!(!in_the_egress_namespace("egress.x"));
+        assert_eq!(
+            MQTT_OUTBOUND_ADDRESS,
+            canonical_address(MQTT_OUTBOUND_CHANNEL)
+        );
     }
 
     #[test]
@@ -987,5 +1074,19 @@ mod tests {
         assert_ne!(u, tool_channel_uuid_from_address(address));
         assert_ne!(u, chat_channel_uuid_from_address(address));
         assert_ne!(u, durable_auto_channel_uuid(address));
+    }
+
+    /// Pinned: every boot's plan must land on the row an earlier one wrote.
+    ///
+    /// **Do NOT change this test if the UUID changes.** Fix the derivation.
+    #[test]
+    fn egress_channel_uuid_is_pinned_and_distinct() {
+        let u = egress_channel_uuid(MQTT_OUTBOUND_ADDRESS);
+        assert_eq!(u.to_string(), "71713547-cec9-5465-89d3-13dc1800d605");
+        assert_ne!(u, egress_channel_uuid("brenn:egress/other"));
+        assert_ne!(u, device_location_channel_uuid(MQTT_OUTBOUND_ADDRESS));
+        assert_ne!(u, tool_channel_uuid_from_address(MQTT_OUTBOUND_ADDRESS));
+        assert_ne!(u, chat_channel_uuid_from_address(MQTT_OUTBOUND_ADDRESS));
+        assert_ne!(u, durable_auto_channel_uuid(MQTT_OUTBOUND_ADDRESS));
     }
 }

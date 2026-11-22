@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use brenn_envelope::addressing::{NON_TEXT_FAMILY_REFUSAL, UNTYPED_CONTENT_TYPE_FAMILY_REFUSAL};
 pub use brenn_envelope::channel_model::ChannelBlockRole;
 use brenn_envelope::channel_model::{
     ChannelDepthKey, TUNING_DURABILITY_IGNORED, depth_required, sink_admitted, standing_admitted,
@@ -27,8 +28,8 @@ use super::{
     AttachGrant, ChannelEntry, ChannelScheme, ComponentGrant, MessagingDirectory,
     SubscriberEntryKind, TOOL_RESULTS_NAMESPACE, WakeMin, canonicalize_channel_address,
     ends_at_tuning_boundary, in_a_tool_namespace, in_app_tool_results_namespace,
-    in_the_device_location_family, is_device_location_prefix, is_reserved_channel_name,
-    is_unreserved_char, nondurable_channel_uuid, tuning_boundary_list,
+    in_the_device_location_family, in_the_egress_namespace, is_device_location_prefix,
+    is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid, tuning_boundary_list,
 };
 use crate::config::AppConfigRaw;
 
@@ -2248,8 +2249,9 @@ pub fn build_channel_entries(
         assert!(
             !is_reserved_channel_name(name),
             "config: [[channel]] address {raw_address:?} is in a reserved namespace \
-             (auto is owned by the auto-channel machinery; the tool namespaces exist \
-             only on brenn:, where a block addressing one tunes it instead)",
+             (auto is owned by the auto-channel machinery and egress by the host's \
+             outbound transports; the tool namespaces exist only on brenn:, where a \
+             block addressing one tunes it instead)",
         );
 
         let capabilities = scheme
@@ -2479,6 +2481,14 @@ pub const TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(16);
 /// enough history to ask where its user was yesterday.
 pub const DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(2000);
 
+/// Retained window the `brenn:egress/` family defaults to.
+///
+/// The window is the history a reader granted the channel sees. 256 is the
+/// most publishes one component activation may buffer
+/// (`MAX_PUBLISHES_PER_ACTIVATION`), so one activation's flush fits whole; at a
+/// household's few hundred commands a day it is about a day of history.
+pub const EGRESS_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(256);
+
 /// The send rate of `system:device-location` on every `brenn:device-location.`
 /// channel, in place of the operator's `default_send_rate`; a tuning block
 /// carrying `send_rate` on the family is refused.
@@ -2510,6 +2520,10 @@ pub enum SystemChannelFamily {
     /// `brenn:device-location.<username>` — one per registered user, carrying
     /// every location fix and sharing change that user's devices report.
     DeviceLocation,
+    /// `brenn:egress/<transport>` — channels the host's admission writes for a
+    /// transport off the bus, which nothing reads; `brenn:egress/mqtt` is the
+    /// one member. Its bodies are payloads, so it is always `non_text`.
+    Egress,
 }
 
 impl SystemChannelFamily {
@@ -2530,6 +2544,8 @@ impl SystemChannelFamily {
             Some(Self::Tool)
         } else if in_the_device_location_family(name) {
             Some(Self::DeviceLocation)
+        } else if in_the_egress_namespace(name) {
+            Some(Self::Egress)
         } else {
             None
         }
@@ -2560,6 +2576,7 @@ impl SystemChannelFamily {
             Self::Ingress => INGRESS_DEFAULT_RETAIN_DEPTH,
             Self::Tool => TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH,
             Self::DeviceLocation => DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH,
+            Self::Egress => EGRESS_DEFAULT_RETAIN_DEPTH,
         }
     }
 }
@@ -2645,7 +2662,8 @@ impl SystemChannelTuning {
 /// - an exact address or prefix in the `brenn:tool-requests/` family
 /// - a duplicate exact address or a duplicate prefix
 /// - `sink = "archive"` (stated or inherited) with no `[messaging].archive_path`
-/// - `non_text` on a block outside the `mqtt:` and `webhook:` families
+/// - `non_text` on a block outside the `mqtt:` and `webhook:` families (the
+///   egress family is always `non_text` and does not state it)
 /// - `untyped_content_type` on a block outside the `mqtt:` family, on one that
 ///   does not also state `non_text`, or naming no well-formed media type
 pub fn build_system_channel_tuning(
@@ -2740,10 +2758,9 @@ pub fn build_system_channel_tuning(
         let family = SystemChannelFamily::of_prefix(&entry_key);
         assert!(
             !ch.non_text || family == Some(SystemChannelFamily::Ingress),
-            "config: [[channel]] {label} tunes a tool or device-location channel and must \
-             not set non_text — those families are written and read by host code that \
-             parses text; non_text on an mqtt: or webhook: block selects the raw ingress \
-             shape",
+            "config: [[channel]] {label} tunes a tool, device-location or egress channel and \
+             must not set non_text — {NON_TEXT_FAMILY_REFUSAL}; non_text on an mqtt: or \
+             webhook: block selects the raw ingress shape",
         );
         if let Some(content_type) = &ch.untyped_content_type {
             assert!(
@@ -2752,8 +2769,7 @@ pub fn build_system_channel_tuning(
                     Some((ChannelScheme::Mqtt, _))
                 ),
                 "config: [[channel]] {label} sets untyped_content_type outside the mqtt: \
-                 family — a webhook: channel's body is typed by its endpoint, and the \
-                 tool and device-location families are text-only",
+                 family — {UNTYPED_CONTENT_TYPE_FAMILY_REFUSAL}",
             );
             assert!(
                 ch.non_text,
@@ -2953,9 +2969,10 @@ pub fn resolve_system_channel(
         send_rate: tuned
             .and_then(|t| t.send_rate)
             .unwrap_or(defaults.default_send_rate),
-        // Only an ingress block may state `non_text`, so a tool or
-        // device-location channel is always text-only.
-        non_text: tuned.is_some_and(|t| t.non_text),
+        // Only an ingress block may state `non_text`: a tool or
+        // device-location channel is always text-only, and an egress channel,
+        // whose bodies are payloads, never is.
+        non_text: family == SystemChannelFamily::Egress || tuned.is_some_and(|t| t.non_text),
         untyped_content_type: tuned.and_then(|t| t.untyped_content_type.clone()),
     }
 }
@@ -3671,6 +3688,18 @@ mod tests {
                 raw_channel("1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32", "shared"),
                 raw_channel("fe2f8b96-8b1c-4a44-a7c1-1ce1d76aa65d", "shared"),
             ],
+            &global_defaults(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is in a reserved namespace")]
+    fn reserved_egress_namespace_channel_panics() {
+        build_channel_entries(
+            &[raw_channel(
+                "1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32",
+                "egress.x",
+            )],
             &global_defaults(),
         );
     }
@@ -4598,7 +4627,9 @@ channel demo at "ephemeral:protobar-demo" {
     }
 
     #[test]
-    #[should_panic(expected = "tunes a tool or device-location channel and must not set non_text")]
+    #[should_panic(
+        expected = "tunes a tool, device-location or egress channel and must not set non_text"
+    )]
     fn a_tuning_block_with_non_text_panics() {
         let mut block = tuning_block("brenn:tools/git-repo-pull", 1, 8, 8);
         block.non_text = true;
@@ -4606,7 +4637,9 @@ channel demo at "ephemeral:protobar-demo" {
     }
 
     #[test]
-    #[should_panic(expected = "tunes a tool or device-location channel and must not set non_text")]
+    #[should_panic(
+        expected = "tunes a tool, device-location or egress channel and must not set non_text"
+    )]
     fn a_device_location_prefix_with_non_text_panics() {
         let mut block = tuning_prefix("brenn:device-location.", 1, 8, 8);
         block.non_text = true;
@@ -4957,6 +4990,70 @@ channel demo at "ephemeral:protobar-demo" {
             resolved.standing_retain_depth,
             DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH
         );
+    }
+
+    #[test]
+    fn the_mqtt_outbound_channel_is_in_the_egress_family() {
+        for address in ["brenn:egress/mqtt", "egress/mqtt", "brenn:egress/other"] {
+            assert_eq!(
+                SystemChannelFamily::of(address),
+                Some(SystemChannelFamily::Egress),
+                "{address}"
+            );
+        }
+        for address in [
+            "brenn:egress",
+            "brenn:egress.x",
+            "brenn:egressive",
+            "ephemeral:egress/mqtt",
+        ] {
+            assert_eq!(SystemChannelFamily::of(address), None, "{address}");
+        }
+        assert_eq!(
+            SystemChannelFamily::of_prefix("brenn:egress/"),
+            Some(SystemChannelFamily::Egress)
+        );
+        assert_eq!(
+            SystemChannelFamily::Egress.default_retain_depth(),
+            Depth::Bounded(256)
+        );
+        assert_eq!(
+            channel_block_role("brenn:egress/mqtt"),
+            ChannelBlockRole::Tuning
+        );
+    }
+
+    /// The egress family's window defaults to 256, its bodies are always
+    /// `non_text` with no declared type, and a block retunes the window.
+    #[test]
+    fn the_egress_family_defaults_to_its_window_and_is_non_text() {
+        let defaults = global_defaults();
+        let untuned = resolve_system_channel("brenn:egress/mqtt", &tuning_of(&[]), &defaults);
+        assert_eq!(untuned.push_depth, SYSTEM_CHANNEL_DEFAULT_PUSH_DEPTH);
+        assert_eq!(untuned.retain_depth, EGRESS_DEFAULT_RETAIN_DEPTH);
+        assert_eq!(untuned.standing_retain_depth, EGRESS_DEFAULT_RETAIN_DEPTH);
+        assert!(untuned.non_text);
+        assert_eq!(untuned.untyped_content_type, None);
+
+        let tuned = resolve_system_channel(
+            "brenn:egress/mqtt",
+            &tuning_of(&[tuning_block("brenn:egress/mqtt", 4, 1000, 1000)]),
+            &defaults,
+        );
+        assert_eq!(tuned.push_depth, Depth::Bounded(4));
+        assert_eq!(tuned.retain_depth, Depth::Bounded(1000));
+        assert_eq!(tuned.standing_retain_depth, Depth::Bounded(1000));
+        assert!(tuned.non_text);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "tunes a tool, device-location or egress channel and must not set non_text"
+    )]
+    fn an_egress_tuning_block_with_non_text_panics() {
+        let mut block = tuning_block("brenn:egress/mqtt", 1, 8, 8);
+        block.non_text = true;
+        tuning_of(&[block]);
     }
 
     /// The family prefix sizes every user; an exact block sizes one and wins.

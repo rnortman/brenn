@@ -488,23 +488,61 @@ pub struct WebhookTransport {
     pub endpoint_slug: String,
 }
 
-/// The transport metadata a [`MessageEnvelope`] carries under the header key
-/// `transport`: `{"mqtt":{…}}` or `{"webhook":{…}}`.
+/// The MQTT metadata of an outbound message, one bound for a broker: where it
+/// goes, the options it is published with, and how long it is worth
+/// delivering. The message's body is the payload, or its one attachment is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MqttPublishTransport {
+    /// The declared client the message is published through.
+    pub client_slug: String,
+    /// Concrete topic name.
+    pub topic: String,
+    /// QoS to publish at: 0, 1 or 2.
+    pub qos: u8,
+    /// The MQTT retain flag to publish with.
+    pub retain: bool,
+    /// The publisher's MQTT 5 message expiry; absent when it stated none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_expiry_s: Option<u32>,
+    /// MQTT 5 Content Type to send; absent sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// End of the message's lifetime inside Brenn: it is not handed to the
+    /// broker at or after this instant.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// The metadata of the transport a message came in on, or of the transport
+/// it is bound for, carried by a [`MessageEnvelope`] under the header key
+/// `transport`: `{"mqtt":{…}}`, `{"webhook":{…}}` or `{"mqtt_publish":{…}}`.
 ///
-/// Closed, like `envelope_type`: a transport added later comes with a new
-/// [`ChannelScheme`], which a reader built before it already refuses.
+/// `Mqtt` and `Webhook` are ingress metadata and appear only on a channel of
+/// their own scheme. `MqttPublish` is outbound metadata and appears only on
+/// the host's MQTT outbound channel ([`addressing::MQTT_OUTBOUND_ADDRESS`]),
+/// a `brenn:` channel.
+///
+/// Closed, like `envelope_type`. An ingress transport added later comes with
+/// a new [`ChannelScheme`], which a reader built before it already refuses at
+/// `envelope_type`. `MqttPublish` rides a `brenn:` envelope, so a reader built
+/// before it fails on the header instead; that is tolerable only because the
+/// channel carrying it did not exist before the variant did, so no older
+/// reader is on it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportMeta {
     Mqtt(MqttTransport),
     Webhook(WebhookTransport),
+    #[serde(rename = "mqtt_publish")]
+    MqttPublish(MqttPublishTransport),
 }
 
 impl TransportMeta {
-    /// The channel scheme of the transport this metadata belongs to.
+    /// The channel scheme of the transport this metadata belongs to. For
+    /// outbound metadata that is the destination's scheme, not the scheme of
+    /// the channel the message is on.
     pub fn scheme(&self) -> ChannelScheme {
         match self {
-            Self::Mqtt(_) => ChannelScheme::Mqtt,
+            Self::Mqtt(_) | Self::MqttPublish(_) => ChannelScheme::Mqtt,
             Self::Webhook(_) => ChannelScheme::Webhook,
         }
     }
@@ -780,11 +818,13 @@ pub struct MessageEnvelope {
     /// Additive to the LLM-facing JSON; the LLM is the maximally-adaptable
     /// consumer.
     pub envelope_type: ChannelScheme,
-    /// The transport's metadata, on a message a transport adaptor published
-    /// with the payload itself as the body; `None` on every other message,
-    /// including the wrapper-shaped ingress messages, whose metadata is
-    /// inside the body. Serialized under the header key `transport`, after
-    /// `envelope_type`, and omitted when absent.
+    /// The metadata of the transport the message came in on, or of the
+    /// transport it is bound for, on a message whose body is the payload
+    /// itself: one a transport adaptor published, or one admitted for an MQTT
+    /// broker. `None` on every other message, including the wrapper-shaped
+    /// ingress messages, whose metadata is inside the body. Serialized under
+    /// the header key `transport`, after `envelope_type`, and omitted when
+    /// absent.
     pub transport: Option<TransportMeta>,
     /// The blobs this message carries, by name; empty on a message that
     /// carries none. Each shape decides what it writes of them
@@ -881,6 +921,52 @@ mod tests {
             assert_eq!(serde_json::to_string(meta).unwrap(), wire);
             assert_eq!(&serde_json::from_str::<TransportMeta>(wire).unwrap(), meta);
             assert_eq!(meta.scheme(), scheme);
+        }
+    }
+
+    /// The outbound variant's wire form, pinned literally beside the ingress
+    /// ones; the optional fields are omitted when absent.
+    #[test]
+    fn mqtt_publish_transport_wire_form_is_pinned_and_round_trips() {
+        let at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let full = TransportMeta::MqttPublish(MqttPublishTransport {
+            client_slug: "broker".to_string(),
+            topic: "lights/kitchen/set".to_string(),
+            qos: 2,
+            retain: true,
+            message_expiry_s: Some(30),
+            content_type: Some("application/json".to_string()),
+            expires_at: at,
+        });
+        let bare = TransportMeta::MqttPublish(MqttPublishTransport {
+            client_slug: "broker".to_string(),
+            topic: "lights/kitchen/set".to_string(),
+            qos: 0,
+            retain: false,
+            message_expiry_s: None,
+            content_type: None,
+            expires_at: at,
+        });
+        for (meta, wire) in [
+            (
+                &full,
+                concat!(
+                    r#"{"mqtt_publish":{"client_slug":"broker","topic":"lights/kitchen/set","#,
+                    r#""qos":2,"retain":true,"message_expiry_s":30,"#,
+                    r#""content_type":"application/json","expires_at":"2023-11-14T22:13:20Z"}}"#
+                ),
+            ),
+            (
+                &bare,
+                concat!(
+                    r#"{"mqtt_publish":{"client_slug":"broker","topic":"lights/kitchen/set","#,
+                    r#""qos":0,"retain":false,"expires_at":"2023-11-14T22:13:20Z"}}"#
+                ),
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(meta).unwrap(), wire);
+            assert_eq!(&serde_json::from_str::<TransportMeta>(wire).unwrap(), meta);
+            assert_eq!(meta.scheme(), ChannelScheme::Mqtt);
         }
     }
 

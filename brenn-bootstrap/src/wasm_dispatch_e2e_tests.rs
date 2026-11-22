@@ -939,6 +939,7 @@ async fn append_ring_message(
             body: body.into(),
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Ephemeral,
+            transport: None,
             reply_to: None,
             delivery_deadline: None,
             impetus: None,

@@ -135,6 +135,7 @@ fn message(sender: &str, body: &str) -> NewMessage {
         body: body.into(),
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
+        transport: None,
         reply_to: None,
         delivery_deadline: None,
         impetus: None,
@@ -185,6 +186,55 @@ async fn deferred_bodies(store: &dyn RetentionStore, sender: &str) -> Vec<String
         .iter()
         .map(|d| d.envelope.body.as_text().unwrap().to_owned())
         .collect()
+}
+
+// ── Transport metadata ────────────────────────────────────────────────────
+
+fn outbound_transport() -> brenn_envelope::TransportMeta {
+    brenn_envelope::TransportMeta::MqttPublish(brenn_envelope::MqttPublishTransport {
+        client_slug: "home".to_string(),
+        topic: "lights/kitchen/set".to_string(),
+        qos: 1,
+        retain: true,
+        message_expiry_s: Some(30),
+        content_type: Some("application/json".to_string()),
+        expires_at: now() + Duration::seconds(30),
+    })
+}
+
+/// A message's transport metadata comes back on the envelope exactly as it
+/// went in, appended or parked, and a message carrying none comes back with
+/// none.
+#[tokio::test]
+async fn transport_metadata_is_retained_verbatim() {
+    for store in stores(DEPTH).await {
+        let mut carried = message_for(&*store, "app:alice", "on");
+        carried.transport = Some(outbound_transport());
+        store.append(carried).await;
+        store
+            .append(message_for(&*store, "app:alice", "plain"))
+            .await;
+        let tail = store.retained_tail(Depth::Unbounded).await;
+        assert_eq!(tail.len(), 2, "{}", store.address());
+        assert_eq!(
+            tail[0].transport,
+            Some(outbound_transport()),
+            "{}",
+            store.address()
+        );
+        assert_eq!(tail[1].transport, None, "{}", store.address());
+
+        let mut parked = message_for(&*store, "app:bob", "later");
+        parked.transport = Some(outbound_transport());
+        store.park(parked, soon()).await.expect("under the cap");
+        let deferred = store.deferred_for_sender("app:bob").await;
+        assert_eq!(
+            deferred[0].envelope.transport,
+            Some(outbound_transport()),
+            "{}",
+            store.address()
+        );
+    }
 }
 
 // ── Identity ──────────────────────────────────────────────────────────────

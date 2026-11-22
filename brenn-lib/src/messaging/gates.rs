@@ -37,9 +37,13 @@ pub fn resolve_publish_sender<'a>(
 /// Layer-2 policy gate: dispatch on `scheme` to the matching publish-ACL check
 /// against the bare channel `name`. The pub/sub schemes each carry a per-scheme
 /// publish ACL (`brenn_publish`, `ephemeral_publish`, `local_publish`);
-/// `mqtt:`/`webhook:`/`pwa_push:` are not publishable through this gate (mqtt
-/// egress has its own gate; webhook/pwa_push are not pub/sub targets) and deny
-/// here.
+/// `mqtt:`/`webhook:`/`pwa_push:` are not publishable through this gate and deny
+/// here. A publish to an `mqtt:` topic is decided by the bus's MQTT admission
+/// (`Messenger::admit_mqtt` in `brenn-messaging`), which reads
+/// `AppPolicy::allows_mqtt_publish` and never asks this function; the `mqtt:`
+/// arm answers `false` so that a reply target or a component output is never
+/// admitted here by an MQTT ACL. `webhook:` and `pwa_push:` are not pub/sub
+/// targets.
 pub fn publish_acl_allows(policy: &AppPolicy, scheme: ChannelScheme, name: &str) -> bool {
     match scheme {
         ChannelScheme::Brenn => policy.allows_brenn_publish(name),

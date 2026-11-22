@@ -560,6 +560,12 @@ impl AsyncTool for ProvidedTool {
                 )));
             }
             PublishResult::RateLimited => return Err(ToolError::RateLimited),
+            // Only the MQTT entry runs the MQTT admission, and a system
+            // publish does not go through it.
+            PublishResult::MqttRefused(refusal) => unreachable!(
+                "provided tool {name:?}: publishing its request returned \
+                 MqttRefused({refusal:?}) — only Messenger::publish_mqtt runs the MQTT admission"
+            ),
             other @ (PublishResult::UnknownChannel(_)
             | PublishResult::MalformedAddress(_)
             | PublishResult::MissingSender

@@ -832,6 +832,24 @@ fn a_surface_output_on_a_tools_address_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
+/// An output onto the MQTT outbound channel would let a page publish past the
+/// host's admission, the only writer an outbound channel has.
+#[test]
+#[should_panic(expected = "which is in the egress namespace")]
+fn a_surface_output_on_the_mqtt_outbound_channel_panics() {
+    let dir = dir_of(vec![
+        brenn_entry("brenn:alerts"),
+        brenn_messaging::mqtt_outbound::mqtt_outbound_entry(
+            &brenn_lib::messaging::config::SystemChannelTuning::default(),
+            &test_globals(),
+        ),
+        ephem("protobar-demo"),
+    ]);
+    let mut raw = valid_surface_raw();
+    raw.outputs[0].channel = Some("brenn:egress/mqtt".to_string());
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
 /// A surface may be bound to a transportable `non_text` channel without its
 /// ports stating it, in either direction; the resolved table carries each
 /// channel's declaration in first-binding order.

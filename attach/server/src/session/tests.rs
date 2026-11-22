@@ -1277,6 +1277,7 @@ async fn seed_with_attachment(
             body: r#"{"n":1}"#.into(),
             urgency: brenn_lib::messaging::Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+            transport: None,
             reply_to: None,
             delivery_deadline: None,
             impetus: None,

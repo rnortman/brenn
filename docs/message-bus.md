@@ -1345,14 +1345,14 @@ behind on that tool. Each drain serves at most the window's newest unseen
 requests and steps over the older ones, as any subscriber's overflow does
 (drop oldest). One activation may queue up to 64 asynchronous calls, and the
 default window is 16: a request pushed past the window before the executor
-dequeues it is lost, attachments or not. No result is published for it, and
-the executor's overflow is silent
-(`TODO(tool-request-window-overflow-silent)`). Its blobs go when GC evicts
-its row. The window is also what keeps a request's attachments alive until the
-executor takes its own holds: a row evicted and reaped in the instant between
-the dequeue and that hold is answered `internal`, naming the attachment. An
-operator who expects bursts of calls to one tool sizes that tool's
-`brenn:tools/<tool>` window for the burst.
+dequeues it is lost, attachments or not. No result is published for it; the
+drain logs how many requests it stepped over and counts them, and the defaults
+still guarantee the case (`TODO(tool-request-window-overflow-silent)`). Its
+blobs go when GC evicts its row. The window is also what keeps a request's
+attachments alive until the executor takes its own holds: a row evicted and
+reaped in the instant between the dequeue and that hold is answered
+`internal`, naming the attachment. An operator who expects bursts of calls to
+one tool sizes that tool's `brenn:tools/<tool>` window for the burst.
 
 An app's `brenn:app-tool-results/<app-slug>` inbox is minted for every app
 granted at least one asynchronous registry tool, at boot and when a reload

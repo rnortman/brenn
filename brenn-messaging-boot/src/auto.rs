@@ -1064,7 +1064,8 @@ fn decide_placement(label: &str, endpoints: &[Endpoint], declared: Option<&str>)
     assert!(
         !is_reserved_channel_name(bare),
         "config: {label}: channel {address:?} is in a reserved namespace ({} are owned by the \
-         tool substrate; auto is owned by the auto-channel machinery)",
+         tool substrate; auto is owned by the auto-channel machinery; egress is owned by the \
+         host's outbound transports)",
         reserved_segment_list(),
     );
 

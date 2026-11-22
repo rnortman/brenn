@@ -467,6 +467,31 @@ fn no_matcher_reaches_into_the_anonymous_namespace() {
 }
 
 #[test]
+fn no_publish_entry_reaches_into_the_egress_namespace() {
+    for pattern in ["exact \"brenn:egress/mqtt\"", "prefix \"brenn:egress/\""] {
+        let refusal = derive_refusal(&consumer(
+            "ports",
+            &format!("    acl publish [{pattern}];\n"),
+        ));
+        assert!(
+            refusal.contains("reaches into the reserved `egress/` namespace"),
+            "{pattern}: {refusal}"
+        );
+    }
+}
+
+#[test]
+fn a_subscribe_entry_may_name_the_egress_namespace() {
+    let config = derived(&surface(
+        "    acl subscribe [exact \"brenn:egress/mqtt\", prefix \"brenn:egress/\"];\n",
+    ));
+    assert_eq!(
+        patterns(&config.surfaces[0].acl.brenn_subscribe),
+        ["egress/mqtt", "egress/"]
+    );
+}
+
+#[test]
 fn a_name_beside_the_anonymous_namespace_is_an_ordinary_channel() {
     let config = derived(&surface(
         "    acl subscribe [prefix \"brenn:automation.\"];\n",
@@ -5989,4 +6014,48 @@ fn a_user_location_channel_is_never_bound_outbound() {
         let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(messages, [direction_refusal.as_str()], "{body}");
     }
+}
+
+// ── the MQTT outbound channel ────────────────────────────────────────────────
+
+const MQTT_OUTBOUND: &str = "brenn:egress/mqtt";
+
+#[test]
+fn a_consumer_binds_the_mqtt_outbound_channel_as_an_input() {
+    let config = derived(&relay(&format!("    in inbound <- \"{MQTT_OUTBOUND}\";\n")));
+    let acl = &config.consumers[0].acl;
+    assert_eq!(patterns(&acl.brenn_subscribe), ["egress/mqtt"]);
+    assert!(acl.brenn_publish.is_empty(), "{:?}", acl.brenn_publish);
+}
+
+#[test]
+fn the_mqtt_outbound_channel_is_never_bound_outbound() {
+    for (port, body) in [
+        ("out", format!("    out outbound -> \"{MQTT_OUTBOUND}\";\n")),
+        ("io", format!("    io acks <-> \"{MQTT_OUTBOUND}\";\n")),
+    ] {
+        let errors = derive_errors(&relay_with("ports", &body));
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [format!(
+                "this {} of consumer `alice_relay` names `{MQTT_OUTBOUND}`, in the egress \
+                 namespace: only Brenn's admission writes an outbound channel, so no `out` or \
+                 `io` port publishes there; an MQTT publish goes to its \
+                 `mqtt:<client>:<topic>` address",
+                "binding"
+            )
+            .as_str()],
+            "{port}"
+        );
+    }
+}
+
+#[test]
+fn an_input_on_another_egress_name_attaches_to_nothing() {
+    let refusal = derive_refusal(&relay("    in inbound <- \"brenn:egress/other\";\n"));
+    assert!(
+        refusal.starts_with("`brenn:egress/other` names no declared channel"),
+        "{refusal}"
+    );
 }

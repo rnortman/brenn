@@ -289,4 +289,21 @@ mod tests {
     fn validate_app_path_rejects_traversal() {
         assert!(validate_app_path("/app/../etc").is_err());
     }
+
+    /// Brenn never mints a file link its own validator refuses: a link built
+    /// by `encode_url_path` comes back from `validate_app_path` unchanged.
+    // TODO(file-link-backslash-refused): `\` is left out of the name because
+    // `encode_url_path` does not encode it and the parser reads it as `/`.
+    #[test]
+    fn validate_app_path_accepts_a_minted_file_link() {
+        let name: String = (0x20u8..=0x7e)
+            .map(char::from)
+            .filter(|c| *c != '/' && *c != '\\')
+            .collect();
+        let link = format!(
+            "/app/x/file/{}",
+            brenn_render::artifact::encode_url_path(&name)
+        );
+        assert_eq!(validate_app_path(&link), Ok(link.clone()));
+    }
 }

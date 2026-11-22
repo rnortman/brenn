@@ -605,6 +605,7 @@ mod tests {
         );
     }
 
+    // TODO(obs-log-capture-test-flaky): once failed under full `make check`, captured line not found.
     #[tokio::test]
     #[traced_test]
     async fn signal_sanitizes_address_in_log_and_alert_body() {

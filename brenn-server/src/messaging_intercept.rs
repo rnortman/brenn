@@ -769,6 +769,11 @@ pub(crate) async fn publish_send(
             "BrennSend publish returned ImpetusUnauthorized: this entry point passes no \
              impetus"
         ),
+        // Only the MQTT entry runs the MQTT admission, and this is not it.
+        PublishResult::MqttRefused(refusal) => unreachable!(
+            "BrennSend publish returned MqttRefused({refusal:?}): only Messenger::publish_mqtt \
+             runs the MQTT admission"
+        ),
     }
 }
 

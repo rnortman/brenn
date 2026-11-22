@@ -28,6 +28,7 @@ pub mod dispatcher;
 pub mod edit;
 pub mod format;
 pub mod live;
+pub mod mqtt_outbound;
 pub mod publish;
 pub mod query;
 pub mod reconcile;
@@ -82,7 +83,8 @@ pub use ingress::{
 pub use live::{GapReason, PrepaidDestination, PrepaidEntry, Replay};
 pub use publish::{
     AttachBatchPublish, AttachSendDraw, AttachSendVerdict, IngressMessage, MissingChannelPosture,
-    PublishOrigin, PublishResult, WasmPublish, is_well_formed_address,
+    MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, WasmPublish,
+    is_well_formed_address,
 };
 pub use query::{MessageQuery, QueryError};
 pub use retained_part::{AdmittedPart, NamedPart, PartRefusal, ToolChannelAttachments};
@@ -921,14 +923,21 @@ pub struct Messenger {
 
     /// Per-`(channel address, subscriber)` count of drops the noise ladder
     /// metered — all of them on a `metered`/`alarm` subscription, none on a
-    /// `silent` one.
+    /// `silent` one — plus, for a system participant, what its drain stepped
+    /// over.
     ///
-    /// It lives here because the ladder does: `enact_overflow_noise` is the one
-    /// writer, and the stores below it hold no drop state at all — every figure
-    /// they report is a subtraction between two seqs. In memory only, so a
+    /// It lives here because the ladder does: `enact_overflow_noise` writes it
+    /// for every subscriber but a system participant, whose rung is `Silent`,
+    /// and `count_stepped_over` writes it for a system participant alone. The
+    /// stores below hold no drop state at all — every figure they report is a
+    /// subtraction between two seqs. In memory only, so a
     /// restart forgets the tallies. A pair is forgotten at detach, so a
     /// departed subscriber leaves nothing behind.
     metered_drops: Mutex<HashMap<(String, String), u64>>,
+    /// The declared MQTT clients an `mqtt:` publish is admitted against,
+    /// installed once at boot via [`Messenger::install_mqtt_clients`]. Empty on
+    /// a messenger built without one, which knows no client.
+    mqtt_clients: std::sync::OnceLock<Arc<dyn brenn_lib::mqtt::MqttClientDirectory>>,
 }
 
 /// The channel registration that names `subscriber`, or `None` when the
@@ -1106,6 +1115,7 @@ impl Messenger {
             dropped_deferred: Mutex::new(HashMap::new()),
             deferred_control_races: Mutex::new(HashMap::new()),
             metered_drops: Mutex::new(HashMap::new()),
+            mqtt_clients: std::sync::OnceLock::new(),
         })
     }
 
@@ -2640,7 +2650,9 @@ impl Messenger {
 
     /// Read the metered drop count for a `(channel_address, subscriber_id)`
     /// pair — the drops the noise ladder counted, which is all of them on a
-    /// `metered`/`alarm` subscription and none on a `silent` one. Returns 0 if
+    /// `metered`/`alarm` subscription and none on a `silent` one, except that a
+    /// system participant's `silent` subscription counts every message its
+    /// drain stepped over (`count_stepped_over`). Returns 0 if
     /// no overflow has ever been metered for this pair. This is the telemetry
     /// read.
     ///
@@ -2674,6 +2686,41 @@ impl Messenger {
             .lock()
             .expect("messaging: metered_drops lock poisoned")
             .remove(&(channel.to_owned(), subscriber.as_str().to_owned()));
+    }
+
+    /// Log and count `dropped` messages a system participant's drain stepped
+    /// over unread on `channel`: one `warn` line naming the participant, the
+    /// channel and the figure, and the same figure added to the participant's
+    /// tally, read through [`Self::drop_counter`].
+    ///
+    /// The tally is exact because nothing else writes it for a system
+    /// participant: its rung is `Silent`, which `enact_overflow_noise` counts
+    /// nothing under, for an advance and for an eviction pass alike.
+    ///
+    /// TODO(system-participant-noise-inert): enacting a system participant's
+    /// rung must replace this count, or one loss would be counted twice.
+    pub(crate) fn count_stepped_over(
+        &self,
+        channel: &str,
+        subscriber: &ParticipantId,
+        dropped: u64,
+    ) {
+        if dropped == 0 {
+            return;
+        }
+        tracing::warn!(
+            subscriber = subscriber.as_str(),
+            channel,
+            dropped,
+            "system participant's drain stepped over messages it never read; its channel's \
+             window was outrun between two passes",
+        );
+        *self
+            .metered_drops
+            .lock()
+            .expect("messaging: metered_drops lock poisoned")
+            .entry((channel.to_owned(), subscriber.as_str().to_owned()))
+            .or_insert(0) += dropped;
     }
 
     /// Enact the noise ladder for `count` overflow drops reported against
@@ -4427,6 +4474,7 @@ mod tests {
                 body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
+                transport: None,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
@@ -4569,6 +4617,7 @@ mod tests {
                 body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
+                transport: None,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
@@ -4649,6 +4698,7 @@ mod tests {
                         body: body.into(),
                         urgency: Urgency::Normal,
                         envelope_type: ChannelScheme::Ephemeral,
+                        transport: None,
                         reply_to: None,
                         delivery_deadline: None,
                         impetus: None,
@@ -4710,6 +4760,7 @@ mod tests {
                 body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
+                transport: None,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
@@ -5140,6 +5191,7 @@ mod tests {
                     body: "parked".into(),
                     urgency: Urgency::Normal,
                     envelope_type: ChannelScheme::Brenn,
+                    transport: None,
                     reply_to: None,
                     delivery_deadline: None,
                     impetus: None,
@@ -6281,6 +6333,7 @@ mod tests {
                 body: body.into(),
                 urgency,
                 envelope_type: ChannelScheme::Brenn,
+                transport: None,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
@@ -6309,6 +6362,7 @@ mod tests {
                 body: body.into(),
                 urgency: Urgency::Normal,
                 envelope_type: entry.transport_type,
+                transport: None,
                 reply_to: None,
                 delivery_deadline: Some(deadline),
                 impetus: None,
@@ -6579,6 +6633,7 @@ mod tests {
                     body: "quiet, and late".into(),
                     urgency: Urgency::Normal,
                     envelope_type: ChannelScheme::Brenn,
+                    transport: None,
                     reply_to: None,
                     delivery_deadline: Some(deadline),
                     impetus: None,
@@ -7563,6 +7618,7 @@ mod tests {
             body: body.into(),
             urgency: Urgency::Normal,
             envelope_type: channel.transport_type,
+            transport: None,
             reply_to: None,
             delivery_deadline: None,
             impetus: None,

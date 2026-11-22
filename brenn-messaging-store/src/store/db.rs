@@ -127,7 +127,7 @@ impl DbStore {
             msg.delivery_deadline,
             deliver_after,
             msg.impetus,
-            None,
+            msg.transport.as_ref(),
             &msg.attachments,
             msg.publish_ts_ns,
         );

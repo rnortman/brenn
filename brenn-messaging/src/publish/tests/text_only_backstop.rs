@@ -323,6 +323,7 @@ async fn park_text(m: &Messenger, addr: &str) -> Uuid {
                 body: "parked".into(),
                 urgency: Urgency::Normal,
                 envelope_type: entry.transport_type,
+                transport: None,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,

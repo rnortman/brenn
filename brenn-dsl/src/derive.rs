@@ -42,10 +42,11 @@ use uuid::Uuid;
 
 use brenn_envelope::ChannelScheme;
 use brenn_envelope::addressing::{
-    MATCHER_BOUNDARIES, TOOL_REQUESTS_NAMESPACE, TUNING_BOUNDARIES, ends_at_matcher_boundary,
+    MATCHER_BOUNDARIES, MQTT_OUTBOUND_CHANNEL, NON_TEXT_FAMILY_REFUSAL, TOOL_REQUESTS_NAMESPACE,
+    TUNING_BOUNDARIES, UNTYPED_CONTENT_TYPE_FAMILY_REFUSAL, ends_at_matcher_boundary,
     ends_at_tuning_boundary, in_a_tool_namespace, in_app_tool_results_namespace,
-    in_the_device_location_family, is_auto_channel_name, is_device_location_prefix,
-    nondurable_channel_uuid,
+    in_the_device_location_family, in_the_egress_namespace, is_auto_channel_name,
+    is_device_location_prefix, is_egress_segment_name, nondurable_channel_uuid,
 };
 use brenn_envelope::channel_model::{
     ChannelBlockRole, ChannelDepthKey, TUNING_DURABILITY_IGNORED, depth_required, sink_admitted,
@@ -106,15 +107,18 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
 ///
 /// The ingress families (`mqtt:`, `webhook:`), the tool substrate's
 /// (`brenn:tools/`, `brenn:tool-results/`, `brenn:tool-requests/`,
-/// `brenn:app-tool-results/`) and the
-/// per-user location channels (`brenn:device-location.<username>`). Everything
+/// `brenn:app-tool-results/`), the
+/// per-user location channels (`brenn:device-location.<username>`) and the
+/// host's outbound channels (`brenn:egress/`). Everything
 /// else is an operator-declared channel's address. A total function of the
 /// address, which is what makes the declaring and tuning roles disjoint.
 fn is_system_minted(address: &str) -> bool {
     match split_spellable(address) {
         Some((ChannelScheme::Mqtt | ChannelScheme::Webhook, _)) => true,
         Some((ChannelScheme::Brenn, name)) => {
-            in_a_tool_namespace(name) || in_the_device_location_family(name)
+            in_a_tool_namespace(name)
+                || in_the_device_location_family(name)
+                || in_the_egress_namespace(name)
         }
         _ => false,
     }
@@ -296,6 +300,14 @@ fn check_channel_roles(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
                 ),
                 channel.address.span().clone(),
             ));
+        } else if split_spellable(address).is_some_and(|(_, name)| is_egress_segment_name(name)) {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{address}` is under the reserved `egress` segment, which the host's \
+                     outbound transports own; no document declares a channel there"
+                ),
+                channel.address.span().clone(),
+            ));
         }
     }
 
@@ -369,8 +381,8 @@ fn check_tuning_address(tuning: &RTuning, errors: &mut Vec<Diagnostic>) {
             format!(
                 "`{address}` names no system-minted family, so a handle-less block tunes \
                  nothing; tuning blocks name `mqtt:`, `webhook:`, `brenn:tools/`, \
-                 `brenn:tool-results/`, `brenn:app-tool-results/` and \
-                 `brenn:device-location.` channels, and a \
+                 `brenn:tool-results/`, `brenn:app-tool-results/`, \
+                 `brenn:device-location.` and `brenn:egress/` channels, and a \
                  declarable channel is written `channel <handle> at \"{address}\"`"
             ),
             span.clone(),
@@ -507,8 +519,7 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
                 format!(
                     "the block tuning `{label}` states no non_text: only an `mqtt:` or \
                      `webhook:` tuning takes it, where it selects the raw ingress shape — \
-                     the payload is the body; the tool and device-location families are \
-                     written and read by host code that parses text"
+                     the payload is the body; {NON_TEXT_FAMILY_REFUSAL}"
                 ),
                 attr.value.span().clone(),
             ));
@@ -534,8 +545,7 @@ fn check_untyped_content_type(
         errors.push(Diagnostic::at(
             format!(
                 "the block tuning `{label}` states no untyped_content_type: only an `mqtt:` \
-                 tuning takes it — a `webhook:` channel's body is typed by its endpoint, \
-                 and the tool and device-location families are text-only"
+                 tuning takes it — {UNTYPED_CONTENT_TYPE_FAMILY_REFUSAL}"
             ),
             span,
         ));
@@ -1951,6 +1961,18 @@ fn plain_entry(
                 endpoint: Spanned::new(bare, span.clone()),
             })
         }
+        Family::BrennPublish if in_the_egress_namespace(&bare) => {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{bare}` reaches into the reserved `egress/` namespace, which no publish \
+                     entry may: a channel there holds messages bound off the bus and only the \
+                     host's admission writes it — publish to an MQTT topic through its \
+                     `mqtt:` address"
+                ),
+                span.clone(),
+            ));
+            return None;
+        }
         _ => DEntry::Chan(channel_matcher(kind, bare, span, errors)?),
     })
 }
@@ -2948,6 +2970,25 @@ fn bound_address(
     if is_device_location_address(address) {
         return device_location_bound(bound, kind, address, errors)
             .then(|| (scheme, bare.to_string()));
+    }
+    let egress_namespace = scheme == ChannelScheme::Brenn && in_the_egress_namespace(bare);
+    if egress_namespace && bound.dir.outbound() {
+        errors.push(Diagnostic::at(
+            format!(
+                "this {} of {} `{label}` names `{address}`, in the egress namespace: only \
+                 Brenn's admission writes an outbound channel, so no `out` or `io` port \
+                 publishes there; an MQTT publish goes to its `mqtt:<client>:<topic>` address",
+                bound.what,
+                kind.label(),
+            ),
+            bound.span.clone(),
+        ));
+        return None;
+    }
+    // The outbound channel is minted by the system, never declared, and is read
+    // by ACL like any channel, so a component's `in` port may name it.
+    if egress_namespace && bare == MQTT_OUTBOUND_CHANNEL && kind != EntityKind::Agent {
+        return Some((scheme, bare.to_string()));
     }
     if matches!(bound.chan, RChanRef::Addr(_))
         && matches!(scheme, ChannelScheme::Brenn | ChannelScheme::Ephemeral)

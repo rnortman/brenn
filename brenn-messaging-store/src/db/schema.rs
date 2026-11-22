@@ -76,8 +76,9 @@ pub fn run_messaging_migrations(conn: &Connection) {
             -- holds a TEXT value for a text body and a BLOB value otherwise
             -- (`body_column`), and the full-text index covers the TEXT rows.
             content_type        TEXT,
-            -- `TransportMeta` JSON on a row a transport adaptor published with
-            -- the payload as the body; NULL on every other row. The decoder
+            -- `TransportMeta` JSON on a row whose body is a transport's payload:
+            -- the metadata of the transport it came in on or is bound for; NULL
+            -- on every other row. The decoder
             -- panics on a value that does not parse (the host wrote every row).
             transport           TEXT,
             -- `Attachments` JSON on a row that names blobs; NULL on every other
@@ -1166,6 +1167,7 @@ mod tests {
                 body: "m3".into(),
                 urgency: brenn_lib::messaging::Urgency::Low,
                 envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+                transport: None,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,

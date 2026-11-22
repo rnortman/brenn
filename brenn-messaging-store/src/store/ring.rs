@@ -855,7 +855,7 @@ impl RingStore {
             impetus: msg.impetus,
             urgency: msg.urgency,
             envelope_type: msg.envelope_type,
-            transport: None,
+            transport: msg.transport,
             attachments,
         };
         (envelope, holds)

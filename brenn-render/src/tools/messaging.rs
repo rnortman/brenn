@@ -164,6 +164,13 @@ fn transport_line(transport: &TransportMeta) -> String {
             "webhook {} key {} from {}",
             webhook.endpoint_slug, webhook.key_id, webhook.client_ip
         ),
+        TransportMeta::MqttPublish(publish) => format!(
+            "mqtt publish {} {} qos {}{}",
+            publish.client_slug,
+            publish.topic,
+            publish.qos,
+            if publish.retain { " retain" } else { "" }
+        ),
     }
 }
 
@@ -436,6 +443,36 @@ mod tests {
             ),
             "{html}"
         );
+    }
+
+    #[test]
+    fn an_mqtt_publish_transport_renders_its_destination_with_and_without_retain() {
+        for (retain, line) in [
+            (false, "mqtt publish broker lights/&lt;k&gt;/set qos 1"),
+            (
+                true,
+                "mqtt publish broker lights/&lt;k&gt;/set qos 1 retain",
+            ),
+        ] {
+            let html = format_message_html_single(&MessageEnvelope {
+                transport: Some(TransportMeta::MqttPublish(
+                    brenn_lib::messaging::MqttPublishTransport {
+                        client_slug: "broker".into(),
+                        topic: "lights/<k>/set".into(),
+                        qos: 1,
+                        retain,
+                        message_expiry_s: None,
+                        content_type: None,
+                        expires_at: Utc::now(),
+                    },
+                )),
+                ..fake_envelope("on")
+            });
+            let expected = format!(
+                r#"<div class="brenn-msg-body"><div class="brenn-msg-transport">{line}</div><p>on</p>"#
+            );
+            assert!(html.contains(&expected), "{html}");
+        }
     }
 
     #[test]

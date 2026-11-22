@@ -16,6 +16,8 @@ use super::db::{
     self, BudgetDecrement, InsertedMessage, decrement_send_budget, insert_ingress_message,
     insert_message_in_tx, refund_send_budget,
 };
+use brenn_lib::mqtt::{MqttPublishOptions, parse_topic_name};
+
 use super::gates::{
     check_body_size, publish_acl_allows, reply_to_visible, resolve_publish_sender, well_formed_name,
 };
@@ -31,9 +33,23 @@ use brenn_messaging_store::blob::HeldAttachments;
 
 use brenn_obs::security::{DenialKind, SecurityEventType, log_component_security_event};
 
+mod mqtt;
+pub use mqtt::{MqttCommitted, MqttPayload, MqttRefusal};
+
 /// Per-channel memoized resolution for a batch flush: the channel entry and its
 /// live attacher-feed targets.
 type ResolvedChannelTargets = (Arc<super::ChannelEntry>, Vec<AttachFeedTarget>);
+
+/// What gate 1 of `publish_gated` resolved a publish to: a bus channel, with
+/// the bare name the layer-2 ACL is asked about, or an MQTT topic whose
+/// admission names the channel at layer 2.
+enum PublishTarget<'a> {
+    Bus {
+        channel_name: &'a str,
+        channel: Arc<ChannelEntry>,
+    },
+    Mqtt(&'a MqttPublishOptions),
+}
 
 /// Outcome of a publish, on any pub/sub scheme. Maps directly to the success /
 /// failure JSON returned to CC by the `MessageSend` PostToolUse intercept.
@@ -90,6 +106,10 @@ pub enum PublishResult {
     /// quietly drop. Nothing was stored, no rate token and no budget were
     /// consumed.
     ImpetusUnauthorized,
+    /// An `mqtt:` publish the MQTT admission refused on its options or payload
+    /// (`Messenger::admit_mqtt`). An argument error, not a policy denial:
+    /// nothing was stored, no rate token and no budget were consumed.
+    MqttRefused(MqttRefusal),
 }
 
 impl PublishResult {
@@ -100,6 +120,7 @@ impl PublishResult {
     /// `Ok`, `BudgetExhausted`, `RateLimited`, and `DeferredQuotaExceeded`
     /// return `None`: the limit arms are normal operational conditions with
     /// their own counters and LLM-facing recovery paths, not policy denials.
+    /// `MqttRefused` returns `None` too: it is an argument error.
     pub fn signal_kind(&self) -> Option<DenialKind> {
         match self {
             Self::MalformedAddress(_) => Some(DenialKind::MalformedAddress),
@@ -111,7 +132,8 @@ impl PublishResult {
             Self::Ok { .. }
             | Self::BudgetExhausted
             | Self::RateLimited
-            | Self::DeferredQuotaExceeded { .. } => None,
+            | Self::DeferredQuotaExceeded { .. }
+            | Self::MqttRefused(_) => None,
         }
     }
 
@@ -341,6 +363,7 @@ impl Messenger {
             delivery_deadline,
             None,
             attachments,
+            None,
         )
         .await
     }
@@ -401,6 +424,7 @@ impl Messenger {
             None,
             None,
             attachments,
+            None,
         )
         .await
     }
@@ -444,6 +468,7 @@ impl Messenger {
             // Server-constructed telemetry: no user gesture behind it.
             None,
             HeldAttachments::none(),
+            None,
         )
         .await
     }
@@ -481,6 +506,7 @@ impl Messenger {
             // In-process substrate output; nothing here descends from a gesture.
             None,
             HeldAttachments::none(),
+            None,
         )
         .await
     }
@@ -514,6 +540,7 @@ impl Messenger {
             None,
             None,
             attachments,
+            None,
         )
         .await
     }
@@ -557,6 +584,7 @@ impl Messenger {
             // attended turn's record must not re-arm every observer downstream.
             None,
             HeldAttachments::none(),
+            None,
         )
         .await
     }
@@ -687,6 +715,7 @@ impl Messenger {
         delivery_deadline: Option<DateTime<Utc>>,
         impetus: Option<Impetus>,
         attachments: HeldAttachments,
+        mqtt: Option<&MqttPublishOptions>,
     ) -> PublishResult {
         let sender = self.principal_identity(principal);
         let result = self
@@ -702,6 +731,7 @@ impl Messenger {
                 delivery_deadline,
                 impetus,
                 attachments,
+                mqtt,
             )
             .await;
         self.record_publish_denial(&sender, &result);
@@ -801,6 +831,7 @@ impl Messenger {
         delivery_deadline: Option<DateTime<Utc>>,
         impetus: Option<Impetus>,
         attachments: HeldAttachments,
+        mqtt: Option<&MqttPublishOptions>,
     ) -> PublishResult {
         // 1. Validate address shape, then resolve. Shape errors return
         //    `MalformedAddress`; well-formed
@@ -821,30 +852,51 @@ impl Messenger {
         //    The scheme comes from the address itself: one ladder serves every
         //    pub/sub scheme, and the scheme is what the shape gate and the
         //    layer-2 ACL are asked about.
-        let scheme = match ChannelScheme::of(addr) {
-            Some(s) => s,
-            None => return PublishResult::MalformedAddress(addr.to_string()),
-        };
-        let reserved_system_target = matches!(principal, PublishPrincipal::System { .. })
-            && addr
-                .strip_prefix(ChannelScheme::Brenn.prefix())
-                .is_some_and(brenn_lib::messaging::is_reserved_channel);
-        let channel_name = if reserved_system_target {
-            match addr.strip_prefix(ChannelScheme::Brenn.prefix()) {
-                Some(name) if !name.is_empty() => name,
-                _ => return PublishResult::MalformedAddress(addr.to_string()),
-            }
+        //
+        //    `mqtt` selects the MQTT admission, not the address's scheme. With
+        //    `None` an `mqtt:` address is refused at the shape gate, as every
+        //    general entry refuses it. With `Some` the address must be an `mqtt:`
+        //    topic name, refused here so a malformed address is `MalformedAddress`
+        //    ahead of the layer-1 grant, in the admission's order; the channel it
+        //    commits to is the outbound one, which the admission names at layer 2.
+        let scheme = if mqtt.is_some() {
+            ChannelScheme::Mqtt
         } else {
-            match well_formed_name(addr, scheme) {
-                Some(name) => name,
+            match ChannelScheme::of(addr) {
+                Some(s) => s,
                 None => return PublishResult::MalformedAddress(addr.to_string()),
             }
         };
-        let channel = match self.directory.resolve(addr) {
-            Some(c) => c,
-            None => return PublishResult::UnknownChannel(addr.to_string()),
+        let target = if let Some(options) = mqtt {
+            if parse_topic_name(addr).is_err() {
+                return PublishResult::MalformedAddress(addr.to_string());
+            }
+            PublishTarget::Mqtt(options)
+        } else {
+            let reserved_system_target = matches!(principal, PublishPrincipal::System { .. })
+                && addr
+                    .strip_prefix(ChannelScheme::Brenn.prefix())
+                    .is_some_and(brenn_lib::messaging::is_reserved_channel);
+            let channel_name = if reserved_system_target {
+                match addr.strip_prefix(ChannelScheme::Brenn.prefix()) {
+                    Some(name) if !name.is_empty() => name,
+                    _ => return PublishResult::MalformedAddress(addr.to_string()),
+                }
+            } else {
+                match well_formed_name(addr, scheme) {
+                    Some(name) => name,
+                    None => return PublishResult::MalformedAddress(addr.to_string()),
+                }
+            };
+            let channel = match self.directory.resolve(addr) {
+                Some(c) => c,
+                None => return PublishResult::UnknownChannel(addr.to_string()),
+            };
+            PublishTarget::Bus {
+                channel_name,
+                channel,
+            }
         };
-        let capabilities = channel.capabilities();
 
         // AUTHZ WARNING (security-5): the per-channel sender authorization
         // (allowlist) below is live. The automation fire path
@@ -866,10 +918,12 @@ impl Messenger {
         //
         //    The grant the layer-1 gate demands follows the target's scheme:
         //    `ephemeral:` traffic is authorized by `EphemeralPublish`, `local:`
-        //    by `LocalPublish`, every other pub/sub scheme by `MessagingPublish`.
+        //    by `LocalPublish`, an `mqtt:` topic by `MqttPublish`, every other
+        //    pub/sub scheme by `MessagingPublish`.
         let grant = match scheme {
             ChannelScheme::Ephemeral => AppCapability::EphemeralPublish,
             ChannelScheme::Local => AppCapability::LocalPublish,
+            ChannelScheme::Mqtt => AppCapability::MqttPublish,
             _ => AppCapability::MessagingPublish,
         };
         let apps = self.apps.load();
@@ -962,9 +1016,45 @@ impl Messenger {
         // against the already-resolved channel and runs BEFORE the budget
         // decrement / DB work, so an out-of-scope publish consumes no budget and
         // takes no lock.
-        if !publish_acl_allows(policy, scheme, channel_name) {
-            return PublishResult::AclDenied(addr.to_string());
-        }
+        //
+        // An `mqtt:` publish is decided by the MQTT admission instead: the topic
+        // ACL, the client, the options and the payload, yielding the outbound
+        // channel and the transport metadata to store. `publish_acl_allows` is
+        // not asked; it refuses every `mqtt:` name.
+        let (channel, mqtt_admitted) = match target {
+            PublishTarget::Bus {
+                channel_name,
+                channel,
+            } => {
+                if !publish_acl_allows(policy, scheme, channel_name) {
+                    return PublishResult::AclDenied(addr.to_string());
+                }
+                (channel, None)
+            }
+            PublishTarget::Mqtt(options) => {
+                match self.admit_mqtt(
+                    policy,
+                    addr,
+                    options,
+                    &body,
+                    &attachments,
+                    reply_to,
+                    deliver_after,
+                    delivery_deadline,
+                ) {
+                    Ok(admitted) => (Arc::clone(&admitted.channel), Some(admitted)),
+                    Err(refusal) => return refusal,
+                }
+            }
+        };
+        let capabilities = channel.capabilities();
+        // The scheme the stored message carries is its channel's: an MQTT
+        // publish is a `brenn:` row on the outbound channel.
+        let envelope_type = if mqtt_admitted.is_some() {
+            channel.transport_type
+        } else {
+            scheme
+        };
 
         // 2a. Impetus is capability-gated, not capability-scoped: it
         //     is carried authority, meaningful on every scheme, so no channel
@@ -1134,6 +1224,9 @@ impl Messenger {
         };
 
         let publish_ts_ns = db::utc_to_ns(Utc::now());
+        let transport = mqtt_admitted.map(|admitted| {
+            super::TransportMeta::MqttPublish(admitted.transport(db::ns_to_utc(publish_ts_ns)))
+        });
 
         // 6. Commit into the channel's retention through its store. One fork for
         //    every scheme — whether the bytes land in a table or a ring, and
@@ -1148,7 +1241,8 @@ impl Messenger {
             sender: sender.to_owned(),
             body: body.clone(),
             urgency,
-            envelope_type: scheme,
+            envelope_type,
+            transport: transport.clone(),
             reply_to: reply_to_target,
             delivery_deadline,
             impetus,
@@ -1216,7 +1310,8 @@ impl Messenger {
                     deliver_after,
                     impetus,
                     urgency,
-                    scheme,
+                    envelope_type,
+                    transport,
                     attachment_refs,
                 ));
                 self.fan_out_attach_feed(
@@ -1339,7 +1434,8 @@ impl Messenger {
 ///
 /// `scheme` is the channel's own, carried verbatim: a fed envelope is
 /// indistinguishable from the one a subscriber reads back out of retention, and
-/// retention stamps the channel's scheme.
+/// retention stamps the channel's scheme. `transport` is the metadata the
+/// committed row stores, for the same reason.
 #[allow(clippy::too_many_arguments)]
 fn surface_feed_envelope(
     message_id: Uuid,
@@ -1354,6 +1450,7 @@ fn surface_feed_envelope(
     impetus: Option<Impetus>,
     urgency: Urgency,
     scheme: ChannelScheme,
+    transport: Option<super::TransportMeta>,
     attachments: Attachments,
 ) -> super::MessageEnvelope {
     super::MessageEnvelope {
@@ -1369,7 +1466,7 @@ fn surface_feed_envelope(
         impetus,
         urgency,
         envelope_type: scheme,
-        transport: None,
+        transport,
         attachments,
     }
 }
@@ -1583,6 +1680,13 @@ impl Messenger {
                     "publish_transport_ingress: host published {:?} transport metadata on \
                      channel '{}'",
                     transport.scheme(),
+                    channel.address
+                );
+                assert!(
+                    !matches!(transport, super::TransportMeta::MqttPublish(_)),
+                    "publish_transport_ingress: host published outbound MQTT metadata on \
+                     ingress channel '{}' — outbound metadata belongs only on the outbound \
+                     channel",
                     channel.address
                 );
                 // TODO(ingress-oversize-payload-as-blob): a raw payload over the
@@ -1804,6 +1908,7 @@ impl Messenger {
                         body: publish.body.clone(),
                         urgency: publish.urgency,
                         envelope_type: scheme,
+                        transport: None,
                         reply_to: reply_to_target,
                         delivery_deadline: None,
                         impetus: None,
@@ -1881,6 +1986,7 @@ impl Messenger {
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
+                            None,
                             publish.attachments.refs().clone(),
                         )),
                         inserted.retained_seq.expect(
@@ -1955,6 +2061,7 @@ impl Messenger {
                             None,
                             urgency,
                             scheme,
+                            None,
                             attachment_refs,
                         ));
                         self.fan_out_attach_feed(
@@ -2336,6 +2443,7 @@ impl Messenger {
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
+                            None,
                             publish.attachments.refs().clone(),
                         )),
                         inserted.retained_seq.expect(

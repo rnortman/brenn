@@ -147,6 +147,7 @@ mod tests {
     //   2. Reset FULL_HOOK_INSTALLED.store(false, SeqCst)
     //   3. Reset SEND_PANIC_MAIL_SYNC_CALL_COUNT.store(0, SeqCst)
     //   4. Call restore_default_hook() before the guard drops.
+    // TODO(correctness-panic-hook-tests-count-foreign-thread-panics): the count asserts also count other tests' panics.
     static HOOK_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn hook_mutex() -> &'static Mutex<()> {
@@ -208,6 +209,7 @@ mod tests {
 
     // Restore the panic hook to a no-op so each test cleans up after itself.
     // The real default (print to stderr + abort) must never re-arm mid-suite.
+    // TODO(errhandling-panic-hook-tests-silence-other-tests-panic-messages): restore the prior hook instead.
     fn restore_default_hook() {
         std::panic::set_hook(Box::new(|_| {}));
     }

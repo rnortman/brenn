@@ -842,6 +842,48 @@ fn output_on_a_tools_address_panics() {
     resolve(&raw, &dir);
 }
 
+/// An output bound to the MQTT outbound channel would publish past the host's
+/// admission, the only writer an outbound channel has; refused.
+#[test]
+#[should_panic(expected = "which is in the egress namespace")]
+fn output_on_the_mqtt_outbound_channel_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch"), mqtt_outbound_entry()]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "egress-forger".to_string(),
+        package: "a".to_string(),
+        subscriptions: vec![sub_raw("brenn:in-ch", "in")],
+        outputs: vec![out_raw("commands", "brenn:egress/mqtt")],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// An input bound to the MQTT outbound channel resolves: the channel is read
+/// by ACL like any other.
+#[test]
+fn input_on_the_mqtt_outbound_channel_resolves() {
+    let dir = dir_of(vec![mqtt_outbound_entry()]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "egress-observer".to_string(),
+        package: "a".to_string(),
+        subscriptions: vec![sub_raw("brenn:egress/mqtt", "outbound")],
+        ..minimal_wasm_consumer()
+    }];
+    let resolved = resolve(&raw, &dir);
+    assert_eq!(resolved[0].inputs.len(), 1);
+    assert_eq!(
+        resolved[0].inputs[0].sub.channel_address,
+        "brenn:egress/mqtt"
+    );
+}
+
+fn mqtt_outbound_entry() -> ChannelEntry {
+    brenn_messaging::mqtt_outbound::mqtt_outbound_entry(
+        &brenn_lib::messaging::config::SystemChannelTuning::default(),
+        &brenn_lib::messaging::config::MessagingGlobalConfig::default(),
+    )
+}
+
 /// Output channel must be a pub/sub scheme; an egress scheme (webhook:) panics.
 #[test]
 #[should_panic(expected = "must be a pub/sub address")]

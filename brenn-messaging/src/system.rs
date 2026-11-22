@@ -294,8 +294,9 @@ impl SystemInbox {
     /// the channel's window, sized for the outage the operator intends to
     /// survive, not forever. So a fresh position re-runs at most a window's
     /// worth of already-handled messages, and anything dropped past the window
-    /// is stepped over silently: the participant's overflow rung is `Silent`,
-    /// which keeps no count and raises no alert. Handlers must tolerate the
+    /// is stepped over: the participant's overflow rung is `Silent`, which
+    /// raises no alert, and the drain logs and counts what it stepped over
+    /// (`Messenger::count_stepped_over`). Handlers must tolerate the
     /// repeat — for the tool executor it is the `Idempotency::Natural` contract
     /// every async tool declares.
     ///
@@ -409,7 +410,8 @@ impl SystemInbox {
             // Advance first: the handler runs against a position already past
             // the batch, so a crash mid-handler loses it rather than repeating it.
             if let Some((through, seen_floor)) = window.advance_span() {
-                self.messenger
+                let outcome = self
+                    .messenger
                     .advance_subscriber(&entry.address, &subscriber, through, seen_floor, sub.noise)
                     .await
                     .unwrap_or_else(|| {
@@ -419,6 +421,13 @@ impl SystemInbox {
                             entry.address
                         )
                     });
+                // A `Silent` rung, which every folded system subscription has,
+                // leaves the ladder counting nothing; a louder one counts the
+                // same loss itself.
+                if sub.noise == NoiseLevel::Silent {
+                    self.messenger
+                        .count_stepped_over(&entry.address, &subscriber, outcome.dropped);
+                }
             }
             batch.extend(new);
         }
@@ -781,6 +790,68 @@ mod tests {
             2,
             "the two the clamp skipped are metered against this participant",
         );
+    }
+
+    /// A drain whose window was outrun logs what it stepped over and adds the
+    /// same figure to the participant's tally, summed across drains; a drain
+    /// that steps over nothing logs nothing and adds nothing.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_drain_logs_and_counts_what_it_stepped_over() {
+        // The `dropped` figure of every stepped-over report logged so far, in order.
+        fn reported() -> Vec<String> {
+            let figures = std::cell::RefCell::new(Vec::new());
+            logs_assert(|lines: &[&str]| {
+                *figures.borrow_mut() = lines
+                    .iter()
+                    .filter(|line| line.contains("stepped over"))
+                    .map(|line| {
+                        line.split_whitespace()
+                            .find_map(|word| word.strip_prefix("dropped="))
+                            .expect("the report carries its figure")
+                            .to_string()
+                    })
+                    .collect();
+                Ok(())
+            });
+            figures.into_inner()
+        }
+
+        let h = harness_windowed(2).await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
+        let address = h
+            .messenger
+            .directory()
+            .by_uuid(&h.reqs_uuid)
+            .expect("channel in directory")
+            .address
+            .clone();
+        let tally = || {
+            h.messenger
+                .drop_counter(&address, &ParticipantId::for_system(COMPONENT))
+        };
+
+        insert_row(&h, "only").await;
+        assert_eq!(bodies(&inbox.dequeue_batch().await), ["only"]);
+        assert_eq!(tally(), 0, "nothing stepped over, nothing counted");
+        assert!(reported().is_empty());
+
+        for n in 1..=5 {
+            insert_row(&h, &format!("first-{n}")).await;
+        }
+        assert_eq!(bodies(&inbox.dequeue_batch().await), ["first-4", "first-5"]);
+        assert_eq!(tally(), 3);
+
+        for n in 1..=4 {
+            insert_row(&h, &format!("second-{n}")).await;
+        }
+        assert_eq!(
+            bodies(&inbox.dequeue_batch().await),
+            ["second-3", "second-4"]
+        );
+        assert_eq!(tally(), 5, "the second drain's figure adds to the first's");
+        assert_eq!(reported(), ["3", "2"], "one line per drain, same figure");
     }
 
     #[tokio::test]

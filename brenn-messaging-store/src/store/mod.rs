@@ -33,7 +33,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use brenn_envelope::{
-    ChannelCapabilities, ChannelScheme, Impetus, MessageBody, MessageEnvelope, Urgency,
+    ChannelCapabilities, ChannelScheme, Impetus, MessageBody, MessageEnvelope, TransportMeta,
+    Urgency,
 };
 use brenn_queue::{GapReason, ReplayDecision, Resume, Retained};
 
@@ -76,6 +77,10 @@ pub struct NewMessage {
     /// The address scheme recorded on the envelope. Follows the channel except
     /// on ingress-bridged channels, where it names the originating transport.
     pub envelope_type: ChannelScheme,
+    /// The metadata of the transport the message came in on or is bound for,
+    /// retained verbatim on the envelope. `None` for a message that touches no
+    /// transport.
+    pub transport: Option<TransportMeta>,
     /// Where a consumer is invited to reply, already resolved. Advisory
     /// metadata the bus routes nothing with, so every scheme carries it.
     pub reply_to: Option<ReplyTarget>,

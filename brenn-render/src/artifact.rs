@@ -501,6 +501,8 @@ pub async fn read_artifact_content(
 
 /// Characters that need percent-encoding in a URL path segment.
 /// Based on RFC 3986 — encodes everything except unreserved + common sub-delimiters.
+// TODO(file-link-backslash-refused): `\` is not in the set; the URL parser reads it
+// as `/`, so a link to a file whose name holds one is refused by the path validator.
 const PATH_SEGMENT_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
     .add(b' ')
     .add(b'"')
@@ -509,6 +511,7 @@ const PATH_SEGMENT_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONT
     .add(b'>')
     .add(b'`')
     .add(b'?')
+    .add(b'^')
     .add(b'{')
     .add(b'}')
     .add(b'%');
@@ -1076,6 +1079,11 @@ mod tests {
     #[test]
     fn encode_url_path_encodes_percent() {
         assert_eq!(encode_url_path("100%.md"), "100%25.md");
+    }
+
+    #[test]
+    fn encode_url_path_encodes_caret() {
+        assert_eq!(encode_url_path("a^b.md"), "a%5Eb.md");
     }
 
     // --- compute_stable_url ---

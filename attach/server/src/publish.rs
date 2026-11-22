@@ -299,6 +299,12 @@ pub async fn handle_publish(
                 max: max as u64,
             }
         }
+        // Only the MQTT entry runs the MQTT admission; an attacher's publish
+        // never reaches it, whatever address the frame names.
+        PublishResult::MqttRefused(refusal) => unreachable!(
+            "attacher publish returned MqttRefused({refusal:?}): only Messenger::publish_mqtt \
+             runs the MQTT admission"
+        ),
         // The channel's existence, its publish ACL coverage, and this sender's
         // authority over it are all boot-resolved and boot-static, so a denial
         // here is a broken boot invariant — and not attacker-reachable, the one

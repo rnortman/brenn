@@ -2424,6 +2424,7 @@ mod tests {
                 body,
                 urgency: Urgency::Normal,
                 envelope_type: inbox.transport_type,
+                transport: None,
                 reply_to: None,
                 delivery_deadline: None,
                 impetus: None,

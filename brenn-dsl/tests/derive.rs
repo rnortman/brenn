@@ -32,15 +32,16 @@ const CHROME: &str = "    new shell: Shell { chrome = true; grants = []; }\n";
 #[test]
 fn a_handle_less_block_tunes_every_family_the_system_mints() {
     let config = derived(&format!(
-        "{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}",
         tuning("mqtt:broker:alice/status"),
         tuning("webhook:alice-inbox"),
         tuning("brenn:tools/pull"),
         tuning("brenn:tool-results/alice"),
         tuning("brenn:app-tool-results/alice"),
         tuning("brenn:device-location.alice"),
+        tuning("brenn:egress/mqtt"),
     ));
-    assert_eq!(config.resolved.tunings.len(), 6);
+    assert_eq!(config.resolved.tunings.len(), 7);
     assert!(config.resolved.channels.is_empty());
     assert!(config.channel_uuids.is_empty());
 }
@@ -51,8 +52,8 @@ fn a_handle_less_block_on_a_declarable_address_is_refused() {
         derive_refusal(&tuning("brenn:alice.status")),
         "`brenn:alice.status` names no system-minted family, so a handle-less block tunes \
          nothing; tuning blocks name `mqtt:`, `webhook:`, `brenn:tools/`, \
-         `brenn:tool-results/`, `brenn:app-tool-results/` and `brenn:device-location.` \
-         channels, and a declarable \
+         `brenn:tool-results/`, `brenn:app-tool-results/`, `brenn:device-location.` and \
+         `brenn:egress/` channels, and a declarable \
          channel is written `channel <handle> at \"brenn:alice.status\"`"
     );
 }
@@ -86,6 +87,7 @@ fn a_declaration_on_a_system_minted_address_is_refused() {
         ),
         ("results", "brenn:tool-results/alice", durable),
         ("fixes", "brenn:device-location.alice", durable),
+        ("outbound", "brenn:egress/mqtt", durable),
         ("inbox", "webhook:alice-inbox", nondurable),
         ("status", "mqtt:broker:alice/status", nondurable),
     ] {
@@ -97,6 +99,25 @@ fn a_declaration_on_a_system_minted_address_is_refused() {
             )
         );
     }
+}
+
+#[test]
+fn a_declaration_under_the_egress_segment_is_refused() {
+    for (address, block) in [
+        ("brenn:egress.x", durable as fn(&str, &str) -> String),
+        ("brenn:egress", durable),
+        ("ephemeral:egress/x", nondurable),
+    ] {
+        assert_eq!(
+            derive_refusal(&block("outbound", address)),
+            format!(
+                "`{address}` is under the reserved `egress` segment, which the host's \
+                 outbound transports own; no document declares a channel there"
+            )
+        );
+    }
+    let config = derived(&durable("outbound", "brenn:egressive.status"));
+    assert_eq!(config.resolved.channels.len(), 1);
 }
 
 #[test]
@@ -1357,7 +1378,7 @@ fn a_tool_tuning_states_no_non_text() {
         "the block tuning `prefix brenn:tools/` states no non_text: only an `mqtt:` or \
          `webhook:` tuning takes it, where it selects the raw ingress shape — the payload is \
          the body; the tool and device-location families are written and read by host code \
-         that parses text"
+         that parses text, and the egress family is always non_text"
     );
     assert_eq!(
         derive_refusal(&tuning_with(
@@ -1367,7 +1388,14 @@ fn a_tool_tuning_states_no_non_text() {
         "the block tuning `prefix brenn:device-location.` states no non_text: only an `mqtt:` \
          or `webhook:` tuning takes it, where it selects the raw ingress shape — the payload \
          is the body; the tool and device-location families are written and read by host \
-         code that parses text"
+         code that parses text, and the egress family is always non_text"
+    );
+    assert!(
+        derive_refusal(&tuning_with(
+            "\"brenn:egress/mqtt\"",
+            "    non_text = true;\n"
+        ))
+        .starts_with("the block tuning `brenn:egress/mqtt` states no non_text")
     );
 }
 
@@ -1401,8 +1429,9 @@ fn untyped_content_type_outside_the_mqtt_family_is_refused() {
             derive_refusal(&tuning_with(address, attrs)),
             format!(
                 "the block tuning `{label}` states no untyped_content_type: only an `mqtt:` \
-                 tuning takes it — a `webhook:` channel's body is typed by its endpoint, and \
-                 the tool and device-location families are text-only"
+                 tuning takes it — a `webhook:` channel's body is typed by its endpoint, the \
+                 tool and device-location families are text-only, and an egress channel's \
+                 bodies are typed by their publishers"
             ),
         );
     }

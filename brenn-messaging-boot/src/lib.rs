@@ -254,15 +254,62 @@ fn walk_call_edges<'a>(
 ///
 /// On a schemeless address, and on a `brenn:` address in a tool namespace.
 fn assert_not_tool_namespace(context: &str, address: &str) {
+    assert_not_in_brenn_namespace(
+        context,
+        address,
+        brenn_envelope::addressing::in_a_tool_namespace,
+        "a namespace the tool substrate owns; component ports do not reach the tool \
+         substrate's channels — a result inbox is wired by a tool grant, a provider's request \
+         inbox by its class's `provide` statements, and a request channel is reached only \
+         through the registry",
+    );
+}
+
+/// Hold one output binding out of the egress namespace.
+///
+/// A component's or surface's output publishes through `publish_from_wasm`,
+/// which has no publish gate, so this refusal is what keeps the host's
+/// admission the only writer of an outbound channel for components. It matches
+/// the refusal the config language raises on the same bindings. Inputs are not
+/// held to it: an egress channel is read by ACL like any other.
+///
+/// `context` is a pre-formatted label naming the block, the placement and the
+/// port, as [`assert_not_tool_namespace`] takes it.
+///
+/// # Panics
+///
+/// On a schemeless address, and on a `brenn:` address in the egress
+/// namespace.
+fn assert_not_egress_output(context: &str, address: &str) {
+    assert_not_in_brenn_namespace(
+        context,
+        address,
+        brenn_envelope::addressing::in_the_egress_namespace,
+        "the egress namespace; only the host's admission writes an outbound channel, so no \
+         component or surface output may publish there (an MQTT publish goes to its \
+         `mqtt:<client>:<topic>` address)",
+    );
+}
+
+/// Hold one binding out of a `brenn:` namespace: `in_namespace` answers for
+/// the scheme-stripped name, and `namespace` names it and says why, completing
+/// "which is in …" in the refusal.
+///
+/// # Panics
+///
+/// On a schemeless address, and on a `brenn:` address `in_namespace` holds.
+fn assert_not_in_brenn_namespace(
+    context: &str,
+    address: &str,
+    in_namespace: fn(&str) -> bool,
+    namespace: &str,
+) {
     use brenn_lib::messaging::ChannelScheme;
     let (scheme, bare) = ChannelScheme::split(address)
         .unwrap_or_else(|| panic!("{context} address {address:?} carries no scheme prefix"));
     assert!(
-        !(scheme == ChannelScheme::Brenn && brenn_envelope::addressing::in_a_tool_namespace(bare)),
-        "{context} is bound to {address:?}, which is in a namespace the tool substrate owns; \
-         component ports do not reach the tool substrate's channels — a result inbox is wired \
-         by a tool grant, a provider's request inbox by its class's `provide` statements, \
-         and a request channel is reached only through the registry",
+        !(scheme == ChannelScheme::Brenn && in_namespace(bare)),
+        "{context} is bound to {address:?}, which is in {namespace}",
     );
 }
 
@@ -1031,9 +1078,10 @@ pub(crate) fn derive_mqtt_ingress_channels(
 /// naming no registered async tool, or a `brenn:tool-results/` block naming no
 /// consumer that holds an async tool grant, a `brenn:app-tool-results/` block
 /// naming no app that holds one (checked only when `app_inbox_slugs` is
-/// given), or a `brenn:device-location.` block
-/// whose remainder is not a username. Also on an exact key of any scheme but
-/// `mqtt:` reaching the fall-through, which is a host bug.
+/// given), a `brenn:egress/` block naming any channel but `brenn:egress/mqtt`,
+/// or a `brenn:device-location.` block whose remainder is not a username. Also
+/// on an exact key of any scheme but `mqtt:` reaching the fall-through, which
+/// is a host bug.
 pub(crate) fn validate_exact_tuning_blocks(
     tuning: &messaging::config::SystemChannelTuning,
     webhook_slugs: &[&str],
@@ -1084,6 +1132,15 @@ pub(crate) fn validate_exact_tuning_blocks(
             (
                 inbox_slugs.contains(slug),
                 "a consumer holding an async tool grant with that slug",
+            )
+        } else if let Some(name) = address
+            .strip_prefix("brenn:")
+            .filter(|n| brenn_envelope::addressing::in_the_egress_namespace(n))
+        {
+            // Every plan mints exactly one egress channel.
+            (
+                name == brenn_envelope::addressing::MQTT_OUTBOUND_CHANNEL,
+                "egress channel by that name; the one there is is `brenn:egress/mqtt`",
             )
         } else if let Some(username) = brenn_envelope::addressing::device_location_user(address) {
             // Users register at runtime, so the population is open-ended like

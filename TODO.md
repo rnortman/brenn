@@ -164,6 +164,28 @@ test against `MemoryHost::set_write_budget` in which bodies that together pass
 the bound are each issued, and one that alone passes it is answered once. The comment
 sits at `Run::build` in `brenn-provider-kit/src/activation.rs`.
 
+## `correctness-panic-hook-tests-count-foreign-thread-panics`
+
+Three `panic_hook::tests` in `brenn-obs/src/panic_hook.rs` install a
+mail-backend panic hook and then assert an exact value of the process-global
+`SEND_PANIC_MAIL_SYNC_CALL_COUNT`: `pending_hook_attempts_send_for_mail_backend`
+(1), `at_most_one_send_after_full_hook_supersedes_pending` (1) and
+`double_install_pending_hook_sends_twice` (2). The hook is process-wide, and
+`send_panic_mail_sync` increments the counter in test builds
+(`brenn-obs/src/alerting.rs`), so it counts a panic on any thread. The test lock
+orders these tests only against each other. A panic in any other test of
+`brenn-obs_test` while one of them is between installing its hook and its
+assertion makes the count wrong. The assertion then panics while that test
+holds the lock, which poisons the lock, and every lock-taking test that runs
+afterwards fails at `lock().unwrap()`. One real failure anywhere in the binary
+can therefore show up as a run of `panic_hook` failures that look like a
+separate defect. This bears on the `panic_hook` failures `obs-log-capture-test-flaky`
+records. It does not establish that this is what happened in that run. The fix
+counts only the installing thread's panics: a thread-local counter seam, or a
+hook that compares `std::thread::current().id()` with the id recorded at
+install. Done = a panic on another thread during any of the three tests' windows
+does not change what they assert. The comment is at the test lock.
+
 ## `dense-request-arguments-outgrow-guest`
 
 A provider's guest parses every new request of an activation into an owned
@@ -200,6 +222,39 @@ refuses each without trapping, or a recorded decision beside
 `parse_request` that the bound is the component's and the operator's, with
 the figures in `docs/component-packages.md`. The comment is at
 `parse_request` in `brenn-wasm/components/guest/src/lib.rs`.
+
+## `errhandling-panic-hook-tests-silence-other-tests-panic-messages`
+
+The six `panic_hook::tests` that take the test lock
+(`brenn-obs/src/panic_hook.rs`) each end with `restore_default_hook`, which installs
+a panic hook that does nothing, process-wide. The hook in place before the test
+is never put back. From the first time one of those tests finishes until the
+`brenn-obs_test` binary exits, a panic in any other test of the binary prints
+nothing: libtest reports the test `FAILED` with no `panicked at` line and no
+assertion message, since that text comes from the hook. A test of these six
+that fails its own assertion also leaves its own hook installed for the rest of
+the run. The comment on `restore_default_hook` gives std's default hook as
+"print to stderr + abort", but that hook prints and does not abort. The fix:
+each test takes the prior hook with `std::panic::take_hook` and restores it
+from a drop guard, so it is also put back when the test's assertion fails. The
+comment is corrected to match. This bears on `obs-log-capture-test-flaky`,
+whose record lacks exactly the messages this hook drops. Done = after any
+`panic_hook` test, success or failure, a panic in another test of the binary
+prints its message. The comment is at `restore_default_hook`.
+
+## `file-link-backslash-refused`
+
+`encode_url_path` (`brenn-render/src/artifact.rs`) does not
+percent-encode `\`, and the URL parser reads `\` as `/` in an `https`
+path. The file link minted for a file whose name holds `\` is therefore
+refused by the path validator (`brenn-server/src/path_validate.rs`, which
+refuses any path the parser rewrites), and a browser that follows it asks
+for another path: the link does not name the file. Adding `\` to the
+encode set is not the whole fix. An encoded `\` reaches the file routes
+(`brenn-server/src/routes/file.rs`) as a decoded `\` in a file path, and
+what those routes do with one has to be established first. Done = a file
+whose name holds `\` has a link that passes the validator and serves that
+file, and the minted-link test in `path_validate.rs` covers `\`.
 
 ## `gmail-body-forms-above-bound`
 
@@ -321,6 +376,51 @@ entries than the floor can decode completes, and one whose store holds more
 in-flight and backlog rows than the floor and the guest's memory cover read
 whole completes, each with a test. The comment sits at `sweep` in
 `brenn-provider-kit/src/activation.rs`.
+
+## `mqtt-egress-unwired`
+
+The bus admits a publish to `mqtt:<client>:<topic>`
+(`Messenger::admit_mqtt` and `Messenger::publish_mqtt`,
+`brenn-messaging/src/publish/mqtt.rs`) and commits it to
+`brenn:egress/mqtt`, but nothing in production calls `publish_mqtt` and
+nothing reads the channel: `system:mqtt-outbound`
+(`brenn-messaging/src/mqtt_outbound.rs`) is declared in every plan as the
+channel's subscriber, and boot neither attaches its position nor runs a
+reader for it. `MqttSend` and the component `mqtt-publish` functions still
+publish to the broker directly, through `brenn-mqtt/src/egress.rs`. A
+message committed through `publish_mqtt` would rest on the channel and never
+reach a broker, so `publish_mqtt` must gain no caller before a reader
+exists. The admission is also unfinished in what it decides: it commits
+every client's messages to one channel, gives a message with no stated
+expiry the lifetime `MQTT_OUTBOUND_DEFAULT_LIFETIME`, and refuses
+`deliver_after` and `reply_to`. No test shows that a live feed of the
+channel carries the `MqttPublish` metadata the retained row does: the
+publish path hands the stored transport to `surface_feed_envelope`, and only
+retention is asserted. Done = every MQTT send is admitted through
+`admit_mqtt`, a reader delivers what it commits, and a test pins the fed
+envelope's transport against the retained row's; or the admission, the
+channel and the participant are removed. The comments are at
+`mqtt_outbound_spec` and at `publish_mqtt`.
+
+## `obs-log-capture-test-flaky`
+
+The log-capture test `signal_sanitizes_address_in_log_and_alert_body`
+(`brenn-obs/src/security.rs`, `#[traced_test]`) failed once under the full
+parallel `make check`: it did not find the log line it captures. In the same
+run of the same test binary, the six `panic_hook::tests` that serialise on
+one test lock (`brenn-obs/src/panic_hook.rs`) also failed, and the lock was
+reported poisoned. The log-capture test does not take that lock. Which
+`panic_hook` test panicked while holding it, why, and whether that is
+connected to the log-capture failure were not recorded. The target passed
+when run alone and on the next full run. The cause is not established.
+`boot-log-capture-tests-flaky` records the same symptom in
+`brenn-messaging-boot`; the two may or may not share a cause. `make check` is
+the pre-commit gate, and a test that fails there at random teaches
+retry-until-green. Done = the cause is found, the `panic_hook` failures of
+that run are accounted for, and the tests pass reliably under the full
+parallel `make check`; or a failure is shown to have had a real reason and
+that is fixed. A retry is not a fix. Code site
+(`TODO(obs-log-capture-test-flaky)`): the log-capture test.
 
 ## `provider-result-activation-trap-strands-request`
 
@@ -4478,21 +4578,28 @@ the backend-`fatal` refusal to those families — or `noise` is refused on the
 blocks whose subscribers cannot enact it, and `docs/message-bus.md` §2.7 says
 which families those are.
 
-Code site (`TODO(system-participant-noise-inert)`):
+A system participant's drain also logs and counts what it steps over
+(`Messenger::count_stepped_over`, into the same tally `drop_counter` reads),
+because the `Silent` rung counts nothing. Enacting a system participant's rung
+must replace that count, or one loss would be counted twice.
+
+Code sites (`TODO(system-participant-noise-inert)`):
 `brenn-messaging/src/system.rs`, at the `SubscriberEntry` built by
-`fold_spec_subscriptions`.
+`fold_spec_subscriptions`; `brenn-messaging/src/lib.rs`, at
+`Messenger::count_stepped_over`.
 
 Done = a tuning block's `noise` is either enacted by the system participant
 subscribed to that channel or refused at load, with no family in between.
 
 ## `tool-request-window-overflow-silent`
 
-A tool call pushed past its request channel's window is lost with no answer and no log
-line. The tool executor drains `brenn:tools/<tool>` as a system participant whose window
+A tool call pushed past its request channel's window is lost with no answer. The tool
+executor drains `brenn:tools/<tool>` as a system participant whose window
 is the channel's `retain_depth` and whose overflow rung is `Silent`: each drain serves
 the window's newest unseen requests and steps over the older ones. A stepped-over call
-gets no result, so the component that made it is never answered, and nothing records
-that it happened; the blobs it carried go when GC evicts its row. The defaults guarantee
+gets no result, so the component that made it is never answered; the drain logs and
+counts how many it stepped over, and the blobs they carried go when GC evicts their
+rows. The defaults guarantee
 the case: one activation may queue 64 asynchronous calls
 (`PROCESSOR_MAX_FAST_TOOL_CALLS_PER_ACTIVATION`, `brenn-wasm/src/lib.rs`) and a request
 channel's default window is 16 (`TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH`,
@@ -4502,20 +4609,17 @@ burst that its own default sizing then drops. `docs/message-bus.md`, the tool-ch
 section, states the behaviour and tells the operator to size the window; that is not
 enough for a default.
 
-Two things are to be done. Make the default sizing and the per-activation call cap
-cohere, so that a burst the host admits in one activation is not lost under defaults.
+Make the default sizing and the per-activation call cap cohere, so that a burst the
+host admits in one activation is not lost under defaults.
 The window's default also sets how long a handed blob rests on a request row and how
 many requests a fresh executor position re-runs, and the cap is shared with fast calls
 and with `MAX_FAST_CALLS_PER_ACTIVATION` in `brenn-tool-registry/src/descriptor.rs`;
-the change weighs those. And make a request the executor steps over observable: a log
-line or alert naming the tool and how many were skipped, at the drain in
-`brenn-messaging/src/system.rs` (`SystemInbox::dequeue_batch`), whatever
-`system-participant-noise-inert` settles about a block's `noise`.
+the change weighs those.
 
 The bus has no backpressure and gets none: no blocking publish, no flow control, no
 redelivery. Loss by overflow stays the bus's rule, and a window an operator sized too
 small for the traffic still drops oldest. What is to be fixed is defaults that guarantee
-the loss and the silence around it.
+the loss.
 
 Code site (`TODO(tool-request-window-overflow-silent)`):
 `brenn-lib/src/messaging/config.rs`, at `TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH`.

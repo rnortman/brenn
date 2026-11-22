@@ -651,6 +651,7 @@ mod tests {
                     body: "with a photo".into(),
                     urgency: crate::Urgency::Normal,
                     envelope_type: ChannelScheme::Brenn,
+                    transport: None,
                     reply_to: None,
                     delivery_deadline: None,
                     impetus: None,

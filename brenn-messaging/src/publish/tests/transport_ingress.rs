@@ -579,3 +579,32 @@ async fn raw_over_the_body_cap_panics() {
         )
         .await;
 }
+
+/// Outbound MQTT metadata names the `mqtt` scheme, so the scheme assertion
+/// alone would pass it on an `mqtt:` ingress channel; the ingress path refuses
+/// it by variant.
+#[tokio::test]
+#[should_panic(expected = "outbound MQTT metadata on ingress channel")]
+async fn publish_transport_ingress_panics_on_outbound_mqtt_metadata() {
+    let (messenger, channel, _, _) = build_mqtt_messenger(true, true).await;
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "mqtt:homeassistant:home/+/state",
+            "homeassistant",
+            IngressMessage::Raw {
+                body: octet_stream(b"on"),
+                transport: crate::TransportMeta::MqttPublish(crate::MqttPublishTransport {
+                    client_slug: "homeassistant".to_owned(),
+                    topic: "home/kitchen/set".to_owned(),
+                    qos: 1,
+                    retain: false,
+                    message_expiry_s: None,
+                    content_type: None,
+                    expires_at: fixture_received_at(),
+                }),
+            },
+            Urgency::Normal,
+        )
+        .await;
+}

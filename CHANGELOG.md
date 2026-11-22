@@ -44,6 +44,22 @@ All notable changes to Brenn are documented here.
   publishes left over from the old connection are failed when the new one
   comes up, so they can no longer shift the acknowledgements of later
   publishes.
+- **BREAKING for operators:** `egress` is now a reserved channel name, in
+  preparation for routing MQTT publishes through the message bus. A declared
+  channel named `egress`, `egress.<x>` or `egress/<x>` no longer loads, and no
+  publish ACL, component output or surface output may name a channel under
+  `brenn:egress/`. The host mints one channel there, `brenn:egress/mqtt`, on
+  every deployment; nothing is published to it yet and MQTT publishing works
+  as before. Its name is not stable, so do not tune it or grant it.
+- **For component authors:** the SDK's `TransportMeta` gains the variant
+  `MqttPublish`. A component that matches the enum exhaustively needs an arm
+  when it is rebuilt against this release; one that uses the SDK's accessors
+  needs nothing. No message a component receives today carries the variant,
+  and no WIT contract changes.
+- Bumped url from 2.5.8 to 2.5.9, clearing RUSTSEC-2026-0592. A `^` in a URL
+  path is now percent-encoded: file links carry `%5E`, `api-request` sends
+  `%5E` for it, and a push `data.url`, redirector target or login return path
+  holding a raw `^` is refused.
 
 ## [0.38.0] — 2026-11-21
 

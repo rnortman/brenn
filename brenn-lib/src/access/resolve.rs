@@ -100,7 +100,7 @@ pub fn build_app_policy(
         brenn_publish: acl
             .brenn_publish
             .iter()
-            .map(|m| resolve_channel(&owner, "brenn_publish", m))
+            .map(|m| resolve_brenn_publish(&owner, "brenn_publish", m))
             .collect(),
         // Ephemeral ACL lists resolve from their raw fields exactly like
         // `brenn_publish` — same `resolve_channel` validation, bare-name matcher
@@ -329,7 +329,7 @@ pub fn build_wasm_policy(
             .collect(),
         brenn_publish: publish_acl
             .iter()
-            .map(|m| resolve_channel(&owner, "publish_acl", m))
+            .map(|m| resolve_brenn_publish(&owner, "publish_acl", m))
             .collect(),
         ephemeral_publish: ephemeral_publish_acl
             .iter()
@@ -514,7 +514,7 @@ pub fn build_attach_policy(
             .collect(),
         brenn_publish: publish_acl
             .iter()
-            .map(|m| resolve_channel(owner, "publish_acl", m))
+            .map(|m| resolve_brenn_publish(owner, "publish_acl", m))
             .collect(),
         ephemeral_subscribe: ephemeral_subscribe_acl
             .iter()
@@ -553,6 +553,25 @@ fn validate_mqtt_client(
         "app {app_slug:?}: {list} matcher names unconfigured MQTT client {client:?} \
          (no matching [[mqtt_client]])",
     );
+}
+
+/// [`resolve_channel`] for a `brenn:` publish list, which may also not reach
+/// into the egress namespace: only the host's admission writes a channel there
+/// (`AppPolicy::allows_brenn_publish`), so such a matcher could never match and
+/// is a configuration error rather than a silent no-op. A subscribe list may
+/// name the namespace; reading it is by ACL like any channel.
+fn resolve_brenn_publish(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelMatcher {
+    let (kind, value) = match raw {
+        ChannelMatcherRaw::Exact(s) => ("exact", s),
+        ChannelMatcherRaw::Prefix(p) => ("prefix", p),
+    };
+    assert!(
+        !crate::messaging::in_the_egress_namespace(value),
+        "{owner}: {list} {kind} matcher {value:?} reaches into the reserved `egress/` \
+         namespace — a channel there holds messages bound off the bus and only the host's \
+         admission writes it; publish to an MQTT topic through its `mqtt:` address",
+    );
+    resolve_channel(owner, list, raw)
 }
 
 /// Convert a raw `brenn:` channel matcher into its resolved form, validating the
@@ -1034,6 +1053,71 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "app \"home\": brenn_publish exact matcher \"egress/mqtt\" \
+                               reaches into the reserved `egress/` namespace"
+    )]
+    fn egress_exact_publish_matcher_panics_for_an_app() {
+        let acl = AppAclRaw {
+            brenn_publish: vec![ChannelMatcherRaw::Exact("egress/mqtt".to_string())],
+            ..AppAclRaw::default()
+        };
+        build_app_policy("home", &[], &acl, &clients(&[]));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "wasm consumer \"etl\": publish_acl prefix matcher \"egress/\" \
+                               reaches into the reserved `egress/` namespace"
+    )]
+    fn egress_prefix_publish_matcher_panics_for_a_wasm_consumer() {
+        let acl = [ChannelMatcherRaw::Prefix("egress/".to_string())];
+        build_wasm_policy(
+            "etl",
+            [],
+            WasmAclsRaw {
+                publish: &acl,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "publish_acl exact matcher \"egress/mqtt\" reaches into the \
+                               reserved `egress/` namespace"
+    )]
+    fn egress_publish_matcher_panics_for_a_surface() {
+        build_attach_policy(
+            AttachOwner::Surface("deskbar"),
+            [AttachGrant::Publish],
+            AttachAclsRaw {
+                publish: &[ChannelMatcherRaw::Exact("egress/mqtt".to_string())],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn egress_subscribe_matchers_resolve() {
+        // Reading the outbound channel is by ACL like any channel.
+        let acl = AppAclRaw {
+            brenn_subscribe: vec![
+                ChannelMatcherRaw::Exact("egress/mqtt".to_string()),
+                ChannelMatcherRaw::Prefix("egress/".to_string()),
+            ],
+            ..AppAclRaw::default()
+        };
+        let policy = build_app_policy(
+            "home",
+            &[AppCapability::MessagingSubscribe],
+            &acl,
+            &clients(&[]),
+        );
+        assert!(policy.allows_brenn_delivery("egress/mqtt"));
     }
 
     #[test]

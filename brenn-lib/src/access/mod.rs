@@ -256,8 +256,12 @@ impl AppPolicy {
     /// grant **and** a covering `brenn_publish` matcher (`Exact`/`Prefix` via
     /// `ChannelMatcher::matches`). `channel` is the `brenn:`-stripped channel name,
     /// matching how `allows_brenn_delivery` treats it.
+    ///
+    /// Never for a name in the egress namespace, whatever the matchers say:
+    /// only the host's admission of an `mqtt:` publish writes a channel there.
     pub fn allows_brenn_publish(&self, channel: &str) -> bool {
         self.grants.has(AppCapability::MessagingPublish)
+            && !crate::messaging::in_the_egress_namespace(channel)
             && Self::acl_covers(&self.acls.brenn_publish, channel)
     }
 
@@ -895,6 +899,25 @@ mod tests {
         // webhook: routes through allows_webhook_delivery (exact).
         assert!(p.allows_channel_access("webhook:github"));
         assert!(!p.allows_channel_access("webhook:gitlab"));
+    }
+
+    #[test]
+    fn no_matcher_grants_a_publish_into_the_egress_namespace() {
+        // Built in code, past the resolver that refuses such matchers.
+        for matcher in [
+            ChannelMatcher::Exact("egress/mqtt".to_string()),
+            ChannelMatcher::Prefix("egress/".to_string()),
+        ] {
+            let p = policy(
+                &[AppCapability::MessagingPublish],
+                AclSet {
+                    brenn_publish: vec![matcher, ChannelMatcher::Exact("alerts".to_string())],
+                    ..AclSet::default()
+                },
+            );
+            assert!(!p.allows_brenn_publish("egress/mqtt"));
+            assert!(p.allows_brenn_publish("alerts"));
+        }
     }
 
     #[test]

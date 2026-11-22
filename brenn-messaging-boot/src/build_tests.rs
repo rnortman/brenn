@@ -4239,6 +4239,120 @@ fn a_location_block_naming_no_possible_user_panics() {
     );
 }
 
+/// The one egress channel every plan mints may be tuned by its exact key.
+#[test]
+fn an_egress_block_naming_the_mqtt_outbound_channel_passes() {
+    let tuning = tuning_of(&[tuning_raw("brenn:egress/mqtt")]);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
+}
+
+/// Any other exact key in the egress namespace names a channel no plan mints.
+#[test]
+#[should_panic(expected = "tunes a channel this config never mints — there is no egress channel")]
+fn an_egress_block_naming_another_channel_panics() {
+    let tuning = tuning_of(&[tuning_raw("brenn:egress/other")]);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &[],
+        &[],
+        &std::collections::HashSet::new(),
+        None,
+        true,
+    );
+}
+
+/// A plan with no `[[mqtt_client]]` still mints `brenn:egress/mqtt` and
+/// declares `system:mqtt-outbound` as its subscriber, at the channel's own
+/// window: a reload that adds the first client must find both already there.
+#[test]
+fn every_plan_mints_the_mqtt_outbound_channel_and_its_drain() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::{SubscriberEntryKind, config::NoiseLevel};
+    use brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT;
+
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    assert!(config.mqtt_clients.is_empty());
+    let plan = plan_messaging(&PlanInputs {
+        config: &config,
+        apps: None,
+        mqtt_clients: &IndexMap::new(),
+        tool_registry: None,
+        replay_store_paths: &[],
+        device_location_users: &[],
+    })
+    .expect("a channel-declaring document configures messaging");
+
+    let entry = plan
+        .directory
+        .resolve("brenn:egress/mqtt")
+        .expect("the outbound channel is minted with no client declared");
+    assert_eq!(
+        entry.uuid,
+        brenn_lib::messaging::egress_channel_uuid("brenn:egress/mqtt")
+    );
+    assert!(entry.capabilities().durable);
+    assert!(entry.resolved_channel.non_text);
+    assert_eq!(entry.resolved_channel.retain_depth, Depth::Bounded(256));
+    let subscriber = entry
+        .subscribers
+        .iter()
+        .find(|s| s.kind == SubscriberEntryKind::System(MQTT_OUTBOUND_COMPONENT.to_string()))
+        .expect("system:mqtt-outbound is folded in as the channel's subscriber");
+    assert_eq!(subscriber.push_depth, Depth::Bounded(256));
+    assert_eq!(subscriber.retain_depth, Depth::Bounded(256));
+    assert_eq!(subscriber.noise, NoiseLevel::Silent);
+    assert_eq!(entry.subscribers.len(), 1);
+    assert!(
+        plan.system_participants
+            .iter()
+            .any(|spec| spec.component == MQTT_OUTBOUND_COMPONENT)
+    );
+    assert!(
+        plan.registrations
+            .contains_key(&SubscriberEntryKind::System(
+                MQTT_OUTBOUND_COMPONENT.to_string()
+            ))
+    );
+}
+
+/// A consumer output bound to the outbound channel meets the egress refusal,
+/// not the unknown-channel one: the entry is in the directory consumer
+/// bindings resolve against.
+#[test]
+#[should_panic(expected = "which is in the egress namespace")]
+fn a_plan_refuses_a_consumer_output_bound_to_the_outbound_channel() {
+    use brenn_lib::config::BrennConfig;
+
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    config.channels.push(durable_channel("brenn:in-ch"));
+    config.wasm_consumers = vec![brenn_lib::messaging::config::WasmConsumerConfigRaw {
+        slug: "forger".to_string(),
+        subscriptions: vec![super::test_fixtures::sub_raw("brenn:in-ch", "in")],
+        outputs: vec![super::test_fixtures::out_raw(
+            "commands",
+            "brenn:egress/mqtt",
+        )],
+        ..minimal_wasm_consumer()
+    }];
+    let _ = plan_messaging(&PlanInputs {
+        config: &config,
+        apps: None,
+        mqtt_clients: &IndexMap::new(),
+        tool_registry: None,
+        replay_store_paths: &[],
+        device_location_users: &[],
+    });
+}
+
 /// The tuning table reaches every site that mints a system channel.
 ///
 /// Each mint site resolves independently, and each one falls back to the family
@@ -4288,6 +4402,7 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
             tuned(Some("brenn:tools/apull"), None, 9),
             tuned(Some("brenn:tool-results/probe"), None, 7),
             tuned(None, Some("mqtt:homeassistant:"), 40),
+            tuned(Some("brenn:egress/mqtt"), None, 12),
         ],
         webhook_endpoints: vec![webhook_endpoint_raw("gh-events")],
         mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
@@ -4318,6 +4433,7 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
         ("brenn:tools/apull", 9),
         ("brenn:tool-results/probe", 7),
         (mqtt_address, 40),
+        ("brenn:egress/mqtt", 12),
     ] {
         let entry = directory
             .resolve(address)

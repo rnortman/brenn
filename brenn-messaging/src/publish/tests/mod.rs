@@ -6,6 +6,7 @@ mod conversation;
 mod dispatch_row;
 mod impetus;
 mod ingress;
+mod mqtt;
 mod publish_core;
 mod scheme_parity;
 mod surface;

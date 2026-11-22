@@ -940,6 +940,11 @@ pub async fn run_server(
     // ingress-delivery paths.
     //
     let mqtt_result = mqtt::start_mqtt(&mqtt_ingress_channels, &mqtt_clients).await;
+    // The bus admits an `mqtt:` publish against the service's client registry,
+    // which reload keeps current.
+    if let Some(messenger) = messaging_result.messenger.as_ref() {
+        messenger.install_mqtt_clients(mqtt_result.service.clone());
+    }
 
     let webhook_result = webhook::build_webhook(webhook_endpoints, &components_roots);
 

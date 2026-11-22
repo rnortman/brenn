@@ -554,6 +554,10 @@ pub(crate) fn resolve_wasm_consumers(
                 )
             });
             validate_bound_address(&entry.address, kind, &out.port);
+            crate::assert_not_egress_output(
+                &format!("[[wasm_consumer]] {slug:?}: {kind} port {:?}", out.port),
+                &entry.address,
+            );
             // `remove` rather than `get`: the exception admits one output per
             // input, so a third binding on the name finds nothing and collides.
             // The addresses must match, not merely both exist: two halves on

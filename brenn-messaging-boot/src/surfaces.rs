@@ -1430,6 +1430,13 @@ pub(crate) fn resolve_surfaces(
                 out.channel.as_deref(),
                 auto_wiring.surface_channel(slug, &out.instance, &out.port),
             );
+            crate::assert_not_egress_output(
+                &format!(
+                    "config: [[surface]] {slug:?}: {direction} instance {:?} port {:?}",
+                    out.instance, out.port
+                ),
+                &channel,
+            );
             if let Some(declared) =
                 validate_binding(direction, &channel, &out.instance, &out.port, out.non_text)
             {

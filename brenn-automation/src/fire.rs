@@ -289,6 +289,13 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
              impetus; job uuid={}",
             job.uuid
         ),
+        // Only the MQTT entry runs the MQTT admission, and a job's publish does
+        // not go through it.
+        PublishResult::MqttRefused(refusal) => unreachable!(
+            "automation fire publish returned MqttRefused({refusal:?}): only \
+             Messenger::publish_mqtt runs the MQTT admission; job uuid={}",
+            job.uuid
+        ),
     };
 
     finish_fire(

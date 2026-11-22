@@ -701,6 +701,15 @@ impl MqttService {
     }
 }
 
+/// The registry is the client table the bus admits an `mqtt:` publish against:
+/// reload already keeps it current, so the bus holds no second copy to swap.
+impl brenn_lib::mqtt::MqttClientDirectory for MqttService {
+    fn outbound_payload_cap(&self, client: &str) -> Option<u32> {
+        self.get_client(client)
+            .map(|handle| handle.config.identity.outbound_payload_cap_bytes)
+    }
+}
+
 impl Default for MqttService {
     fn default() -> Self {
         Self {
@@ -1468,6 +1477,22 @@ mod tests {
         );
         assert!(svc.get_client("home").is_none());
         assert_eq!(svc.client_slugs(), vec!["attic".to_string()]);
+    }
+
+    /// The bus's client directory reads the registry: a registered slug answers
+    /// its configured outbound cap, and an absent or removed one answers none.
+    #[tokio::test]
+    async fn the_client_directory_reads_the_registry() {
+        use brenn_lib::mqtt::MqttClientDirectory;
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        let cap = handle.config.identity.outbound_payload_cap_bytes;
+        svc.add_client(handle);
+
+        assert_eq!(svc.outbound_payload_cap("home"), Some(cap));
+        assert_eq!(svc.outbound_payload_cap("attic"), None);
+        svc.remove_client("home");
+        assert_eq!(svc.outbound_payload_cap("home"), None);
     }
 
     /// Removing a slug the registry does not hold is a host bug.
