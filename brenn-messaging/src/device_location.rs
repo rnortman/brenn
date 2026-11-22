@@ -47,6 +47,7 @@ pub fn device_location_spec() -> SystemParticipantSpec {
         component: DEVICE_LOCATION_COMPONENT,
         policy,
         subscriptions: vec![],
+        noise: crate::config::NoiseLevel::Silent,
     }
 }
 

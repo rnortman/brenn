@@ -1078,13 +1078,15 @@ pub(crate) fn derive_mqtt_ingress_channels(
 /// naming no registered async tool, or a `brenn:tool-results/` block naming no
 /// consumer that holds an async tool grant, a `brenn:app-tool-results/` block
 /// naming no app that holds one (checked only when `app_inbox_slugs` is
-/// given), a `brenn:egress/` block naming any channel but `brenn:egress/mqtt`,
-/// or a `brenn:device-location.` block whose remainder is not a username. Also
+/// given), a `brenn:egress/` block naming any channel but the egress channel
+/// `brenn:egress/mqtt/<client>` of a declared MQTT client, or a
+/// `brenn:device-location.` block whose remainder is not a username. Also
 /// on an exact key of any scheme but `mqtt:` reaching the fall-through, which
 /// is a host bug.
 pub(crate) fn validate_exact_tuning_blocks(
     tuning: &messaging::config::SystemChannelTuning,
     webhook_slugs: &[&str],
+    mqtt_client_slugs: &[&str],
     async_tool_names: &[&'static str],
     inbox_slugs: &std::collections::HashSet<String>,
     app_inbox_slugs: Option<&std::collections::HashSet<String>>,
@@ -1137,10 +1139,12 @@ pub(crate) fn validate_exact_tuning_blocks(
             .strip_prefix("brenn:")
             .filter(|n| brenn_envelope::addressing::in_the_egress_namespace(n))
         {
-            // Every plan mints exactly one egress channel.
+            // Every plan mints one egress channel per declared MQTT client.
             (
-                name == brenn_envelope::addressing::MQTT_OUTBOUND_CHANNEL,
-                "egress channel by that name; the one there is is `brenn:egress/mqtt`",
+                brenn_envelope::addressing::mqtt_egress_client(name)
+                    .is_some_and(|client| mqtt_client_slugs.contains(&client)),
+                "`[[mqtt_client]]` with that slug; an egress channel is \
+                 `brenn:egress/mqtt/<client>`",
             )
         } else if let Some(username) = brenn_envelope::addressing::device_location_user(address) {
             // Users register at runtime, so the population is open-ended like

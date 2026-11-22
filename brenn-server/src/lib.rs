@@ -23,6 +23,7 @@ mod messaging_intercept;
 pub mod messaging_router;
 mod middleware;
 mod model_cache;
+pub mod mqtt_egress;
 mod mqtt_intercept;
 pub mod mqtt_router;
 mod mqtt_subscribe;

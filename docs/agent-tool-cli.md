@@ -192,10 +192,13 @@ attachments; passing it is `invalid_args`.
 place of `body` or `body_base64`: its `attachment` argument is a single reference,
 `{"message_id": "<uuid>", "name": "<attachment name>"}`, under the rule
 above, and the attachment's bytes are published with its content type as the
-MQTT Content Type.
+MQTT Content Type. `lifetime_s` is required, as on every `MqttSend` call: how
+many seconds Brenn keeps trying to send the message, or `"forever"`. The call
+answers once the message is committed, with its id; delivery happens
+afterwards and is not reported to the caller.
 
 ```bash
-brenn-tool call MqttSend --str to=mqtt:home:cam/snapshot \
+brenn-tool call MqttSend --str to=mqtt:home:cam/snapshot --set lifetime_s=300 \
     --set 'attachment={"message_id": "0b6a5c2e-7d1f-4e8a-9c3b-2f4d6e8a10e4", "name": "snap.png"}'
 ```
 
@@ -251,8 +254,10 @@ everything. Each is a refusal you can read — nothing waits for room.
 `tool_channel_attachment`, `too_many_attachments`,
 `duplicate_attachment_name`, `malformed_content_type`, `no_files`,
 `blob_too_large`, `send_files_too_large`, `blob_budget_exhausted`,
-`blobs_unavailable` and `payload_too_large` (an `MqttSend` payload over the
-MQTT client's `outbound_payload_cap_bytes`). `not_read` — after a restart, a compaction, or a user
+`blobs_unavailable`, `payload_too_large` (an `MqttSend` payload over the
+MQTT client's `outbound_payload_cap_bytes`) and `payload_unstorable` (an
+`MqttSend` payload over the bus's body cap that the blob store could not
+take). `not_read` — after a restart, a compaction, or a user
 turn that began with `/` — is cured by reading the message again
 (`MessageChannelGet`) and retrying; for a tool result, by calling the tool
 again. `tool_channel_attachment` is final: the message is on a channel of

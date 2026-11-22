@@ -169,6 +169,10 @@ pub(crate) struct ReloadEnv {
     pub mqtt_service: Arc<brenn_mqtt::MqttService>,
     /// The concrete ingress router. Always present.
     pub mqtt_event_router: Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
+    /// The bus side of every client's egress reader. A reload opens a position
+    /// for each client it adds or restarts and closes the one of each client
+    /// it removes.
+    pub mqtt_egress: Arc<brenn_server::mqtt_egress::MqttEgressHub>,
     pub max_payload_bytes: usize,
     /// The live Claude Code sessions. A reload condemns the ones whose agent's
     /// per-process view moved, or whose conversation belongs to a user the
@@ -2692,8 +2696,9 @@ channel scratch at "ephemeral:scratch" {{
         }
         let mut reload_notify = None;
         let mut executor_notify = None;
+        let mut egress_notify = None;
         for spec in &result.system_participants {
-            if spec.subscriptions.is_empty() {
+            if !crate::binds_delivery(spec) {
                 continue;
             }
             let notify = Arc::new(tokio::sync::Notify::new());
@@ -2703,6 +2708,9 @@ channel scratch at "ephemeral:scratch" {{
             if spec.component == brenn_tool_registry::TOOL_EXECUTOR_COMPONENT {
                 executor_notify = Some(Arc::clone(&notify));
             }
+            if spec.component == brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT {
+                egress_notify = Some(Arc::clone(&notify));
+            }
             router.register_delivery_binding(
                 SubscriberEntryKind::System(spec.component.to_string()),
                 DeliveryBinding::ParkedNotify(notify),
@@ -2710,6 +2718,7 @@ channel scratch at "ephemeral:scratch" {{
         }
         let reload_notify =
             reload_notify.expect("every fixture document declares the reload facility");
+        let egress_notify = egress_notify.expect("the MQTT egress spec is derived in every plan");
         let plan = plan_like_the_driver(
             &document.config,
             &apps,
@@ -2738,6 +2747,14 @@ channel scratch at "ephemeral:scratch" {{
             )
             .await
         };
+        messenger.install_mqtt_clients(mqtt.0.clone());
+        let mqtt_egress = crate::mqtt::start_mqtt_egress(
+            &mqtt.0,
+            messenger.clone(),
+            alert_dispatcher.clone(),
+            egress_notify,
+        )
+        .await;
 
         // The async tool executor's grant table: the plan's own value, installed
         // where the executor's spec exists — which is when some consumer holds
@@ -2909,6 +2926,7 @@ channel scratch at "ephemeral:scratch" {{
                 attach_registry,
                 mqtt_service: mqtt.0.clone(),
                 mqtt_event_router: mqtt.1.clone(),
+                mqtt_egress: mqtt_egress.clone(),
                 max_payload_bytes: document.config.messaging.max_body_bytes,
                 active_bridges,
                 apps_swapped_tx: apps_swapped_tx.clone(),
@@ -3802,6 +3820,13 @@ new sifter: Demo {{
             router.route_uuids().contains(&uuid),
             "{ADDRESS} has no route"
         );
+        for client in ["ha", "spare"] {
+            assert_eq!(
+                egress_entry_noise(&booted.messenger, client),
+                Some(brenn_lib::messaging::config::NoiseLevel::Alarm),
+                "the egress participant subscribes to {client}'s egress channel",
+            );
+        }
         booted.stop_mqtt();
     }
 
@@ -3860,6 +3885,18 @@ new sifter: Demo {{
             "{ADDRESS} still has a route",
         );
         assert!(service.get_client("spare").is_none());
+        assert!(
+            booted
+                .messenger
+                .directory()
+                .resolve(&brenn_lib::messaging::mqtt_egress_address("spare"))
+                .is_none(),
+            "the removed client's egress channel and its entry are gone",
+        );
+        assert_eq!(
+            egress_entry_noise(&booted.messenger, "ha"),
+            Some(brenn_lib::messaging::config::NoiseLevel::Alarm),
+        );
     }
 
     /// A rotated broker password with no document edit at all: the file's bytes
@@ -5622,6 +5659,26 @@ remote pod {{
             .expect("the channel is declared");
         let conn = messenger.db().lock().await;
         brenn_messaging_store::db::load_subscriber_cursor(&conn, entry.uuid, subscriber)
+    }
+
+    /// The overflow rung of the MQTT egress participant's subscriber entry on
+    /// `client`'s egress channel; `None` when the channel or the entry is
+    /// absent.
+    pub(crate) fn egress_entry_noise(
+        messenger: &Messenger,
+        client: &str,
+    ) -> Option<brenn_lib::messaging::config::NoiseLevel> {
+        let kind = SubscriberEntryKind::System(
+            brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT.to_string(),
+        );
+        let entry = messenger
+            .directory()
+            .resolve(&brenn_lib::messaging::mqtt_egress_address(client))?;
+        entry
+            .subscribers
+            .iter()
+            .find(|sub| sub.kind.same_principal(&kind))
+            .map(|sub| sub.noise)
     }
 
     /// Addresses of live directory entries that carry `kind`.

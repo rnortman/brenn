@@ -1168,8 +1168,14 @@ name other statements can reach. The second is a **tuning** — no handle, a
 matcher over a system-minted family, possibly a prefix — which says something
 about channels the system creates rather than creating one. The tunable
 families are `webhook:`, `mqtt:`, `brenn:tools/`, `brenn:tool-results/`,
-`brenn:app-tool-results/` and `brenn:device-location.` (`docs/message-bus.md`
-§2.7). The four tool namespaces — `tools`, `tool-requests`, `tool-results`
+`brenn:app-tool-results/`, `brenn:device-location.` and
+`brenn:egress/mqtt/` (`docs/message-bus.md` §2.7). The last holds one channel
+per `mqtt_client`, `brenn:egress/mqtt/<client>`, carrying that client's
+`MqttSend` publishes (`docs/message-bus.md` §2.7.3): `channel at prefix
+"brenn:egress/mqtt/" { … }` tunes every client's, and `channel at
+"brenn:egress/mqtt/<client>" { … }` tunes one and is refused unless the
+document declares an `mqtt_client` of that slug. Its window is the outage to
+survive in that client's publishes; a retune needs a restart. The four tool namespaces — `tools`, `tool-requests`, `tool-results`
 and `app-tool-results` — are reserved channel segments: no channel may be
 declared named `<segment>`, `<segment>.…` or `<segment>/…`. A handle and a
 literal address are disjoint spellings: a channel that is declared is referred
@@ -1613,9 +1619,10 @@ A binding names a port, an arrow, and a channel: `in port <- chan`,
 `out port -> chan`, `io port <-> chan`. The channel is a handle where a
 declaration exists and a literal address where none does (`local:` planes,
 system-minted `webhook:`/`mqtt:` channels, a user's
-`brenn:device-location.<username>` channel). The trailing block tunes *this
-subscription* — `push_depth` is what wakes this instance, `retain_depth` what it
-can see — and both are held at or under the channel's ceiling: its
+`brenn:device-location.<username>` channel, a declared client's
+`brenn:egress/mqtt/<client>` channel, which only an `in` port may name). The
+trailing block tunes *this subscription* — `push_depth` is what wakes this
+instance, `retain_depth` what it can see — and both are held at or under the channel's ceiling: its
 `standing_retain_depth` on a durable channel, its `retain_depth` on every other
 scheme.
 A deeper binding is not clamped, it is refused at boot, naming the channel

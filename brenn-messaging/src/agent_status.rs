@@ -160,6 +160,7 @@ pub fn agent_status_spec(entries: &[ChannelEntry]) -> Option<SystemParticipantSp
         component: AGENT_STATUS_COMPONENT,
         policy,
         subscriptions: vec![ACCOUNTS_ADDRESS.to_string()],
+        noise: crate::config::NoiseLevel::Silent,
     })
 }
 

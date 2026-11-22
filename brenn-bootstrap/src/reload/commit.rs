@@ -34,10 +34,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use brenn_lib::messaging::config::{Depth, DormantSubscription};
-use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntryKind};
+use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntryKind, mqtt_egress_address};
 use brenn_lib::mqtt::config::MqttClientConfig;
 use brenn_lib::wasm_package::Verified;
 use brenn_messaging::Messenger;
+use brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT;
 use brenn_messaging_boot::MessagingPlan;
 use brenn_server::messaging_router::DeliveryBinding;
 
@@ -179,11 +180,13 @@ pub(crate) async fn apply(
         deferred: mqtt_outgoing(env, delta).await,
         failed: Vec::new(),
     };
+    retire_egress_readers(env, delta).await;
     remove_channels(env, delta);
     add_channels(env, delta).await;
     swap_api_keys(env, delta);
     swap_tools(env, delta);
     subscribe_tool_executor(env, delta, &planned).await;
+    start_egress_readers(env, delta, &planned).await;
     swap_agents(env, plan, delta);
     let sessions = retire_stale_sessions(env, delta).await;
     start_agent_subscriptions(env, delta, &planned).await;
@@ -619,6 +622,105 @@ async fn subscribe_tool_executor(
     env.messenger.dispatch_kick();
 }
 
+/// Put each client this reload adds into egress service: its position on its
+/// egress channel, the candidate plan's subscriber entry for the participant,
+/// and its reader on the session `start_added_clients` registered.
+///
+/// After `add_channels`, so the channel is in the directory; position before
+/// entry, for the reason `subscribe_tool_executor` gives. Before `swap_agents`,
+/// and no policy names a client before the swap that introduces it, so no
+/// publish precedes the position. A position created over a channel row an
+/// earlier client of the slug left skips what that row retains.
+async fn start_egress_readers(
+    env: &ReloadEnv,
+    delta: &PlanDelta,
+    planned: &PlannedSubscribers<'_>,
+) {
+    if delta.mqtt_clients.added.is_empty() {
+        return;
+    }
+    let kind = SubscriberEntryKind::System(MQTT_OUTBOUND_COMPONENT.to_string());
+    let mut arriving: HashSet<Uuid> = HashSet::new();
+    for client in &delta.mqtt_clients.added {
+        let address = mqtt_egress_address(&client.identity.slug);
+        let entry = planned
+            .of_principal(&kind)
+            .iter()
+            .find(|(entry, _)| entry.address == address)
+            .unwrap_or_else(|| {
+                panic!(
+                    "reload commit: client {:?} is added but the plan holds no egress subscriber \
+                     entry on {address:?} — the plan derives one per declared client, so this \
+                     is a host bug",
+                    client.identity.slug,
+                )
+            });
+        arriving.insert(entry.0.uuid);
+    }
+    let mut buses = Vec::new();
+    for client in &delta.mqtt_clients.added {
+        let slug = &client.identity.slug;
+        buses.push((slug, env.mqtt_egress.open(slug).await));
+    }
+    planned.fold_onto(
+        env.messenger.directory(),
+        &kind,
+        "system participant",
+        &arriving,
+    );
+    for (slug, bus) in buses {
+        let handle = env.mqtt_service.get_client(slug).unwrap_or_else(|| {
+            panic!(
+                "reload commit: client {slug:?} is added but the registry holds no session for \
+                 it — `start_added_clients` registered one, so this is a host bug",
+            )
+        });
+        brenn_mqtt::start_egress_reader(&handle, bus);
+        info!(client = %slug, "reload: MQTT egress reader started");
+    }
+}
+
+/// Take each client this reload removes out of egress service while its
+/// channel is still in the directory: retire its reader (which reports what
+/// it held and what it abandons), remove the participant's subscriber entry,
+/// and drop the position. The session stops later, after `swap_agents`.
+///
+/// The channel row and what it retains stay, as for every durable channel
+/// that leaves the directory.
+async fn retire_egress_readers(env: &ReloadEnv, delta: &PlanDelta) {
+    // TODO(mqtt-egress-removed-client-rows): nothing reaps a removed client's
+    // egress channel row or its retained messages.
+    // TODO(correctness-publish-during-egress-retirement-silently-lost): a
+    // publish admitted for a removed client after its reader abandons, and
+    // committed before or after `remove_channels`, is never published or
+    // reported.
+    let kind = SubscriberEntryKind::System(MQTT_OUTBOUND_COMPONENT.to_string());
+    let live = env.messenger.directory();
+    for slug in &delta.mqtt_clients.removed {
+        let handle = env.mqtt_service.get_client(slug).unwrap_or_else(|| {
+            panic!(
+                "reload commit: client {slug:?} is removed but the registry holds no session \
+                 for it — the delta was computed against the registry, so this is a host bug",
+            )
+        });
+        handle.retire_egress_reader().await;
+        let address = mqtt_egress_address(slug);
+        let channel = live.resolve(&address).unwrap_or_else(|| {
+            panic!(
+                "reload commit: client {slug:?} is removed but its egress channel {address:?} is \
+                 not in the live directory — host bug",
+            )
+        });
+        assert!(
+            live.remove_subscriber(&channel.uuid, &kind).is_some(),
+            "reload commit: client {slug:?}'s egress channel {address:?} holds no subscriber \
+             entry for the egress participant — host bug",
+        );
+        env.mqtt_egress.close(slug).await;
+        info!(client = %slug, "reload: MQTT egress reader retired");
+    }
+}
+
 /// Step 5: install the candidate's agent map, and with it the tool list every
 /// successor process will read.
 ///
@@ -935,6 +1037,7 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
     let mut sessions = tokio::task::JoinSet::new();
     for new in &delta.mqtt_clients.changed {
         let service = env.mqtt_service.clone();
+        let hub = env.mqtt_egress.clone();
         let router = router.clone();
         let new = Arc::clone(new);
         sessions.spawn(async move {
@@ -949,6 +1052,9 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
             let (host, port) = (new.identity.host.clone(), new.identity.port);
             let successor =
                 register_and_spawn(&service, new, ArrivingFilters::Successor(&old), router).await;
+            // The predecessor's reader was joined with its session; the
+            // successor resumes from the same position on the same channel.
+            brenn_mqtt::start_egress_reader(&successor, hub.open(&slug).await);
             // The inherited set lands on the successor after the predecessor's
             // join, so a filter a concurrent subscribe added late is in this
             // count.

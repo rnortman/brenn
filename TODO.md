@@ -186,6 +186,24 @@ hook that compares `std::thread::current().id()` with the id recorded at
 install. Done = a panic on another thread during any of the three tests' windows
 does not change what they assert. The comment is at the test lock.
 
+## `correctness-publish-during-egress-retirement-silently-lost`
+
+A reload that removes an MQTT client retires the client's egress reader
+(`retire_egress_readers`, which abandons and reports what the channel held)
+before `remove_channels` takes the channel out of the directory, and the
+client stays in the MQTT service's table until its session stops after
+`swap_agents`. An `MqttSend` admitted in between, or admitted before the
+directory removal and committed after it, is answered as committed, lands
+past the abandoned position (or after the position is detached) and is never
+published, counted, logged or alerted. Admission and commit are not
+serialised against the directory removal, so reordering the steps narrows
+the window without closing it. Done = no commit to a removed client's egress
+channel can be answered committed without being published or reported
+dropped: for example admission refuses a client whose egress is closing,
+checked at commit under the same lock the retirement takes, or a count of the
+channel's entries past the abandoned position taken once no commit can land
+and reported as `Dropped { ClientRemoved }`.
+
 ## `dense-request-arguments-outgrow-guest`
 
 A provider's guest parses every new request of an activation into an owned
@@ -377,30 +395,67 @@ in-flight and backlog rows than the floor and the guest's memory cover read
 whole completes, each with a test. The comment sits at `sweep` in
 `brenn-provider-kit/src/activation.rs`.
 
+## `mqtt-async-publish-component-survey`
+
+The component functions `mqtt-publish` and `mqtt-publish-expiring` are to
+become commit-and-return: they stop returning `broker(..)` and
+`broker-rejected(..)`, and a publish from an activation that later traps is
+not sent. That rests on a survey of out-of-tree components for any that relies
+on the inline broker outcome. The survey read the owner's private component
+repository (one caller, `usage-proxy`, which retries no message),
+`brenn-fastmail` and `brenn-component-demo` (no MQTT publish calls). A
+repository named `brenn-demo-components` was named as out-of-tree and was not
+found; `brenn-component-demo` was read in its place. The owner says: whether
+`brenn-component-demo` is the one meant, and whether any component repository
+exists that the survey did not read. If one does and it relies on the inline
+outcome, the old functions keep their synchronous behaviour and the
+asynchronous one arrives only in a new contract version; if none does, the
+switch goes ahead as planned. The cycle that makes the switch repeats the
+survey over every repository it can reach and records what it could not check.
+Done = the owner has answered, or the switch has shipped with its survey
+recorded.
+
+## `mqtt-egress-removed-client-rows`
+
+A removed MQTT client's egress channel row and retained messages stay in the
+database with nothing to reap them, as for every durable channel that leaves
+the directory (`tool-registry-unregistered-tool-sweep` is the general case). A
+client added again under the same slug gets the same channel; its reader's new
+position skips whatever the channel still retains and logs the count. Done =
+removed channels are reaped under the general policy, or this channel family
+is reaped at removal.
+
 ## `mqtt-egress-unwired`
 
-The bus admits a publish to `mqtt:<client>:<topic>`
-(`Messenger::admit_mqtt` and `Messenger::publish_mqtt`,
-`brenn-messaging/src/publish/mqtt.rs`) and commits it to
-`brenn:egress/mqtt`, but nothing in production calls `publish_mqtt` and
-nothing reads the channel: `system:mqtt-outbound`
-(`brenn-messaging/src/mqtt_outbound.rs`) is declared in every plan as the
-channel's subscriber, and boot neither attaches its position nor runs a
-reader for it. `MqttSend` and the component `mqtt-publish` functions still
-publish to the broker directly, through `brenn-mqtt/src/egress.rs`. A
-message committed through `publish_mqtt` would rest on the channel and never
-reach a broker, so `publish_mqtt` must gain no caller before a reader
-exists. The admission is also unfinished in what it decides: it commits
-every client's messages to one channel, gives a message with no stated
-expiry the lifetime `MQTT_OUTBOUND_DEFAULT_LIFETIME`, and refuses
-`deliver_after` and `reply_to`. No test shows that a live feed of the
-channel carries the `MqttPublish` metadata the retained row does: the
-publish path hands the stored transport to `surface_feed_envelope`, and only
-retention is asserted. Done = every MQTT send is admitted through
-`admit_mqtt`, a reader delivers what it commits, and a test pins the fed
-envelope's transport against the retained row's; or the admission, the
-channel and the participant are removed. The comments are at
-`mqtt_outbound_spec` and at `publish_mqtt`.
+A component's `mqtt-publish` and `mqtt-publish-expiring` still publish to the
+broker directly and synchronously, through `brenn-mqtt/src/egress.rs` and
+`brenn-bootstrap/src/wasm_mqtt.rs`, under the 10 s `PUBLISH_WAIT`; only
+`MqttSend` goes through the bus admission (`Messenger::admit_mqtt`) and the
+per-client egress channels. The admission still refuses `deliver_after` and
+`reply_to` on an MQTT publish. Done = both component functions buffer with the
+activation and flush through `admit_mqtt`, `egress.rs`'s direct path and the
+wait machinery (`PUBLISH_WAIT`, `MqttError::TimedOut`, the wait budget, the
+MQTT `blocked` credit) are deleted, `reply_to` on an MQTT publish names an
+MQTT topic on the same broker that the sender's ACLs allow it to publish to
+and is sent as the MQTT 5 Response Topic, and `deliver_after` on an MQTT
+publish is accepted, the message parked on the bus and released into the
+client's egress channel with its lifetime counted from release. Documenting
+either refusal as final does not close this entry.
+
+## `mqtt-publish-acl-ops-config`
+
+Per-topic MQTT publish ACLs exist (`acl publish [topic_filter …]`), but the
+deployment config in the `brenn-ops` repository still grants publish per
+client: `deploy/brenn/config/prod/site.brenn` says "publish ACLs are per
+client, not per topic", and `deploy/brenn/config/prod/switcher.brenn` uses the
+client-only form, which deployment text now refuses. The wishlist in this
+project's brief asks for the owner's personal-assistant app to be scoped to
+`ha/cmd`, `zigbee2mqtt/+/set` and `zigbee2mqtt/+/get`. That repository is
+outside what the make-mqtt-great-again workflow may change. The owner decides:
+bring `brenn-ops` into the workflow's scope, or make the config change by hand
+at the deploy that carries the ACLs. Until one happens, every PA can publish
+to every topic on its broker. Done = the production config grants each MQTT
+publisher only the topic filters it needs.
 
 ## `obs-log-capture-test-flaky`
 
@@ -4562,8 +4617,10 @@ than concatenate.
 A `[[channel]]` tuning block may carry `noise`, and on a
 `brenn:tools/<tool>` request channel nothing reads it: the only substrate
 subscriber there is the tool executor, folded in as a system participant, and
-`fold_spec_subscriptions` hard-codes `NoiseLevel::Silent` on every system
-participant's subscription. So an operator who sizes a request channel and asks
+`fold_spec_subscriptions` writes the rung the participant's spec states, not
+the block's — `Silent` for every participant but the MQTT egress one
+(`system:mqtt-outbound`, `Alarm`), so the block's `noise` is inert on every
+system family, `brenn:egress/mqtt/<client>` included. So an operator who sizes a request channel and asks
 for `noise = alarm` on its overflow gets silence, and `noise = fatal` there is
 accepted and ignored — while the same rung on a `brenn:tool-results/<slug>`
 block is now inherited by the consumer's folded-in subscription and `fatal` is
@@ -4578,9 +4635,9 @@ the backend-`fatal` refusal to those families — or `noise` is refused on the
 blocks whose subscribers cannot enact it, and `docs/message-bus.md` §2.7 says
 which families those are.
 
-A system participant's drain also logs and counts what it steps over
-(`Messenger::count_stepped_over`, into the same tally `drop_counter` reads),
-because the `Silent` rung counts nothing. Enacting a system participant's rung
+A `Silent` system participant's drain also logs and counts what it steps
+over (`Messenger::count_stepped_over`, into the same tally `drop_counter`
+reads), because the `Silent` rung counts nothing. Enacting a system participant's rung
 must replace that count, or one loss would be counted twice.
 
 Code sites (`TODO(system-participant-noise-inert)`):

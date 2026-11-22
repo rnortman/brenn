@@ -10,6 +10,7 @@ use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::directory::SubscriberEntryKind;
 use brenn_lib::messaging::gates::{BodySizeExceeded, check_body_size};
 use brenn_messaging::SubscriberRegistration;
+use brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT;
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_surface_schema::LogLevel;
 use brenn_surface_server::bindings_doc::{BindingsDocParams, build_bindings_documents};
@@ -199,6 +200,16 @@ const SURFACE_DESCRIPTION_PARTICIPANTS: [&str; 2] =
 /// are keyed by participant rather than by channel, and its policy matches the
 /// request channels by prefix. A process that runs no executor has no inbox
 /// to grow, so an executor newly derived is refused.
+///
+/// The MQTT egress participant's subscriptions may differ in either direction:
+/// they are derived from the `[[mqtt_client]]` list, one per client, which a
+/// reload may change; its policy is one prefix matcher over the family, the
+/// same for every client set; its registration and delivery binding are keyed
+/// by participant; and the commit moves each subscription with its client's
+/// channel. Its policy and rung must still be equal, and a plan that stops
+/// deriving it is still refused.
+///
+/// Every participant's overflow rung is compared with the rest of its spec.
 pub(crate) fn system_participant_refusals(
     baseline: &[SystemParticipantSpec],
     candidate: &[SystemParticipantSpec],
@@ -219,6 +230,12 @@ pub(crate) fn system_participant_refusals(
                  process is running: {NEEDS_RESTART}"
             ));
         }
+        if now.noise != spec.noise {
+            out.push(format!(
+                "the {component:?} system participant's overflow rung is not the one this \
+                 process is running: {NEEDS_RESTART}"
+            ));
+        }
         if *component == TOOL_EXECUTOR_COMPONENT {
             for address in &spec.subscriptions {
                 if !now.subscriptions.contains(address) {
@@ -227,6 +244,8 @@ pub(crate) fn system_participant_refusals(
                     ));
                 }
             }
+        } else if *component == MQTT_OUTBOUND_COMPONENT {
+            // Moved with the client list; the commit moves each subscription.
         } else if now.subscriptions != spec.subscriptions {
             out.push(format!(
                 "the {component:?} system participant's subscriptions are not the ones this \
@@ -1158,6 +1177,39 @@ mod tests {
             vec![format!(
                 "the \"cc-profile\" system participant's subscriptions are not the ones this \
                  process is running: {NEEDS_RESTART}"
+            )],
+        );
+    }
+
+    /// The MQTT egress participant's subscriptions move with the client list
+    /// in either direction; its policy and its rung may not.
+    #[test]
+    fn the_mqtt_egress_participant_may_gain_and_lose_subscriptions() {
+        use brenn_messaging::mqtt_outbound::mqtt_outbound_spec;
+        let one = vec![mqtt_outbound_spec(["home", "away"])];
+        let two = vec![mqtt_outbound_spec(["away", "loft"])];
+        assert!(system_participant_refusals(&one, &two).is_empty());
+        assert!(system_participant_refusals(&one, &[mqtt_outbound_spec([])]).is_empty());
+
+        let mut quieter = mqtt_outbound_spec(["home"]);
+        quieter.noise = brenn_lib::messaging::NoiseLevel::Metered;
+        assert_eq!(
+            system_participant_refusals(&one, &[quieter]),
+            vec![format!(
+                "the \"mqtt-outbound\" system participant's overflow rung is not the one this \
+                 process is running: {NEEDS_RESTART}"
+            )],
+        );
+        let mut widened = mqtt_outbound_spec(["home"]);
+        widened
+            .policy
+            .grants
+            .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
+        assert_eq!(system_participant_refusals(&one, &[widened]).len(), 1);
+        assert_eq!(
+            system_participant_refusals(&one, &[]),
+            vec![format!(
+                "the \"mqtt-outbound\" system participant is no longer derived: {NEEDS_RESTART}"
             )],
         );
     }

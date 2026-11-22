@@ -1248,11 +1248,12 @@ Some channels are minted by the system rather than declared by the operator: the
 webhook ingress channels (`webhook:<slug>`), the MQTT ingress channels
 (`mqtt:<client>:<topic>`), the async-tool substrate's request and result
 channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`,
-`brenn:app-tool-results/<app-slug>`), and the per-user
-device-location channels (`brenn:device-location.<username>`). Nothing in config
-brings these into existence — an endpoint block, a subscription, a registered
-tool or a registered user does — so there is no declaring `[[channel]]` block to
-carry their depths.
+`brenn:app-tool-results/<app-slug>`), the per-user
+device-location channels (`brenn:device-location.<username>`), and the MQTT
+egress channels (`brenn:egress/mqtt/<client>`, §2.7.3). Nothing in config
+brings these into existence as channels — an endpoint block, a subscription, a
+registered tool, a registered user or an `mqtt_client` block does — so there
+is no declaring `[[channel]]` block to carry their depths.
 
 They still have to be *sized*, and the sizing rule is the same one everything
 else obeys: bounded, and visible to whoever ought to be deciding. Each family has
@@ -1263,6 +1264,7 @@ a bounded in-code default:
 | `webhook:<slug>`, `mqtt:<client>:<topic>` | 1 | 100 | 100 |
 | `brenn:tools/<tool>`, `brenn:tool-results/<slug>`, `brenn:app-tool-results/<app-slug>` | 1 | 16 | 16 |
 | `brenn:device-location.<username>` | 1 | 2000 | 2000 |
+| `brenn:egress/mqtt/<client>` | 1 | 256 | 256 |
 
 Ingress channels are fact channels; at their arrival rates a hundred messages is
 a horizon of days to months, which is what "sized for the outage you intend to
@@ -1335,9 +1337,11 @@ rungs from the channel's `retain_depth`; the channel's own push rung is the
 near-inert one described just above.
 
 A `brenn:tools/<tool>` request channel is the other way round: its only
-substrate subscriber is the tool executor, folded in as a system participant,
-and a system participant's overflow rung is `Silent` whatever the channel says.
-A `noise` written on a request-channel block is inert today
+substrate subscriber is the tool executor, folded in as a system participant.
+A system participant's overflow rung is the one its own spec states, whatever
+the channel says: `Silent` for every participant but the MQTT egress one,
+whose rung is `Alarm` (§2.7.3). A `noise` written on a tuning block of any
+system family, a request channel's included, is inert today
 (`TODO(system-participant-noise-inert)`).
 
 A request channel's window is also how many requests the executor can be
@@ -1617,6 +1621,26 @@ conversation sends it to a channel it may publish to with `brenn-tool send`
 (`docs/agent-tool-cli.md`), which answers with the new message's id, and
 names the attachment from that answer in `MqttSend`'s `attachment`.
 
+**The lifetime.** `lifetime_s` is required: a whole number of seconds from 1
+to 4294967295, or the string `"forever"`. It is how long Brenn keeps trying to
+hand the message to the broker, counted from the commit, and what is left of
+it when the message is handed over is sent as the MQTT 5 Message Expiry
+Interval, rounded up to whole seconds. `"forever"` sends no expiry. A missing,
+zero, negative, fractional or otherwise malformed value is an argument error
+naming both forms.
+
+**Commit, not delivery.** A call that passes every check is committed to the
+client's egress channel (§2.7.3) and answers at once:
+`{"ok": true, "message_id": "<uuid>", "remaining_budget": n,
+"client_connected": bool}`. `client_connected` is whether the client's session
+is connected at that instant; when it is not, the answer also carries a `note`
+naming the session's health and saying the message is committed and waits for
+a connection within its lifetime. A client that is not connected is not an
+error. What happens to the message afterwards — delivered, refused by the
+broker, expired, lost with a connection — is not in the answer and is not
+told to the caller; it goes to the operator (§2.7.3). At QoS 1 a message may
+be delivered twice after a reconnect.
+
 **The bound.** Each MQTT client publishes at most
 `outbound_payload_cap_bytes` (default 4 MiB, `docs/config-dsl.md`) per
 `MqttSend` call, measured on the bytes published: the string's UTF-8 length,
@@ -1626,42 +1650,167 @@ over it is refused with `reason` `payload_too_large`. The bound is
 `MqttSend`'s alone: a component's `mqtt-publish` is held to
 `[messaging] max_body_bytes` and never to this key.
 
+**The carrier.** A message's payload is its body when it fits
+`[messaging] max_body_bytes`. An inline payload over that cap is written to
+the blob store and committed as one attachment named `payload` beside an
+empty body; an attachment payload is committed as the attachment it names.
+Either way the bytes published are the payload's and the Content Type sent is
+the one the call stated, or the attachment's recorded type. With no blob store
+configured an over-cap inline payload is refused with `reason`
+`payload_unstorable`, as is one the blob store refuses, naming the store's
+reason.
+
 **Order.** A call is checked in this order, and every refusal before the
 budget spends none: the arguments; the attachment's admission, which takes a
-hold on the blob and reads no byte; the app's `mqtt_publish` grant and
-per-topic ACL, and the client's session; the bound; the read of the
-attachment's bytes; then the send budget and the publish. A denied or
-over-bound call reads no blob byte, and a denied call learns nothing of the
-client's bound. A source message evicted after admission does not affect the
-call: the hold keeps the bytes.
+hold on the blob and reads no byte; then the bus's admission — the address,
+the app's `mqtt_publish` grant and per-topic ACL, the client and its egress
+channel, QoS and content type, the payload's shape, the bound, the body cap's
+need for a blob store; the send rate; the send budget; the write of an
+over-cap inline payload to the blob store, whose refusal refunds the budget
+unit; then the commit. A denied call learns nothing of the client's bound. A
+client the server does not configure is answered as not configured, which is
+not a security event. A source attachment's message evicted after admission
+does not affect the call: the hold keeps the bytes.
 
 **The broker's maximum packet size.** When the broker's CONNACK advertises a
-Maximum Packet Size, a publish whose packet would exceed it is refused before
-it is sent, for a conversation and a component alike; the session stays up.
-The check runs in the publish step, after the budget, so for a conversation
-it spends one unit. `MqttSend` answers an error naming the packet's size, the
-client and the broker's maximum; a component's `mqtt-publish` answers
-`invalid-payload` with a fixed text and no broker-derived number, the numbers
-going to the host log. A broker that advertises no maximum arms no check.
+Maximum Packet Size, a packet that would exceed it is never sent, and the
+session stays up. For `MqttSend` the message is already committed: it is
+reported to the operator as refused, naming the packet's size and the
+broker's maximum. A component's `mqtt-publish` is refused before it is sent,
+after the budget, and answers `invalid-payload` with a fixed text and no
+broker-derived number, the numbers going to the host log. A broker that
+advertises no maximum arms no check.
 
-**The wait.** A publish waits on its MQTT session for at most 10 seconds from
-the call, for a conversation and a component alike: for room to submit, and at
-QoS 1 and 2 for the broker's acknowledgement. A publish the broker has not
-answered by then fails: `MqttSend` answers an error saying the publish did not
-complete in time and may still be delivered, and a component's `mqtt-publish`
-answers `broker("timed out")`. For a conversation the send budget unit is
-spent, as for any broker error. Brenn neither recalls nor resends the message:
-on a connection that recovers it goes out and is acknowledged late, so a retry
-can deliver it twice; on a connection that is lost it is dropped with the
-connection. For a component, time stopped in `mqtt-publish` is not charged to
-the activation's running-time limit; the host instead limits the total time
-one activation waits on one client, keyed on the client the host parsed out of
-the address. Once that is spent — 10 seconds of accumulated waiting, which one
-timed-out call reaches alone — every further publish to that client in the
-activation fails at once with `broker("wait budget spent")`. One activation is
-therefore stopped in publishes to one client for under 20 seconds, whatever the
-number of calls and however the guest spells the address; the next activation
-starts with a fresh budget.
+**A component's wait.** A component's `mqtt-publish` does not go through the
+bus: it publishes on its MQTT session directly and waits for at most 10
+seconds from the call, for room to submit and at QoS 1 and 2 for the broker's
+acknowledgement. A publish the broker has not answered by then fails with
+`broker("timed out")`. Brenn neither recalls nor resends the message: on a
+connection that recovers it goes out and is acknowledged late, so a retry can
+deliver it twice; on a connection that is lost it is dropped with the
+connection. Time stopped in `mqtt-publish` is not charged to the activation's
+running-time limit; the host instead limits the total time one activation
+waits on one client, keyed on the client the host parsed out of the address.
+Once that is spent — 10 seconds of accumulated waiting, which one timed-out
+call reaches alone — every further publish to that client in the activation
+fails at once with `broker("wait budget spent")`. One activation is therefore
+stopped in publishes to one client for under 20 seconds, whatever the number
+of calls and however the guest spells the address; the next activation starts
+with a fresh budget.
+
+### 2.7.3 MQTT egress
+
+Every `[[mqtt_client]]` has one egress channel, `brenn:egress/mqtt/<client>`,
+minted with the client at boot and by a reload that adds it. It is a durable,
+`non_text` channel the host alone writes: `MqttSend` commits to it, and no
+publish ACL, component output or surface output may name it. A component's
+`in` port may read a declared client's channel. Each message carries the
+publish in the envelope's `transport` key — `{"mqtt_publish": {"client_slug",
+"topic", "qos", "retain", "content_type", "expires"}}`, where `expires` is
+`{"at": "<rfc3339>"}` or `"never"` and `content_type` is absent when the call
+stated none — and its payload as the body or as one attachment (§2.7.2).
+
+**Admission.** `MqttSend`'s publish is admitted by the bus as any publish is,
+against the client's channel: authority, the client and its channel, the
+MQTT checks, the body cap, the send rate (drawn per sender and client) and the
+budget. A client being added or removed by a reload can be absent for a
+moment; a publish in that moment is answered as for an unknown client. A
+removed client is not absent at once: its reader is retired before its
+channel leaves the directory, and the client stays registered until its
+session stops. A publish admitted for it after the reader is retired is
+answered as committed and is never published, counted, logged or alerted
+(`TODO(correctness-publish-during-egress-retirement-silently-lost)`).
+
+**The reader.** Each client's session has one reader, a host task holding the
+system participant `system:mqtt-outbound`'s position on that client's channel.
+It hands the channel's messages to the session in channel order, one cursor,
+no other subscriber's business. It reads only while the session is connected.
+For each message it moves the cursor past the message *first*, durably, and
+then hands it to the MQTT library. So a crash between the two, or while the
+message is in flight, loses it and reports nothing: delivery is at most once
+across a crash. What a crash can lose is bounded by the in-flight limit.
+
+**The in-flight limit.** The reader keeps at most
+`min(Receive Maximum, window)` messages handed and not yet resolved: the
+broker's Receive Maximum from the current connection's CONNACK (65535 when it
+states none) and the channel's retain depth. Both are someone's stated
+intent — the broker's of what it will hold unacknowledged, the operator's of
+how many of this client's messages may be pending at once — and handing more
+moves messages from the durable channel into memory for no throughput. The
+count covers every QoS, which keeps channel order.
+
+**Lifetime.** A message's lifetime is judged when the reader reaches it, on
+the wall clock: one whose `expires` has passed is stepped over and reported
+expired, never sent; otherwise what is left is sent as the Message Expiry
+Interval, rounded up. A message waits on its channel while the client is
+disconnected and is judged when the client is next connected, so an expired
+message is reported then, not at the instant it expired.
+
+**Outcomes and who hears of them.** The caller hears of none: the call
+answered at commit. The operator hears of every outcome but a delivery. Each
+is a `warn` line naming the client, the kind, the cause or the broker's
+reason, the message id, the sender and the topic, a count per client and
+kind, and a `Warning` alert:
+
+| Outcome | When |
+|---|---|
+| delivered | the broker acknowledged it (QoS 1, 2), or it was written (QoS 0); logged at `debug` and counted, no alert |
+| rejected | the broker refused it with a reason code, or its packet is over the broker's Maximum Packet Size |
+| expired | its lifetime passed before the reader handed it over |
+| unknown | it was in flight when the connection was lost (QoS 0, 2) or when the session stopped |
+| dropped | the session stopped, or its client was removed, with messages the reader held or still owed; reported as a count |
+
+Alerts are coalesced per client and kind: the first failure of a kind raises
+an alert and opens an episode; later failures of that kind are logged and
+counted only; the client's next delivery, or its reader running dry, closes
+every open episode and raises one summary alert per episode that withheld
+any, with how many. A reconnect that finds 200 expired messages raises two
+alerts, not 200.
+
+**QoS across a reconnect.** A QoS 1 message in flight when the connection is
+lost is sent again as a new publish on the next connection, ahead of anything
+newer, so a subscriber may see it twice. A QoS 0 or QoS 2 message in flight at
+a loss is reported unknown and not resent. The reader hands nothing new until
+every message of the lost connection is resolved. When a client's
+configuration changes, its session is stopped and replaced: what was in
+flight is reported unknown, and what the reader held for resubmission is
+dropped and counted, not handed to the successor. The successor's reader
+resumes from the same cursor.
+
+**Overflow.** The egress channel is a window like any other: an outage longer
+than the window drops the oldest. Window overflow is the bus's to report, not
+the reader's: the participant's subscriber entry on each egress channel
+carries the `Alarm` rung, so the hourly eviction pass — which runs whether or
+not the client is connected — and the reader's own advance each count what
+the position was outrun by into the channel's drop tally, write a `warn` line,
+and raise a `Warning` alert naming the channel and the count. The store says
+how many, not which. A client that is down longer than the window is reported
+within one eviction pass of the loss.
+
+**Sizing.** The default window is 256 messages. A prefix block
+`channel at prefix "brenn:egress/mqtt/" { … }` tunes every client's; an exact
+block `channel at "brenn:egress/mqtt/<client>" { … }` tunes one, and must name
+a declared client. The window is the outage to survive, counted in this
+client's publishes, and also the in-flight ceiling. A retune needs a restart:
+a reload that changes an egress channel's tuning is refused. The channel is
+durable and the cursor survives, so the restart loses nothing.
+
+**Reload.** A reload that adds a client mints its channel, gives the reader a
+position on it and starts the reader before any policy can name the client.
+One that removes a client retires the reader before the channel leaves: what
+the channel held for the reader when it was retired is abandoned and reported
+dropped with the count, and the position and subscriber entry are removed with
+the channel. A publish committed after that is lost unreported (Admission,
+above). The removed
+channel's stored row and retained messages stay in the database
+(`TODO(mqtt-egress-removed-client-rows)`). One that changes a client keeps the
+channel and the cursor and starts a reader on the successor session.
+
+**A fresh position.** A position created on a channel that already retains
+messages — a client added again under a slug that was removed — skips them:
+they were committed for the earlier client and are not published. The skip is
+logged at `warn` with the count. A restart resumes an existing position and
+hands off exactly what was not handed.
 
 ### 2.8 The reload pair
 

@@ -8,6 +8,7 @@ use brenn_mqtt::{ArrivingFilters, register_and_spawn, union_subscriptions};
 use indexmap::IndexMap;
 use tracing::info;
 
+use brenn_server::mqtt_egress::MqttEgressHub;
 use brenn_server::mqtt_router::{IngressRoute, MqttEventRouterImpl};
 
 /// Outcome of starting the MQTT service.
@@ -123,6 +124,56 @@ pub(crate) async fn wire_mqtt_state(
         routes = route_count,
         "MQTT service started; supervisors running"
     );
+}
+
+/// Put every registered client's egress channel into service: build the hub,
+/// give each client its position and start its reader, and spawn the relay
+/// that turns the participant's one delivery wake into a wake for every
+/// reader.
+///
+/// Must run before anything can publish to an egress channel, so a fresh
+/// position's skip covers only what an earlier client of the slug left.
+///
+/// The relay holds no timer: it waits on `notify` alone. A reader woken for
+/// another client's channel reads its own once and finds nothing.
+///
+/// # Panics
+///
+/// If a registered client's egress channel is not in the directory (the plan
+/// mints one per declared client), or a reader was already started on a
+/// client's handle.
+pub(crate) async fn start_mqtt_egress(
+    service: &MqttService,
+    messenger: Arc<brenn_messaging::Messenger>,
+    alerts: brenn_obs::alerting::AlertDispatcher,
+    notify: Arc<tokio::sync::Notify>,
+) -> Arc<MqttEgressHub> {
+    let hub = MqttEgressHub::new(messenger, alerts);
+    for slug in service.client_slugs() {
+        let handle = service
+            .get_client(&slug)
+            .unwrap_or_else(|| panic!("MQTT client {slug:?} was listed and is not registered"));
+        brenn_mqtt::start_egress_reader(&handle, hub.open(&slug).await);
+        info!(client = %slug, "MQTT egress reader started");
+    }
+    // The relay does not keep the hub alive: a hub nothing else holds has no
+    // reader to wake, and the relay ends at the first wake after it is gone.
+    // The handle is dropped, as for the other drain tasks; a panic is process
+    // death.
+    let relay = Arc::downgrade(&hub);
+    drop(tokio::spawn(brenn_lib::panic_util::abort_on_panic(
+        "MQTT egress wake relay panicked",
+        async move {
+            loop {
+                notify.notified().await;
+                let Some(hub) = relay.upgrade() else {
+                    return;
+                };
+                hub.wake_all();
+            }
+        },
+    )));
+    hub
 }
 
 #[cfg(test)]

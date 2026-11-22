@@ -2521,8 +2521,9 @@ pub enum SystemChannelFamily {
     /// every location fix and sharing change that user's devices report.
     DeviceLocation,
     /// `brenn:egress/<transport>` — channels the host's admission writes for a
-    /// transport off the bus, which nothing reads; `brenn:egress/mqtt` is the
-    /// one member. Its bodies are payloads, so it is always `non_text`.
+    /// transport off the bus and the host reads to hand each message to that
+    /// transport; the members are `brenn:egress/mqtt/<client>`, one per
+    /// `[[mqtt_client]]`. Its bodies are payloads, so it is always `non_text`.
     Egress,
 }
 

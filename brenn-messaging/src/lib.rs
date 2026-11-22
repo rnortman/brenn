@@ -2688,14 +2688,15 @@ impl Messenger {
             .remove(&(channel.to_owned(), subscriber.as_str().to_owned()));
     }
 
-    /// Log and count `dropped` messages a system participant's drain stepped
-    /// over unread on `channel`: one `warn` line naming the participant, the
-    /// channel and the figure, and the same figure added to the participant's
-    /// tally, read through [`Self::drop_counter`].
+    /// Log and count `dropped` messages a `Silent` system participant's drain
+    /// stepped over unread on `channel`: one `warn` line naming the
+    /// participant, the channel and the figure, and the same figure added to
+    /// the participant's tally, read through [`Self::drop_counter`].
     ///
-    /// The tally is exact because nothing else writes it for a system
-    /// participant: its rung is `Silent`, which `enact_overflow_noise` counts
-    /// nothing under, for an advance and for an eviction pass alike.
+    /// The tally is exact because nothing else writes it for such a
+    /// participant: `enact_overflow_noise` counts nothing under `Silent`, for
+    /// an advance and for an eviction pass alike. A participant whose spec
+    /// states another rung is counted there and must not be counted here.
     ///
     /// TODO(system-participant-noise-inert): enacting a system participant's
     /// rung must replace this count, or one loss would be counted twice.
@@ -2766,6 +2767,13 @@ impl Messenger {
             }
         }
         if noise == config::NoiseLevel::Alarm {
+            tracing::warn!(
+                channel,
+                subscriber = subscriber.as_str(),
+                dropped = count,
+                "subscriber's position was outrun: the channel's window dropped messages it \
+                 never read",
+            );
             self.router.alarm(channel, subscriber, count);
         }
     }

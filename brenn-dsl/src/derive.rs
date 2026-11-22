@@ -42,11 +42,11 @@ use uuid::Uuid;
 
 use brenn_envelope::ChannelScheme;
 use brenn_envelope::addressing::{
-    MATCHER_BOUNDARIES, MQTT_OUTBOUND_CHANNEL, NON_TEXT_FAMILY_REFUSAL, TOOL_REQUESTS_NAMESPACE,
-    TUNING_BOUNDARIES, UNTYPED_CONTENT_TYPE_FAMILY_REFUSAL, ends_at_matcher_boundary,
-    ends_at_tuning_boundary, in_a_tool_namespace, in_app_tool_results_namespace,
-    in_the_device_location_family, in_the_egress_namespace, is_auto_channel_name,
-    is_device_location_prefix, is_egress_segment_name, nondurable_channel_uuid,
+    MATCHER_BOUNDARIES, NON_TEXT_FAMILY_REFUSAL, TOOL_REQUESTS_NAMESPACE, TUNING_BOUNDARIES,
+    UNTYPED_CONTENT_TYPE_FAMILY_REFUSAL, ends_at_matcher_boundary, ends_at_tuning_boundary,
+    in_a_tool_namespace, in_app_tool_results_namespace, in_the_device_location_family,
+    in_the_egress_namespace, is_auto_channel_name, is_device_location_prefix,
+    is_egress_segment_name, mqtt_egress_client, nondurable_channel_uuid,
 };
 use brenn_envelope::channel_model::{
     ChannelBlockRole, ChannelDepthKey, TUNING_DURABILITY_IGNORED, depth_required, sink_admitted,
@@ -2020,6 +2020,8 @@ fn family_admits(
         return true;
     }
     if family == Family::MqttPublish && kind == MatcherKind::Client {
+        // TODO(mqtt-publish-acl-ops-config): the production deployment text
+        // still uses this refused form.
         errors.push(Diagnostic::at(
             client_only_publish(bare),
             matcher.val.span().clone(),
@@ -2985,10 +2987,23 @@ fn bound_address(
         ));
         return None;
     }
-    // The outbound channel is minted by the system, never declared, and is read
-    // by ACL like any channel, so a component's `in` port may name it.
-    if egress_namespace && bare == MQTT_OUTBOUND_CHANNEL && kind != EntityKind::Agent {
-        return Some((scheme, bare.to_string()));
+    // A client's egress channel is minted by the system, never declared, and
+    // is read by ACL like any channel, so a component's `in` port may name it.
+    if egress_namespace && kind != EntityKind::Agent {
+        if mqtt_egress_client(bare).is_some_and(|client| refs.clients.contains(client)) {
+            return Some((scheme, bare.to_string()));
+        }
+        errors.push(Diagnostic::at(
+            format!(
+                "this {} of {} `{label}` names `{address}`, in the egress namespace, which \
+                 is no declared client's egress channel: each `mqtt_client` has one, \
+                 `brenn:egress/mqtt/<client>`",
+                bound.what,
+                kind.label(),
+            ),
+            bound.span.clone(),
+        ));
+        return None;
     }
     if matches!(bound.chan, RChanRef::Addr(_))
         && matches!(scheme, ChannelScheme::Brenn | ChannelScheme::Ephemeral)

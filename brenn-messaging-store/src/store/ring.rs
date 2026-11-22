@@ -44,8 +44,8 @@ use crate::db::ns_to_utc;
 use crate::store::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
     DeliverableSubscriber, MessageSeq, NewMessage, OverflowEvent, Parked, ReleaseOutcome, Released,
-    ResumeCursor, RetentionStore, StoreReplay, SubscriberWindow, depth_bound, instant_of,
-    release_time_of,
+    ResumeCursor, RetentionStore, StoreReplay, SubscriberWindow, assert_sampled_head_unasked,
+    depth_bound, instant_of, release_time_of,
 };
 use brenn_lib::messaging::ParticipantId;
 use brenn_lib::messaging::config::Depth;
@@ -925,6 +925,26 @@ impl RetentionStore for RingStore {
                 .map(|entry| (MessageSeq(entry.seq), entry.message))
                 .collect(),
         })
+    }
+
+    async fn unseen_head(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+        limit: usize,
+    ) -> Option<Vec<(MessageSeq, Arc<MessageEnvelope>)>> {
+        assert_sampled_head_unasked(self.address(), push_limit);
+        let bound = depth_bound(push_limit);
+        let window = RingStore::window(self, subscriber, bound, bound)?;
+        Some(
+            window
+                .entries
+                .into_iter()
+                .skip(window.new_from)
+                .take(limit)
+                .map(|entry| (MessageSeq(entry.seq), entry.message))
+                .collect(),
+        )
     }
 
     /// `None` for a subscriber with no cursor on this channel.

@@ -290,12 +290,23 @@ pub const EGRESS_SEGMENT: &str = "egress";
 /// surface output may name one as a publish target.
 pub const EGRESS_NAMESPACE: &str = "egress/";
 
-/// Bare name of the MQTT outbound channel, which every admitted publish to an
-/// `mqtt:<client>:<topic>` address is committed to.
-pub const MQTT_OUTBOUND_CHANNEL: &str = "egress/mqtt";
+/// Bare-name prefix of the MQTT egress channels: each configured MQTT client
+/// `<client>` has one, `egress/mqtt/<client>`, which every admitted publish
+/// to an `mqtt:<client>:<topic>` address is committed to.
+pub const MQTT_EGRESS_PREFIX: &str = "egress/mqtt/";
 
-/// Canonical address of [`MQTT_OUTBOUND_CHANNEL`].
-pub const MQTT_OUTBOUND_ADDRESS: &str = "brenn:egress/mqtt";
+/// Canonical address of `client`'s MQTT egress channel,
+/// `brenn:egress/mqtt/<client>`.
+pub fn mqtt_egress_address(client: &str) -> String {
+    canonical_address(&format!("{MQTT_EGRESS_PREFIX}{client}"))
+}
+
+/// The client slug of a bare MQTT egress channel name (`egress/mqtt/<client>`),
+/// `None` for any other name, including the prefix with nothing after it.
+pub fn mqtt_egress_client(bare: &str) -> Option<&str> {
+    bare.strip_prefix(MQTT_EGRESS_PREFIX)
+        .filter(|client| !client.is_empty())
+}
 
 /// Why no tuning of a system-minted family other than ingress takes
 /// `non_text`, so the config language and boot give the operator the same
@@ -630,13 +641,29 @@ mod tests {
                 "{name} must not be reserved"
             );
         }
-        assert!(in_the_egress_namespace(MQTT_OUTBOUND_CHANNEL));
+        assert!(in_the_egress_namespace("egress/mqtt/home"));
+        assert!(is_reserved_channel_name("egress/mqtt/home"));
         assert!(!in_the_egress_namespace("egress"));
         assert!(!in_the_egress_namespace("egress.x"));
-        assert_eq!(
-            MQTT_OUTBOUND_ADDRESS,
-            canonical_address(MQTT_OUTBOUND_CHANNEL)
-        );
+    }
+
+    #[test]
+    fn mqtt_egress_names_round_trip() {
+        assert_eq!(mqtt_egress_address("home"), "brenn:egress/mqtt/home");
+        for client in ["home", "a.b_c~d-1"] {
+            let address = mqtt_egress_address(client);
+            let bare = address.strip_prefix(BRENN_ADDRESS_PREFIX).unwrap();
+            assert_eq!(mqtt_egress_client(bare), Some(client));
+        }
+        for bare in [
+            "egress/mqtt/",
+            "egress/mqtt",
+            "egress/other/home",
+            "mqtt/home",
+            "",
+        ] {
+            assert_eq!(mqtt_egress_client(bare), None, "{bare:?}");
+        }
     }
 
     #[test]
@@ -1081,12 +1108,16 @@ mod tests {
     /// **Do NOT change this test if the UUID changes.** Fix the derivation.
     #[test]
     fn egress_channel_uuid_is_pinned_and_distinct() {
-        let u = egress_channel_uuid(MQTT_OUTBOUND_ADDRESS);
+        let u = egress_channel_uuid("brenn:egress/mqtt");
         assert_eq!(u.to_string(), "71713547-cec9-5465-89d3-13dc1800d605");
-        assert_ne!(u, egress_channel_uuid("brenn:egress/other"));
-        assert_ne!(u, device_location_channel_uuid(MQTT_OUTBOUND_ADDRESS));
-        assert_ne!(u, tool_channel_uuid_from_address(MQTT_OUTBOUND_ADDRESS));
-        assert_ne!(u, chat_channel_uuid_from_address(MQTT_OUTBOUND_ADDRESS));
-        assert_ne!(u, durable_auto_channel_uuid(MQTT_OUTBOUND_ADDRESS));
+        let address = mqtt_egress_address("home");
+        let client = egress_channel_uuid(&address);
+        assert_eq!(client.to_string(), "9677ad96-cd13-57dd-b4af-2b569a324169");
+        assert_ne!(client, u);
+        assert_ne!(client, egress_channel_uuid(&mqtt_egress_address("away")));
+        assert_ne!(client, device_location_channel_uuid(&address));
+        assert_ne!(client, tool_channel_uuid_from_address(&address));
+        assert_ne!(client, chat_channel_uuid_from_address(&address));
+        assert_ne!(client, durable_auto_channel_uuid(&address));
     }
 }

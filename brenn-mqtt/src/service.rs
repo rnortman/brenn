@@ -19,8 +19,8 @@ use crate::connection::{
 };
 use crate::payload::InboundPayload;
 use crate::state::{
-    ConnectorHealthLabel, DEFERRED_SUBSCRIBES_POISONED, MqttClientHandle,
-    PENDING_PUBLISHES_POISONED, PendingPublish, PubackOutcome, SubAckOutcome, SupervisorState,
+    ConnectorHealthLabel, DEFERRED_SUBSCRIBES_POISONED, MqttClientHandle, NoticeOutcome,
+    PubackOutcome, SubAckOutcome, SupervisorState, notice_outcome,
 };
 use brenn_lib::messaging::Urgency;
 use brenn_lib::mqtt::config::MqttClientConfig;
@@ -522,7 +522,9 @@ impl MqttService {
     /// Publish a message on the session for `handle`.
     ///
     /// - QoS 0: returns success once the client accepts the packet.
-    /// - QoS 1/2: waits for PUBACK/PUBCOMP.
+    /// - QoS 1/2: waits for the outcome the client library reports for the
+    ///   packet: acknowledged, rejected by the broker, or its connection ended
+    ///   first (`NotConnected`, with the supervisor's current `last_error`).
     ///
     /// The whole call waits on the session at most [`PUBLISH_WAIT`], measured
     /// from entry; past it the call returns `Err(MqttError::TimedOut)`. A
@@ -530,16 +532,14 @@ impl MqttService {
     /// still be delivered; nothing recalls or resends it.
     ///
     /// Returns `Err(MqttError::NotConnected)` without waiting if the client is
-    /// currently disconnected (no queueing), and
-    /// `Err(MqttError::PacketTooLarge)` without submitting anything if the
+    /// currently disconnected (no queueing) or its request channel is full,
+    /// and `Err(MqttError::PacketTooLarge)` without submitting anything if the
     /// encoded packet exceeds the Maximum Packet Size the broker advertised for
     /// the current connection. The client library would otherwise fail the
     /// packet in its event loop and drop the whole session with it.
     ///
-    /// The future can be dropped at any await. The only await at which a
-    /// waiter exists is the wait for the acknowledgement; dropping it there
-    /// leaves the waiter in its slot, where its own acknowledgement or the end
-    /// of the connection removes it.
+    /// The future can be dropped at any await; dropping it while it waits for
+    /// the outcome drops the packet's notice and leaves nothing behind.
     pub async fn publish_on_handle(
         &self,
         handle: &Arc<MqttClientHandle>,
@@ -547,25 +547,17 @@ impl MqttService {
         payload: Vec<u8>,
         props: PublishProps,
     ) -> Result<PubackOutcome, MqttError> {
-        use rumqttc::PublishProperties;
-        use rumqttc::mqttbytes::QoS;
-
         let PublishProps {
             content_type,
             qos,
             retain,
             message_expiry_s,
         } = props;
-        let rumq_qos = match qos {
-            0 => QoS::AtMostOnce,
-            1 => QoS::AtLeastOnce,
-            2 => QoS::ExactlyOnce,
-            _ => {
-                return Err(MqttError::NotConnected {
-                    client_slug: handle.config.identity.slug.clone(),
-                    last_error: Some(format!("invalid qos: {qos}")),
-                });
-            }
+        let Some(rumq_qos) = qos_of(qos) else {
+            return Err(MqttError::NotConnected {
+                client_slug: handle.config.identity.slug.clone(),
+                last_error: Some(format!("invalid qos: {qos}")),
+            });
         };
 
         let deadline = tokio::time::Instant::now() + PUBLISH_WAIT;
@@ -573,51 +565,29 @@ impl MqttService {
             client_slug: handle.config.identity.slug.clone(),
             waited: PUBLISH_WAIT,
         };
+        let not_connected = |last_error: Option<String>| MqttError::NotConnected {
+            client_slug: handle.config.identity.slug.clone(),
+            last_error,
+        };
 
-        let properties =
-            (content_type.is_some() || message_expiry_s.is_some()).then(|| PublishProperties {
-                content_type,
-                message_expiry_interval: message_expiry_s,
-                ..Default::default()
-            });
+        let properties = publish_properties(content_type, message_expiry_s);
 
         // Submit phase: `Ok(None)` once a QoS 0 packet is accepted, `Ok(Some)`
-        // with the acknowledgement receiver once a QoS 1/2 packet is submitted.
+        // with the packet's notice once a QoS 1/2 packet is submitted.
         let submit = async {
-            // Held across the QoS 1/2 submit so concurrent publishers push and
-            // submit in one order, and so no publisher submits onto a client the
-            // supervisor has already cleared and drained.
+            // Held across the QoS 1/2 submit so no publisher submits onto a
+            // client the supervisor has already cleared.
             let client_guard = handle.client.lock().await;
-            let client = match client_guard.as_ref() {
-                None => {
-                    let state = handle.supervisor_state.read().await;
-                    return Err(MqttError::NotConnected {
-                        client_slug: handle.config.identity.slug.clone(),
-                        last_error: state.last_error().map(|s| s.to_string()),
-                    });
-                }
-                Some(c) => c.clone(),
+            let Some(client) = client_guard.as_ref() else {
+                let state = handle.supervisor_state.read().await;
+                return Err(not_connected(state.last_error().map(|s| s.to_string())));
             };
 
-            // Measured as the library will encode it: same topic, QoS, retain,
-            // payload and properties, and a non-zero packet identifier at QoS
-            // 1/2, which the encoder counts only when set. `Bytes::from(Vec)`
-            // takes the buffer without copying, and the measured packet shares
-            // it.
             let payload = bytes::Bytes::from(payload);
             let broker_max = handle.broker_max_packet_size.load(Ordering::Relaxed);
             if broker_max != 0 {
-                let mut packet = rumqttc::Publish::new(
-                    topic.as_str(),
-                    rumq_qos,
-                    payload.clone(),
-                    properties.clone(),
-                );
-                packet.retain = retain;
-                if qos != 0 {
-                    packet.pkid = 1;
-                }
-                let packet_bytes = packet.size();
+                let packet_bytes =
+                    publish_packet_size(&topic, rumq_qos, retain, &payload, &properties);
                 if packet_bytes > broker_max as usize {
                     return Err(MqttError::PacketTooLarge {
                         client_slug: handle.config.identity.slug.clone(),
@@ -628,6 +598,7 @@ impl MqttService {
             }
 
             if qos == 0 {
+                let client = client.clone();
                 drop(client_guard);
                 let result = if let Some(props) = properties {
                     client
@@ -636,69 +607,95 @@ impl MqttService {
                 } else {
                     client.publish(topic, rumq_qos, retain, payload).await
                 };
-                result.map_err(|e| MqttError::NotConnected {
-                    client_slug: handle.config.identity.slug.clone(),
-                    last_error: Some(e.to_string()),
-                })?;
+                result.map_err(|e| not_connected(Some(e.to_string())))?;
                 return Ok(None);
             }
 
-            // QoS 1/2: push the waiter and submit in one synchronous section,
-            // under the still-held `client` guard, so the pkid binding order
-            // (bound in the supervisor's `Outgoing::Publish` arm, FIFO) matches
-            // submission order across concurrent publishers on the shared
-            // session, and so no await separates a waiter from its packet.
-            //
-            // Submission uses the non-blocking `try_publish`, not
-            // `publish(...).await`. The blocking form awaits request-channel
-            // capacity; awaiting it while holding the `client` guard deadlocks
-            // the session — on a stalled/disconnecting broker the supervisor
-            // drains and rebuilds the event loop only after re-acquiring this
-            // same guard. A full channel therefore surfaces at once as
-            // `NotConnected`, and the waiter is popped again: no other
-            // publisher can have pushed since, so it is provably at the back.
-            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-            let result = {
-                let mut pending = handle
-                    .pending_publishes
-                    .lock()
-                    .expect(PENDING_PUBLISHES_POISONED);
-                pending.push_back(PendingPublish { ack_tx });
-                let result = if let Some(props) = properties {
-                    client.try_publish_with_properties(topic, rumq_qos, retain, payload, props)
-                } else {
-                    client.try_publish(topic, rumq_qos, retain, payload)
-                };
-                if result.is_err() {
-                    pending.pop_back();
-                }
-                result
+            // QoS 1/2 submits with the non-blocking `try_*` form, not the
+            // awaiting one. The awaiting form waits for request-channel
+            // capacity; waiting for it while holding the `client` guard
+            // deadlocks the session, because the supervisor clears the cell
+            // under this same guard before it rebuilds the event loop. A full
+            // channel therefore surfaces at once as `NotConnected`.
+            let notice = if let Some(props) = properties {
+                client.try_publish_with_properties_tracked(topic, rumq_qos, retain, payload, props)
+            } else {
+                client.try_publish_tracked(topic, rumq_qos, retain, payload)
             };
             drop(client_guard);
-            result.map_err(|e| MqttError::NotConnected {
-                client_slug: handle.config.identity.slug.clone(),
-                last_error: Some(e.to_string()),
-            })?;
-            Ok(Some(ack_rx))
+            let notice = notice.map_err(|e| not_connected(Some(e.to_string())))?;
+            Ok(Some(notice))
         };
 
-        let ack_rx = match tokio::time::timeout_at(deadline, submit).await {
+        let notice = match tokio::time::timeout_at(deadline, submit).await {
             Err(_elapsed) => return Err(timed_out()),
             Ok(submitted) => submitted?,
         };
-        let Some(ack_rx) = ack_rx else {
+        let Some(notice) = notice else {
             return Ok(PubackOutcome::Success);
         };
 
-        match tokio::time::timeout_at(deadline, ack_rx).await {
+        match tokio::time::timeout_at(deadline, notice.wait_async()).await {
             Err(_elapsed) => Err(timed_out()),
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => Err(MqttError::NotConnected {
-                client_slug: handle.config.identity.slug.clone(),
-                last_error: Some("supervisor task dropped the ack channel".to_string()),
-            }),
+            Ok(result) => match notice_outcome(result) {
+                NoticeOutcome::Delivered => Ok(PubackOutcome::Success),
+                NoticeOutcome::Rejected { reason } => {
+                    tracing::warn!(
+                        client = %handle.config.identity.slug,
+                        reason = %reason,
+                        "publish rejected by broker",
+                    );
+                    Ok(PubackOutcome::BrokerRejected { reason })
+                }
+                NoticeOutcome::ConnectionEnded => {
+                    let state = handle.supervisor_state.read().await;
+                    Err(not_connected(state.last_error().map(|s| s.to_string())))
+                }
+            },
         }
     }
+}
+
+/// The library's QoS for an MQTT QoS number; `None` above 2.
+pub(crate) fn qos_of(qos: u8) -> Option<rumqttc::mqttbytes::QoS> {
+    match qos {
+        0 => Some(rumqttc::mqttbytes::QoS::AtMostOnce),
+        1 => Some(rumqttc::mqttbytes::QoS::AtLeastOnce),
+        2 => Some(rumqttc::mqttbytes::QoS::ExactlyOnce),
+        _ => None,
+    }
+}
+
+/// The PUBLISH properties carrying `content_type` and the Message Expiry
+/// Interval `expiry`; `None` when there is neither.
+pub(crate) fn publish_properties(
+    content_type: Option<String>,
+    expiry: Option<u32>,
+) -> Option<rumqttc::PublishProperties> {
+    (content_type.is_some() || expiry.is_some()).then(|| rumqttc::PublishProperties {
+        content_type,
+        message_expiry_interval: expiry,
+        ..Default::default()
+    })
+}
+
+/// The size of a PUBLISH as the client library will encode it: same topic,
+/// QoS, retain, payload and properties, and a non-zero packet identifier at
+/// QoS 1/2, which the encoder counts only when set. The measured packet shares
+/// `payload`'s buffer.
+pub(crate) fn publish_packet_size(
+    topic: &str,
+    qos: rumqttc::mqttbytes::QoS,
+    retain: bool,
+    payload: &bytes::Bytes,
+    properties: &Option<rumqttc::PublishProperties>,
+) -> usize {
+    let mut packet = rumqttc::Publish::new(topic, qos, payload.clone(), properties.clone());
+    packet.retain = retain;
+    if qos != rumqttc::mqttbytes::QoS::AtMostOnce {
+        packet.pkid = 1;
+    }
+    packet.size()
 }
 
 /// The registry is the client table the bus admits an `mqtt:` publish against:
@@ -1147,9 +1144,9 @@ mod tests {
     }
 
     /// A publish one byte over the broker's maximum is refused before it is
-    /// submitted, at QoS 0 and at QoS 1: no waiter is queued and the event
-    /// loop holds nothing, so the session is never handed a packet it would
-    /// fail on. One exactly at the maximum is submitted.
+    /// submitted, at QoS 0 and at QoS 1: the event loop holds nothing, so the
+    /// session is never handed a packet it would fail on. One exactly at the
+    /// maximum is submitted.
     #[tokio::test]
     async fn publish_over_the_broker_maximum_is_refused_before_submit() {
         let svc = MqttService::new();
@@ -1176,7 +1173,6 @@ mod tests {
             }),
             "the packet identifier counts at QoS 1",
         );
-        assert!(handle.pending_publishes.lock().unwrap().is_empty());
         assert_eq!(queued_requests(&mut eventloop), 0);
 
         let exact = publish_bytes(&svc, &handle, 10, 0).await;
@@ -1217,7 +1213,7 @@ mod tests {
         client
             .try_publish("t/fill", rumqttc::mqttbytes::QoS::AtMostOnce, false, "x")
             .expect("the one slot is free");
-        crate::connection::install_connection(&handle, client, None).await;
+        crate::connection::install_connection(&handle, client, None, None).await;
         (handle, eventloop)
     }
 
@@ -1231,14 +1227,14 @@ mod tests {
     }
 
     /// A QoS 1 publish whose acknowledgement never comes returns `TimedOut`
-    /// once `PUBLISH_WAIT` has passed, and leaves its waiter in its slot for
-    /// its own acknowledgement or the end of the connection to remove.
+    /// once `PUBLISH_WAIT` has passed; its packet stays with the client
+    /// library.
     #[tokio::test(start_paused = true)]
     async fn a_qos1_publish_with_no_acknowledgement_times_out() {
         let svc = MqttService::new();
         let handle = make_handle("home");
         svc.add_client(handle.clone());
-        let _eventloop = crate::test_support::install_unpolled_client(&handle, None).await;
+        let mut eventloop = crate::test_support::install_unpolled_client(&handle, None).await;
 
         let start = tokio::time::Instant::now();
         let result = publish_bytes(&svc, &handle, 1, 1).await;
@@ -1250,18 +1246,13 @@ mod tests {
             })
         );
         assert!(start.elapsed() >= PUBLISH_WAIT);
-        let pending = handle.pending_publishes.lock().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert!(
-            pending[0].ack_tx.is_closed(),
-            "the caller's receiver is gone"
-        );
+        assert_eq!(queued_requests(&mut eventloop), 1);
     }
 
     /// With the request channel full a QoS 1 publish fails at once with
-    /// `NotConnected`, and the waiter it pushed is popped again.
+    /// `NotConnected`.
     #[tokio::test(start_paused = true)]
-    async fn a_qos1_publish_onto_a_full_request_channel_fails_at_once_and_rolls_back() {
+    async fn a_qos1_publish_onto_a_full_request_channel_fails_at_once() {
         let svc = MqttService::new();
         let (handle, _eventloop) = handle_with_a_full_request_channel(&svc).await;
 
@@ -1274,7 +1265,39 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(start.elapsed(), std::time::Duration::ZERO);
-        assert!(handle.pending_publishes.lock().unwrap().is_empty());
+    }
+
+    /// A QoS 1 or 2 publish whose connection ends while it waits returns
+    /// `NotConnected` carrying the reason the supervisor recorded for the
+    /// loss, which the supervisor writes before it drops the event loop.
+    #[tokio::test]
+    async fn a_publish_whose_connection_ends_while_waiting_is_not_connected() {
+        for q in [1, 2] {
+            let svc = MqttService::new();
+            let handle = make_handle("home");
+            svc.add_client(handle.clone());
+            let eventloop = crate::test_support::install_unpolled_client(&handle, None).await;
+
+            let fut = publish_bytes(&svc, &handle, 1, q);
+            tokio::pin!(fut);
+            poll_once_pending(fut.as_mut()).await;
+
+            *handle.client.lock().await = None;
+            *handle.supervisor_state.write().await = SupervisorState::Disconnected {
+                last_error: Some("connection reset by peer".to_string()),
+                next_attempt_at: std::time::Instant::now(),
+            };
+            drop(eventloop);
+
+            assert_eq!(
+                fut.await.err(),
+                Some(MqttError::NotConnected {
+                    client_slug: "home".to_string(),
+                    last_error: Some("connection reset by peer".to_string()),
+                }),
+                "qos {q}",
+            );
+        }
     }
 
     /// With the request channel full a QoS 0 publish waits for room for
@@ -1296,13 +1319,13 @@ mod tests {
     }
 
     /// While something else holds the `client` lock a publish waits for it
-    /// only until `PUBLISH_WAIT`, and touches the queue not at all.
+    /// only until `PUBLISH_WAIT`, and submits nothing.
     #[tokio::test(start_paused = true)]
     async fn a_publish_blocked_on_the_client_lock_times_out() {
         let svc = MqttService::new();
         let handle = make_handle("home");
         svc.add_client(handle.clone());
-        let _eventloop = crate::test_support::install_unpolled_client(&handle, None).await;
+        let mut eventloop = crate::test_support::install_unpolled_client(&handle, None).await;
         let held = handle.client.lock().await;
 
         let start = tokio::time::Instant::now();
@@ -1312,15 +1335,15 @@ mod tests {
             "{result:?}"
         );
         assert!(start.elapsed() >= PUBLISH_WAIT);
-        assert!(handle.pending_publishes.lock().unwrap().is_empty());
         drop(held);
+        assert_eq!(queued_requests(&mut eventloop), 0);
     }
 
-    /// A publish future dropped while it waits for the `client` lock leaves no
-    /// entry; one dropped while it waits for its acknowledgement leaves exactly
-    /// its own, whose receiver is gone.
+    /// A publish future dropped while it waits for the `client` lock submits
+    /// nothing; one dropped while it waits for its outcome has submitted
+    /// exactly its own packet.
     #[tokio::test]
-    async fn a_publish_dropped_at_either_await_leaves_the_queue_in_step() {
+    async fn a_publish_dropped_at_either_await_submits_at_most_its_packet() {
         let svc = MqttService::new();
         let handle = make_handle("home");
         svc.add_client(handle.clone());
@@ -1333,7 +1356,6 @@ mod tests {
             poll_once_pending(fut).await;
         }
         drop(held);
-        assert!(handle.pending_publishes.lock().unwrap().is_empty());
         assert_eq!(queued_requests(&mut eventloop), 0);
 
         {
@@ -1341,10 +1363,6 @@ mod tests {
             tokio::pin!(fut);
             poll_once_pending(fut).await;
         }
-        let pending = handle.pending_publishes.lock().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert!(pending[0].ack_tx.is_closed());
-        drop(pending);
         assert_eq!(queued_requests(&mut eventloop), 1);
     }
 

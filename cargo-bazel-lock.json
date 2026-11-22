@@ -1,5 +1,5 @@
 {
-  "checksum": "7d28ff192748ccf3faff407211e91ac3f9b53d546d61a09f693a79fd5cc32305",
+  "checksum": "182d0152cb29b697947139ae1f14ad202510fc5c915174a2e4863ab9d9aef651",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -4710,6 +4710,10 @@
               "target": "bytes"
             },
             {
+              "id": "chrono 0.4.45",
+              "target": "chrono"
+            },
+            {
               "id": "libc 0.2.186",
               "target": "libc"
             },
@@ -4752,6 +4756,10 @@
             {
               "id": "tracing 0.1.44",
               "target": "tracing"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
             }
           ],
           "selects": {}
@@ -4761,10 +4769,6 @@
             {
               "id": "rusqlite 0.41.1",
               "target": "rusqlite"
-            },
-            {
-              "id": "uuid 1.24.0",
-              "target": "uuid"
             }
           ],
           "selects": {}
@@ -5607,6 +5611,10 @@
             {
               "id": "base64ct 1.8.3",
               "target": "base64ct"
+            },
+            {
+              "id": "bytes 1.11.1",
+              "target": "bytes"
             },
             {
               "id": "chrono 0.4.45",

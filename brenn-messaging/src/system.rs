@@ -47,6 +47,9 @@ pub struct SystemParticipantSpec {
     /// publish-only participants. Non-empty ⇒ the participant is a
     /// subscriber and must be given a drain task (see [`SystemInbox`]).
     pub subscriptions: Vec<String>,
+    /// The overflow rung of every subscription the participant holds,
+    /// code-built like the policy. Never `Fatal`, which is surface-only.
+    pub noise: NoiseLevel,
 }
 
 impl SystemParticipantSpec {
@@ -98,6 +101,7 @@ impl SystemParticipantSpec {
             component,
             policy,
             subscriptions: vec![],
+            noise: NoiseLevel::Silent,
         }
     }
 
@@ -135,6 +139,7 @@ impl SystemParticipantSpec {
             component,
             policy,
             subscriptions: addrs.to_vec(),
+            noise: NoiseLevel::Silent,
         }
     }
 }
@@ -174,14 +179,18 @@ pub fn registrations_from_specs(
 /// finalization — so system subscriptions flow through the same
 /// deliverability validation and dispatch as every other subscriber.
 ///
-/// Both depths are the channel's own `retain_depth` and noise is `Silent`
-/// deliberately: a drain that sees a window's worth sees everything there is,
+/// Both depths are the channel's own `retain_depth`, deliberately: a drain
+/// that sees a window's worth sees everything there is,
 /// so the participant is owed exactly what the channel retains. Sizing the
 /// window is the operator's decision on the channel block; a subscriber that
 /// reached past it would pin the channel against reaping and quietly move the
-/// retention decision out of the operator's hands.
+/// retention decision out of the operator's hands. The overflow rung is the
+/// spec's own `noise`.
 ///
 /// # Panics
+///
+/// Panics on a spec whose `noise` is `Fatal`: that rung is surface-only, and
+/// the backend overflow path panics on it at the first drop instead.
 ///
 /// Panics when a subscription address matches no channel entry, or when a spec
 /// would install a second `System(component)` subscriber on the same channel (a
@@ -197,6 +206,12 @@ pub fn registrations_from_specs(
 /// really a channel sized to hold nothing.
 pub fn fold_spec_subscriptions(entries: &mut [ChannelEntry], specs: &[SystemParticipantSpec]) {
     for spec in specs {
+        assert!(
+            spec.noise != NoiseLevel::Fatal,
+            "system participant {:?} states the overflow rung `fatal`, which is surface-only — \
+             host wiring bug",
+            spec.component,
+        );
         for address in &spec.subscriptions {
             let entry = entries
                 .iter_mut()
@@ -227,13 +242,13 @@ pub fn fold_spec_subscriptions(entries: &mut [ChannelEntry], specs: &[SystemPart
                 spec.component,
             );
             // TODO(system-participant-noise-inert): a system participant's
-            // overflow rung is `Silent` whatever its channel's `noise` says, so
-            // the setting is inert on every family folded here.
+            // overflow rung is its spec's whatever its channel's `noise` says,
+            // so the setting is inert on every family folded here.
             entry.subscribers.push(SubscriberEntry {
                 kind: SubscriberEntryKind::System(spec.component.to_string()),
                 push_depth: window,
                 retain_depth: window,
-                noise: NoiseLevel::Silent,
+                noise: spec.noise,
                 wake_min: None,
             });
         }
@@ -501,6 +516,7 @@ mod tests {
             component,
             policy: subscribe_policy("inbox/"),
             subscriptions,
+            noise: NoiseLevel::Silent,
         }
     }
 
@@ -512,6 +528,7 @@ mod tests {
             component,
             policy: subscribe_policy(prefix),
             subscriptions: vec![],
+            noise: NoiseLevel::Silent,
         }
     }
 
@@ -1208,6 +1225,26 @@ mod tests {
                 ..
             }] if c == COMPONENT
         ));
+    }
+
+    #[test]
+    fn fold_spec_subscriptions_writes_the_spec_rung() {
+        for noise in [NoiseLevel::Silent, NoiseLevel::Metered, NoiseLevel::Alarm] {
+            let mut entries = vec![test_channel_entry("inbox/reqs", vec![])];
+            let mut participant = spec(COMPONENT, vec!["brenn:inbox/reqs".to_string()]);
+            participant.noise = noise;
+            fold_spec_subscriptions(&mut entries, &[participant]);
+            assert_eq!(entries[0].subscribers[0].noise, noise);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "states the overflow rung `fatal`")]
+    fn fold_spec_subscriptions_panics_on_a_fatal_spec() {
+        let mut entries = vec![test_channel_entry("inbox/reqs", vec![])];
+        let mut participant = spec(COMPONENT, vec!["brenn:inbox/reqs".to_string()]);
+        participant.noise = NoiseLevel::Fatal;
+        fold_spec_subscriptions(&mut entries, &[participant]);
     }
 
     #[test]

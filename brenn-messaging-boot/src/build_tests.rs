@@ -4067,6 +4067,7 @@ fn a_tuning_block_for_an_undeclared_webhook_panics() {
         &tuning,
         &[],
         &[],
+        &[],
         &std::collections::HashSet::new(),
         None,
         true,
@@ -4080,6 +4081,7 @@ fn a_tuning_block_for_an_unregistered_tool_panics() {
     let tuning = tuning_of(&[tuning_raw("brenn:tools/nope")]);
     validate_exact_tuning_blocks(
         &tuning,
+        &[],
         &[],
         &["apull"],
         &std::collections::HashSet::new(),
@@ -4097,6 +4099,7 @@ fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
     validate_exact_tuning_blocks(
         &tuning,
         &[],
+        &[],
         &["apull"],
         &std::collections::HashSet::new(),
         None,
@@ -4110,7 +4113,7 @@ fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
 fn a_tuning_block_for_an_ungranted_inbox_panics() {
     let tuning = tuning_of(&[tuning_raw("brenn:tool-results/ghost")]);
     let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
-    validate_exact_tuning_blocks(&tuning, &[], &["apull"], &slugs, None, true);
+    validate_exact_tuning_blocks(&tuning, &[], &[], &["apull"], &slugs, None, true);
 }
 
 /// With no tool registry answering, the two tool families have no population
@@ -4127,6 +4130,7 @@ fn without_a_registry_the_tool_arms_are_skipped_and_the_webhook_arm_is_not() {
         &tuning,
         &[],
         &[],
+        &[],
         &std::collections::HashSet::new(),
         None,
         false,
@@ -4136,6 +4140,7 @@ fn without_a_registry_the_tool_arms_are_skipped_and_the_webhook_arm_is_not() {
     let refused = std::panic::catch_unwind(|| {
         validate_exact_tuning_blocks(
             &webhook,
+            &[],
             &[],
             &[],
             &std::collections::HashSet::new(),
@@ -4162,7 +4167,7 @@ fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
         tuning_raw("brenn:tool-results/sync"),
     ]);
     let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
-    validate_exact_tuning_blocks(&tuning, &["gh-events"], &["apull"], &slugs, None, true);
+    validate_exact_tuning_blocks(&tuning, &["gh-events"], &[], &["apull"], &slugs, None, true);
 }
 
 /// An app's result inbox is checked against the apps holding an async tool
@@ -4175,6 +4180,7 @@ fn an_app_inbox_block_names_an_app_holding_an_async_grant() {
         &tuning,
         &[],
         &[],
+        &[],
         &std::collections::HashSet::new(),
         Some(&apps),
         true,
@@ -4183,6 +4189,7 @@ fn an_app_inbox_block_names_an_app_holding_an_async_grant() {
     let refused = std::panic::catch_unwind(|| {
         validate_exact_tuning_blocks(
             &ungranted,
+            &[],
             &[],
             &[],
             &std::collections::HashSet::new(),
@@ -4194,12 +4201,13 @@ fn an_app_inbox_block_names_an_app_holding_an_async_grant() {
     // A consumer slug does not stand in for an app's.
     let consumers: std::collections::HashSet<String> = ["graf".to_string()].into_iter().collect();
     let refused = std::panic::catch_unwind(|| {
-        validate_exact_tuning_blocks(&ungranted, &[], &[], &consumers, Some(&apps), true);
+        validate_exact_tuning_blocks(&ungranted, &[], &[], &[], &consumers, Some(&apps), true);
     });
     assert!(refused.is_err());
     // Without the apps to check against, the arm is skipped.
     validate_exact_tuning_blocks(
         &ungranted,
+        &[],
         &[],
         &[],
         &std::collections::HashSet::new(),
@@ -4215,6 +4223,7 @@ fn a_location_block_naming_a_well_formed_user_passes() {
     let tuning = tuning_of(&[tuning_raw("brenn:device-location.alice")]);
     validate_exact_tuning_blocks(
         &tuning,
+        &[],
         &[],
         &[],
         &std::collections::HashSet::new(),
@@ -4233,19 +4242,21 @@ fn a_location_block_naming_no_possible_user_panics() {
         &tuning,
         &[],
         &[],
+        &[],
         &std::collections::HashSet::new(),
         None,
         true,
     );
 }
 
-/// The one egress channel every plan mints may be tuned by its exact key.
+/// A declared client's egress channel may be tuned by its exact key.
 #[test]
-fn an_egress_block_naming_the_mqtt_outbound_channel_passes() {
-    let tuning = tuning_of(&[tuning_raw("brenn:egress/mqtt")]);
+fn an_egress_block_naming_a_declared_clients_channel_passes() {
+    let tuning = tuning_of(&[tuning_raw("brenn:egress/mqtt/home")]);
     validate_exact_tuning_blocks(
         &tuning,
         &[],
+        &["home", "away"],
         &[],
         &std::collections::HashSet::new(),
         None,
@@ -4253,34 +4264,59 @@ fn an_egress_block_naming_the_mqtt_outbound_channel_passes() {
     );
 }
 
-/// Any other exact key in the egress namespace names a channel no plan mints.
+/// An exact key in the egress namespace that is not a declared client's
+/// channel names a channel no plan mints: an undeclared client, the bare
+/// family name, or any other egress name.
 #[test]
-#[should_panic(expected = "tunes a channel this config never mints — there is no egress channel")]
-fn an_egress_block_naming_another_channel_panics() {
-    let tuning = tuning_of(&[tuning_raw("brenn:egress/other")]);
-    validate_exact_tuning_blocks(
-        &tuning,
-        &[],
-        &[],
-        &std::collections::HashSet::new(),
-        None,
-        true,
-    );
+fn an_egress_block_naming_anything_else_panics() {
+    for address in [
+        "brenn:egress/mqtt/ghost",
+        "brenn:egress/mqtt",
+        "brenn:egress/mqtt/",
+        "brenn:egress/other",
+    ] {
+        let tuning = tuning_of(&[tuning_raw(address)]);
+        let refused = std::panic::catch_unwind(|| {
+            validate_exact_tuning_blocks(
+                &tuning,
+                &[],
+                &["home"],
+                &[],
+                &std::collections::HashSet::new(),
+                None,
+                true,
+            );
+        });
+        let message = refused
+            .expect_err(address)
+            .downcast::<String>()
+            .expect("a formatted panic");
+        assert!(
+            message.contains(
+                "tunes a channel this config never mints — there is no `[[mqtt_client]]` \
+                 with that slug; an egress channel is `brenn:egress/mqtt/<client>`"
+            ),
+            "{address}: {message}"
+        );
+    }
 }
 
-/// A plan with no `[[mqtt_client]]` still mints `brenn:egress/mqtt` and
-/// declares `system:mqtt-outbound` as its subscriber, at the channel's own
-/// window: a reload that adds the first client must find both already there.
+/// Every plan mints one egress channel per declared client, folds
+/// `system:mqtt-outbound` onto each at the channel's own window with the
+/// `Alarm` rung, and declares the participant with no client too: a reload
+/// that adds the first client must find it already registered.
 #[test]
-fn every_plan_mints_the_mqtt_outbound_channel_and_its_drain() {
+fn every_plan_mints_one_egress_channel_per_client_and_its_reader() {
     use brenn_lib::config::BrennConfig;
     use brenn_lib::messaging::{SubscriberEntryKind, config::NoiseLevel};
     use brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT;
 
+    let participant = SubscriberEntryKind::System(MQTT_OUTBOUND_COMPONENT.to_string());
     let mut config = BrennConfig::default();
     config.channels.push(surface_index_channel());
     assert!(config.mqtt_clients.is_empty());
-    let plan = plan_messaging(&PlanInputs {
+
+    let none = plan_messaging(&PlanInputs {
         config: &config,
         apps: None,
         mqtt_clients: &IndexMap::new(),
@@ -4289,64 +4325,100 @@ fn every_plan_mints_the_mqtt_outbound_channel_and_its_drain() {
         device_location_users: &[],
     })
     .expect("a channel-declaring document configures messaging");
-
-    let entry = plan
-        .directory
-        .resolve("brenn:egress/mqtt")
-        .expect("the outbound channel is minted with no client declared");
-    assert_eq!(
-        entry.uuid,
-        brenn_lib::messaging::egress_channel_uuid("brenn:egress/mqtt")
-    );
-    assert!(entry.capabilities().durable);
-    assert!(entry.resolved_channel.non_text);
-    assert_eq!(entry.resolved_channel.retain_depth, Depth::Bounded(256));
-    let subscriber = entry
-        .subscribers
-        .iter()
-        .find(|s| s.kind == SubscriberEntryKind::System(MQTT_OUTBOUND_COMPONENT.to_string()))
-        .expect("system:mqtt-outbound is folded in as the channel's subscriber");
-    assert_eq!(subscriber.push_depth, Depth::Bounded(256));
-    assert_eq!(subscriber.retain_depth, Depth::Bounded(256));
-    assert_eq!(subscriber.noise, NoiseLevel::Silent);
-    assert_eq!(entry.subscribers.len(), 1);
     assert!(
-        plan.system_participants
+        none.directory
+            .list()
             .iter()
-            .any(|spec| spec.component == MQTT_OUTBOUND_COMPONENT)
+            .all(|e| !e.address.starts_with("brenn:egress/")),
+        "no client, no egress channel"
     );
-    assert!(
-        plan.registrations
-            .contains_key(&SubscriberEntryKind::System(
-                MQTT_OUTBOUND_COMPONENT.to_string()
-            ))
+    let spec = none
+        .system_participants
+        .iter()
+        .find(|spec| spec.component == MQTT_OUTBOUND_COMPONENT)
+        .expect("the participant is derived with no client");
+    assert!(spec.subscriptions.is_empty());
+    assert_eq!(spec.noise, NoiseLevel::Alarm);
+    assert!(none.registrations.contains_key(&participant));
+
+    config.mqtt_clients = vec![minimal_mqtt_client("home"), minimal_mqtt_client("away")];
+    let clients = brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients);
+    let plan = plan_messaging(&PlanInputs {
+        config: &config,
+        apps: None,
+        mqtt_clients: &clients,
+        tool_registry: None,
+        replay_store_paths: &[],
+        device_location_users: &[],
+    })
+    .expect("a channel-declaring document configures messaging");
+    assert!(plan.directory.resolve("brenn:egress/mqtt").is_none());
+    for slug in ["home", "away"] {
+        let address = format!("brenn:egress/mqtt/{slug}");
+        let entry = plan
+            .directory
+            .resolve(&address)
+            .expect("each declared client's egress channel is minted");
+        assert_eq!(
+            entry.uuid,
+            brenn_lib::messaging::egress_channel_uuid(&address)
+        );
+        assert!(entry.capabilities().durable);
+        assert!(entry.resolved_channel.non_text);
+        assert_eq!(entry.resolved_channel.retain_depth, Depth::Bounded(256));
+        let [subscriber] = entry.subscribers.as_slice() else {
+            panic!("{address}: exactly one subscriber, the participant");
+        };
+        assert_eq!(subscriber.kind, participant);
+        assert_eq!(subscriber.push_depth, Depth::Bounded(256));
+        assert_eq!(subscriber.retain_depth, Depth::Bounded(256));
+        assert_eq!(subscriber.noise, NoiseLevel::Alarm);
+    }
+    let spec = plan
+        .system_participants
+        .iter()
+        .find(|spec| spec.component == MQTT_OUTBOUND_COMPONENT)
+        .expect("the participant is derived");
+    assert_eq!(
+        spec.subscriptions,
+        ["brenn:egress/mqtt/home", "brenn:egress/mqtt/away"]
+    );
+    assert_eq!(
+        spec.policy,
+        none.system_participants
+            .iter()
+            .find(|spec| spec.component == MQTT_OUTBOUND_COMPONENT)
+            .unwrap()
+            .policy
     );
 }
 
-/// A consumer output bound to the outbound channel meets the egress refusal,
-/// not the unknown-channel one: the entry is in the directory consumer
-/// bindings resolve against.
+/// A consumer output bound to a client's egress channel meets the egress
+/// refusal, not the unknown-channel one: the entry is in the directory
+/// consumer bindings resolve against.
 #[test]
 #[should_panic(expected = "which is in the egress namespace")]
-fn a_plan_refuses_a_consumer_output_bound_to_the_outbound_channel() {
+fn a_plan_refuses_a_consumer_output_bound_to_an_egress_channel() {
     use brenn_lib::config::BrennConfig;
 
     let mut config = BrennConfig::default();
     config.channels.push(surface_index_channel());
     config.channels.push(durable_channel("brenn:in-ch"));
+    config.mqtt_clients = vec![minimal_mqtt_client("home")];
+    let clients = brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients);
     config.wasm_consumers = vec![brenn_lib::messaging::config::WasmConsumerConfigRaw {
         slug: "forger".to_string(),
         subscriptions: vec![super::test_fixtures::sub_raw("brenn:in-ch", "in")],
         outputs: vec![super::test_fixtures::out_raw(
             "commands",
-            "brenn:egress/mqtt",
+            "brenn:egress/mqtt/home",
         )],
         ..minimal_wasm_consumer()
     }];
     let _ = plan_messaging(&PlanInputs {
         config: &config,
         apps: None,
-        mqtt_clients: &IndexMap::new(),
+        mqtt_clients: &clients,
         tool_registry: None,
         replay_store_paths: &[],
         device_location_users: &[],
@@ -4402,7 +4474,7 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
             tuned(Some("brenn:tools/apull"), None, 9),
             tuned(Some("brenn:tool-results/probe"), None, 7),
             tuned(None, Some("mqtt:homeassistant:"), 40),
-            tuned(Some("brenn:egress/mqtt"), None, 12),
+            tuned(Some("brenn:egress/mqtt/homeassistant"), None, 12),
         ],
         webhook_endpoints: vec![webhook_endpoint_raw("gh-events")],
         mqtt_clients: vec![minimal_mqtt_client("homeassistant")],
@@ -4433,7 +4505,7 @@ async fn a_tuning_block_reaches_every_system_channel_mint_site() {
         ("brenn:tools/apull", 9),
         ("brenn:tool-results/probe", 7),
         (mqtt_address, 40),
-        ("brenn:egress/mqtt", 12),
+        ("brenn:egress/mqtt/homeassistant", 12),
     ] {
         let entry = directory
             .resolve(address)

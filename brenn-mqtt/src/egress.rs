@@ -1,9 +1,9 @@
-//! Shared MQTT-egress enforcement orchestration.
+//! The direct MQTT publish path: a publish that goes straight to the broker
+//! and waits for its answer, bypassing the bus.
 //!
-//! Both the LLM `MqttSend` intercept and the WASM host-fn publish path must
-//! enforce the same capability/ACL/budget gate chain. This module owns that
-//! sequencing once so "both paths enforce identically" is a structural property,
-//! not a code-review discipline.
+//! A component's `mqtt-publish` host function is its one production caller.
+//! `MqttSend` commits through the bus's MQTT admission instead, so
+//! [`SendBudget::Conversation`] has no production caller.
 //!
 //! The chain's order is fixed and load-bearing — "validate before budget": ACL,
 //! session lookup, budget, publish. It is exposed in two halves so a caller can
@@ -30,24 +30,22 @@ use crate::state::{MqttClientHandle, PubackOutcome};
 use brenn_db::Db;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::mqtt::address::MqttAddress;
-use brenn_lib::mqtt::config::MqttClientIdentity;
 use brenn_lib::mqtt::error::MqttError;
 use brenn_messaging_store::db::{BudgetDecrement, decrement_send_budget};
 
 /// How the send budget is gated, which differs by caller kind.
 pub enum SendBudget<'a> {
-    /// LLM caller: a per-conversation budget row. The function acquires the DB
-    /// lock for *just* the synchronous decrement and drops it **before** the
-    /// broker-publish await — it never holds the connection guard across `.await`.
+    // TODO(mqtt-egress-unwired): goes with the direct publish path.
+    /// A per-conversation budget row. No production caller: `MqttSend`
+    /// publishes through the bus, which draws the conversation's budget
+    /// itself.
     ///
-    /// This matters for two reasons: (1) `rusqlite::Connection` is `!Sync`, so a
-    /// guard held across `.await` would make the calling future `!Send`, and the
-    /// sole LLM call site runs inside a `tokio::spawn`ed task (the CC event loop)
-    /// that requires `Send`; (2) holding the single DB mutex across a (possibly
-    /// slow, QoS-2) broker round-trip would serialize all DB access for that
-    /// duration. The variant therefore takes the `Db` handle (not a borrowed live
-    /// connection), and the "decrement under the lock, before publish" invariant
-    /// is preserved by scoping the lock to the decrement alone.
+    /// The function acquires the DB lock for *just* the synchronous decrement
+    /// and drops it **before** the broker-publish await. A guard held across
+    /// `.await` would make the caller's future `!Send` (`rusqlite::Connection`
+    /// is `!Sync`) and would serialize all DB access for a possibly slow QoS 2
+    /// round-trip, so the variant takes the `Db` handle, not a live
+    /// connection.
     Conversation {
         /// The shared DB handle. The function locks it only for the decrement.
         db: &'a Db,
@@ -123,11 +121,6 @@ pub struct Authorized {
 }
 
 impl Authorized {
-    /// The configuration of the session this publish will use.
-    pub fn client(&self) -> &MqttClientIdentity {
-        &self.handle.config.identity
-    }
-
     /// Steps 3-4: budget, then publish.
     ///
     /// 3. **Budget** — for [`SendBudget::Conversation`], decrement under the
@@ -565,8 +558,7 @@ mod tests {
     }
 
     /// `authorize` runs steps 1-2 alone: it denies an unlisted client, misses
-    /// an unregistered one, and for an allowed, registered client hands back
-    /// the session's configuration without touching any budget.
+    /// an unregistered one, and authorizes an allowed, registered client.
     #[tokio::test]
     async fn authorize_runs_acl_then_session_lookup() {
         let svc = service_with_client("home").await;
@@ -587,11 +579,9 @@ mod tests {
             authorize(&svc, &policy, &addr("gone", "cmd/light")),
             Err(MqttEgressError::ClientNotRegistered { ref client }) if client == "gone"
         ));
-        let authorized = match authorize(&svc, &policy, &addr("home", "cmd/light")) {
-            Ok(a) => a,
-            Err(e) => panic!("expected Authorized, got {e:?}"),
-        };
-        assert_eq!(authorized.client().slug, "home");
+        if let Err(e) = authorize(&svc, &policy, &addr("home", "cmd/light")) {
+            panic!("expected Authorized, got {e:?}");
+        }
     }
 
     /// `Authorized::publish` runs steps 3-4: the budget is spent, then the

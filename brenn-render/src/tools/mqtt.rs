@@ -59,7 +59,7 @@ fn render_mqtt_status_badge(outcome: Option<&serde_json::Value>) -> String {
     };
     let ok = outcome.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     if ok {
-        r#"<span class="brenn-mqtt-status brenn-mqtt-status-ok">delivered</span>"#.to_string()
+        r#"<span class="brenn-mqtt-status brenn-mqtt-status-ok">committed</span>"#.to_string()
     } else {
         let err = outcome
             .get("error")
@@ -157,6 +157,11 @@ mod tests {
             html.contains("brenn-mqtt-status-ok"),
             "expected ok badge: {html}"
         );
+        assert!(
+            html.contains(">committed<"),
+            "ok badge reads committed: {html}"
+        );
+        assert!(!html.contains("delivered"), "{html}");
     }
 
     #[test]

@@ -121,6 +121,7 @@ pub fn config_reload_spec(entries: &[ChannelEntry]) -> Option<SystemParticipantS
         component: CONFIG_RELOAD_COMPONENT,
         policy,
         subscriptions: vec![RELOAD_ADDRESS.to_string()],
+        noise: crate::config::NoiseLevel::Silent,
     })
 }
 

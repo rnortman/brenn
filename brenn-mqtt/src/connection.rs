@@ -3,9 +3,9 @@
 //! Each supervisor runs in a dedicated `tokio::spawn` task. It owns the
 //! `rumqttc::AsyncClient` + `EventLoop`, drives the event loop forever, handles
 //! reconnect with jittered exponential backoff, re-asserts subscriptions on every
-//! successful connect, binds outbound publish acks, and routes every inbound
-//! PUBLISH to the bridge router. One session per client carries both the publish
-//! and the ingress-delivery paths.
+//! successful connect, records the facts of each connection a publish needs,
+//! and routes every inbound PUBLISH to the bridge router. One session per
+//! client carries both the publish and the ingress-delivery paths.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -14,16 +14,16 @@ use std::time::{Duration, Instant};
 use rumqttc::mqttbytes::QoS;
 use rumqttc::{
     AsyncClient, ConnectReturnCode, ConnectionError, DisconnectReasonCode, Event, Filter, Incoming,
-    MqttOptions, Outgoing, PubAckReason, RetainForwardRule, StateError, SubscribeProperties,
-    SubscribeReasonCode, TlsConfiguration, Transport,
+    MqttOptions, Outgoing, RetainForwardRule, StateError, SubscribeProperties, SubscribeReasonCode,
+    TlsConfiguration, Transport,
 };
 use rustls_pki_types::pem::PemObject as _;
 
 use crate::payload::InboundPayload;
-use crate::service::{MqttEventRouter, MqttService};
+use crate::service::{MqttEventRouter, MqttService, qos_of};
 use crate::state::{
-    DEFERRED_SUBSCRIBES_POISONED, IngressSubscription, MqttClientHandle,
-    PENDING_PUBLISHES_POISONED, PENDING_SUBSCRIBES_POISONED, PubackOutcome, SupervisorState,
+    DEFAULT_RECEIVE_MAXIMUM, DEFERRED_SUBSCRIBES_POISONED, IngressSubscription, MqttClientHandle,
+    PENDING_SUBSCRIBES_POISONED, SupervisorState,
 };
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsVersionMin};
 
@@ -32,17 +32,6 @@ use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsV
 // prevents a non-conforming or slow-to-close broker from hanging the supervisor
 // task indefinitely after the terminal state is already written.
 const DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The `last_error` a publish waiting for its PUBACK is failed with when the
-/// session it was submitted on is stopped — by a reload restarting or removing
-/// the client, or by shutdown.
-const STOPPED_BY_OWNER: &str = "client session stopped";
-
-/// The `last_error` a publish waiting for its PUBACK is failed with when a new
-/// connection is installed while it still waits: its packet went, or was
-/// queued to go, on an event loop that no longer exists.
-pub const SUPERSEDED_BY_NEW_CONNECTION: &str =
-    "the connection this publish was sent on ended before the broker answered";
 
 // What the SubAck arm logs as the filter when no pending SUBSCRIBE was bound to
 // the acked pkid — a broker resending a SubAck from a session brenn did not
@@ -88,11 +77,12 @@ pub fn union_subscriptions(
 /// the current retained message on every (re)subscribe, and the subscription's
 /// MQTT 5 Subscription Identifier.
 fn subscribe_request(sub: &IngressSubscription) -> (Filter, SubscribeProperties) {
-    let rumq_qos = match sub.qos {
-        0 => QoS::AtMostOnce,
-        1 => QoS::AtLeastOnce,
-        _ => QoS::ExactlyOnce,
-    };
+    let rumq_qos = qos_of(sub.qos).unwrap_or_else(|| {
+        panic!(
+            "subscription {:?} with QoS {}, which config validation refuses",
+            sub.topic_filter, sub.qos
+        )
+    });
     let filter = Filter {
         path: sub.topic_filter.clone(),
         qos: rumq_qos,
@@ -271,11 +261,12 @@ fn build_mqtt_options(broker: &MqttClientConfig, transport: Transport) -> MqttOp
 
     // Last Will.
     if let Some(ref lw) = broker.identity.last_will {
-        let rumq_qos = match lw.qos {
-            0 => QoS::AtMostOnce,
-            1 => QoS::AtLeastOnce,
-            _ => QoS::ExactlyOnce,
-        };
+        let rumq_qos = qos_of(lw.qos).unwrap_or_else(|| {
+            panic!(
+                "last will with QoS {}, which config validation refuses",
+                lw.qos
+            )
+        });
         let will = rumqttc::LastWill::new(
             lw.topic.clone(),
             lw.payload.as_bytes().to_vec(),
@@ -564,6 +555,10 @@ async fn stop_requested(stop_rx: &mut tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+/// What a CONNACK says that the session keeps: Session Present, and the
+/// broker's Maximum Packet Size and Receive Maximum, each if it sent one.
+type ConnackFacts = (bool, Option<u32>, Option<u16>);
+
 /// The actual supervisor body, wrapped by the watchdog in
 /// `spawn_client_supervisor`.
 async fn supervisor_body(
@@ -595,12 +590,6 @@ async fn supervisor_body(
             // dead body's client still there; its event loop died with that
             // body, so there is no session to disconnect, only a handle to drop.
             *handle.client.lock().await = None;
-            // A publish waiting for its PUBACK is waiting on a session that is
-            // over: nothing polls this eventloop again, so the ack can never be
-            // attributed and the waiter would hang on its oneshot forever.
-            handle
-                .fail_all_publishes(Some(STOPPED_BY_OWNER.to_string()))
-                .await;
             if terminal_reason.is_none() {
                 terminal_reason = Some(SupervisorState::Disconnected {
                     last_error: None,
@@ -629,9 +618,8 @@ async fn supervisor_body(
         // `NotConnected` on the publish path rather than unbounded growth.
         let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
 
-        // Poll until ConnAck or error. `None` = stop requested. `Ok` carries
-        // Session Present and the broker's Maximum Packet Size, if it sent one.
-        let connack: Option<Result<(bool, Option<u32>), ConnectionError>> = loop {
+        // Poll until ConnAck or error. `None` = stop requested.
+        let connack: Option<Result<ConnackFacts, ConnectionError>> = loop {
             tokio::select! {
                 biased;
                 _ = stop_requested(&mut stop_rx) => {
@@ -641,9 +629,10 @@ async fn supervisor_body(
                     match event {
                         Err(e) => break Some(Err(e)),
                         Ok(Event::Incoming(Incoming::ConnAck(ack))) => {
-                            let max_packet_size =
-                                ack.properties.as_ref().and_then(|p| p.max_packet_size);
-                            break Some(Ok((ack.session_present, max_packet_size)));
+                            let props = ack.properties.as_ref();
+                            let max_packet_size = props.and_then(|p| p.max_packet_size);
+                            let receive_max = props.and_then(|p| p.receive_max);
+                            break Some(Ok((ack.session_present, max_packet_size, receive_max)));
                         }
                         Ok(_) => continue,
                     }
@@ -651,7 +640,7 @@ async fn supervisor_body(
             }
         };
 
-        let (session_present, broker_max_packet_size) = match connack {
+        let (session_present, broker_max_packet_size, broker_receive_max) = match connack {
             None => {
                 // Clean stop during connect handshake; no client installed yet.
                 if terminal_reason.is_none() {
@@ -665,24 +654,33 @@ async fn supervisor_body(
             Some(Err(e)) => {
                 let authoritative = is_authoritative_failure(&e);
                 let error_str = e.to_string();
-                handle.fail_all_publishes(None).await;
                 clear_subscribe_tracking(&handle).await;
                 {
-                    // The terminal state is written here, under the client
-                    // lock, and not only in the tail: a reader that finds the
-                    // client cell empty and then reads the supervisor state to
-                    // tell a deferral from a dead session must not see a
-                    // retrying state for a session that has already given up.
-                    // The tail rewrites the same value.
+                    // The state is written here, under the client lock: a
+                    // reader that finds the client cell empty and then reads
+                    // the supervisor state to tell a deferral from a dead
+                    // session must not see a retrying state for a session that
+                    // has already given up. For a `Failed` the tail rewrites
+                    // the same value.
                     let mut client_guard = handle.client.lock().await;
                     *client_guard = None;
-                    if authoritative {
-                        let mut state = handle.supervisor_state.write().await;
-                        *state = SupervisorState::Failed {
+                    let mut state = handle.supervisor_state.write().await;
+                    *state = if authoritative {
+                        SupervisorState::Failed {
                             reason: error_str.clone(),
-                        };
-                    }
+                        }
+                    } else {
+                        SupervisorState::Disconnected {
+                            last_error: Some(error_str.clone()),
+                            next_attempt_at: Instant::now(),
+                        }
+                    };
                 }
+                // Ended after the state that carries the reason is written, as
+                // at every end of a connection. Its client was never installed,
+                // so no publish notice can be waiting on it.
+                drop(eventloop);
+                drop(client);
                 if authoritative {
                     tracing::error!(
                         client = %client_slug,
@@ -702,13 +700,6 @@ async fn supervisor_body(
                     error = %error_str,
                     "broker connection failed; will retry",
                 );
-                {
-                    let mut state = handle.supervisor_state.write().await;
-                    *state = SupervisorState::Disconnected {
-                        last_error: Some(error_str),
-                        next_attempt_at: Instant::now(),
-                    };
-                }
                 let delay = backoff_duration(
                     attempt,
                     broker.identity.reconnect_backoff_initial_secs,
@@ -741,7 +732,13 @@ async fn supervisor_body(
             .expect(DEFERRED_SUBSCRIBES_POISONED)
             .clear();
 
-        install_connection(&handle, client.clone(), broker_max_packet_size).await;
+        install_connection(
+            &handle,
+            client.clone(),
+            broker_max_packet_size,
+            broker_receive_max,
+        )
+        .await;
         {
             let mut state = handle.supervisor_state.write().await;
             *state = SupervisorState::Connected;
@@ -873,16 +870,11 @@ async fn supervisor_body(
                             );
                         }
                     }
-                    // A stop is terminal for this session, so the broker's
-                    // answers go with the client here as they do on every other
-                    // path out of a connection. The drain above discards events
-                    // without attributing them, so a PUBACK that arrives in it
-                    // reaches nobody: every waiter is failed here, as the
-                    // connection-lost path does, rather than left on a oneshot
-                    // whose sender lives in this handle's queue.
-                    handle
-                        .fail_all_publishes(Some(STOPPED_BY_OWNER.to_string()))
-                        .await;
+                    // A stop is terminal for this session. The library resolved
+                    // every notice the drain's acknowledgements answered;
+                    // dropping the event loop and the client ends the rest.
+                    drop(eventloop);
+                    drop(client);
                     clear_subscribe_tracking(&handle).await;
                     break 'supervisor;
                 }
@@ -903,21 +895,28 @@ async fn supervisor_body(
         // Connection lost.
         let (disconnect_reason, disconnect_authoritative) = disconnect_reason;
         {
-            // Terminal state under the client lock, for the reason the connect
-            // path writes it there too: an empty client cell paired with a
-            // retrying supervisor state is read as "will reconnect".
+            // State under the client lock, for the reason the connect path
+            // writes it there too: an empty client cell paired with a retrying
+            // supervisor state is read as "will reconnect".
             let mut client_guard = handle.client.lock().await;
             *client_guard = None;
-            if disconnect_authoritative {
-                let mut state = handle.supervisor_state.write().await;
-                *state = SupervisorState::Failed {
+            let mut state = handle.supervisor_state.write().await;
+            *state = if disconnect_authoritative {
+                SupervisorState::Failed {
                     reason: disconnect_reason.clone(),
-                };
-            }
+                }
+            } else {
+                SupervisorState::Disconnected {
+                    last_error: Some(disconnect_reason.clone()),
+                    next_attempt_at: Instant::now(),
+                }
+            };
         }
-        handle
-            .fail_all_publishes(Some(disconnect_reason.clone()))
-            .await;
+        // Ends the connection's publish notices now rather than after the
+        // backoff, and after the state that carries the reason is written, so a
+        // waiter woken by the end reads the reason of this loss.
+        drop(eventloop);
+        drop(client);
         clear_subscribe_tracking(&handle).await;
 
         if disconnect_authoritative {
@@ -943,13 +942,6 @@ async fn supervisor_body(
             unasserted = unasserted.len(),
             "broker connection lost; reconnecting",
         );
-        {
-            let mut state = handle.supervisor_state.write().await;
-            *state = SupervisorState::Disconnected {
-                last_error: Some(disconnect_reason),
-                next_attempt_at: Instant::now(),
-            };
-        }
 
         let delay = backoff_duration(
             attempt,
@@ -1076,6 +1068,16 @@ async fn handle_event(
     router: &Arc<dyn MqttEventRouter>,
 ) {
     let client_slug = handle.config.identity.slug.as_str();
+    // A request slot may have freed. The event loop takes a request off the
+    // channel only to process it, and processing any request emits an
+    // outgoing event: the PUBLISH, SUBSCRIBE or UNSUBSCRIBE written, an
+    // acknowledgement, or `AwaitAck` for a publish parked on a packet-id
+    // collision. An outgoing packet no request caused (a keep-alive PINGREQ,
+    // an automatic PUBACK) wakes the egress reader for one pass with nothing
+    // new to do.
+    if matches!(event, Event::Outgoing(_)) {
+        handle.egress_wake.notify_one();
+    }
     match event {
         // --- Inbound publish ---
         // SECURITY: inbound payloads are untrusted. Any MQTT client with write
@@ -1191,146 +1193,6 @@ async fn handle_event(
             }
         }
 
-        // --- Outgoing publish: bind pkid → pending waiter (FIFO) ---
-        Event::Outgoing(Outgoing::Publish(pkid)) if pkid != 0 => {
-            let pending_entry = handle
-                .pending_publishes
-                .lock()
-                .expect(PENDING_PUBLISHES_POISONED)
-                .pop_front();
-            if let Some(entry) = pending_entry {
-                handle.inflight_publishes.lock().await.insert(pkid, entry);
-            } else {
-                tracing::warn!(
-                    client = %client_slug,
-                    pkid,
-                    "Outgoing::Publish with non-zero pkid but no pending waiter — \
-                     possible rumqttc session resend or bookkeeping mismatch",
-                );
-            }
-        }
-
-        // --- PubAck (QoS 1 ack) ---
-        Event::Incoming(Incoming::PubAck(ack)) => {
-            let entry = handle.inflight_publishes.lock().await.remove(&ack.pkid);
-            if let Some(entry) = entry {
-                let outcome = if ack.reason == PubAckReason::Success
-                    || ack.reason == PubAckReason::NoMatchingSubscribers
-                {
-                    Ok(PubackOutcome::Success)
-                } else {
-                    let reason = ack
-                        .properties
-                        .as_ref()
-                        .and_then(|p| p.reason_string.clone())
-                        .unwrap_or_else(|| format!("{:?}", ack.reason));
-                    tracing::warn!(
-                        client = %client_slug,
-                        pkid = ack.pkid,
-                        reason = %reason,
-                        "publish rejected by broker (PUBACK)",
-                    );
-                    Ok(PubackOutcome::BrokerRejected { reason })
-                };
-                if entry.ack_tx.send(outcome).is_err() {
-                    tracing::debug!(
-                        client = %client_slug,
-                        pkid = ack.pkid,
-                        "PUBACK receiver dropped before ack arrived (caller cancelled or timed out)",
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    client = %client_slug,
-                    pkid = ack.pkid,
-                    "PUBACK for unknown pkid — no matching inflight publish; possible broker \
-                     double-ack or session resend",
-                );
-            }
-        }
-
-        // --- PubRec (QoS 2 receive-ack) ---
-        //
-        // Only surfaced here on broker rejection. rumqttc drives a successful
-        // PubRec through to PubRel/PubComp internally, so success needs no action
-        // (the PubComp arm resolves the waiter). A rejection (reason >= 0x80)
-        // completes the packet WITHOUT emitting PubRel/PubComp, so if we do not
-        // resolve the waiter here it blocks forever and the inflight entry leaks.
-        Event::Incoming(Incoming::PubRec(rec))
-            if rec.reason != rumqttc::PubRecReason::Success
-                && rec.reason != rumqttc::PubRecReason::NoMatchingSubscribers =>
-        {
-            let entry = handle.inflight_publishes.lock().await.remove(&rec.pkid);
-            if let Some(entry) = entry {
-                let reason = rec
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.reason_string.clone())
-                    .unwrap_or_else(|| format!("{:?}", rec.reason));
-                tracing::warn!(
-                    client = %client_slug,
-                    pkid = rec.pkid,
-                    reason = %reason,
-                    "publish rejected by broker (PUBREC)",
-                );
-                if entry
-                    .ack_tx
-                    .send(Ok(PubackOutcome::BrokerRejected { reason }))
-                    .is_err()
-                {
-                    tracing::debug!(
-                        client = %client_slug,
-                        pkid = rec.pkid,
-                        "PUBREC receiver dropped before ack arrived (caller cancelled or timed out)",
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    client = %client_slug,
-                    pkid = rec.pkid,
-                    "PUBREC rejection for unknown pkid — no matching inflight publish; \
-                     possible broker double-ack or session resend",
-                );
-            }
-        }
-
-        // --- PubComp (QoS 2 final ack) ---
-        Event::Incoming(Incoming::PubComp(comp)) => {
-            let entry = handle.inflight_publishes.lock().await.remove(&comp.pkid);
-            if let Some(entry) = entry {
-                let outcome = if comp.reason == rumqttc::PubCompReason::Success {
-                    Ok(PubackOutcome::Success)
-                } else {
-                    let reason = comp
-                        .properties
-                        .as_ref()
-                        .and_then(|p| p.reason_string.clone())
-                        .unwrap_or_else(|| format!("{:?}", comp.reason));
-                    tracing::warn!(
-                        client = %client_slug,
-                        pkid = comp.pkid,
-                        reason = %reason,
-                        "publish rejected by broker (PUBCOMP)",
-                    );
-                    Ok(PubackOutcome::BrokerRejected { reason })
-                };
-                if entry.ack_tx.send(outcome).is_err() {
-                    tracing::debug!(
-                        client = %client_slug,
-                        pkid = comp.pkid,
-                        "PUBCOMP receiver dropped before ack arrived (caller cancelled or timed out)",
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    client = %client_slug,
-                    pkid = comp.pkid,
-                    "PUBCOMP for unknown pkid — no matching inflight publish; possible broker \
-                     double-ack or session resend",
-                );
-            }
-        }
-
         _ => {}
     }
 }
@@ -1348,52 +1210,39 @@ pub(crate) fn unpolled_client(capacity: usize) -> (AsyncClient, rumqttc::EventLo
     AsyncClient::builder(opts).capacity(capacity).build()
 }
 
-/// Make `client` the session's current client, starting its connection with no
-/// publish waiters.
+/// Make `client` the session's current client.
 ///
-/// Under the `client` guard, in order: every waiter still in
-/// `pending_publishes` or `inflight_publishes` is failed with
-/// [`SUPERSEDED_BY_NEW_CONNECTION`], the broker's Maximum Packet Size is
-/// stored (`None`: none advertised), and the client becomes visible. A waiter
-/// left over would be bound by position to the new connection's first
-/// packet ids, so every later acknowledgement on the session would resolve the
-/// wrong publish.
-///
-/// The drain is complete because a QoS 1/2 publisher pushes its waiter only
-/// while it holds the same guard, in the synchronous section that submits its
-/// packet. A publisher that ran before the drain submitted onto the old client;
-/// one that runs after finds the new client. No waiter for an old connection
-/// can appear after the drain, and none for the new one exists before it.
-///
-/// Every normal exit from a connection fails the waiters itself, so the drain
-/// finds none. A body that panicked while connected runs no exit; a non-zero
-/// count is its trace and is logged.
+/// Under the `client` guard, in order: the broker's Maximum Packet Size
+/// (`None`: none advertised, stored as `0`) and Receive Maximum (`None`:
+/// [`DEFAULT_RECEIVE_MAXIMUM`]) are stored, the connection epoch is
+/// incremented, and the client becomes visible. A submitter that takes the
+/// guard therefore reads the facts of the connection whose client it took.
+/// The egress wake is notified last.
 pub(crate) async fn install_connection(
     handle: &MqttClientHandle,
     client: AsyncClient,
     broker_max_packet_size: Option<u32>,
+    broker_receive_max: Option<u16>,
 ) {
-    let mut client_guard = handle.client.lock().await;
-    let superseded = handle
-        .fail_all_publishes(Some(SUPERSEDED_BY_NEW_CONNECTION.to_string()))
-        .await;
-    if superseded > 0 {
-        tracing::warn!(
-            client = %handle.config.identity.slug,
-            superseded,
-            "failed publish waiters left from a previous connection before installing a new one",
+    {
+        let mut client_guard = handle.client.lock().await;
+        handle
+            .broker_max_packet_size
+            .store(broker_max_packet_size.unwrap_or(0), Ordering::Relaxed);
+        handle.broker_receive_max.store(
+            broker_receive_max.unwrap_or(DEFAULT_RECEIVE_MAXIMUM),
+            Ordering::Relaxed,
         );
+        handle.connection_epoch.fetch_add(1, Ordering::Relaxed);
+        *client_guard = Some(client);
     }
-    handle
-        .broker_max_packet_size
-        .store(broker_max_packet_size.unwrap_or(0), Ordering::Relaxed);
-    *client_guard = Some(client);
+    handle.egress_wake.notify_one();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{PendingPublish, PubackOutcome, SubAckOutcome};
+    use crate::state::SubAckOutcome;
     use brenn_lib::messaging::Urgency;
 
     fn channel(client: &str, topic: &str, qos: u8) -> ResolvedMqttIngressChannel {
@@ -2053,137 +1902,60 @@ mod tests {
         ));
     }
 
-    // --- PubRec rejection (QoS2 caller-hang guard) ---
-
-    /// A QoS2 publish rejected at PUBREC (reason >= 0x80) resolves its waiter with
-    /// `BrokerRejected` and removes the inflight entry — without this arm the broker
-    /// emits no PUBREL/PUBCOMP, so `ack_rx.await` would hang forever and the entry
-    /// would leak.
+    /// Installing a connection stores the broker's Maximum Packet Size and
+    /// Receive Maximum, advances the epoch, makes the client visible and
+    /// leaves a wake. A CONNACK that states neither stores `0` and the MQTT 5
+    /// default.
     #[tokio::test]
-    async fn pubrec_rejection_resolves_waiter_and_removes_inflight() {
+    async fn install_connection_records_the_connection_and_wakes_egress() {
         let handle = test_handle();
-        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        assert_eq!(handle.connection_epoch.load(Ordering::Relaxed), 0);
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        handle
-            .inflight_publishes
-            .lock()
-            .await
-            .insert(7, PendingPublish { ack_tx });
-
-        let rec = rumqttc::PubRec {
-            pkid: 7,
-            reason: rumqttc::PubRecReason::NotAuthorized,
-            properties: None,
-        };
-        handle_event(Event::Incoming(Incoming::PubRec(rec)), &handle, &router).await;
-
-        match ack_rx.await {
-            Ok(Ok(PubackOutcome::BrokerRejected { reason })) => {
-                // reason falls back to the debug form of the reason code.
-                assert!(reason.contains("NotAuthorized"), "reason was {reason:?}");
-            }
-            other => panic!("expected BrokerRejected, got {other:?}"),
-        }
-        assert!(
-            !handle.inflight_publishes.lock().await.contains_key(&7),
-            "rejected pkid must be removed from the inflight map",
-        );
-    }
-
-    /// A *successful* PUBREC is left for rumqttc to drive to PUBCOMP: the rejection
-    /// arm's guard excludes it, so the inflight entry stays in place (the PubComp arm
-    /// resolves it later).
-    #[tokio::test]
-    async fn pubrec_success_leaves_inflight_for_pubcomp() {
-        let handle = test_handle();
-        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
-
-        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
-        handle
-            .inflight_publishes
-            .lock()
-            .await
-            .insert(9, PendingPublish { ack_tx });
-
-        let rec = rumqttc::PubRec {
-            pkid: 9,
-            reason: rumqttc::PubRecReason::Success,
-            properties: None,
-        };
-        handle_event(Event::Incoming(Incoming::PubRec(rec)), &handle, &router).await;
-
-        assert!(
-            handle.inflight_publishes.lock().await.contains_key(&9),
-            "a successful PUBREC must leave the inflight entry for the PUBCOMP arm",
-        );
-    }
-
-    /// A body that panicked while connected leaves its client (event loop
-    /// gone) in the cell and its waiters in both maps. Installing the next
-    /// connection fails every one of them, and the first publish on the new
-    /// connection is then bound to its own waiter, not to a stale one.
-    #[tokio::test]
-    async fn a_new_connection_starts_with_no_publish_waiters() {
-        let handle = test_handle();
-        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
-        let (dead_client, dead_eventloop) = unpolled_client(1);
-        drop(dead_eventloop);
-        *handle.client.lock().await = Some(dead_client);
-
-        let (stale_tx1, stale_rx1) = tokio::sync::oneshot::channel();
-        let (stale_tx2, stale_rx2) = tokio::sync::oneshot::channel();
-        let (stale_tx3, stale_rx3) = tokio::sync::oneshot::channel();
-        {
-            let mut pending = handle.pending_publishes.lock().unwrap();
-            pending.push_back(PendingPublish { ack_tx: stale_tx1 });
-            pending.push_back(PendingPublish { ack_tx: stale_tx2 });
-        }
-        handle
-            .inflight_publishes
-            .lock()
-            .await
-            .insert(1, PendingPublish { ack_tx: stale_tx3 });
-
-        let (new_client, _new_eventloop) = unpolled_client(64);
-        install_connection(&handle, new_client, Some(4096)).await;
-
-        for rx in [stale_rx1, stale_rx2, stale_rx3] {
-            match rx.await {
-                Ok(Err(brenn_lib::mqtt::error::MqttError::NotConnected {
-                    last_error: Some(e),
-                    ..
-                })) => assert_eq!(e, SUPERSEDED_BY_NEW_CONNECTION),
-                other => panic!("stale waiter resolved to {other:?}"),
-            }
-        }
-        assert!(handle.pending_publishes.lock().unwrap().is_empty());
-        assert!(handle.inflight_publishes.lock().await.is_empty());
+        let (client, _eventloop) = unpolled_client(4);
+        install_connection(&handle, client, Some(4096), Some(10)).await;
+        assert!(handle.client.lock().await.is_some());
         assert_eq!(handle.broker_max_packet_size.load(Ordering::Relaxed), 4096);
+        assert_eq!(handle.broker_receive_max.load(Ordering::Relaxed), 10);
+        assert_eq!(handle.connection_epoch.load(Ordering::Relaxed), 1);
+        tokio::time::timeout(Duration::from_secs(1), handle.egress_wake.notified())
+            .await
+            .expect("install leaves a wake");
 
-        // The next publish, pushed and submitted in one section as the publish
-        // path does, is resolved by the acknowledgement of packet id 1 on the
-        // new connection.
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        {
-            let client_guard = handle.client.lock().await;
-            let client = client_guard.as_ref().expect("install set the client");
-            let mut pending = handle.pending_publishes.lock().unwrap();
-            pending.push_back(PendingPublish { ack_tx });
-            client
-                .try_publish("t", rumqttc::mqttbytes::QoS::AtLeastOnce, false, "x")
-                .expect("the new client's request channel has room");
+        let (client, _eventloop2) = unpolled_client(4);
+        install_connection(&handle, client, None, None).await;
+        assert_eq!(handle.broker_max_packet_size.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            handle.broker_receive_max.load(Ordering::Relaxed),
+            DEFAULT_RECEIVE_MAXIMUM
+        );
+        assert_eq!(handle.connection_epoch.load(Ordering::Relaxed), 2);
+    }
+
+    /// Every outgoing event wakes the egress side: the event loop emits one
+    /// for each request it takes off the channel, whatever the request's
+    /// kind, so each is a request slot that may have freed. A full channel of
+    /// SUBSCRIBEs drains through `Outgoing::Subscribe` alone.
+    #[tokio::test]
+    async fn every_outgoing_event_wakes_egress() {
+        let handle = test_handle();
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        for outgoing in [
+            Outgoing::Publish(0),
+            Outgoing::Publish(3),
+            Outgoing::AwaitAck(4),
+            Outgoing::Subscribe(5),
+            Outgoing::Unsubscribe(6),
+            Outgoing::PubAck(7),
+            Outgoing::PubRec(8),
+            Outgoing::PubRel(9),
+            Outgoing::PubComp(10),
+            Outgoing::PingReq,
+        ] {
+            handle_event(Event::Outgoing(outgoing.clone()), &handle, &router).await;
+            tokio::time::timeout(Duration::from_secs(1), handle.egress_wake.notified())
+                .await
+                .unwrap_or_else(|_| panic!("{outgoing:?} leaves no wake"));
         }
-        handle_event(Event::Outgoing(Outgoing::Publish(1)), &handle, &router).await;
-        handle_event(
-            Event::Incoming(Incoming::PubAck(rumqttc::PubAck::new(1, None))),
-            &handle,
-            &router,
-        )
-        .await;
-        assert!(matches!(ack_rx.await, Ok(Ok(PubackOutcome::Success))));
-        assert!(handle.pending_publishes.lock().unwrap().is_empty());
-        assert!(handle.inflight_publishes.lock().await.is_empty());
     }
 
     // --- backoff_duration ---
@@ -2339,47 +2111,6 @@ mod tests {
         assert!(is_authoritative_failure(
             &ConnectionError::AuthProcessingError
         ));
-    }
-
-    // --- fail_all_publishes ---
-
-    #[tokio::test]
-    async fn fail_all_publishes_drains_both_deques() {
-        let handle = test_handle();
-
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let (tx3, rx3) = tokio::sync::oneshot::channel();
-        {
-            let mut p = handle.pending_publishes.lock().unwrap();
-            p.push_back(crate::state::PendingPublish { ack_tx: tx1 });
-            p.push_back(crate::state::PendingPublish { ack_tx: tx2 });
-        }
-        {
-            let mut inflight = handle.inflight_publishes.lock().await;
-            inflight.insert(42, crate::state::PendingPublish { ack_tx: tx3 });
-        }
-
-        assert_eq!(
-            handle.fail_all_publishes(Some("test error".into())).await,
-            3
-        );
-
-        assert!(matches!(
-            rx1.await.unwrap(),
-            Err(brenn_lib::mqtt::error::MqttError::NotConnected { .. })
-        ));
-        assert!(matches!(
-            rx2.await.unwrap(),
-            Err(brenn_lib::mqtt::error::MqttError::NotConnected { .. })
-        ));
-        assert!(matches!(
-            rx3.await.unwrap(),
-            Err(brenn_lib::mqtt::error::MqttError::NotConnected { .. })
-        ));
-
-        assert!(handle.pending_publishes.lock().unwrap().is_empty());
-        assert!(handle.inflight_publishes.lock().await.is_empty());
     }
 
     // ---------------------------------------------------------------------------

@@ -461,9 +461,8 @@ mod tests {
                         topic: "lights/<k>/set".into(),
                         qos: 1,
                         retain,
-                        message_expiry_s: None,
                         content_type: None,
-                        expires_at: Utc::now(),
+                        expires: brenn_lib::messaging::MqttExpiry::Never,
                     },
                 )),
                 ..fake_envelope("on")

@@ -603,7 +603,11 @@ pub(crate) fn convergibility_refusals(
     // executor qualifies on an added entry only: commit folds its subscription
     // to a newly registered tool's request channel in, and rule 7 has vetted
     // that its subscriptions are exactly the registered async tools' channels.
-    // A system participant is never folded out.
+    // The MQTT egress participant qualifies on an added or removed entry: those
+    // are a client's egress channel arriving or leaving with its client, and
+    // commit folds its subscription in or takes it out with the channel. A
+    // changed egress entry is a retune, which a restart applies. No other
+    // system participant is ever folded out.
     let moving_agents = delta.moving_agents();
     for entry in &delta.channels_added {
         rule_1(
@@ -614,6 +618,7 @@ pub(crate) fn convergibility_refusals(
                 surfaces: &joining_surfaces,
                 agents: &moving_agents,
                 tool_executor: true,
+                mqtt_egress: true,
             },
             &mut out,
         );
@@ -623,15 +628,25 @@ pub(crate) fn convergibility_refusals(
         surfaces: &leaving_surfaces,
         agents: &moving_agents,
         tool_executor: false,
+        mqtt_egress: false,
     };
     let joining = Movers {
         consumers: &arriving,
         surfaces: &joining_surfaces,
         agents: &moving_agents,
         tool_executor: false,
+        mqtt_egress: false,
     };
     for entry in &delta.channels_removed {
-        rule_1(entry, "removed", &leaving, &mut out);
+        rule_1(
+            entry,
+            "removed",
+            &Movers {
+                mqtt_egress: true,
+                ..leaving
+            },
+            &mut out,
+        );
     }
     for change in &delta.channels_changed {
         rule_1(&change.old, "changed", &leaving, &mut out);
@@ -703,6 +718,7 @@ pub(crate) fn live_subscriber_refusals(
         surfaces: &leaving_surfaces,
         agents: &no_agents,
         tool_executor: false,
+        mqtt_egress: false,
     };
     let mut out = Vec::new();
     // The added arm. A channel the candidate mints that the live directory
@@ -767,7 +783,8 @@ fn arriving_surfaces(delta: &PlanDelta) -> HashSet<&str> {
 }
 
 /// Rule 1: every subscriber on a moving entry must be a consumer, a surface or
-/// an agent that moves with it, or the tool executor on an added entry.
+/// an agent that moves with it, the tool executor on an added entry, or the
+/// MQTT egress participant on an added or removed entry.
 fn rule_1(entry: &ChannelEntry, what: &str, movers: &Movers<'_>, out: &mut Vec<String>) {
     for subscriber in &entry.subscribers {
         if !movers.accounts(&subscriber.kind) {
@@ -790,6 +807,10 @@ struct Movers<'a> {
     /// Whether the tool executor's subscriber is folded in on this side: true
     /// for added entries only.
     tool_executor: bool,
+    /// Whether the MQTT egress participant's subscriber moves on this side:
+    /// true for added and removed entries, false for both sides of a changed
+    /// one.
+    mqtt_egress: bool,
 }
 
 impl Movers<'_> {
@@ -800,7 +821,9 @@ impl Movers<'_> {
             SubscriberEntryKind::Surface(slug) => self.surfaces.contains(slug.as_str()),
             SubscriberEntryKind::App(slug) => self.agents.contains(slug.as_str()),
             SubscriberEntryKind::System(name) => {
-                self.tool_executor && name == brenn_tool_registry::TOOL_EXECUTOR_COMPONENT
+                (self.tool_executor && name == brenn_tool_registry::TOOL_EXECUTOR_COMPONENT)
+                    || (self.mqtt_egress
+                        && name == brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT)
             }
             _ => false,
         }
@@ -2144,6 +2167,27 @@ mod tests {
         subscriber(SubscriberEntryKind::System(
             brenn_tool_registry::TOOL_EXECUTOR_COMPONENT.into(),
         ))
+    }
+
+    /// Rule 1's MQTT egress arm: the participant's subscriber moves with an
+    /// added or removed entry, and a retune is refused.
+    #[test]
+    fn the_mqtt_egress_participant_is_accounted_on_an_added_or_removed_entry() {
+        let egress = || {
+            subscriber(SubscriberEntryKind::System(
+                brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT.into(),
+            ))
+        };
+        assert!(refusals_for_arrival_or_departure(vec![egress()], true).is_empty());
+        assert!(refusals_for_arrival_or_departure(vec![egress()], false).is_empty());
+        assert_eq!(
+            refusals_for_retune(vec![egress()]),
+            vec![
+                "brenn:work is changed but the \"mqtt-outbound\" system participant \
+                 subscribes to it: this change needs a restart"
+                    .to_string(),
+            ],
+        );
     }
 
     /// Rule 1's tool-executor arm: commit folds the executor's subscriber in

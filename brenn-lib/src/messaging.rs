@@ -27,16 +27,17 @@ pub mod test_support;
 
 pub use brenn_envelope::addressing::{
     APP_TOOL_RESULTS_NAMESPACE, AUTO_CHANNEL_SEGMENT, DEVICE_LOCATION_PREFIX, EGRESS_NAMESPACE,
-    MQTT_OUTBOUND_ADDRESS, MQTT_OUTBOUND_CHANNEL, TOOL_RESULTS_NAMESPACE, auto_channel_cid,
-    auto_channel_name, canonical_address, canonicalize_channel_address,
-    chat_channel_uuid_from_address, device_location_address, device_location_channel_uuid,
-    device_location_user, durable_auto_channel_uuid, egress_channel_uuid, ends_at_matcher_boundary,
+    MQTT_EGRESS_PREFIX, TOOL_RESULTS_NAMESPACE, auto_channel_cid, auto_channel_name,
+    canonical_address, canonicalize_channel_address, chat_channel_uuid_from_address,
+    device_location_address, device_location_channel_uuid, device_location_user,
+    durable_auto_channel_uuid, egress_channel_uuid, ends_at_matcher_boundary,
     ends_at_tuning_boundary, ephemeral_channel_uuid_from_name, in_a_tool_namespace,
     in_app_tool_results_namespace, in_the_device_location_family, in_the_egress_namespace,
     is_auto_channel_name, is_device_location_prefix, is_reserved_channel, is_reserved_channel_name,
     is_unreserved_char, is_unreserved_name, local_channel_uuid_from_name, matcher_boundary_list,
-    mqtt_channel_uuid_from_address, nondurable_channel_uuid, tool_channel_uuid_from_address,
-    tuning_boundary_list, webhook_channel_uuid_from_slug,
+    mqtt_channel_uuid_from_address, mqtt_egress_address, mqtt_egress_client,
+    nondurable_channel_uuid, tool_channel_uuid_from_address, tuning_boundary_list,
+    webhook_channel_uuid_from_slug,
 };
 pub use brenn_envelope::channel_model::ChannelBlockRole;
 
@@ -69,7 +70,7 @@ pub use tombstone::{Lookup, TombstonedRegistry};
 pub use brenn_envelope::{
     AttachmentName, Attachments, BRENN_ADDRESS_PREFIX, BlobId, BlobRef, BodyError, ChannelScheme,
     EPHEMERAL_ADDRESS_PREFIX, EnvelopeShape, Impetus, LOCAL_ADDRESS_PREFIX, MQTT_ADDRESS_PREFIX,
-    MessageBody, MessageEnvelope, MqttEnvelope, MqttPayloadBody, MqttPublishTransport,
+    MessageBody, MessageEnvelope, MqttEnvelope, MqttExpiry, MqttPayloadBody, MqttPublishTransport,
     MqttTransport, PWA_PUSH_ADDRESS_PREFIX, ShapedEnvelope, TextShape, TransportMeta, Urgency,
     WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope, WebhookTransport, check_content_type,
     is_text_content_type, serialize_text_shape, utc_from_epoch_ms, write_attachment_metadata,

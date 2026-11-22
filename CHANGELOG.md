@@ -4,6 +4,20 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **BREAKING for MqttSend callers:** `MqttSend` now commits the message to the
+  bus and returns, instead of waiting for the broker. A new argument,
+  `lifetime_s`, is required: a number of seconds from 1 to 4294967295, or
+  `"forever"`. It is how long Brenn keeps trying to send the message, and what
+  is left of it is sent as the MQTT message expiry. The answer is `ok` with
+  the message's id, the remaining budget and whether the client is connected
+  now; it never reports delivery. A client that is not connected is no longer
+  an error: the message waits for the connection within its lifetime. Broker
+  refusals, a packet over the broker's maximum size, expiry and messages lost
+  with a connection go to the operator as `warn` lines and phone alerts, not to
+  the caller. At QoS 1 a message may be delivered twice after a reconnect. An
+  inline payload over `[messaging] max_body_bytes` needs a blob store and is
+  refused as `payload_unstorable` without one. The `MqttSend` card's badge
+  reads "committed".
 - **BREAKING for operators:** MQTT publish ACLs are per topic. Until now, an
   app or component allowed to publish through a broker client could publish to
   every topic on it; it is now limited to the topics its ACL names. A publish entry
@@ -27,12 +41,11 @@ All notable changes to Brenn are documented here.
   the caller's spelling); a string `body` is still published verbatim, and a
   number, boolean or null `body` is refused. `content_type` also types a
   `body`, and is refused beside an `attachment`, which publishes its own.
-- **An MQTT publish now waits at most 10 seconds, and a component is no longer
-  trapped for a slow broker.** A conversation's `MqttSend` and a component's
-  `mqtt-publish` both give up on a broker that has not acknowledged within 10
-  seconds of the call; the message may still be delivered, so a retry can
-  deliver it twice. Time a component spends waiting in `mqtt-publish` no
-  longer counts against its running-time limit. Instead, once one activation
+- **A component's MQTT publish now waits at most 10 seconds, and a component
+  is no longer trapped for a slow broker.** A component's `mqtt-publish` gives
+  up on a broker that has not acknowledged within 10 seconds of the call; the
+  message may still be delivered, so a retry can deliver it twice. Time a
+  component spends waiting in `mqtt-publish` no longer counts against its running-time limit. Instead, once one activation
   has spent 10 seconds in total waiting on one MQTT client, further publishes
   to that client in that activation fail at once, so an activation waits on
   any one client for under 20 seconds. Components see two new transient
@@ -48,14 +61,23 @@ All notable changes to Brenn are documented here.
   preparation for routing MQTT publishes through the message bus. A declared
   channel named `egress`, `egress.<x>` or `egress/<x>` no longer loads, and no
   publish ACL, component output or surface output may name a channel under
-  `brenn:egress/`. The host mints one channel there, `brenn:egress/mqtt`, on
-  every deployment; nothing is published to it yet and MQTT publishing works
-  as before. Its name is not stable, so do not tune it or grant it.
+  `brenn:egress/`. The host mints one channel there per `[[mqtt_client]]`,
+  `brenn:egress/mqtt/<client>`, which carries that client's `MqttSend`
+  publishes. Its window (default 256) is the outage it survives; tune every
+  client's with `channel at prefix "brenn:egress/mqtt/"` or one client's with
+  `channel at "brenn:egress/mqtt/<client>"`, and restart to apply a retune. A
+  message dropped because the window overflowed is counted and alerted.
+  Known gap: a publish to a client that a config reload is removing can be
+  committed and lost without a report. A
+  component's `in` port may read a declared client's channel; nothing else may
+  name it.
 - **For component authors:** the SDK's `TransportMeta` gains the variant
-  `MqttPublish`. A component that matches the enum exhaustively needs an arm
-  when it is rebuilt against this release; one that uses the SDK's accessors
-  needs nothing. No message a component receives today carries the variant,
-  and no WIT contract changes.
+  `MqttPublish { client_slug, topic, qos, retain, content_type, expires }`,
+  where `expires` is `{"at": "<rfc3339>"}` or `"never"`. A component that
+  matches the enum exhaustively needs an arm when it is rebuilt against this
+  release; one that uses the SDK's accessors needs nothing. A component reads
+  it only on a `brenn:egress/mqtt/<client>` channel its `in` port binds. No WIT
+  contract changes.
 - Bumped url from 2.5.8 to 2.5.9, clearing RUSTSEC-2026-0592. A `^` in a URL
   path is now percent-encoded: file links carry `%5E`, `api-request` sends
   `%5E` for it, and a push `data.url`, redirector target or login return path

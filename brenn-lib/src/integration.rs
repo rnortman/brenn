@@ -1500,45 +1500,50 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         tools.push(VirtualToolDef {
             name: "MqttSend".to_string(),
             cli: CliAccess::Available,
-            description: format!(
-                "{}QoS 1/2: waits for PUBACK/PUBCOMP, at most {} s; on a timeout the call fails \
-                 and the message may still have been delivered. {}",
-                concat!(
-                    "Publish a message to an MQTT topic. Address format: `mqtt:<client>:<topic>`. ",
-                    "Example: `mqtt:homeassistant:home/sensor/temperature`.\n\n",
-                    "Give the payload in exactly one of three arguments. `body` as a string ",
-                    "publishes the text, its UTF-8 bytes. JSON is given as `body`, as a value (an ",
-                    "object or an array) or as text, and is published as JSON; a value is published ",
-                    "as a serialization of it, not your spelling of it. A number, boolean or null is ",
-                    "given as its JSON text in a string. When the exact bytes matter, `body_base64` ",
-                    "carries them unchanged: the base64 of bytes you compose yourself, published ",
-                    "decoded. `content_type` with `body` or `body_base64` is sent as the MQTT ",
-                    "Content Type; none is sent otherwise. `attachment` as ",
-                    "`{\"message_id\": …, \"name\": …}` publishes ",
-                    "an attachment of a message you were shown, by reference: its bytes never enter ",
-                    "this conversation, and its own content type is sent as the MQTT Content Type ",
-                    "(`content_type` is refused beside it). Give ",
-                    "the `message_id` and the attachment's name exactly as the message showed them. ",
-                    "The source message must still be retained on its channel and must have been ",
-                    "shown to this conversation since its context was last reset; otherwise read it ",
-                    "again with MessageChannelGet.\n\n",
-                    "A payload over the MQTT client's outbound bound (4 MiB unless the deployment ",
-                    "sets `outbound_payload_cap_bytes`) is refused with reason `payload_too_large`. ",
-                    "A refused attachment or an over-bound payload refuses the call with a `reason` ",
-                    "and spends no budget.\n\n",
-                    "`qos` is 0, 1, or 2 (default 1). `retain` is true/false (default false).\n\n",
-                ),
-                crate::mqtt::PUBLISH_WAIT.as_secs(),
-                concat!(
-                    "QoS 0: fire-and-forget (no broker ack). ",
-                    "Wildcards (`+` or `#`) in the topic are rejected — use a concrete topic name. ",
-                    "The app publishes only to topics its `acl publish` entries admit; a refusal ",
-                    "names the topic. ",
-                    "Cross-protocol misuse: `brenn:` addresses → BrennSend; `pwa_push:` → PwaPushSend. ",
-                    "Returns `{ ok: true }` on success or `{ ok: false, error: \"...\" }` on failure. ",
-                    "Counts against the per-conversation send budget."
-                ),
-            ),
+            description: concat!(
+                "Publish a message to an MQTT topic. Address format: `mqtt:<client>:<topic>`. ",
+                "Example: `mqtt:homeassistant:home/sensor/temperature`.\n\n",
+                "Give the payload in exactly one of three arguments. `body` as a string ",
+                "publishes the text, its UTF-8 bytes. JSON is given as `body`, as a value (an ",
+                "object or an array) or as text, and is published as JSON; a value is published ",
+                "as a serialization of it, not your spelling of it. A number, boolean or null is ",
+                "given as its JSON text in a string. When the exact bytes matter, `body_base64` ",
+                "carries them unchanged: the base64 of bytes you compose yourself, published ",
+                "decoded. `content_type` with `body` or `body_base64` is sent as the MQTT ",
+                "Content Type; none is sent otherwise. `attachment` as ",
+                "`{\"message_id\": …, \"name\": …}` publishes ",
+                "an attachment of a message you were shown, by reference: its bytes never enter ",
+                "this conversation, and its own content type is sent as the MQTT Content Type ",
+                "(`content_type` is refused beside it). Give ",
+                "the `message_id` and the attachment's name exactly as the message showed them. ",
+                "The source message must still be retained on its channel and must have been ",
+                "shown to this conversation since its context was last reset; otherwise read it ",
+                "again with MessageChannelGet.\n\n",
+                "A payload over the MQTT client's outbound bound (4 MiB unless the deployment ",
+                "sets `outbound_payload_cap_bytes`) is refused with reason `payload_too_large`. ",
+                "A refused attachment or an over-bound payload refuses the call with a `reason` ",
+                "and spends no budget.\n\n",
+                "`qos` is 0, 1, or 2 (default 1). `retain` is true/false (default false). ",
+                "`lifetime_s` is required: a whole number of seconds (at least 1) or \"forever\". ",
+                "It is how long Brenn keeps trying to deliver the message, and what is left of it ",
+                "when the message goes out is sent as the MQTT Message Expiry Interval (none for ",
+                "\"forever\").\n\n",
+                "The call returns once the message is committed for delivery, with its ",
+                "`message_id`; delivery happens afterwards and the result does not report it. ",
+                "`client_connected` says whether the client is connected now; when it is not, ",
+                "the message waits for a connection within its lifetime. A message whose ",
+                "lifetime passes before it is sent is dropped, and the operator, not you, is ",
+                "told; so are broker rejections and messages lost with a connection. A QoS 1 ",
+                "message may be delivered twice after a reconnect.\n\n",
+                "Wildcards (`+` or `#`) in the topic are rejected — use a concrete topic name. ",
+                "The app publishes only to topics its `acl publish` entries admit; a refusal ",
+                "names the topic. ",
+                "Cross-protocol misuse: `brenn:` addresses → BrennSend; `pwa_push:` → PwaPushSend. ",
+                "Returns `{ ok: true, message_id, remaining_budget, client_connected }` on commit ",
+                "or `{ ok: false, error: \"...\" }` on refusal. ",
+                "Counts against the per-conversation send budget."
+            )
+            .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1570,9 +1575,17 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                     "retain": {
                         "type": "boolean",
                         "description": "Set the MQTT retain flag (default false)"
+                    },
+                    "lifetime_s": {
+                        "type": ["integer", "string"],
+                        "anyOf": [
+                            { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+                            { "type": "string", "enum": ["forever"] }
+                        ],
+                        "description": "Required. Seconds Brenn keeps trying to deliver the message, at least 1, or \"forever\"; what is left of it at send is the MQTT Message Expiry Interval"
                     }
                 },
-                "required": ["to"]
+                "required": ["to", "lifetime_s"]
             }),
         });
     }
@@ -2203,11 +2216,11 @@ mod tests {
         );
     }
 
-    /// `MqttSend`'s description states the publish wait bound and that a
-    /// timed-out message may still have been delivered, so the conversation
-    /// knows a retry can deliver it twice.
+    /// `MqttSend`'s description says the call returns at commit, that delivery
+    /// is not reported to the caller, and what `lifetime_s` is, and states no
+    /// broker wait.
     #[test]
-    fn mqtt_send_description_states_the_wait_bound_and_possible_delivery() {
+    fn mqtt_send_description_states_commit_and_lifetime() {
         let tools = mqtt_virtual_tools(true);
         let send = tools
             .iter()
@@ -2215,14 +2228,23 @@ mod tests {
             .expect("MqttSend offered when MQTT is enabled");
 
         let desc = &send.description;
-        let bound = format!("at most {} s", crate::mqtt::PUBLISH_WAIT.as_secs());
+        for phrase in [
+            "returns once the message is committed",
+            "the result does not report it",
+            "`lifetime_s` is required",
+            "MQTT Message Expiry Interval",
+            "the operator, not you, is told",
+            "may be delivered twice after a reconnect",
+        ] {
+            assert!(
+                desc.contains(phrase),
+                "description must say {phrase:?}: {desc}"
+            );
+        }
+        assert!(!desc.contains("PUBACK"), "{desc}");
         assert!(
-            desc.contains(&bound),
-            "description must state {bound:?}: {desc}"
-        );
-        assert!(
-            desc.contains("the message may still have been delivered"),
-            "description must warn a timed-out message may be delivered: {desc}"
+            !desc.contains(&format!("{} s", crate::mqtt::PUBLISH_WAIT.as_secs())),
+            "{desc}"
         );
     }
 
@@ -2822,7 +2844,10 @@ mod tests {
             def.input_schema["properties"]["attachment"]["type"],
             "object"
         );
-        assert_eq!(def.input_schema["required"], serde_json::json!(["to"]));
+        assert_eq!(
+            def.input_schema["required"],
+            serde_json::json!(["to", "lifetime_s"])
+        );
         assert_eq!(
             brenn_envelope::tool_schema::check_input_schema(&def.input_schema),
             Ok(())
@@ -2865,6 +2890,21 @@ mod tests {
         assert_eq!(props["body_base64"]["type"], "string");
         assert_eq!(props["content_type"]["type"], "string");
         assert!(props["body"].get("oneOf").is_none());
+        assert_eq!(
+            props["lifetime_s"]["type"],
+            serde_json::json!(["integer", "string"])
+        );
+        assert_eq!(
+            props["lifetime_s"]["anyOf"],
+            serde_json::json!([
+                { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+                { "type": "string", "enum": ["forever"] }
+            ])
+        );
+        assert_eq!(
+            def.input_schema["required"],
+            serde_json::json!(["to", "lifetime_s"])
+        );
         assert!(!def.description.contains("binary_base64"));
         for (name, prop) in props.as_object().unwrap() {
             assert!(prop.get("type").is_some(), "{name} has no `type`");
@@ -2883,13 +2923,16 @@ mod tests {
             serde_json::json!(true),
             serde_json::Value::Null,
         ] {
-            let err = check(serde_json::json!({ "to": "mqtt:c:t", "body": body }))
-                .expect_err("a scalar body is refused");
+            let err =
+                check(serde_json::json!({ "to": "mqtt:c:t", "lifetime_s": 60, "body": body }))
+                    .expect_err("a scalar body is refused");
             assert!(err.contains("'body'"), "{err}");
         }
         for b64 in [serde_json::json!(7), serde_json::json!({ "x": "AAEC" })] {
-            let err = check(serde_json::json!({ "to": "mqtt:c:t", "body_base64": b64 }))
-                .expect_err("a non-string body_base64 is refused");
+            let err = check(
+                serde_json::json!({ "to": "mqtt:c:t", "lifetime_s": 60, "body_base64": b64 }),
+            )
+            .expect_err("a non-string body_base64 is refused");
             assert!(err.contains("'body_base64'"), "{err}");
         }
         for body in [
@@ -2899,7 +2942,7 @@ mod tests {
         ] {
             assert_eq!(
                 check(
-                    serde_json::json!({ "to": "mqtt:c:t", "body": body, "content_type": "application/json" })
+                    serde_json::json!({ "to": "mqtt:c:t", "lifetime_s": "forever", "body": body, "content_type": "application/json" })
                 ),
                 Ok(())
             );

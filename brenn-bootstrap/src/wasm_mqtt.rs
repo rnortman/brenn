@@ -114,6 +114,11 @@ impl brenn_wasm::MqttPublisher for WasmMqttPublisher {
             retain,
             message_expiry_s,
         };
+        // TODO(mqtt-egress-unwired): a component's publish goes to the broker
+        // directly and waits for its answer, bypassing the bus admission.
+        // TODO(mqtt-async-publish-component-survey): making this
+        // commit-and-return waits on the owner's answer about out-of-tree
+        // components.
         let result = tokio::runtime::Handle::current().block_on(enforce_and_publish(
             svc,
             policy,

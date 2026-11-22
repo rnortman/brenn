@@ -39,7 +39,7 @@ fn a_handle_less_block_tunes_every_family_the_system_mints() {
         tuning("brenn:tool-results/alice"),
         tuning("brenn:app-tool-results/alice"),
         tuning("brenn:device-location.alice"),
-        tuning("brenn:egress/mqtt"),
+        tuning("brenn:egress/mqtt/broker"),
     ));
     assert_eq!(config.resolved.tunings.len(), 7);
     assert!(config.resolved.channels.is_empty());
@@ -87,7 +87,7 @@ fn a_declaration_on_a_system_minted_address_is_refused() {
         ),
         ("results", "brenn:tool-results/alice", durable),
         ("fixes", "brenn:device-location.alice", durable),
-        ("outbound", "brenn:egress/mqtt", durable),
+        ("outbound", "brenn:egress/mqtt/broker", durable),
         ("inbox", "webhook:alice-inbox", nondurable),
         ("status", "mqtt:broker:alice/status", nondurable),
     ] {
@@ -1392,10 +1392,10 @@ fn a_tool_tuning_states_no_non_text() {
     );
     assert!(
         derive_refusal(&tuning_with(
-            "\"brenn:egress/mqtt\"",
+            "\"brenn:egress/mqtt/broker\"",
             "    non_text = true;\n"
         ))
-        .starts_with("the block tuning `brenn:egress/mqtt` states no non_text")
+        .starts_with("the block tuning `brenn:egress/mqtt/broker` states no non_text")
     );
 }
 

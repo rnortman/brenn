@@ -191,6 +191,7 @@ fn system_spec_with_policy(
         component: "relay",
         policy,
         subscriptions: vec!["brenn:system-boot".to_string()],
+        noise: brenn_lib::messaging::config::NoiseLevel::Silent,
     }
 }
 
@@ -832,21 +833,22 @@ fn a_surface_output_on_a_tools_address_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
-/// An output onto the MQTT outbound channel would let a page publish past the
-/// host's admission, the only writer an outbound channel has.
+/// An output onto an MQTT egress channel would let a page publish past the
+/// host's admission, the only writer an egress channel has.
 #[test]
 #[should_panic(expected = "which is in the egress namespace")]
-fn a_surface_output_on_the_mqtt_outbound_channel_panics() {
+fn a_surface_output_on_an_mqtt_egress_channel_panics() {
     let dir = dir_of(vec![
         brenn_entry("brenn:alerts"),
-        brenn_messaging::mqtt_outbound::mqtt_outbound_entry(
+        brenn_messaging::mqtt_outbound::mqtt_egress_entry(
+            "home",
             &brenn_lib::messaging::config::SystemChannelTuning::default(),
             &test_globals(),
         ),
         ephem("protobar-demo"),
     ]);
     let mut raw = valid_surface_raw();
-    raw.outputs[0].channel = Some("brenn:egress/mqtt".to_string());
+    raw.outputs[0].channel = Some("brenn:egress/mqtt/home".to_string());
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 

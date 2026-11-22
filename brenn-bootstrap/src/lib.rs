@@ -1005,13 +1005,13 @@ pub async fn run_server(
     // Register a ParkedNotify delivery binding for every subscribing system
     // participant (before set_state, like the wasm notifiers above, so a request
     // row found by the startup dispatcher sweep can eager-wake the drain loop),
-    // retaining each `Notify` for the participant's drain task. Publish-only
-    // specs (no subscriptions) are never dispatch targets and get no binding.
+    // retaining each `Notify` for the participant's drain task. Which specs
+    // get one is `binds_delivery`'s answer.
     let system_notifiers: Vec<(&'static str, std::sync::Arc<tokio::sync::Notify>)> = {
         let mut notifiers = Vec::new();
         if let Some(ref router) = messaging_result.router {
             for spec in &messaging_result.system_participants {
-                if spec.subscriptions.is_empty() {
+                if !binds_delivery(spec) {
                     continue;
                 }
                 let notify = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -1267,6 +1267,23 @@ pub async fn run_server(
         )
         .await;
 
+        // Before anything can publish to an egress channel, for the reason the
+        // executor's position is taken above.
+        let mqtt_egress = mqtt::start_mqtt_egress(
+            &mqtt_result.service,
+            messenger.clone(),
+            guard.alert_dispatcher.clone(),
+            system_notifier(
+                &system_notifiers,
+                brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT,
+            )
+            .expect(
+                "the MQTT egress spec is derived in every plan and always gets a parked-notify \
+                 binding",
+            ),
+        )
+        .await;
+
         reload::status::attach_and_publish_booted(
             &messaging_result.system_participants,
             messenger,
@@ -1381,6 +1398,7 @@ pub async fn run_server(
                 attach_registry: state.attach_registry.clone(),
                 mqtt_service: mqtt_result.service.clone(),
                 mqtt_event_router: mqtt_result.event_router.clone(),
+                mqtt_egress,
                 max_payload_bytes: config.messaging.max_body_bytes,
                 active_bridges: state.active_bridges.clone(),
                 apps_swapped_tx: state.apps_swapped_tx.clone(),
@@ -1627,6 +1645,16 @@ fn assert_one_app_table(
     }
 }
 
+/// Whether boot registers a parked-notify delivery binding for `spec`: every
+/// subscribing system participant, and the MQTT egress participant with no
+/// subscription too, because a reload adds its subscriptions with the first
+/// client and registers no binding. Other publish-only specs are never
+/// dispatch targets.
+pub(crate) fn binds_delivery(spec: &brenn_messaging::system::SystemParticipantSpec) -> bool {
+    !spec.subscriptions.is_empty()
+        || spec.component == brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT
+}
+
 /// Boot cross-check: every directory subscriber must resolve to both a
 /// wake-economics registration and a delivery binding. This is what makes "a
 /// new subscriber kind silently inherits nothing and strands its messages"
@@ -1694,6 +1722,29 @@ mod tests {
             ),
             ..Roots::default()
         }
+    }
+
+    /// The MQTT egress participant gets a delivery binding with no client
+    /// declared, so a reload's first client finds one; other publish-only
+    /// specs get none.
+    #[test]
+    fn binds_delivery_covers_the_egress_participant_with_no_client() {
+        use brenn_lib::messaging::ChannelScheme;
+        use brenn_messaging::mqtt_outbound::mqtt_outbound_spec;
+        use brenn_messaging::system::SystemParticipantSpec;
+
+        let no_clients = mqtt_outbound_spec(std::iter::empty());
+        assert!(no_clients.subscriptions.is_empty());
+        assert!(binds_delivery(&no_clients));
+        assert!(binds_delivery(&mqtt_outbound_spec(["home"])));
+        assert!(!binds_delivery(&SystemParticipantSpec::publish_only(
+            "publisher",
+            ChannelScheme::Brenn,
+            &["status".to_string()],
+        )));
+        assert!(!binds_delivery(
+            &brenn_messaging::device_location::device_location_spec()
+        ));
     }
 
     /// A valid build id (non-empty, at most 64 chars) must not panic. The

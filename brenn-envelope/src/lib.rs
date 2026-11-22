@@ -501,15 +501,24 @@ pub struct MqttPublishTransport {
     pub qos: u8,
     /// The MQTT retain flag to publish with.
     pub retain: bool,
-    /// The publisher's MQTT 5 message expiry; absent when it stated none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_expiry_s: Option<u32>,
     /// MQTT 5 Content Type to send; absent sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    /// End of the message's lifetime inside Brenn: it is not handed to the
-    /// broker at or after this instant.
-    pub expires_at: DateTime<Utc>,
+    /// End of the message's lifetime. What is left of it at hand-off is sent
+    /// as the MQTT 5 Message Expiry Interval. Always serialized: a row
+    /// without it does not decode.
+    pub expires: MqttExpiry,
+}
+
+/// When an outbound MQTT message's lifetime ends: `{"at":"<rfc3339>"}` or
+/// `"never"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MqttExpiry {
+    /// Not handed to the broker at or after this instant.
+    At(DateTime<Utc>),
+    /// Never expires; no Message Expiry Interval is sent.
+    Never,
 }
 
 /// The metadata of the transport a message came in on, or of the transport
@@ -518,8 +527,8 @@ pub struct MqttPublishTransport {
 ///
 /// `Mqtt` and `Webhook` are ingress metadata and appear only on a channel of
 /// their own scheme. `MqttPublish` is outbound metadata and appears only on
-/// the host's MQTT outbound channel ([`addressing::MQTT_OUTBOUND_ADDRESS`]),
-/// a `brenn:` channel.
+/// the host's MQTT egress channels ([`addressing::mqtt_egress_address`]),
+/// `brenn:` channels.
 ///
 /// Closed, like `envelope_type`. An ingress transport added later comes with
 /// a new [`ChannelScheme`], which a reader built before it already refuses at
@@ -925,7 +934,7 @@ mod tests {
     }
 
     /// The outbound variant's wire form, pinned literally beside the ingress
-    /// ones; the optional fields are omitted when absent.
+    /// ones; the content type is omitted when absent, the expiry never is.
     #[test]
     fn mqtt_publish_transport_wire_form_is_pinned_and_round_trips() {
         let at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
@@ -934,33 +943,31 @@ mod tests {
             topic: "lights/kitchen/set".to_string(),
             qos: 2,
             retain: true,
-            message_expiry_s: Some(30),
             content_type: Some("application/json".to_string()),
-            expires_at: at,
+            expires: MqttExpiry::At(at),
         });
         let bare = TransportMeta::MqttPublish(MqttPublishTransport {
             client_slug: "broker".to_string(),
             topic: "lights/kitchen/set".to_string(),
             qos: 0,
             retain: false,
-            message_expiry_s: None,
             content_type: None,
-            expires_at: at,
+            expires: MqttExpiry::Never,
         });
         for (meta, wire) in [
             (
                 &full,
                 concat!(
                     r#"{"mqtt_publish":{"client_slug":"broker","topic":"lights/kitchen/set","#,
-                    r#""qos":2,"retain":true,"message_expiry_s":30,"#,
-                    r#""content_type":"application/json","expires_at":"2023-11-14T22:13:20Z"}}"#
+                    r#""qos":2,"retain":true,"content_type":"application/json","#,
+                    r#""expires":{"at":"2023-11-14T22:13:20Z"}}}"#
                 ),
             ),
             (
                 &bare,
                 concat!(
                     r#"{"mqtt_publish":{"client_slug":"broker","topic":"lights/kitchen/set","#,
-                    r#""qos":0,"retain":false,"expires_at":"2023-11-14T22:13:20Z"}}"#
+                    r#""qos":0,"retain":false,"expires":"never"}}"#
                 ),
             ),
         ] {
@@ -968,6 +975,17 @@ mod tests {
             assert_eq!(&serde_json::from_str::<TransportMeta>(wire).unwrap(), meta);
             assert_eq!(meta.scheme(), ChannelScheme::Mqtt);
         }
+    }
+
+    /// A row without `expires` is a decode error, not a forever lifetime.
+    #[test]
+    fn mqtt_publish_transport_without_expires_does_not_decode() {
+        let wire = concat!(
+            r#"{"mqtt_publish":{"client_slug":"broker","topic":"t","#,
+            r#""qos":0,"retain":false}}"#
+        );
+        let err = serde_json::from_str::<TransportMeta>(wire).unwrap_err();
+        assert!(err.to_string().contains("expires"), "{err}");
     }
 
     /// The wrapped webhook shape, headers included: order kept, a repeated name

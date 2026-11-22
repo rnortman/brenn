@@ -715,7 +715,7 @@ impl Messenger {
         delivery_deadline: Option<DateTime<Utc>>,
         impetus: Option<Impetus>,
         attachments: HeldAttachments,
-        mqtt: Option<&MqttPublishOptions>,
+        mqtt: Option<mqtt::MqttTarget<'_>>,
     ) -> PublishResult {
         let sender = self.principal_identity(principal);
         let result = self
@@ -831,7 +831,7 @@ impl Messenger {
         delivery_deadline: Option<DateTime<Utc>>,
         impetus: Option<Impetus>,
         attachments: HeldAttachments,
-        mqtt: Option<&MqttPublishOptions>,
+        mqtt: Option<mqtt::MqttTarget<'_>>,
     ) -> PublishResult {
         // 1. Validate address shape, then resolve. Shape errors return
         //    `MalformedAddress`; well-formed
@@ -858,7 +858,12 @@ impl Messenger {
         //    general entry refuses it. With `Some` the address must be an `mqtt:`
         //    topic name, refused here so a malformed address is `MalformedAddress`
         //    ahead of the layer-1 grant, in the admission's order; the channel it
-        //    commits to is the outbound one, which the admission names at layer 2.
+        //    commits to is the client's egress channel, which the admission
+        //    names at layer 2.
+        let (mqtt, over_cap) = match mqtt {
+            Some(target) => (Some(target.options), target.over_cap),
+            None => (None, None),
+        };
         let scheme = if mqtt.is_some() {
             ChannelScheme::Mqtt
         } else {
@@ -1018,8 +1023,8 @@ impl Messenger {
         // takes no lock.
         //
         // An `mqtt:` publish is decided by the MQTT admission instead: the topic
-        // ACL, the client, the options and the payload, yielding the outbound
-        // channel and the transport metadata to store. `publish_acl_allows` is
+        // ACL, the client, the options and the payload, yielding the client's
+        // egress channel and the transport metadata to store. `publish_acl_allows` is
         // not asked; it refuses every `mqtt:` name.
         let (channel, mqtt_admitted) = match target {
             PublishTarget::Bus {
@@ -1032,12 +1037,22 @@ impl Messenger {
                 (channel, None)
             }
             PublishTarget::Mqtt(options) => {
+                let payload_len = match &over_cap {
+                    Some(bytes) => {
+                        assert!(
+                            body.as_bytes().is_empty() && attachments.is_empty(),
+                            "an MQTT payload over the body cap comes with an empty body and \
+                             no attachments"
+                        );
+                        Some(bytes.len() as u64)
+                    }
+                    None => mqtt::mqtt_payload_len(&body, &attachments),
+                };
                 match self.admit_mqtt(
                     policy,
                     addr,
                     options,
-                    &body,
-                    &attachments,
+                    payload_len,
                     reply_to,
                     deliver_after,
                     delivery_deadline,
@@ -1049,7 +1064,7 @@ impl Messenger {
         };
         let capabilities = channel.capabilities();
         // The scheme the stored message carries is its channel's: an MQTT
-        // publish is a `brenn:` row on the outbound channel.
+        // publish is a `brenn:` row on its client's egress channel.
         let envelope_type = if mqtt_admitted.is_some() {
             channel.transport_type
         } else {
@@ -1090,6 +1105,22 @@ impl Messenger {
                 max: e.max,
             };
         }
+
+        //    An MQTT payload over the body cap rides as a blob, so a messenger
+        //    with no blob store cannot carry it. Validate-only: refused here,
+        //    ahead of both spending gates.
+        let over_cap = match over_cap {
+            Some(bytes) => match self.blob_store() {
+                Some(store) => Some((bytes, Arc::clone(store))),
+                None => {
+                    return PublishResult::MqttRefused(MqttRefusal::NeedsBlobStore {
+                        len: bytes.len() as u64,
+                        max_body: self.defaults.max_body_bytes,
+                    });
+                }
+            },
+            None => None,
+        };
 
         // 3a. Resolve reply_to (if any): shape → visibility → resolve. Shape
         //    errors return `MalformedAddress`. The visibility gate runs BEFORE
@@ -1221,6 +1252,29 @@ impl Messenger {
                 }
             }
             PublishOrigin::System => None,
+        };
+
+        // 5a. An MQTT payload over the body cap is written to the blob store
+        //     here, after every gate that can refuse the publish, so a refused
+        //     publish writes nothing. A blob the store refuses lands no message,
+        //     so the budget drawn in step 5 is refunded.
+        let attachments = match over_cap {
+            Some((bytes, store)) => {
+                let options = mqtt.expect("an over-cap payload is an MQTT publish's");
+                match mqtt::write_payload_blob(store, bytes, options).await {
+                    Ok(held) => held,
+                    Err(refused) => {
+                        if let PublishOrigin::Conversation { id } = origin {
+                            let budget = conversation_send_budget
+                                .expect("Conversation origin requires a send budget");
+                            let conn = self.db.lock().await;
+                            refund_send_budget(&conn, id, budget);
+                        }
+                        return refused;
+                    }
+                }
+            }
+            None => attachments,
         };
 
         let publish_ts_ns = db::utc_to_ns(Utc::now());
@@ -1685,7 +1739,7 @@ impl Messenger {
                 assert!(
                     !matches!(transport, super::TransportMeta::MqttPublish(_)),
                     "publish_transport_ingress: host published outbound MQTT metadata on \
-                     ingress channel '{}' — outbound metadata belongs only on the outbound \
+                     ingress channel '{}' — outbound metadata belongs only on an MQTT egress \
                      channel",
                     channel.address
                 );

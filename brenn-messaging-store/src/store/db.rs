@@ -25,7 +25,8 @@ use brenn_lib::messaging::config::Depth;
 use super::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
     DeliverableSubscriber, MessageSeq, NewMessage, Parked, ReleaseOutcome, Released, ResumeCursor,
-    RetentionStore, StoreReplay, StoreRetained, SubscriberWindow, compose_window, depth_bound,
+    RetentionStore, StoreReplay, StoreRetained, SubscriberWindow, assert_sampled_head_unasked,
+    compose_window, depth_bound,
 };
 
 fn store_retained((seq, envelope): (i64, MessageEnvelope)) -> StoreRetained {
@@ -291,6 +292,31 @@ impl RetentionStore for DbStore {
             .map(|(seq, envelope)| (retained_seq(seq), Arc::new(envelope)))
             .collect();
         Some(compose_window(entries, next_owed, push_limit))
+    }
+
+    /// One query from the later of the cursor and the push tail's floor,
+    /// ascending, capped at `limit`; the cursor read and the select share one
+    /// connection hold.
+    async fn unseen_head(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+        limit: usize,
+    ) -> Option<Vec<(MessageSeq, Arc<MessageEnvelope>)>> {
+        assert_sampled_head_unasked(&self.address, push_limit);
+        let conn = self.db.lock().await;
+        let cursor = db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)?;
+        let Some(tail_floor) = db::retained_tail_floor_seq(&conn, self.channel_uuid, push_limit)
+        else {
+            return Some(Vec::new());
+        };
+        let from = cursor.next_owed_seq.max(tail_floor);
+        Some(
+            db::load_channel_retained_from_seq(&conn, self.channel_uuid, from, limit)
+                .into_iter()
+                .map(|(seq, envelope)| (retained_seq(seq), Arc::new(envelope)))
+                .collect(),
+        )
     }
 
     /// Move the cursor to `through + 1` and report the unseen seqs no window

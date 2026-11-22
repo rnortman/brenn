@@ -196,9 +196,8 @@ fn outbound_transport() -> brenn_envelope::TransportMeta {
         topic: "lights/kitchen/set".to_string(),
         qos: 1,
         retain: true,
-        message_expiry_s: Some(30),
         content_type: Some("application/json".to_string()),
-        expires_at: now() + Duration::seconds(30),
+        expires: brenn_envelope::MqttExpiry::At(now() + Duration::seconds(30)),
     })
 }
 
@@ -1875,6 +1874,135 @@ async fn serve(
         None => AdvanceOutcome::default(),
     };
     (new, advance)
+}
+
+/// Seqs and bodies of a head read, oldest first.
+fn head_entries(head: &[(MessageSeq, Arc<brenn_envelope::MessageEnvelope>)]) -> Vec<(u64, String)> {
+    head.iter()
+        .map(|(seq, envelope)| (seq.0, envelope.body.as_text().unwrap().to_owned()))
+        .collect()
+}
+
+/// The head read serves exactly the first `limit` of what the window calls new,
+/// whatever the position, the push limit and the cap: nothing unseen, fewer
+/// unseen than the cap, more than the cap, and more unseen than the push limit.
+#[tokio::test]
+async fn the_head_read_is_the_oldest_of_the_windows_new_entries() {
+    // (messages before the read, already advanced over, push limit, cap)
+    let cases: [(usize, usize, u64, usize); 6] = [
+        (3, 3, 4, 2),
+        (3, 1, 4, 5),
+        (6, 1, 8, 2),
+        (6, 0, 3, 2),
+        (6, 0, 3, 5),
+        (0, 0, 4, 2),
+    ];
+    for (published, seen, push_limit, cap) in cases {
+        for store in stores(DEPTH).await {
+            let sub = wasm_sub("proc");
+            store.attach(&sub, "proc", ATTACH_DEPTH).await;
+            for i in 0..published {
+                let msg = message_for(store.as_ref(), "alice", &format!("m{i}"));
+                store.append(msg).await;
+            }
+            if seen > 0 {
+                let window = store
+                    .window(&sub, ATTACH_DEPTH, Depth::Bounded(0))
+                    .await
+                    .expect("attached");
+                let (through, _) = window.new_entries()[seen - 1];
+                let floor = window.new_entries()[0].0;
+                store.advance(&sub, through, floor).await.expect("attached");
+            }
+
+            let push = Depth::Bounded(push_limit);
+            let head = store
+                .unseen_head(&sub, push, cap)
+                .await
+                .expect("the case attached this subscriber");
+            let window = store.window(&sub, push, push).await.expect("attached");
+            let expected: Vec<(u64, String)> = window
+                .new_entries()
+                .iter()
+                .take(cap)
+                .map(|(seq, envelope)| (seq.0, envelope.body.as_text().unwrap().to_owned()))
+                .collect();
+            let case = format!(
+                "{}: published {published}, seen {seen}, push {push_limit}, cap {cap}",
+                store.address()
+            );
+            assert_eq!(head_entries(&head), expected, "{case}");
+            assert_eq!(
+                head.len(),
+                published
+                    .saturating_sub(seen)
+                    .min(push_limit as usize)
+                    .min(cap),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// The head read moves nothing: read twice, it answers the same, and an advance
+/// over its first entry reports the gap the push limit cut, as an advance over
+/// the window does.
+#[tokio::test]
+async fn the_head_read_is_pure_and_its_advance_reports_the_cut() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        for body in ["a", "b", "c", "d", "e"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+        let push = Depth::Bounded(2);
+        let first = store.unseen_head(&sub, push, 1).await.expect("attached");
+        let again = store.unseen_head(&sub, push, 1).await.expect("attached");
+        assert_eq!(
+            head_entries(&first),
+            head_entries(&again),
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            head_entries(&first)[0].1,
+            "d",
+            "the oldest of the newest two: {}",
+            store.address()
+        );
+
+        let (seq, _) = first[0];
+        let advance = store.advance(&sub, seq, seq).await.expect("attached");
+        assert_eq!(advance.dropped, 3, "a, b and c: {}", store.address());
+        let next = store.unseen_head(&sub, push, 5).await.expect("attached");
+        assert_eq!(
+            head_entries(&next)
+                .into_iter()
+                .map(|(_, b)| b)
+                .collect::<Vec<_>>(),
+            vec!["e"],
+            "{}",
+            store.address()
+        );
+    }
+}
+
+/// A subscriber the store holds no position for gets `None`.
+#[tokio::test]
+async fn the_head_read_of_an_unattached_subscriber_is_none() {
+    for store in stores(DEPTH).await {
+        let msg = message_for(store.as_ref(), "alice", "a");
+        store.append(msg).await;
+        assert!(
+            store
+                .unseen_head(&wasm_sub("ghost"), ATTACH_DEPTH, 4)
+                .await
+                .is_none(),
+            "{}",
+            store.address()
+        );
+    }
 }
 
 /// A retained-primed queue is owed the tail, and the window hands it over oldest

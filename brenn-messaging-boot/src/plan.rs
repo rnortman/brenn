@@ -339,20 +339,22 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         )
     });
 
-    // The MQTT outbound channel, minted in every plan whether or not a client
-    // is declared, so the same entry and the same participant are derived from
-    // every document and a reload never adds or removes either. Minted with the
-    // environment entries so a binding to it resolves against `pre_directory`
-    // and meets the egress refusal rather than the unknown-channel one.
-    let mqtt_outbound_entry = brenn_messaging::mqtt_outbound::mqtt_outbound_entry(
-        &system_channel_tuning,
-        global_defaults,
-    );
+    // One egress channel per declared MQTT client. Minted with the
+    // environment entries so a binding to one resolves against
+    // `pre_directory` and meets the egress rules rather than the
+    // unknown-channel one.
+    let mqtt_egress_entries = inputs.mqtt_clients.keys().map(|client| {
+        brenn_messaging::mqtt_outbound::mqtt_egress_entry(
+            client,
+            &system_channel_tuning,
+            global_defaults,
+        )
+    });
 
     let mut environment_entries = webhook_channel_entries;
     environment_entries.extend(mqtt_channel_entries);
     environment_entries.extend(device_location_entries);
-    environment_entries.push(mqtt_outbound_entry);
+    environment_entries.extend(mqtt_egress_entries);
     let topology = lower_channel_topology(config, environment_entries);
 
     // Resolve WASM consumer subscriptions before finalizing the directory:
@@ -606,9 +608,11 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         .iter()
         .map(|raw| raw.slug.as_str())
         .collect();
+    let mqtt_client_slugs: Vec<&str> = mqtt_clients.keys().map(String::as_str).collect();
     validate_exact_tuning_blocks(
         &system_channel_tuning,
         &webhook_slugs,
+        &mqtt_client_slugs,
         &async_tool_names,
         &tuned_inbox_slugs,
         // An app's inbox needs both the registry and the resolved apps to
@@ -659,9 +663,12 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
     // The location channels' writer exists whenever messaging does: the
     // grant that feeds it lives on an app, and an app means messaging.
     system_participants.push(brenn_messaging::device_location::device_location_spec());
-    // The declared subscriber of `brenn:egress/mqtt`, present in every plan
-    // like its channel.
-    system_participants.push(brenn_messaging::mqtt_outbound::mqtt_outbound_spec());
+    // The declared subscriber of every MQTT egress channel, present in every
+    // plan, with no client too, so a reload that adds the first client finds
+    // it registered.
+    system_participants.push(brenn_messaging::mqtt_outbound::mqtt_outbound_spec(
+        inputs.mqtt_clients.keys().map(String::as_str),
+    ));
     // One roster channel per configured app, and the single identity that
     // writes them. Boot-declared rather than provisioned with a conversation:
     // apps are static config, and an app with no conversations still owes a

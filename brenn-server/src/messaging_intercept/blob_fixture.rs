@@ -124,11 +124,17 @@ pub(crate) async fn fixture_with_limits(limits: BlobLimits) -> Fixture {
 pub(crate) const MQTT_CLIENT: &str = "home";
 
 /// [`fixture`] whose `testapp` also holds `MqttPublish` with an
-/// `mqtt_publish` matcher for [`MQTT_CLIENT`], and whose bridge's MQTT
-/// service holds a session for that client publishing at most `bound` bytes a
-/// call. The session never connects.
+/// `mqtt_publish` matcher for [`MQTT_CLIENT`], whose directory holds that
+/// client's egress channel, and whose bridge's MQTT service, installed as the
+/// messenger's client table, holds a session for that client publishing at
+/// most `bound` bytes a call. The session never connects.
 pub(crate) async fn fixture_with_mqtt(bound: u32) -> Fixture {
-    build(TEST_BLOB_LIMITS, None, Some(bound)).await
+    fixture_with_mqtt_limits(bound, TEST_BLOB_LIMITS).await
+}
+
+/// [`fixture_with_mqtt`] with a blob store of `limits`.
+pub(crate) async fn fixture_with_mqtt_limits(bound: u32, limits: BlobLimits) -> Fixture {
+    build(limits, None, Some(bound)).await
 }
 
 /// [`fixture`] whose bridge holds `tools` and grants `testapp` each tool
@@ -191,6 +197,13 @@ async fn build(
                 brenn_tool_registry::TOOL_EXECUTOR_COMPONENT.to_string(),
                 brenn_tool_registry::bus_wiring::tool_executor_system_policy(),
             )]),
+        ));
+    }
+    if mqtt_bound.is_some() {
+        durable.push(brenn_messaging::mqtt_outbound::mqtt_egress_entry(
+            MQTT_CLIENT,
+            &brenn_lib::messaging::config::SystemChannelTuning::default(),
+            &brenn_lib::messaging::MessagingGlobalConfig::default(),
         ));
     }
     let ring = ephemeral_channel_entry("ring", RING_DEPTH);
@@ -279,6 +292,7 @@ async fn build(
     };
     if let Some(bound) = mqtt_bound {
         crate::test_support::mqtt::register_test_client(bridge.mqtt_service(), MQTT_CLIENT, bound);
+        m.install_mqtt_clients(bridge.mqtt_service().clone());
     }
     Fixture { bridge, m, blobs }
 }

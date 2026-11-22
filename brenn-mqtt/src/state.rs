@@ -1,20 +1,21 @@
 //! MQTT client registry state: the per-client handle and supervisor state.
 //!
 //! `MqttClientHandle` is the single handle type serving both the publish path
-//! (pending/inflight ack tracking) and the ingress delivery + reconnect
-//! re-assert path. One is built per declared `[[mqtt_client]]`, whether or not
+//! (the current client and the facts of its connection) and the ingress
+//! delivery + reconnect re-assert path. One is built per declared `[[mqtt_client]]`, whether or not
 //! anything is bound through it, and held on `MqttService` in a
 //! `client_slug`-keyed registry.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use brenn_lib::mqtt::config::MqttClientConfig;
-use brenn_lib::mqtt::error::MqttError;
+
+use crate::reader::ReaderSlot;
 
 /// How long [`MqttClientHandle::stop_and_join`] waits for a supervisor it has
 /// asked to stop.
@@ -29,12 +30,6 @@ const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 /// mid-section and the FIFO no longer matches the request channel.
 pub(crate) const PENDING_SUBSCRIBES_POISONED: &str =
     "pending_subscribes lock poisoned: a holder panicked inside its critical section";
-
-/// Poisoning message for [`MqttClientHandle::pending_publishes`]. Its critical
-/// sections are synchronous and short, so poisoning means a holder panicked
-/// mid-section and the FIFO no longer matches the request channel.
-pub(crate) const PENDING_PUBLISHES_POISONED: &str =
-    "pending_publishes lock poisoned: a holder panicked inside its critical section";
 
 /// Poisoning message for [`MqttClientHandle::deferred_subscribes`].
 pub(crate) const DEFERRED_SUBSCRIBES_POISONED: &str =
@@ -123,10 +118,10 @@ impl SupervisorState {
 }
 
 // ---------------------------------------------------------------------------
-// Pending publish tracking (for QoS 1/2 ack binding)
+// Publish outcomes
 // ---------------------------------------------------------------------------
 
-/// Outcome of a QoS ≥ 1 publish waiting for PUBACK/PUBCOMP.
+/// Outcome of a QoS ≥ 1 publish on the synchronous path.
 #[derive(Debug, Clone)]
 pub enum PubackOutcome {
     /// Broker acknowledged with a success reason code.
@@ -135,10 +130,82 @@ pub enum PubackOutcome {
     BrokerRejected { reason: String },
 }
 
-/// A publish awaiting pkid binding (pending) or awaiting PUBACK/PUBCOMP (inflight).
-pub struct PendingPublish {
-    pub ack_tx: tokio::sync::oneshot::Sender<Result<PubackOutcome, MqttError>>,
+/// What the client library reported for one tracked publish when its notice
+/// resolved. Every submitter on a session reads its outcome through
+/// [`notice_outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeOutcome {
+    /// Flushed to the network (QoS 0), or acknowledged with a success reason
+    /// (QoS 1/2).
+    Delivered,
+    /// The broker answered with a failure reason: the packet's reason string
+    /// when it carried one, else the reason code.
+    Rejected { reason: String },
+    /// The connection the publish was submitted on ended before an answer.
+    ConnectionEnded,
 }
+
+/// Map a resolved publish notice to its outcome.
+///
+/// # Panics
+///
+/// On a topic-alias replay failure or a completion-check error: Brenn sets no
+/// topic alias and never asks the library to check completion, so either is a
+/// host bug.
+pub fn notice_outcome(
+    result: Result<rumqttc::PublishResult, rumqttc::PublishNoticeError>,
+) -> NoticeOutcome {
+    use rumqttc::{PubAckReason, PubCompReason, PublishNoticeError as E, PublishResult as R};
+    match result {
+        Ok(R::Qos0Flushed) => NoticeOutcome::Delivered,
+        Ok(R::Qos1(ack)) => {
+            if ack.reason == PubAckReason::Success
+                || ack.reason == PubAckReason::NoMatchingSubscribers
+            {
+                NoticeOutcome::Delivered
+            } else {
+                NoticeOutcome::Rejected {
+                    reason: reason_text(ack.properties.and_then(|p| p.reason_string), &ack.reason),
+                }
+            }
+        }
+        Ok(R::Qos2Completed(comp)) => {
+            if comp.reason == PubCompReason::Success {
+                NoticeOutcome::Delivered
+            } else {
+                NoticeOutcome::Rejected {
+                    reason: reason_text(
+                        comp.properties.and_then(|p| p.reason_string),
+                        &comp.reason,
+                    ),
+                }
+            }
+        }
+        Ok(R::Qos2PubRecRejected(rec)) => NoticeOutcome::Rejected {
+            reason: reason_text(rec.properties.and_then(|p| p.reason_string), &rec.reason),
+        },
+        Err(E::Recv | E::SessionReset | E::Qos0NotFlushed) => NoticeOutcome::ConnectionEnded,
+        Err(
+            e @ (E::TopicAliasReplayUnavailable(_)
+            | E::V5PubAck(_)
+            | E::V5PubRec(_)
+            | E::V5PubComp(_)),
+        ) => {
+            panic!(
+                "publish notice resolved with {e:?}: Brenn sets no topic alias and never asks for a completion check"
+            )
+        }
+    }
+}
+
+/// The broker's reason string when it sent one, else the reason code.
+fn reason_text(reason_string: Option<String>, code: &dyn std::fmt::Debug) -> String {
+    reason_string.unwrap_or_else(|| format!("{code:?}"))
+}
+
+/// The Receive Maximum MQTT 5.0 section 3.2.2.3.3 gives a CONNACK that states
+/// none.
+pub const DEFAULT_RECEIVE_MAXIMUM: u16 = u16::MAX;
 
 // ---------------------------------------------------------------------------
 // Ingress subscription set
@@ -171,7 +238,7 @@ pub struct IngressSubscription {
 /// registry.
 ///
 /// This single handle serves both directions on one session: the publish path
-/// (`pending_publishes`/`inflight_publishes`) and the ingress delivery +
+/// (`client` and the facts of its connection) and the ingress delivery +
 /// reconnect re-assert path (`subscriptions`, `pending_subscribes`/
 /// `inflight_subscribes` for SubAck filter attribution).
 pub struct MqttClientHandle {
@@ -200,22 +267,20 @@ pub struct MqttClientHandle {
     /// value of the connection whose client it took.
     pub(crate) broker_max_packet_size: AtomicU32,
 
-    /// Waiters of QoS ≥ 1 publishes awaiting pkid binding (FIFO) — one entry
-    /// per PUBLISH packet, bound by position in the supervisor's
-    /// `Outgoing::Publish` arm.
-    ///
-    /// The lock exists only to make a push onto this FIFO atomic with the
-    /// non-blocking submit of the matching PUBLISH onto the session's request
-    /// channel (and the pop that undoes the push when the submit fails), so the
-    /// FIFO's order is the order the event loop receives the requests. Nothing
-    /// may hold it across an await: a publish future can then be dropped at any
-    /// await without leaving an entry that has no packet behind it. It is a
-    /// `std::sync::Mutex` so that holding it across an await makes the future
-    /// `!Send`, which `tokio::spawn` rejects.
-    pub pending_publishes: std::sync::Mutex<std::collections::VecDeque<PendingPublish>>,
+    /// The Receive Maximum the broker stated in the CONNACK of the connection
+    /// whose client [`Self::client`] holds, [`DEFAULT_RECEIVE_MAXIMUM`] when it
+    /// stated none. Written and read only under the `client` lock.
+    pub(crate) broker_receive_max: AtomicU16,
 
-    /// Inflight publishes (pkid → waiter).
-    pub inflight_publishes: Mutex<HashMap<u16, PendingPublish>>,
+    /// Counts the connections installed on this handle; the current one's
+    /// number. Written and read only under the `client` lock, so a submitter
+    /// knows which connection a publish went out on.
+    pub(crate) connection_epoch: AtomicU64,
+
+    /// Woken when a connection is installed and whenever the event loop writes
+    /// a PUBLISH, which is when room may have freed on the request channel. A
+    /// wake, not a state: "connected" is the `client` cell alone.
+    pub egress_wake: Notify,
 
     /// Filters awaiting pkid binding (FIFO) — one entry per SUBSCRIBE packet,
     /// for SubAck attribution.
@@ -273,7 +338,15 @@ pub struct MqttClientHandle {
     /// [`Self::set_supervisor`] right after the spawn. `None` before the spawn
     /// and after [`Self::stop_and_join`] has taken it.
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+
+    /// The egress reader, recorded by [`crate::reader::start_egress_reader`].
+    /// A `std::sync::Mutex`: every section is a synchronous take or store.
+    pub(crate) egress_reader: std::sync::Mutex<ReaderSlot>,
 }
+
+/// Poisoning message for [`MqttClientHandle::egress_reader`].
+pub(crate) const EGRESS_READER_POISONED: &str =
+    "egress reader slot poisoned: a holder panicked inside its critical section";
 
 impl MqttClientHandle {
     pub fn new(
@@ -290,14 +363,16 @@ impl MqttClientHandle {
             }),
             client: Mutex::new(None),
             broker_max_packet_size: AtomicU32::new(0),
-            pending_publishes: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            inflight_publishes: Mutex::new(HashMap::new()),
+            broker_receive_max: AtomicU16::new(DEFAULT_RECEIVE_MAXIMUM),
+            connection_epoch: AtomicU64::new(0),
+            egress_wake: Notify::new(),
             pending_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             deferred_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             inflight_subscribes: Mutex::new(HashMap::new()),
             subscribe_outcomes: Mutex::new(HashMap::new()),
             stop_tx,
             supervisor: Mutex::new(None),
+            egress_reader: std::sync::Mutex::new(ReaderSlot::Never),
         })
     }
 
@@ -307,39 +382,6 @@ impl MqttClientHandle {
         let label = state.health_label();
         let err = state.last_error().map(|s| s.to_string());
         (label, err)
-    }
-
-    /// Fail all pending and inflight publishes with `MqttError::NotConnected`
-    /// and return how many waiters were failed.
-    ///
-    /// Called by the supervisor when a connection ends, and by
-    /// `install_connection` before a new connection's client becomes visible,
-    /// where a non-zero count is the trace of a supervisor body that panicked
-    /// while connected. The pending lock is released before the in-flight lock
-    /// is awaited, so no std guard is held across an await.
-    pub async fn fail_all_publishes(&self, last_error: Option<String>) -> usize {
-        let error = MqttError::NotConnected {
-            client_slug: self.config.identity.slug.clone(),
-            last_error,
-        };
-
-        let pending: Vec<PendingPublish> = self
-            .pending_publishes
-            .lock()
-            .expect(PENDING_PUBLISHES_POISONED)
-            .drain(..)
-            .collect();
-        let mut failed = pending.len();
-        for p in pending {
-            let _ = p.ack_tx.send(Err(error.clone()));
-        }
-
-        let mut inflight = self.inflight_publishes.lock().await;
-        failed += inflight.len();
-        for (_, p) in inflight.drain() {
-            let _ = p.ack_tx.send(Err(error.clone()));
-        }
-        failed
     }
 
     /// Add a topic filter to this client's runtime subscription set if not already
@@ -477,7 +519,8 @@ impl MqttClientHandle {
         *slot = Some(join);
     }
 
-    /// Signal the supervisor to stop, then wait for it to exit.
+    /// Signal the supervisor and the egress reader to stop, then wait for the
+    /// reader, if one is running, and then the supervisor to exit.
     ///
     /// Bounded twice over. The supervisor's stop arm drains the DISCONNECT
     /// under its own timeout and its connect and backoff sleeps race the stop
@@ -496,6 +539,10 @@ impl MqttClientHandle {
     /// itself, so a join error here means the runtime tore the task down.
     pub async fn stop_and_join(&self) {
         self.stop();
+        let reader = self.take_egress_reader();
+        if let Some((join, _retire)) = reader {
+            self.join_egress_reader(join).await;
+        }
         let join = self.supervisor.lock().await.take().unwrap_or_else(|| {
             panic!(
                 "MqttClientHandle::stop_and_join with no supervisor recorded for client {:?}",
@@ -516,6 +563,76 @@ impl MqttClientHandle {
         if let Err(e) = joined {
             panic!(
                 "MQTT supervisor for client {:?} could not be joined: {e}",
+                self.config.identity.slug,
+            );
+        }
+    }
+
+    /// Retire the egress reader and wait for it to exit, leaving the session
+    /// running. The reader reports what it had outstanding, moves its position
+    /// past everything the channel retains and reports how many that skipped.
+    ///
+    /// # Panics
+    ///
+    /// If no reader is running on this handle, or as
+    /// [`Self::stop_and_join`] does for its supervisor when the reader does
+    /// not exit within [`STOP_JOIN_TIMEOUT`].
+    pub async fn retire_egress_reader(&self) {
+        let (join, retire) = self.take_egress_reader().unwrap_or_else(|| {
+            panic!(
+                "MqttClientHandle::retire_egress_reader with no egress reader running for client \
+                 {:?}",
+                self.config.identity.slug,
+            )
+        });
+        retire
+            .send(())
+            .expect("a running egress reader holds its retire receiver until it exits");
+        self.join_egress_reader(join).await;
+    }
+
+    /// Whether an egress reader was started on this handle and has been
+    /// neither retired nor joined.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn egress_reader_running(&self) -> bool {
+        matches!(
+            *self.egress_reader.lock().expect(EGRESS_READER_POISONED),
+            ReaderSlot::Running { .. }
+        )
+    }
+
+    /// Take the running reader out of its slot, leaving the slot `Gone`.
+    /// `None` when no reader is running.
+    fn take_egress_reader(
+        &self,
+    ) -> Option<(
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        let mut slot = self.egress_reader.lock().expect(EGRESS_READER_POISONED);
+        match std::mem::replace(&mut *slot, ReaderSlot::Gone) {
+            ReaderSlot::Running { join, retire } => Some((join, retire)),
+            previous @ (ReaderSlot::Never | ReaderSlot::Gone) => {
+                *slot = previous;
+                None
+            }
+        }
+    }
+
+    async fn join_egress_reader(&self, join: tokio::task::JoinHandle<()>) {
+        let joined = tokio::time::timeout(STOP_JOIN_TIMEOUT, join)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "MQTT egress reader for client {:?} did not exit within {}s of being asked \
+                     to — it waits on no broker, so this is a host bug",
+                    self.config.identity.slug,
+                    STOP_JOIN_TIMEOUT.as_secs(),
+                )
+            });
+        if let Err(e) = joined {
+            panic!(
+                "MQTT egress reader for client {:?} could not be joined: {e}",
                 self.config.identity.slug,
             );
         }
@@ -649,6 +766,110 @@ mod tests {
             handle.subscribe_outcome("sensors/#").await,
             Some(SubAckOutcome::Granted)
         );
+    }
+
+    fn puback(reason: rumqttc::PubAckReason, reason_string: Option<&str>) -> rumqttc::PubAck {
+        rumqttc::PubAck {
+            pkid: 1,
+            reason,
+            properties: reason_string.map(|r| rumqttc::PubAckProperties {
+                reason_string: Some(r.to_string()),
+                user_properties: vec![],
+            }),
+        }
+    }
+
+    /// Every row of the notice table: what is delivered, what is rejected
+    /// and with which words, and what means the connection ended first.
+    #[test]
+    fn notice_outcome_maps_every_resolution() {
+        use rumqttc::{
+            PubAckReason, PubComp, PubCompProperties, PubCompReason, PubRec, PubRecProperties,
+            PubRecReason, PublishNoticeError as E, PublishResult as R,
+        };
+        let rejected = |reason: &str| NoticeOutcome::Rejected {
+            reason: reason.to_string(),
+        };
+
+        assert_eq!(notice_outcome(Ok(R::Qos0Flushed)), NoticeOutcome::Delivered);
+        for reason in [PubAckReason::Success, PubAckReason::NoMatchingSubscribers] {
+            assert_eq!(
+                notice_outcome(Ok(R::Qos1(puback(reason, None)))),
+                NoticeOutcome::Delivered
+            );
+        }
+        assert_eq!(
+            notice_outcome(Ok(R::Qos1(puback(PubAckReason::NotAuthorized, None)))),
+            rejected("NotAuthorized"),
+            "with no reason string the reason code's name is the reason",
+        );
+        assert_eq!(
+            notice_outcome(Ok(R::Qos1(puback(
+                PubAckReason::QuotaExceeded,
+                Some("over quota")
+            )))),
+            rejected("over quota"),
+        );
+
+        let comp = |reason, reason_string: Option<&str>| PubComp {
+            pkid: 2,
+            reason,
+            properties: reason_string.map(|r| PubCompProperties {
+                reason_string: Some(r.to_string()),
+                user_properties: vec![],
+            }),
+        };
+        assert_eq!(
+            notice_outcome(Ok(R::Qos2Completed(comp(PubCompReason::Success, None)))),
+            NoticeOutcome::Delivered
+        );
+        assert_eq!(
+            notice_outcome(Ok(R::Qos2Completed(comp(
+                PubCompReason::PacketIdentifierNotFound,
+                None
+            )))),
+            rejected("PacketIdentifierNotFound"),
+        );
+        assert_eq!(
+            notice_outcome(Ok(R::Qos2Completed(comp(
+                PubCompReason::PacketIdentifierNotFound,
+                Some("lost it")
+            )))),
+            rejected("lost it"),
+        );
+
+        let rec = PubRec {
+            pkid: 3,
+            reason: PubRecReason::NotAuthorized,
+            properties: Some(PubRecProperties {
+                reason_string: Some("denied".to_string()),
+                user_properties: vec![],
+            }),
+        };
+        assert_eq!(
+            notice_outcome(Ok(R::Qos2PubRecRejected(rec))),
+            rejected("denied")
+        );
+
+        for e in [E::Recv, E::SessionReset, E::Qos0NotFlushed] {
+            assert_eq!(notice_outcome(Err(e)), NoticeOutcome::ConnectionEnded);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Brenn sets no topic alias")]
+    fn a_topic_alias_replay_failure_panics() {
+        notice_outcome(Err(
+            rumqttc::PublishNoticeError::TopicAliasReplayUnavailable(1),
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "never asks for a completion check")]
+    fn a_completion_check_error_panics() {
+        notice_outcome(Err(rumqttc::PublishNoticeError::V5PubAck(
+            rumqttc::PubAckReason::NotAuthorized,
+        )));
     }
 
     #[test]

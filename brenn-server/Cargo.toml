@@ -80,6 +80,7 @@ ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
 url = "2.5.8"
 uuid = { version = "1.23.0", features = ["v4"] }
 brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
+bytes = "1.11.1"
 # Optional, enabled by "testutils": `test_support::state` hands the crates above
 # a router over a temp working dir. Also a dev-dependency below, for this
 # crate's own tests.

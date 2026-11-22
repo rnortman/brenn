@@ -360,6 +360,7 @@ pub fn tool_executor_spec(
             .iter()
             .map(|tool| canonical_address(&request_channel_name(tool)))
             .collect(),
+        noise: NoiseLevel::Silent,
     }
 }
 

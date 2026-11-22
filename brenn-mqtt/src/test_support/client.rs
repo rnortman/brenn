@@ -30,7 +30,7 @@ pub fn session_client_id(client_slug: &str) -> String {
 /// Install in `handle`, as the supervisor installs a connection's client, a
 /// client that never connects, recording
 /// `broker_max_packet_size` as the Maximum Packet Size its broker advertised
-/// (`None`: none advertised).
+/// (`None`: none advertised) and no Receive Maximum.
 ///
 /// Returns the client's event loop, which the caller keeps alive: requests sit
 /// queued in it, unsent, so a QoS 0 publish is accepted with no broker, and a
@@ -41,7 +41,7 @@ pub async fn install_unpolled_client(
     broker_max_packet_size: Option<u32>,
 ) -> rumqttc::EventLoop {
     let (client, eventloop) = crate::connection::unpolled_client(64);
-    crate::connection::install_connection(handle, client, broker_max_packet_size).await;
+    crate::connection::install_connection(handle, client, broker_max_packet_size, None).await;
     eventloop
 }
 

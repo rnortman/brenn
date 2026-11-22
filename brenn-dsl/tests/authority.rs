@@ -6016,30 +6016,34 @@ fn a_user_location_channel_is_never_bound_outbound() {
     }
 }
 
-// ── the MQTT outbound channel ────────────────────────────────────────────────
+// ── the MQTT egress channels ─────────────────────────────────────────────────
 
-const MQTT_OUTBOUND: &str = "brenn:egress/mqtt";
+/// The egress channel of `INGRESS`'s client.
+const MQTT_EGRESS: &str = "brenn:egress/mqtt/bob_hub";
 
 #[test]
-fn a_consumer_binds_the_mqtt_outbound_channel_as_an_input() {
-    let config = derived(&relay(&format!("    in inbound <- \"{MQTT_OUTBOUND}\";\n")));
+fn a_consumer_binds_a_declared_clients_egress_channel_as_an_input() {
+    let config = derived(&format!(
+        "{INGRESS}{}",
+        relay(&format!("    in inbound <- \"{MQTT_EGRESS}\";\n"))
+    ));
     let acl = &config.consumers[0].acl;
-    assert_eq!(patterns(&acl.brenn_subscribe), ["egress/mqtt"]);
+    assert_eq!(patterns(&acl.brenn_subscribe), ["egress/mqtt/bob_hub"]);
     assert!(acl.brenn_publish.is_empty(), "{:?}", acl.brenn_publish);
 }
 
 #[test]
-fn the_mqtt_outbound_channel_is_never_bound_outbound() {
+fn an_egress_channel_is_never_bound_outbound() {
     for (port, body) in [
-        ("out", format!("    out outbound -> \"{MQTT_OUTBOUND}\";\n")),
-        ("io", format!("    io acks <-> \"{MQTT_OUTBOUND}\";\n")),
+        ("out", format!("    out outbound -> \"{MQTT_EGRESS}\";\n")),
+        ("io", format!("    io acks <-> \"{MQTT_EGRESS}\";\n")),
     ] {
-        let errors = derive_errors(&relay_with("ports", &body));
+        let errors = derive_errors(&format!("{INGRESS}{}", relay_with("ports", &body)));
         let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(
             messages,
             [format!(
-                "this {} of consumer `alice_relay` names `{MQTT_OUTBOUND}`, in the egress \
+                "this {} of consumer `alice_relay` names `{MQTT_EGRESS}`, in the egress \
                  namespace: only Brenn's admission writes an outbound channel, so no `out` or \
                  `io` port publishes there; an MQTT publish goes to its \
                  `mqtt:<client>:<topic>` address",
@@ -6052,10 +6056,23 @@ fn the_mqtt_outbound_channel_is_never_bound_outbound() {
 }
 
 #[test]
-fn an_input_on_another_egress_name_attaches_to_nothing() {
-    let refusal = derive_refusal(&relay("    in inbound <- \"brenn:egress/other\";\n"));
-    assert!(
-        refusal.starts_with("`brenn:egress/other` names no declared channel"),
-        "{refusal}"
-    );
+fn an_input_on_any_other_egress_name_is_refused_naming_the_per_client_form() {
+    for address in [
+        "brenn:egress/mqtt/carol_hub",
+        "brenn:egress/mqtt",
+        "brenn:egress/other",
+    ] {
+        let refusal = derive_refusal(&format!(
+            "{INGRESS}{}",
+            relay(&format!("    in inbound <- \"{address}\";\n"))
+        ));
+        assert_eq!(
+            refusal,
+            format!(
+                "this binding of consumer `alice_relay` names `{address}`, in the egress \
+                 namespace, which is no declared client's egress channel: each \
+                 `mqtt_client` has one, `brenn:egress/mqtt/<client>`"
+            ),
+        );
+    }
 }

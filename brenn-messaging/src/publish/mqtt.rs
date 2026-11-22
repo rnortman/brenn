@@ -1,11 +1,13 @@
 //! The front door for a bus publish to an MQTT topic.
 //!
-//! An admitted publish to `mqtt:<client>:<topic>` is committed to the one
-//! outbound channel, `brenn:egress/mqtt`, with the payload as its body (or its
-//! one attachment) and the MQTT options as `MqttPublish` transport metadata.
+//! An admitted publish to `mqtt:<client>:<topic>` is committed to the
+//! client's egress channel, `brenn:egress/mqtt/<client>`, with the payload as
+//! its body (or its one attachment) and the MQTT options as `MqttPublish`
+//! transport metadata.
 //! [`Messenger::admit_mqtt`] is the one decision on whether it may be; the
 //! common publish gates (body cap, send rate, send budget, commit) follow it
-//! inside `publish_gated`.
+//! inside `publish_gated`, which also writes an inline payload over the body
+//! cap to the blob store once every gate has passed.
 
 use std::sync::Arc;
 
@@ -13,13 +15,19 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use brenn_envelope::grants::AppCapability;
-use brenn_envelope::{MessageBody, check_content_type};
+use brenn_envelope::{AttachmentName, MessageBody, check_content_type};
 use brenn_lib::access::AppPolicy;
-use brenn_lib::mqtt::{MqttClientDirectory, MqttPublishOptions, parse_topic_name};
-use brenn_messaging_store::blob::HeldAttachments;
+use brenn_lib::mqtt::{MqttClientDirectory, MqttLifetime, MqttPublishOptions, parse_topic_name};
+use brenn_messaging_store::blob::{BlobError, BlobStore, HeldAttachments};
 
 use super::{PublishOrigin, PublishPrincipal, PublishResult};
-use crate::{ChannelEntry, MQTT_OUTBOUND_ADDRESS, Messenger, MqttPublishTransport, Urgency};
+use crate::{
+    ChannelEntry, Messenger, MqttExpiry, MqttPublishTransport, Urgency, mqtt_egress_address,
+};
+
+/// The name of the one attachment an MQTT payload rides as when it is not the
+/// body.
+const PAYLOAD_ATTACHMENT: &str = "payload";
 
 /// Why the MQTT admission refused a publish on its options or payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,20 +40,25 @@ pub enum MqttRefusal {
     DeliveryDeadline,
     /// QoS above 2.
     InvalidQos { qos: u8 },
-    /// A stated message expiry of 0.
-    InvalidExpiry,
     /// A stated content type that is not a well-formed media type.
     InvalidContentType { reason: String },
     /// Neither the body alone nor exactly one attachment beside an empty body.
     PayloadShape,
     /// The payload is over the client's `outbound_payload_cap_bytes`.
     PayloadOverClientCap { len: u64, cap: u32 },
+    /// An inline payload over the bus's body cap must ride as a blob, and the
+    /// messenger has no blob store.
+    NeedsBlobStore { len: u64, max_body: usize },
+    /// An inline payload over the bus's body cap must ride as a blob, and the
+    /// blob store refused it.
+    BlobRefused { reason: String },
 }
 
 /// The payload of a conversation's MQTT publish.
 #[derive(Debug)]
 pub enum MqttPayload {
-    /// The bytes themselves, carried as the message body.
+    /// The bytes themselves, carried as the message body, or as one blob
+    /// attachment when they are over the bus's body cap.
     Inline(Vec<u8>),
     /// Held attachments, carried beside an empty body; the admission accepts
     /// exactly one.
@@ -61,8 +74,17 @@ pub struct MqttCommitted {
     pub remaining_budget: Option<u32>,
 }
 
-/// An admitted MQTT publish: the outbound channel to commit to, and what the
-/// stored transport metadata is built from.
+/// What `publish_gated` is handed for an MQTT publish: its options, and an
+/// inline payload over the bus's body cap, which rides as a blob written after
+/// every gate has passed. With `over_cap` set the body is empty and there are
+/// no attachments.
+pub(crate) struct MqttTarget<'a> {
+    pub(crate) options: &'a MqttPublishOptions,
+    pub(crate) over_cap: Option<Vec<u8>>,
+}
+
+/// An admitted MQTT publish: the client's egress channel to commit to, and
+/// what the stored transport metadata is built from.
 pub(crate) struct MqttAdmitted {
     pub(crate) channel: Arc<ChannelEntry>,
     client: String,
@@ -73,17 +95,34 @@ pub(crate) struct MqttAdmitted {
 impl MqttAdmitted {
     /// The transport metadata for a message committed at `committed_at`.
     pub(crate) fn transport(&self, committed_at: DateTime<Utc>) -> MqttPublishTransport {
-        let lifetime = chrono::Duration::from_std(self.options.lifetime())
-            .expect("an MQTT lifetime of at most u32::MAX seconds fits a chrono duration");
+        let expires = match self.options.lifetime {
+            MqttLifetime::Seconds(s) => {
+                MqttExpiry::At(committed_at + chrono::Duration::seconds(i64::from(s.get())))
+            }
+            MqttLifetime::Forever => MqttExpiry::Never,
+        };
         MqttPublishTransport {
             client_slug: self.client.clone(),
             topic: self.topic.clone(),
             qos: self.options.qos,
             retain: self.options.retain,
-            message_expiry_s: self.options.message_expiry_s,
             content_type: self.options.content_type.clone(),
-            expires_at: committed_at + lifetime,
+            expires,
         }
+    }
+}
+
+/// The length of an MQTT publish's payload as it is about to be committed:
+/// the body's, or its one attachment's beside an empty body. `None` for any
+/// other shape.
+pub(crate) fn mqtt_payload_len(body: &MessageBody, attachments: &HeldAttachments) -> Option<u64> {
+    if attachments.is_empty() {
+        return Some(body.as_bytes().len() as u64);
+    }
+    let refs = attachments.refs();
+    match refs.iter().next() {
+        Some((_, blob)) if refs.len() == 1 && body.as_bytes().is_empty() => Some(blob.size),
+        _ => None,
     }
 }
 
@@ -102,8 +141,10 @@ impl Messenger {
         }
     }
 
-    /// Decide whether `policy` may publish `body` and `attachments` to the
-    /// MQTT topic address `addr` with `options`. Spends nothing.
+    /// Decide whether `policy` may publish a payload of `payload_len` bytes to
+    /// the MQTT topic address `addr` with `options`. Spends nothing.
+    /// `payload_len` is [`mqtt_payload_len`]'s answer: `None` when the payload
+    /// is neither the body alone nor one attachment beside an empty body.
     ///
     /// The checks run in a fixed order, and the order is part of the answer: a
     /// publisher refused on its grant or ACL learns nothing of the client.
@@ -114,24 +155,21 @@ impl Messenger {
     /// 1. `addr` is a well-formed `mqtt:` topic name → `MalformedAddress`.
     /// 2. the policy holds `MqttPublish` → `MissingSender`.
     /// 3. `allows_mqtt_publish(client, topic)` → `AclDenied`.
-    /// 4. the client is registered → `UnknownChannel`.
+    /// 4. the client is registered and its egress channel is in the
+    ///    directory → `UnknownChannel`. Either can be absent for a moment
+    ///    while a reload adds or removes the client, and "unknown client" is
+    ///    the true answer in that moment.
     /// 5. no `deliver_after`, `reply_to` or `delivery_deadline` → `MqttRefused`.
-    /// 6. QoS ≤ 2, a stated expiry ≥ 1, a stated content type well formed.
+    /// 6. QoS ≤ 2, a stated content type well formed.
     /// 7. the payload is the body, or one attachment beside an empty body.
     /// 8. the payload's length is within the client's outbound cap.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the client is registered and the directory holds no
-    /// `brenn:egress/mqtt`: every messaging plan mints it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_mqtt(
         &self,
         policy: &AppPolicy,
         addr: &str,
         options: &MqttPublishOptions,
-        body: &MessageBody,
-        attachments: &HeldAttachments,
+        payload_len: Option<u64>,
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
@@ -154,8 +192,13 @@ impl Messenger {
         else {
             return Err(PublishResult::UnknownChannel(addr.to_string()));
         };
+        let Some(channel) = self.directory.resolve(&mqtt_egress_address(&parsed.client)) else {
+            return Err(PublishResult::UnknownChannel(addr.to_string()));
+        };
 
         // A stated option the broker cannot carry is refused, never silently dropped.
+        // TODO(mqtt-egress-unwired): `deliver_after` and `reply_to` are refused
+        // here until the egress path carries them.
         if deliver_after.is_some() {
             return refuse(MqttRefusal::DeliverAfter);
         }
@@ -169,9 +212,6 @@ impl Messenger {
         if options.qos > 2 {
             return refuse(MqttRefusal::InvalidQos { qos: options.qos });
         }
-        if options.message_expiry_s == Some(0) {
-            return refuse(MqttRefusal::InvalidExpiry);
-        }
         if let Some(ct) = options.content_type.as_deref()
             && let Err(e) = check_content_type(ct)
         {
@@ -180,28 +220,13 @@ impl Messenger {
             });
         }
 
-        let len = if attachments.is_empty() {
-            body.as_bytes().len() as u64
-        } else {
-            let refs = attachments.refs();
-            match refs.iter().next() {
-                Some((_, blob)) if refs.len() == 1 && body.as_bytes().is_empty() => blob.size,
-                _ => return refuse(MqttRefusal::PayloadShape),
-            }
+        let Some(len) = payload_len else {
+            return refuse(MqttRefusal::PayloadShape);
         };
         if len > u64::from(cap) {
             return refuse(MqttRefusal::PayloadOverClientCap { len, cap });
         }
 
-        let channel = self
-            .directory
-            .resolve(MQTT_OUTBOUND_ADDRESS)
-            .unwrap_or_else(|| {
-                panic!(
-                    "admit_mqtt: {MQTT_OUTBOUND_ADDRESS} is not in the directory — every messaging \
-                 plan mints it"
-                )
-            });
         Ok(MqttAdmitted {
             channel,
             client: parsed.client,
@@ -212,21 +237,26 @@ impl Messenger {
 
     /// Publish `payload` to the MQTT topic address `addr` on behalf of an app's
     /// conversation, through the common publish gates with the MQTT admission
-    /// at layer 2. Returns at commit. Nothing reads `brenn:egress/mqtt`, so a
-    /// committed message reaches no broker.
+    /// at layer 2. Returns at commit, with the message on the client's egress
+    /// channel.
     ///
-    /// An inline payload becomes a body typed by `options.content_type` when
-    /// its bytes are valid for that type, and an `application/octet-stream`
-    /// body of the same bytes otherwise, so text reads as text to an observer
-    /// of the channel and other bytes are still carried exactly. The MQTT
-    /// Content Type sent is `options.content_type`, never the body's type. An
+    /// An inline payload within the bus's body cap becomes a body typed by
+    /// `options.content_type` when its bytes are valid for that type, and an
+    /// `application/octet-stream` body of the same bytes otherwise, so text
+    /// reads as text to an observer of the channel and other bytes are still
+    /// carried exactly. An inline payload over the body cap is written to the
+    /// blob store, typed by `options.content_type` or
+    /// `application/octet-stream`, and rides as one attachment named
+    /// `payload` beside an empty body; the blob is written only after the
+    /// admission, the send rate and the send budget have all passed, so a
+    /// refused publish writes no blob. The MQTT Content Type sent is
+    /// `options.content_type`, never the body's or the blob's type. An
     /// attached payload rides beside an empty body.
     ///
     /// # Panics
     ///
     /// Panics on a `System` origin: an app's publish is priced by its
     /// conversation.
-    // TODO(mqtt-egress-unwired): no production caller; it must gain none before a reader exists.
     pub async fn publish_mqtt(
         &self,
         origin: PublishOrigin,
@@ -240,7 +270,13 @@ impl Messenger {
             "Messenger::publish_mqtt called with PublishOrigin::System — an app's MQTT \
              publish is attributed to a conversation"
         );
-        let (body, attachments) = match payload {
+        let principal = PublishPrincipal::App {
+            slug: sender_app_slug,
+        };
+        let (body, attachments, over_cap) = match payload {
+            MqttPayload::Inline(bytes) if bytes.len() > self.max_body_bytes() => {
+                (MessageBody::text(""), HeldAttachments::none(), Some(bytes))
+            }
             MqttPayload::Inline(bytes) => {
                 // A content type the admission will refuse also fails here; the
                 // fallback body only carries the publish as far as that refusal.
@@ -249,16 +285,14 @@ impl Messenger {
                         MessageBody::from_parts(Some("application/octet-stream"), &bytes)
                             .expect("application/octet-stream is a well-formed binary type")
                     });
-                (body, HeldAttachments::none())
+                (body, HeldAttachments::none(), None)
             }
-            MqttPayload::Attached(attachments) => (MessageBody::text(""), attachments),
+            MqttPayload::Attached(attachments) => (MessageBody::text(""), attachments, None),
         };
         let result = self
             .publish_core(
                 origin,
-                PublishPrincipal::App {
-                    slug: sender_app_slug,
-                },
+                principal,
                 addr,
                 body,
                 Urgency::Normal,
@@ -267,7 +301,7 @@ impl Messenger {
                 None,
                 None,
                 attachments,
-                Some(options),
+                Some(MqttTarget { options, over_cap }),
             )
             .await;
         match result {
@@ -282,4 +316,52 @@ impl Messenger {
             refused => Err(refused),
         }
     }
+}
+
+/// Write `bytes` to a new blob in `store` on the blocking pool and return it
+/// as the one attachment `payload`.
+pub(super) async fn write_payload_blob(
+    store: Arc<BlobStore>,
+    bytes: Vec<u8>,
+    options: &MqttPublishOptions,
+) -> Result<HeldAttachments, PublishResult> {
+    let content_type = options
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let hold = tokio::task::spawn_blocking(move || write_blob(&store, &content_type, &bytes))
+        .await
+        .expect("the MQTT payload blob write panicked")
+        .map_err(|reason| PublishResult::MqttRefused(MqttRefusal::BlobRefused { reason }))?;
+    let name = AttachmentName::new(PAYLOAD_ATTACHMENT)
+        .expect("`payload` is a well-formed attachment name");
+    Ok(HeldAttachments::new([(name, hold)]).expect("one attachment is within every bound"))
+}
+
+/// Create, write and seal one blob holding `bytes`. A refusal the store
+/// states for budget or size, and an I/O error (logged at `warn`), are
+/// returned as their text.
+///
+/// # Panics
+///
+/// On a content type the store refuses (the admission checked it first) and
+/// on any other refusal one whole write cannot meet.
+fn write_blob(
+    store: &Arc<BlobStore>,
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<brenn_messaging_store::blob::BlobHold, String> {
+    let refused = |e: BlobError| match e {
+        BlobError::TooLarge { .. } | BlobError::BudgetExhausted { .. } => e.to_string(),
+        BlobError::Io(ref io) => {
+            tracing::warn!(error = %io, "blob store write failed for an MQTT payload");
+            e.to_string()
+        }
+        other => panic!("writing an MQTT payload blob: {other}"),
+    };
+    let mut writer = store.create(content_type).map_err(refused)?;
+    writer.write(0, bytes).map_err(refused)?;
+    Ok(writer
+        .seal()
+        .unwrap_or_else(|_| panic!("a blob written whole in one write seals")))
 }

@@ -842,43 +842,44 @@ fn output_on_a_tools_address_panics() {
     resolve(&raw, &dir);
 }
 
-/// An output bound to the MQTT outbound channel would publish past the host's
-/// admission, the only writer an outbound channel has; refused.
+/// An output bound to an MQTT egress channel would publish past the host's
+/// admission, the only writer an egress channel has; refused.
 #[test]
 #[should_panic(expected = "which is in the egress namespace")]
-fn output_on_the_mqtt_outbound_channel_panics() {
-    let dir = dir_of(vec![brenn_entry("brenn:in-ch"), mqtt_outbound_entry()]);
+fn output_on_an_mqtt_egress_channel_panics() {
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch"), mqtt_egress_entry()]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "egress-forger".to_string(),
         package: "a".to_string(),
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
-        outputs: vec![out_raw("commands", "brenn:egress/mqtt")],
+        outputs: vec![out_raw("commands", "brenn:egress/mqtt/home")],
         ..minimal_wasm_consumer()
     }];
     resolve(&raw, &dir);
 }
 
-/// An input bound to the MQTT outbound channel resolves: the channel is read
-/// by ACL like any other.
+/// An input bound to an MQTT egress channel resolves: the channel is read by
+/// ACL like any other.
 #[test]
-fn input_on_the_mqtt_outbound_channel_resolves() {
-    let dir = dir_of(vec![mqtt_outbound_entry()]);
+fn input_on_an_mqtt_egress_channel_resolves() {
+    let dir = dir_of(vec![mqtt_egress_entry()]);
     let raw = vec![WasmConsumerConfigRaw {
         slug: "egress-observer".to_string(),
         package: "a".to_string(),
-        subscriptions: vec![sub_raw("brenn:egress/mqtt", "outbound")],
+        subscriptions: vec![sub_raw("brenn:egress/mqtt/home", "outbound")],
         ..minimal_wasm_consumer()
     }];
     let resolved = resolve(&raw, &dir);
     assert_eq!(resolved[0].inputs.len(), 1);
     assert_eq!(
         resolved[0].inputs[0].sub.channel_address,
-        "brenn:egress/mqtt"
+        "brenn:egress/mqtt/home"
     );
 }
 
-fn mqtt_outbound_entry() -> ChannelEntry {
-    brenn_messaging::mqtt_outbound::mqtt_outbound_entry(
+fn mqtt_egress_entry() -> ChannelEntry {
+    brenn_messaging::mqtt_outbound::mqtt_egress_entry(
+        "home",
         &brenn_lib::messaging::config::SystemChannelTuning::default(),
         &brenn_lib::messaging::config::MessagingGlobalConfig::default(),
     )

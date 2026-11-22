@@ -88,6 +88,9 @@ mod blob_tool_call_tests;
 #[cfg(test)]
 mod ingress_bytes_tests;
 
+#[cfg(test)]
+mod mqtt_egress_tests;
+
 /// Reload's MQTT convergence against a real broker. Filtered out of the
 /// hermetic test target and run by one that spawns `mosquitto`.
 #[cfg(test)]

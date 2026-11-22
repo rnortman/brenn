@@ -1594,8 +1594,13 @@ impl ActiveBridge {
     /// reaches the later validation it exercises.
     pub(crate) async fn test_new_with_mqtt_publish_acl() -> Arc<Self> {
         let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
-        let messenger = make_test_messenger_with_mqtt_publish(db.clone(), &[("ha", "#")]);
-        Self::inject_for_test_full(
+        let messenger = make_test_messenger_with_mqtt_publish(
+            db.clone(),
+            &[("ha", "#")],
+            brenn_lib::messaging::MessagingGlobalConfig::default(),
+        )
+        .await;
+        let bridge = Self::inject_for_test_full(
             user_id,
             conversation_id,
             "testapp",
@@ -1603,10 +1608,12 @@ impl ActiveBridge {
             tx,
             brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
-                messenger: Some(messenger),
+                messenger: Some(messenger.clone()),
                 ..Default::default()
             },
-        )
+        );
+        messenger.install_mqtt_clients(bridge.mqtt_service().clone());
+        bridge
     }
 
     /// Test bridge whose `"testapp"` policy does **not** grant `MqttPublish`, with
@@ -1638,17 +1645,14 @@ impl ActiveBridge {
     ///
     /// - A real `Messenger` whose `"testapp"` policy grants `MqttPublish` and
     ///   holds an `mqtt_publish` ACL matcher for each client in `allowed_clients`.
-    /// - An `MqttService` with a registered (disconnected) session for each client
-    ///   in `session_clients`, so an allowed publish resolves the session handle and
-    ///   reaches `publish_on_handle` (which returns `NotConnected` without a live
-    ///   broker — the test only needs the ACL check to pass and the session lookup to
-    ///   succeed, not a real broker ack).
+    /// - The egress channel of each client in `allowed_clients`.
+    /// - An `MqttService`, installed as the messenger's client table, with a
+    ///   registered (disconnected) session for each client in
+    ///   `session_clients`.
     ///
     /// `allowed_clients` (the ACL) and `session_clients` (the sessions) are
-    /// independent so a test can exercise "session exists but ACL denies" and the
-    /// happy path separately. (An ACL-allowed client with no session is a
-    /// boot-prevented invariant that panics at the publish path, so it is not a
-    /// fixture case.)
+    /// independent so a test can exercise "session exists but ACL denies",
+    /// "ACL allows a client with no session" and the commit separately.
     pub(crate) async fn test_new_for_mqtt_publish_acl(
         allowed_clients: &[&str],
         session_clients: &[&str],
@@ -1664,8 +1668,23 @@ impl ActiveBridge {
         matchers: &[(&str, &str)],
         session_clients: &[&str],
     ) -> Arc<Self> {
+        Self::test_new_for_mqtt_publish_with_global(
+            matchers,
+            session_clients,
+            brenn_lib::messaging::MessagingGlobalConfig::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::test_new_for_mqtt_publish_filters`], over a messenger built
+    /// with `global`.
+    pub(crate) async fn test_new_for_mqtt_publish_with_global(
+        matchers: &[(&str, &str)],
+        session_clients: &[&str],
+        global: brenn_lib::messaging::MessagingGlobalConfig,
+    ) -> Arc<Self> {
         let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
-        let messenger = make_test_messenger_with_mqtt_publish(db.clone(), matchers);
+        let messenger = make_test_messenger_with_mqtt_publish(db.clone(), matchers, global).await;
 
         let mqtt_service = brenn_mqtt::MqttService::new();
         for client in session_clients {
@@ -1674,6 +1693,7 @@ impl ActiveBridge {
             let handle = brenn_mqtt::MqttClientHandle::new(config, vec![], stop_tx);
             mqtt_service.add_client(handle);
         }
+        messenger.install_mqtt_clients(mqtt_service.clone());
 
         Self::inject_for_test_full(
             user_id,
@@ -1820,15 +1840,31 @@ async fn make_minimal_test_db_and_channel() -> (Db, broadcast::Sender<WsServerMe
     (db, tx, user_id, conversation_id)
 }
 
-/// Build a `Messenger` (empty directory) whose `"testapp"` policy grants
-/// `MqttPublish` and holds one `mqtt_publish` ACL matcher per `(client,
-/// topic_filter)` pair in `matchers`. Used by MQTT-publish intercept
-/// fixtures/tests so the publish ACL check — which reaches the policy via
-/// `messenger.app_policy("testapp")` — resolves and passes for those topics.
-fn make_test_messenger_with_mqtt_publish(
+/// Build a `Messenger` whose `"testapp"` policy grants `MqttPublish` with the
+/// `mqtt_publish` `matchers`, and whose directory (and database) holds the
+/// egress channel of every client the matchers name.
+async fn make_test_messenger_with_mqtt_publish(
     db: Db,
     matchers: &[(&str, &str)],
+    global: brenn_lib::messaging::MessagingGlobalConfig,
 ) -> Arc<brenn_messaging::Messenger> {
+    let mut egress: Vec<brenn_lib::messaging::ChannelEntry> = Vec::new();
+    for (client, _) in matchers {
+        if !egress
+            .iter()
+            .any(|e| e.address == brenn_lib::messaging::mqtt_egress_address(client))
+        {
+            egress.push(brenn_messaging::mqtt_outbound::mqtt_egress_entry(
+                client,
+                &brenn_lib::messaging::config::SystemChannelTuning::default(),
+                &global,
+            ));
+        }
+    }
+    {
+        let conn = db.lock().await;
+        brenn_messaging_store::db::upsert_channels(&conn, &egress);
+    }
     let mut testapp_cfg =
         crate::test_support::app_config::default_test_app_config("testapp", "testapp");
     testapp_cfg
@@ -1850,12 +1886,12 @@ fn make_test_messenger_with_mqtt_publish(
     brenn_messaging::Messenger::new(
         db,
         Arc::new(brenn_lib::messaging::MessagingDirectory::with_entries(
-            vec![],
+            egress,
         )),
         Arc::from("test-source"),
         Arc::new(messenger_apps),
         Arc::new(brenn_messaging::query::NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
-        brenn_lib::messaging::MessagingGlobalConfig::default(),
+        global,
     )
 }
 

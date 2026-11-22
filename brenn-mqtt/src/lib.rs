@@ -18,6 +18,8 @@
 //! - `state`      — `MqttClientHandle`, `SupervisorState`, `IngressSubscription`.
 //! - `egress`     — shared capability/ACL/budget enforcement + broker publish (`enforce_and_publish`).
 //! - `service`    — `MqttService`, `MqttEventRouter` trait.
+//! - `reader`     — the per-client egress reader (`start_egress_reader`) and the
+//!   `EgressBus` view of a client's egress channel it reads through.
 //! - `connection` — unified per-client supervisor (`spawn_client_supervisor`) plus
 //!   subscription helpers (`union_subscriptions`, `try_assert_ingress_subscription`).
 //! - `test_support` — a `mosquitto` harness and its throwaway TLS material, for
@@ -27,6 +29,7 @@
 pub mod connection;
 pub mod egress;
 pub mod payload;
+pub mod reader;
 pub mod service;
 pub mod state;
 #[cfg(feature = "testutils")]
@@ -38,6 +41,10 @@ pub use connection::{
 pub use egress::{MqttEgressError, SendBudget, enforce_and_publish};
 pub use payload::{
     InboundClass, InboundPayload, OutboundArg, OutboundPayload, classify_inbound, decode_outbound,
+};
+pub use reader::{
+    DropCause, EgressBus, EgressItem, EgressMessage, EgressMeta, EgressReport, UnknownCause,
+    start_egress_reader,
 };
 pub use service::{
     IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService, PUBLISH_WAIT,

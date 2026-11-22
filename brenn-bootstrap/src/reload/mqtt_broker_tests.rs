@@ -18,6 +18,8 @@
 //! running and skipping is `brenn_mqtt::broker_gate!`, beside the harness it
 //! gates.
 
+mod egress;
+
 use std::sync::Arc;
 
 use brenn_mqtt::broker_gate;
@@ -32,8 +34,9 @@ use rumqttc::mqttbytes::QoS;
 use super::driver::TriggerSource;
 use super::driver::tests::{
     BootFixture, Booted, READER, Tree, bodies_on, boot_with, conversation_of, cursor_of, document,
-    document_push_subscribing_acl, document_subscribing_acl, dynamic_rows, insert_dynamic_mqtt_row,
-    install_package, live_entry_of_reader, seat_user, staged_module, staged_module_opt,
+    document_push_subscribing_acl, document_subscribing_acl, dynamic_rows, egress_entry_noise,
+    insert_dynamic_mqtt_row, install_package, live_entry_of_reader, seat_user, staged_module,
+    staged_module_opt,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -1376,6 +1379,11 @@ async fn a_client_added_by_reload_connects_and_its_first_binding_receives() {
         .expect("the reload minted the entry")
         .uuid;
     assert!(router.route_uuids().contains(&arrived_uuid));
+    assert_eq!(
+        egress_entry_noise(&booted.messenger, CLIENT),
+        Some(brenn_lib::messaging::config::NoiseLevel::Alarm),
+        "the first client's egress channel carries the egress participant's entry",
+    );
 
     let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
     publisher

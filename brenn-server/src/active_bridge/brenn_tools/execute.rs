@@ -554,7 +554,11 @@ pub(super) mod tests {
                 &bridge,
                 CallOrigin::Socket,
                 "MqttSend",
-                json!({ "to": "mqtt:home:cam/snapshot", "attachment": reference }),
+                json!({
+                    "to": "mqtt:home:cam/snapshot",
+                    "lifetime_s": 60,
+                    "attachment": reference,
+                }),
             )
             .await,
             Ok(ToolOutcome::Err(json!({
@@ -570,6 +574,7 @@ pub(super) mod tests {
                 "MqttSend",
                 json!({
                     "to": "mqtt:home:cam/snapshot",
+                    "lifetime_s": 60,
                     "attachments": { "a.png": { "message_id": "m", "name": "a.png" } },
                 }),
             )

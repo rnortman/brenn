@@ -233,6 +233,15 @@ pub fn depth_bound(limit: Depth) -> u64 {
     }
 }
 
+/// The guard both stores' [`RetentionStore::unseen_head`] open with.
+pub(crate) fn assert_sampled_head_unasked(address: &str, push_limit: Depth) {
+    assert!(
+        push_limit.is_push_enabled(),
+        "messaging store: {address}: a head read for a sampled subscriber, which is never \
+         handed anything"
+    );
+}
+
 /// Cut the window shape out of a retained span: the newest
 /// `min(unseen, push_limit)` entries are new, the rest is context.
 ///
@@ -507,6 +516,31 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
         push_limit: Depth,
         retain_limit: Depth,
     ) -> Option<SubscriberWindow>;
+
+    /// The oldest `limit` of the entries [`RetentionStore::window`] would serve
+    /// `subscriber` as new at `push_limit`: unseen, and among the newest
+    /// `push_limit` retained. Oldest first.
+    ///
+    /// For a consumer that hands messages on one at a time and advances over
+    /// each: it decodes only the rows it returns, and the drop arithmetic of the
+    /// advance that follows is the one a window read would have produced — the
+    /// first advance after an outrun window reports the gap.
+    ///
+    /// Pure read: no position moves, nothing is charged, and the position's
+    /// depth cache is not retuned.
+    ///
+    /// `None` when the store holds no position for this subscriber.
+    ///
+    /// # Panics
+    ///
+    /// On a sampled (`push_limit = 0`) read: nothing is ever new to a sampled
+    /// subscriber, so no correct caller asks.
+    async fn unseen_head(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+        limit: usize,
+    ) -> Option<Vec<(MessageSeq, Arc<MessageEnvelope>)>>;
 
     /// Advance `subscriber` past everything through `through`, and report the
     /// unseen seqs no window ever served it.

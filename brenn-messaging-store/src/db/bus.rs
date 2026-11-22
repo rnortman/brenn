@@ -655,6 +655,35 @@ pub fn load_channel_retained_window_seq(
     .collect()
 }
 
+/// The oldest `limit` retained messages on `channel_uuid` at or above retention
+/// sequence `from_seq`, oldest first, each with its retention sequence — the
+/// head of a subscriber's unseen suffix.
+pub fn load_channel_retained_from_seq(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    from_seq: i64,
+    limit: usize,
+) -> Vec<(i64, MessageEnvelope)> {
+    let sql = format!(
+        "SELECT {ENVELOPE_COLUMNS}, m.id, m.retained_seq
+         {ENVELOPE_FROM_JOINS}
+         WHERE m.channel_uuid = ?1 AND m.retained_seq IS NOT NULL AND m.retained_seq >= ?2
+         ORDER BY m.retained_seq ASC LIMIT ?3"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .expect("prepare load_channel_retained_from_seq");
+    let limit = i64::try_from(limit).expect("messaging: head read limit out of range");
+    let rows = stmt
+        .query_map(
+            rusqlite::params![channel_uuid.as_bytes().to_vec(), from_seq, limit],
+            |row| Ok((row.get::<_, i64>(18)?, super::row_to_envelope(row)?)),
+        )
+        .expect("query load_channel_retained_from_seq");
+    rows.map(|r| r.expect("read load_channel_retained_from_seq row"))
+        .collect()
+}
+
 /// One row of a retained-window read: the message plus both keys callers select
 /// on — its rowid identity and its retention position.
 struct RetainedRow {
