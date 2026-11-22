@@ -4,6 +4,14 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.38.0] — 2026-11-21
+
+A component can unsubscribe a mailbox from a mailing list: the new
+`one-click-unsubscribe` tool sends the RFC 8058 request, and a provider
+component built on `brenn-provider-kit` can now call any tool it is granted,
+not only `api-request`. Breaking for provider-kit authors; read the bold
+entry below.
+
 - **A new tool, `one-click-unsubscribe`, sends the RFC 8058 one-click
   unsubscribe request.** Called with an `https` URL, it sends one `POST` with
   the body `List-Unsubscribe=One-Click` and no credential or cookie, follows no
