@@ -1630,6 +1630,25 @@ client and the broker's maximum; a component's `mqtt-publish` answers
 `invalid-payload` with a fixed text and no broker-derived number, the numbers
 going to the host log. A broker that advertises no maximum arms no check.
 
+**The wait.** A publish waits on its MQTT session for at most 10 seconds from
+the call, for a conversation and a component alike: for room to submit, and at
+QoS 1 and 2 for the broker's acknowledgement. A publish the broker has not
+answered by then fails: `MqttSend` answers an error saying the publish did not
+complete in time and may still be delivered, and a component's `mqtt-publish`
+answers `broker("timed out")`. For a conversation the send budget unit is
+spent, as for any broker error. Brenn neither recalls nor resends the message:
+on a connection that recovers it goes out and is acknowledged late, so a retry
+can deliver it twice; on a connection that is lost it is dropped with the
+connection. For a component, time stopped in `mqtt-publish` is not charged to
+the activation's running-time limit; the host instead limits the total time
+one activation waits on one client, keyed on the client the host parsed out of
+the address. Once that is spent — 10 seconds of accumulated waiting, which one
+timed-out call reaches alone — every further publish to that client in the
+activation fails at once with `broker("wait budget spent")`. One activation is
+therefore stopped in publishes to one client for under 20 seconds, whatever the
+number of calls and however the guest spells the address; the next activation
+starts with a fresh budget.
+
 ### 2.8 The reload pair
 
 Two channels are the config-reload facility, and they are **declared, not

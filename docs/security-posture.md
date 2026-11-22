@@ -1190,7 +1190,9 @@ internally-originated.
   pending requests up to a fixed cap and, for an instance granted `blobs`, by
   the bytes of attachment on its new messages and its pending requests up to
   a fixed cap (§7.6, "What bounds one activation"); the
-  epoch deadline bounds its wall clock whatever its fuel.
+  epoch deadline bounds its wall clock whatever its fuel, except the time it
+  is stopped in `calls.call` or `mqtt.mqtt-publish`, which the deadline does
+  not count.
 - **Output volume is bounded.** Per-activation call budgets and payload-size
   limits must bound what a guest can emit, and guest-produced strings that reach
   host logs/alerts/diagnostics must be sanitized (length-bounded and made
@@ -1391,6 +1393,21 @@ Both substrate halves, and the residual each leaves:
   guard. That is the browser co-host asymmetry this section already records —
   a page component needs no grant at all to hold the main thread — and not a
   property of the `calls` grant.
+
+`mqtt.mqtt-publish` (and `mqtt-publish-expiring`) stops the component on its
+stack while the broker answers, and that wait is likewise **not** charged
+against the epoch deadline: a component must not trap for a slow broker.
+Unlike the peer call the wait is bounded. One call waits at most 10 s
+(`PUBLISH_WAIT`), and the host keeps a per-activation, per-client wait budget
+(10 s, `PROCESSOR_MQTT_WAIT_BUDGET`, compiled to be no larger than the
+per-call bound): a call starts only while the client's accumulated wait is
+under it, so one activation is stopped in publishes to one client for under
+20 s, times the number of clients in its `mqtt_publish` ACL. For that time it
+holds one blocking-pool thread and serves none of its bound inputs. Both the
+wait budget and the per-client token bucket are keyed on the client the host
+parsed out of the `mqtt:<client>:<topic>` address — the session the call
+reaches — not on the guest's `client` text, so a guest cannot multiply either
+by respelling the address.
 
 Cross-host calls do not exist: a call whose caller and callee are not placed
 together is refused at compile time.

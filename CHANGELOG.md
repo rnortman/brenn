@@ -4,6 +4,24 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **An MQTT publish now waits at most 10 seconds, and a component is no longer
+  trapped for a slow broker.** A conversation's `MqttSend` and a component's
+  `mqtt-publish` both give up on a broker that has not acknowledged within 10
+  seconds of the call; the message may still be delivered, so a retry can
+  deliver it twice. Time a component spends waiting in `mqtt-publish` no
+  longer counts against its running-time limit. Instead, once one activation
+  has spent 10 seconds in total waiting on one MQTT client, further publishes
+  to that client in that activation fail at once, so an activation waits on
+  any one client for under 20 seconds. Components see two new transient
+  `broker` error kinds, `"timed out"` and `"wait budget spent"`.
+- A component's per-client publish rate limit now counts every publish that
+  reaches the client, however the guest spelled the `client` string: `home:a`
+  with topic `b` is charged to `home`.
+- **Fixed:** after an MQTT session's supervisor recovers from a panic,
+  publishes left over from the old connection are failed when the new one
+  comes up, so they can no longer shift the acknowledgements of later
+  publishes.
+
 ## [0.38.0] — 2026-11-21
 
 A component can unsubscribe a mailbox from a mailing list: the new

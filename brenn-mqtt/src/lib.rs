@@ -40,6 +40,7 @@ pub use payload::{
     InboundClass, InboundPayload, OutboundPayload, classify_inbound, decode_outbound_body,
 };
 pub use service::{
-    IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService, PublishProps,
+    IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService, PUBLISH_WAIT,
+    PublishProps,
 };
 pub use state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle, SubAckOutcome};

@@ -87,6 +87,12 @@ impl TcpRelay {
         self.broadcast(Mode::Stall);
     }
 
+    /// Resume forwarding on all current connections after [`Self::stall`]. Bytes
+    /// held in the socket buffers while stalled are forwarded first, in order.
+    pub async fn resume(&self) {
+        self.broadcast(Mode::Forward);
+    }
+
     /// Close all current connections (drop both stream halves). The listener keeps
     /// accepting, so a reconnect goes through in `Forward` mode.
     pub async fn sever(&self) {

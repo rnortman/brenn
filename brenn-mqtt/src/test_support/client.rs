@@ -27,7 +27,8 @@ pub fn session_client_id(client_slug: &str) -> String {
     crate::connection::client_id_of_slug(client_slug)
 }
 
-/// Install in `handle` a client that never connects, recording
+/// Install in `handle`, as the supervisor installs a connection's client, a
+/// client that never connects, recording
 /// `broker_max_packet_size` as the Maximum Packet Size its broker advertised
 /// (`None`: none advertised).
 ///
@@ -40,11 +41,7 @@ pub async fn install_unpolled_client(
     broker_max_packet_size: Option<u32>,
 ) -> rumqttc::EventLoop {
     let (client, eventloop) = crate::connection::unpolled_client(64);
-    let mut guard = handle.client.lock().await;
-    handle
-        .broker_max_packet_size
-        .store(broker_max_packet_size.unwrap_or(0), Ordering::Relaxed);
-    *guard = Some(client);
+    crate::connection::install_connection(handle, client, broker_max_packet_size).await;
     eventloop
 }
 

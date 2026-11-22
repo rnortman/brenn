@@ -23,7 +23,7 @@ use crate::payload::InboundPayload;
 use crate::service::{MqttEventRouter, MqttService};
 use crate::state::{
     DEFERRED_SUBSCRIBES_POISONED, IngressSubscription, MqttClientHandle,
-    PENDING_SUBSCRIBES_POISONED, PubackOutcome, SupervisorState,
+    PENDING_PUBLISHES_POISONED, PENDING_SUBSCRIBES_POISONED, PubackOutcome, SupervisorState,
 };
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsVersionMin};
 
@@ -37,6 +37,12 @@ const DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// session it was submitted on is stopped — by a reload restarting or removing
 /// the client, or by shutdown.
 const STOPPED_BY_OWNER: &str = "client session stopped";
+
+/// The `last_error` a publish waiting for its PUBACK is failed with when a new
+/// connection is installed while it still waits: its packet went, or was
+/// queued to go, on an event loop that no longer exists.
+pub const SUPERSEDED_BY_NEW_CONNECTION: &str =
+    "the connection this publish was sent on ended before the broker answered";
 
 // What the SubAck arm logs as the filter when no pending SUBSCRIBE was bound to
 // the acked pkid — a broker resending a SubAck from a session brenn did not
@@ -735,15 +741,7 @@ async fn supervisor_body(
             .expect(DEFERRED_SUBSCRIBES_POISONED)
             .clear();
 
-        // The broker's maximum packet size is stored under the same lock,
-        // before the client is visible.
-        {
-            let mut client_guard = handle.client.lock().await;
-            handle
-                .broker_max_packet_size
-                .store(broker_max_packet_size.unwrap_or(0), Ordering::Relaxed);
-            *client_guard = Some(client.clone());
-        }
+        install_connection(&handle, client.clone(), broker_max_packet_size).await;
         {
             let mut state = handle.supervisor_state.write().await;
             *state = SupervisorState::Connected;
@@ -1195,10 +1193,11 @@ async fn handle_event(
 
         // --- Outgoing publish: bind pkid → pending waiter (FIFO) ---
         Event::Outgoing(Outgoing::Publish(pkid)) if pkid != 0 => {
-            let pending_entry = {
-                let mut pending = handle.pending_publishes.lock().await;
-                pending.pop_front()
-            };
+            let pending_entry = handle
+                .pending_publishes
+                .lock()
+                .expect(PENDING_PUBLISHES_POISONED)
+                .pop_front();
             if let Some(entry) = pending_entry {
                 handle.inflight_publishes.lock().await.insert(pkid, entry);
             } else {
@@ -1347,6 +1346,48 @@ async fn handle_event(
 pub(crate) fn unpolled_client(capacity: usize) -> (AsyncClient, rumqttc::EventLoop) {
     let opts = MqttOptions::new("test-unpolled", ("127.0.0.1", 1));
     AsyncClient::builder(opts).capacity(capacity).build()
+}
+
+/// Make `client` the session's current client, starting its connection with no
+/// publish waiters.
+///
+/// Under the `client` guard, in order: every waiter still in
+/// `pending_publishes` or `inflight_publishes` is failed with
+/// [`SUPERSEDED_BY_NEW_CONNECTION`], the broker's Maximum Packet Size is
+/// stored (`None`: none advertised), and the client becomes visible. A waiter
+/// left over would be bound by position to the new connection's first
+/// packet ids, so every later acknowledgement on the session would resolve the
+/// wrong publish.
+///
+/// The drain is complete because a QoS 1/2 publisher pushes its waiter only
+/// while it holds the same guard, in the synchronous section that submits its
+/// packet. A publisher that ran before the drain submitted onto the old client;
+/// one that runs after finds the new client. No waiter for an old connection
+/// can appear after the drain, and none for the new one exists before it.
+///
+/// Every normal exit from a connection fails the waiters itself, so the drain
+/// finds none. A body that panicked while connected runs no exit; a non-zero
+/// count is its trace and is logged.
+pub(crate) async fn install_connection(
+    handle: &MqttClientHandle,
+    client: AsyncClient,
+    broker_max_packet_size: Option<u32>,
+) {
+    let mut client_guard = handle.client.lock().await;
+    let superseded = handle
+        .fail_all_publishes(Some(SUPERSEDED_BY_NEW_CONNECTION.to_string()))
+        .await;
+    if superseded > 0 {
+        tracing::warn!(
+            client = %handle.config.identity.slug,
+            superseded,
+            "failed publish waiters left from a previous connection before installing a new one",
+        );
+    }
+    handle
+        .broker_max_packet_size
+        .store(broker_max_packet_size.unwrap_or(0), Ordering::Relaxed);
+    *client_guard = Some(client);
 }
 
 #[cfg(test)]
@@ -2078,6 +2119,73 @@ mod tests {
         );
     }
 
+    /// A body that panicked while connected leaves its client (event loop
+    /// gone) in the cell and its waiters in both maps. Installing the next
+    /// connection fails every one of them, and the first publish on the new
+    /// connection is then bound to its own waiter, not to a stale one.
+    #[tokio::test]
+    async fn a_new_connection_starts_with_no_publish_waiters() {
+        let handle = test_handle();
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        let (dead_client, dead_eventloop) = unpolled_client(1);
+        drop(dead_eventloop);
+        *handle.client.lock().await = Some(dead_client);
+
+        let (stale_tx1, stale_rx1) = tokio::sync::oneshot::channel();
+        let (stale_tx2, stale_rx2) = tokio::sync::oneshot::channel();
+        let (stale_tx3, stale_rx3) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = handle.pending_publishes.lock().unwrap();
+            pending.push_back(PendingPublish { ack_tx: stale_tx1 });
+            pending.push_back(PendingPublish { ack_tx: stale_tx2 });
+        }
+        handle
+            .inflight_publishes
+            .lock()
+            .await
+            .insert(1, PendingPublish { ack_tx: stale_tx3 });
+
+        let (new_client, _new_eventloop) = unpolled_client(64);
+        install_connection(&handle, new_client, Some(4096)).await;
+
+        for rx in [stale_rx1, stale_rx2, stale_rx3] {
+            match rx.await {
+                Ok(Err(brenn_lib::mqtt::error::MqttError::NotConnected {
+                    last_error: Some(e),
+                    ..
+                })) => assert_eq!(e, SUPERSEDED_BY_NEW_CONNECTION),
+                other => panic!("stale waiter resolved to {other:?}"),
+            }
+        }
+        assert!(handle.pending_publishes.lock().unwrap().is_empty());
+        assert!(handle.inflight_publishes.lock().await.is_empty());
+        assert_eq!(handle.broker_max_packet_size.load(Ordering::Relaxed), 4096);
+
+        // The next publish, pushed and submitted in one section as the publish
+        // path does, is resolved by the acknowledgement of packet id 1 on the
+        // new connection.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        {
+            let client_guard = handle.client.lock().await;
+            let client = client_guard.as_ref().expect("install set the client");
+            let mut pending = handle.pending_publishes.lock().unwrap();
+            pending.push_back(PendingPublish { ack_tx });
+            client
+                .try_publish("t", rumqttc::mqttbytes::QoS::AtLeastOnce, false, "x")
+                .expect("the new client's request channel has room");
+        }
+        handle_event(Event::Outgoing(Outgoing::Publish(1)), &handle, &router).await;
+        handle_event(
+            Event::Incoming(Incoming::PubAck(rumqttc::PubAck::new(1, None))),
+            &handle,
+            &router,
+        )
+        .await;
+        assert!(matches!(ack_rx.await, Ok(Ok(PubackOutcome::Success))));
+        assert!(handle.pending_publishes.lock().unwrap().is_empty());
+        assert!(handle.inflight_publishes.lock().await.is_empty());
+    }
+
     // --- backoff_duration ---
 
     #[test]
@@ -2243,7 +2351,7 @@ mod tests {
         let (tx2, rx2) = tokio::sync::oneshot::channel();
         let (tx3, rx3) = tokio::sync::oneshot::channel();
         {
-            let mut p = handle.pending_publishes.lock().await;
+            let mut p = handle.pending_publishes.lock().unwrap();
             p.push_back(crate::state::PendingPublish { ack_tx: tx1 });
             p.push_back(crate::state::PendingPublish { ack_tx: tx2 });
         }
@@ -2252,7 +2360,10 @@ mod tests {
             inflight.insert(42, crate::state::PendingPublish { ack_tx: tx3 });
         }
 
-        handle.fail_all_publishes(Some("test error".into())).await;
+        assert_eq!(
+            handle.fail_all_publishes(Some("test error".into())).await,
+            3
+        );
 
         assert!(matches!(
             rx1.await.unwrap(),
@@ -2267,7 +2378,7 @@ mod tests {
             Err(brenn_lib::mqtt::error::MqttError::NotConnected { .. })
         ));
 
-        assert!(handle.pending_publishes.lock().await.is_empty());
+        assert!(handle.pending_publishes.lock().unwrap().is_empty());
         assert!(handle.inflight_publishes.lock().await.is_empty());
     }
 

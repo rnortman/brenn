@@ -30,6 +30,12 @@ const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const PENDING_SUBSCRIBES_POISONED: &str =
     "pending_subscribes lock poisoned: a holder panicked inside its critical section";
 
+/// Poisoning message for [`MqttClientHandle::pending_publishes`]. Its critical
+/// sections are synchronous and short, so poisoning means a holder panicked
+/// mid-section and the FIFO no longer matches the request channel.
+pub(crate) const PENDING_PUBLISHES_POISONED: &str =
+    "pending_publishes lock poisoned: a holder panicked inside its critical section";
+
 /// Poisoning message for [`MqttClientHandle::deferred_subscribes`].
 pub(crate) const DEFERRED_SUBSCRIBES_POISONED: &str =
     "deferred_subscribes lock poisoned: a holder panicked inside its critical section";
@@ -194,8 +200,19 @@ pub struct MqttClientHandle {
     /// value of the connection whose client it took.
     pub(crate) broker_max_packet_size: AtomicU32,
 
-    /// Pending QoS ≥ 1 publishes waiting for pkid binding (FIFO order).
-    pub pending_publishes: Mutex<std::collections::VecDeque<PendingPublish>>,
+    /// Waiters of QoS ≥ 1 publishes awaiting pkid binding (FIFO) — one entry
+    /// per PUBLISH packet, bound by position in the supervisor's
+    /// `Outgoing::Publish` arm.
+    ///
+    /// The lock exists only to make a push onto this FIFO atomic with the
+    /// non-blocking submit of the matching PUBLISH onto the session's request
+    /// channel (and the pop that undoes the push when the submit fails), so the
+    /// FIFO's order is the order the event loop receives the requests. Nothing
+    /// may hold it across an await: a publish future can then be dropped at any
+    /// await without leaving an entry that has no packet behind it. It is a
+    /// `std::sync::Mutex` so that holding it across an await makes the future
+    /// `!Send`, which `tokio::spawn` rejects.
+    pub pending_publishes: std::sync::Mutex<std::collections::VecDeque<PendingPublish>>,
 
     /// Inflight publishes (pkid → waiter).
     pub inflight_publishes: Mutex<HashMap<u16, PendingPublish>>,
@@ -273,7 +290,7 @@ impl MqttClientHandle {
             }),
             client: Mutex::new(None),
             broker_max_packet_size: AtomicU32::new(0),
-            pending_publishes: Mutex::new(std::collections::VecDeque::new()),
+            pending_publishes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             inflight_publishes: Mutex::new(HashMap::new()),
             pending_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             deferred_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -292,23 +309,37 @@ impl MqttClientHandle {
         (label, err)
     }
 
-    /// Fail all pending and inflight publishes with `MqttError::NotConnected`.
-    /// Called by the supervisor when the connection drops.
-    pub async fn fail_all_publishes(&self, last_error: Option<String>) {
+    /// Fail all pending and inflight publishes with `MqttError::NotConnected`
+    /// and return how many waiters were failed.
+    ///
+    /// Called by the supervisor when a connection ends, and by
+    /// `install_connection` before a new connection's client becomes visible,
+    /// where a non-zero count is the trace of a supervisor body that panicked
+    /// while connected. The pending lock is released before the in-flight lock
+    /// is awaited, so no std guard is held across an await.
+    pub async fn fail_all_publishes(&self, last_error: Option<String>) -> usize {
         let error = MqttError::NotConnected {
             client_slug: self.config.identity.slug.clone(),
             last_error,
         };
 
-        let mut pending = self.pending_publishes.lock().await;
-        for p in pending.drain(..) {
+        let pending: Vec<PendingPublish> = self
+            .pending_publishes
+            .lock()
+            .expect(PENDING_PUBLISHES_POISONED)
+            .drain(..)
+            .collect();
+        let mut failed = pending.len();
+        for p in pending {
             let _ = p.ack_tx.send(Err(error.clone()));
         }
 
         let mut inflight = self.inflight_publishes.lock().await;
+        failed += inflight.len();
         for (_, p) in inflight.drain() {
             let _ = p.ack_tx.send(Err(error.clone()));
         }
+        failed
     }
 
     /// Add a topic filter to this client's runtime subscription set if not already

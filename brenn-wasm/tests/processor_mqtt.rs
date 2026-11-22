@@ -8,15 +8,16 @@
 // false)` and maps the returned `PublishError` to a processing failure
 // `"ErrorVariant:detail"`.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION;
 use brenn_wasm::{
-    ComponentGrant, MqttPublishFn, MqttPublishOutcome, MqttPublishProps, ProcessorComponent,
-    ProcessorLoadSpec, ProcessorOutcome,
+    ComponentGrant, MqttPublishFn, MqttPublishOutcome, MqttPublishProps, MqttPublisher, MqttTarget,
+    ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
 };
 
 mod common;
@@ -64,11 +65,17 @@ fn trap_after_publish_activation() -> ProcessorActivation {
     }
 }
 
-/// Load the mqtt-test fixture with a given `mqtt_publish` callback.
+/// Load the mqtt-test fixture with a given `mqtt_publish` callback, and `out`
+/// bound so the hold path's buffered publishes appear in
+/// `ProcessorOutcome::Ok`.
 fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
-    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Mqtt].into_iter().collect();
+    let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Mqtt, ComponentGrant::Ports]
+        .into_iter()
+        .collect();
     ProcessorComponent::load(ProcessorLoadSpec {
         input_amplification_mt: common::amp_in(),
+        output_ports: HashMap::from([("out".to_string(), common::out_spec("brenn:out"))]),
+        declared_out_ports: BTreeSet::from(["out".to_string()]),
         grants,
         alerter: common::noop_alerter(),
         output_acl: common::allow_all(),
@@ -88,7 +95,7 @@ fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
 /// propagates the broker outcome inline.
 #[test]
 fn mqtt_publish_broker_error_propagates_to_guest() {
-    let callback: MqttPublishFn = Arc::new(|_client, _topic, _payload, _props| {
+    let callback: MqttPublishFn = common::passthrough_mqtt(|_client, _topic, _payload, _props| {
         MqttPublishOutcome::Broker("test-broker-error".to_string())
     });
     let comp = load_mqtt_test(callback);
@@ -124,8 +131,9 @@ fn mqtt_publish_broker_error_propagates_to_guest() {
 /// end-to-end seam: a real guest activation receives the `not-permitted` variant.
 #[test]
 fn mqtt_publish_not_permitted_propagates_to_guest() {
-    let callback: MqttPublishFn =
-        Arc::new(|_client, _topic, _payload, _props| MqttPublishOutcome::NotPermitted);
+    let callback: MqttPublishFn = common::passthrough_mqtt(|_client, _topic, _payload, _props| {
+        MqttPublishOutcome::NotPermitted
+    });
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(common::host_activation(single_activation()));
@@ -158,8 +166,9 @@ fn mqtt_publish_not_permitted_propagates_to_guest() {
 /// the `processor-mqtt-test` fixture + `load_mqtt_test` helper.
 #[test]
 fn mqtt_publish_no_connector_propagates_to_guest() {
-    let callback: MqttPublishFn =
-        Arc::new(|_client, _topic, _payload, _props| MqttPublishOutcome::NoConnector);
+    let callback: MqttPublishFn = common::passthrough_mqtt(|_client, _topic, _payload, _props| {
+        MqttPublishOutcome::NoConnector
+    });
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(common::host_activation(single_activation()));
@@ -196,7 +205,7 @@ fn mqtt_publish_no_connector_propagates_to_guest() {
 /// guest). Reuses the `processor-mqtt-test` fixture + `load_mqtt_test` helper.
 #[test]
 fn mqtt_publish_invalid_payload_propagates_to_guest() {
-    let callback: MqttPublishFn = Arc::new(|_client, _topic, _payload, _props| {
+    let callback: MqttPublishFn = common::passthrough_mqtt(|_client, _topic, _payload, _props| {
         MqttPublishOutcome::InvalidPayload("wildcard not allowed in publish topic".to_string())
     });
     let comp = load_mqtt_test(callback);
@@ -235,10 +244,11 @@ fn mqtt_publish_invalid_payload_propagates_to_guest() {
 fn mqtt_publish_then_trap_does_not_roll_back_broker_send() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_cb = Arc::clone(&calls);
-    let callback: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _props| {
-        calls_cb.fetch_add(1, Ordering::SeqCst);
-        MqttPublishOutcome::Ok
-    });
+    let callback: MqttPublishFn =
+        common::passthrough_mqtt(move |_client, _topic, _payload, _props| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+            MqttPublishOutcome::Ok
+        });
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(common::host_activation(trap_after_publish_activation()));
@@ -304,10 +314,11 @@ fn mqtt_publish_quota_exceeded_propagates_to_guest() {
     // cause — the substring check alone would still pass in that case (test-4).
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_cb = Arc::clone(&calls);
-    let callback: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _props| {
-        calls_cb.fetch_add(1, Ordering::SeqCst);
-        MqttPublishOutcome::Ok
-    });
+    let callback: MqttPublishFn =
+        common::passthrough_mqtt(move |_client, _topic, _payload, _props| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+            MqttPublishOutcome::Ok
+        });
     let comp = load_mqtt_test(callback);
 
     let outcome = comp.handle(common::host_activation(single_activation()));
@@ -368,7 +379,7 @@ fn recording_callback(
 ) -> (MqttPublishFn, Arc<std::sync::Mutex<Vec<PublishArgs>>>) {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_cb = Arc::clone(&seen);
-    let callback: MqttPublishFn = Arc::new(move |client, topic, payload, props| {
+    let callback: MqttPublishFn = common::passthrough_mqtt(move |client, topic, payload, props| {
         seen_cb
             .lock()
             .expect("the recording callback's lock is never poisoned")
@@ -386,12 +397,13 @@ fn recording_callback(
 fn switchable_callback() -> (MqttPublishFn, Arc<std::sync::Mutex<MqttPublishOutcome>>) {
     let cell = Arc::new(std::sync::Mutex::new(MqttPublishOutcome::Ok));
     let cell_cb = Arc::clone(&cell);
-    let callback: MqttPublishFn = Arc::new(move |_client, _topic, _payload, _props| {
-        cell_cb
-            .lock()
-            .expect("the switchable callback's lock is never poisoned")
-            .clone()
-    });
+    let callback: MqttPublishFn =
+        common::passthrough_mqtt(move |_client, _topic, _payload, _props| {
+            cell_cb
+                .lock()
+                .expect("the switchable callback's lock is never poisoned")
+                .clone()
+        });
     (callback, cell)
 }
 
@@ -591,4 +603,269 @@ fn the_sdk_classifies_a_quota_exhaustion_as_permanent() {
         }
         other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
     }
+}
+
+// ── the hold: time stopped in mqtt-publish ───────────────────────────────────
+
+/// What the hold publisher does on each call.
+#[derive(Clone)]
+struct HoldScript {
+    /// Map every client string to `home`, as the host's parser maps the
+    /// fixture's `home:<i>` spellings.
+    all_to_home: bool,
+    sleep: Duration,
+    outcome: MqttPublishOutcome,
+}
+
+/// A publisher whose behaviour is read from a shared script at call time, so
+/// one loaded component serves every hold case: loading compiles the guest,
+/// which dominates this suite's runtime.
+struct HoldPublisher {
+    script: Mutex<HoldScript>,
+    published: AtomicUsize,
+}
+
+impl HoldPublisher {
+    fn script(&self) -> HoldScript {
+        self.script
+            .lock()
+            .expect("the hold script's lock is never poisoned")
+            .clone()
+    }
+}
+
+impl MqttPublisher for HoldPublisher {
+    fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String> {
+        let client = if self.script().all_to_home {
+            "home".to_string()
+        } else {
+            client.to_string()
+        };
+        Ok(MqttTarget {
+            client,
+            topic: topic.to_string(),
+        })
+    }
+
+    fn publish(
+        &self,
+        _target: MqttTarget,
+        _payload: Vec<u8>,
+        _props: MqttPublishProps,
+    ) -> MqttPublishOutcome {
+        let script = self.script();
+        std::thread::sleep(script.sleep);
+        self.published.fetch_add(1, Ordering::SeqCst);
+        script.outcome
+    }
+}
+
+/// Fuel no hold case comes near: every case is about wall time.
+const HOLD_FUEL: u64 = 1 << 50;
+
+/// The fixture's `HOLD_CALLS`.
+const HOLD_CALLS: usize = 20;
+
+/// The scheduling allowance on top of a computed wall-time bound.
+const SLACK: Duration = Duration::from_millis(400);
+
+/// One epoch tick: the deadline every hold case runs under.
+const ONE_TICK: u64 = 1;
+
+/// What one hold activation produced.
+struct Held {
+    outcome: ProcessorOutcome,
+    wall: Duration,
+    published: usize,
+}
+
+impl Held {
+    /// The two buffered publishes, flushed: `before`, then the tally.
+    fn tally(&self) -> &str {
+        let ProcessorOutcome::Ok { publishes, .. } = &self.outcome else {
+            panic!("expected ProcessorOutcome::Ok; got {:?}", self.outcome);
+        };
+        let bodies: Vec<&str> = publishes
+            .iter()
+            .map(|p| p.body.as_text().expect("the fixture publishes text"))
+            .collect();
+        assert_eq!(bodies.len(), 2, "both buffered publishes flush: {bodies:?}");
+        assert_eq!(bodies[0], "before");
+        bodies[1]
+    }
+}
+
+fn run_hold(
+    comp: &ProcessorComponent,
+    publisher: &HoldPublisher,
+    sentinel: &str,
+    script: HoldScript,
+    budget: Duration,
+) -> Held {
+    *publisher
+        .script
+        .lock()
+        .expect("the hold script's lock is never poisoned") = script;
+    publisher.published.store(0, Ordering::SeqCst);
+    let started = Instant::now();
+    let outcome = comp.handle_with_mqtt_wait_budget(
+        common::host_activation(activation_with_body(sentinel)),
+        ONE_TICK,
+        HOLD_FUEL,
+        budget,
+    );
+    Held {
+        outcome,
+        wall: started.elapsed(),
+        published: publisher.published.load(Ordering::SeqCst),
+    }
+}
+
+/// Time stopped in `mqtt-publish` is not charged to the epoch deadline, and the
+/// per-client wait budget bounds it instead.
+///
+/// Every case runs under a one-tick (100 ms) deadline, which each outlasts in
+/// wall time: an activation charged for its broker waits would trap and flush
+/// nothing.
+#[test]
+fn the_hold_in_mqtt_publish_is_uncharged_and_bounded_per_client() {
+    let publisher = Arc::new(HoldPublisher {
+        script: Mutex::new(HoldScript {
+            all_to_home: false,
+            sleep: Duration::ZERO,
+            outcome: MqttPublishOutcome::Ok,
+        }),
+        published: AtomicUsize::new(0),
+    });
+    let comp = load_mqtt_test(Arc::clone(&publisher) as MqttPublishFn);
+    let spent = |n: usize| {
+        format!(
+            "ok={n} broker={} other=0 kinds=wait budget spent",
+            HOLD_CALLS - n
+        )
+    };
+
+    // Held past the whole deadline, the guest receives the error and runs on.
+    let held = run_hold(
+        &comp,
+        &publisher,
+        "HOLD",
+        HoldScript {
+            all_to_home: false,
+            sleep: Duration::from_millis(300),
+            outcome: MqttPublishOutcome::Broker("timed out".to_string()),
+        },
+        Duration::from_secs(1),
+    );
+    let tally = held.tally();
+    assert!(
+        tally.starts_with(&format!("ok=0 broker={HOLD_CALLS} other=0 kinds=timed out")),
+        "a broker timeout reaches the guest: {tally}"
+    );
+
+    // Each call ok and slow, together several times past the deadline.
+    let held = run_hold(
+        &comp,
+        &publisher,
+        "HOLD",
+        HoldScript {
+            all_to_home: false,
+            sleep: Duration::from_millis(50),
+            outcome: MqttPublishOutcome::Ok,
+        },
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        held.tally(),
+        format!("ok={HOLD_CALLS} broker=0 other=0 kinds="),
+        "{held_wall:?} of slow successes is not charged",
+        held_wall = held.wall
+    );
+    assert_eq!(held.published, HOLD_CALLS);
+
+    // The worst case when no call times out: the budget is crossed during some
+    // call, that call finishes, and every later one is refused at once. A sleep
+    // is never shorter than asked and may overrun, so the count is a range.
+    let budget = Duration::from_millis(250);
+    let call = Duration::from_millis(100);
+    let held = run_hold(
+        &comp,
+        &publisher,
+        "HOLD",
+        HoldScript {
+            all_to_home: false,
+            sleep: call,
+            outcome: MqttPublishOutcome::Ok,
+        },
+        budget,
+    );
+    let n = held.published;
+    assert!((1..=3).contains(&n), "publish ran {n} times");
+    assert_eq!(held.tally(), spent(n));
+    assert!(
+        held.wall < budget + call + SLACK,
+        "held {:?} for a {budget:?} budget",
+        held.wall
+    );
+
+    // The worst case when a call times out: one call spends the whole budget.
+    let held = run_hold(
+        &comp,
+        &publisher,
+        "HOLD",
+        HoldScript {
+            all_to_home: false,
+            sleep: Duration::from_millis(300),
+            outcome: MqttPublishOutcome::Broker("timed out".to_string()),
+        },
+        Duration::from_millis(300),
+    );
+    assert_eq!(held.published, 1, "the one timed-out call spent the budget");
+    assert_eq!(
+        held.tally(),
+        format!("ok=0 broker={HOLD_CALLS} other=0 kinds=timed out|wait budget spent")
+    );
+
+    // Respelling the client buys no time: twenty client strings, one session,
+    // one budget.
+    let held = run_hold(
+        &comp,
+        &publisher,
+        "HOLD_SPELL",
+        HoldScript {
+            all_to_home: true,
+            sleep: call,
+            outcome: MqttPublishOutcome::Ok,
+        },
+        budget,
+    );
+    let n = held.published;
+    assert!(
+        (1..=3).contains(&n),
+        "publish ran {n} times across {HOLD_CALLS} spellings of one client"
+    );
+    assert_eq!(held.tally(), spent(n));
+    assert!(
+        held.wall < budget + call + SLACK,
+        "held {:?} for a {budget:?} budget",
+        held.wall
+    );
+
+    // A guest that burns its own running time still traps.
+    let held = run_hold(
+        &comp,
+        &publisher,
+        "HOLD_SPIN",
+        HoldScript {
+            all_to_home: false,
+            sleep: Duration::ZERO,
+            outcome: MqttPublishOutcome::Ok,
+        },
+        budget,
+    );
+    assert!(
+        matches!(held.outcome, ProcessorOutcome::Trap(_)),
+        "a spinning guest traps on its own time; got {:?}",
+        held.outcome
+    );
 }

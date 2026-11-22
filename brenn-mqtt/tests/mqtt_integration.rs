@@ -15,20 +15,24 @@ use brenn_lib::access::acl::{AclSet, MqttClientMatcher};
 use brenn_lib::access::{AppPolicy, GrantSet};
 use brenn_lib::mqtt::address::MqttAddress;
 use brenn_lib::mqtt::config::TlsVersionMin;
-use brenn_mqtt::PublishProps;
 use brenn_mqtt::broker_gate;
+use brenn_mqtt::connection::SUPERSEDED_BY_NEW_CONNECTION;
 use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
 use brenn_mqtt::payload::InboundPayload;
+use brenn_mqtt::service::MqttEventRouter;
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
+use brenn_mqtt::state::{IngressSubscription, PendingPublish};
 use brenn_mqtt::test_support::client::wait_for_filter_acked;
+use brenn_mqtt::{ArrivingFilters, MqttService, register_and_spawn};
+use brenn_mqtt::{PUBLISH_WAIT, PublishProps};
 use common::{
     AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, SpawnedClient, TcpRelay,
     await_puback, broker_auth, broker_tls13, certs, direct_publisher_acked, direct_subscriber,
-    direct_subscriber_publish, log_records_disconnect, log_records_disconnect_before_reconnect,
-    log_records_publish_to_subscriber, log_records_unsubscribe, recv_delivery, session_client_id,
-    spawn_client, spawn_client_tls13, spawn_client_with_config, subscribe_live_confirmed,
-    test_client_config, wait_for_health,
+    direct_subscriber_every, direct_subscriber_publish, log_records_disconnect,
+    log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
+    log_records_unsubscribe, recv_delivery, session_client_id, spawn_client, spawn_client_tls13,
+    spawn_client_with_config, subscribe_live_confirmed, test_client_config, wait_for_health,
 };
 use rumqttc::mqttbytes::QoS;
 
@@ -1241,7 +1245,7 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
     // rather than resolving via the client-is-None fast path.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let registered = !handle.pending_publishes.lock().await.is_empty()
+        let registered = !handle.pending_publishes.lock().unwrap().is_empty()
             || !handle.inflight_publishes.lock().await.is_empty();
         if registered {
             break;
@@ -1282,6 +1286,435 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
         "post-reconnect sentinel payload mismatch: {:?}",
         msg.payload
     );
+
+    handle.stop();
+}
+
+// ---------------------------------------------------------------------------
+// The publish wait: a broker that does not answer releases the caller after
+// `PUBLISH_WAIT`. The sessions keep `keepalive_secs: Some(30)`, so keepalive
+// cannot end a wait before 30 s and the bound is what is observed.
+// ---------------------------------------------------------------------------
+
+/// A session for `slug` dialling a relay in front of a fresh broker, Connected,
+/// with a direct subscriber on `topic` that bypasses the relay.
+struct RelayedSession {
+    _broker: BrokerHarness,
+    relay: TcpRelay,
+    spawned: SpawnedClient,
+    deliver_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+async fn relayed_session(slug: &str, topic: &str) -> RelayedSession {
+    let broker = BrokerHarness::start();
+    let relay = TcpRelay::start(broker.port).await;
+    let ca = certs::ca_pem_bytes();
+    let deliver_rx = direct_subscriber_every(broker.port, ca.clone(), topic).await;
+    let config = Arc::new(test_client_config(
+        slug,
+        relay.port,
+        ca,
+        TlsVersionMin::Tls12,
+    ));
+    let spawned = spawn_client_with_config(config, vec![]).await;
+    wait_for_health(
+        &spawned.svc,
+        &spawned.client_slug,
+        &[ConnectorHealthLabel::Connected],
+        5,
+        "session never reached Connected through the relay",
+    )
+    .await;
+    RelayedSession {
+        _broker: broker,
+        relay,
+        spawned,
+        deliver_rx,
+    }
+}
+
+/// A component's publish: `enforce_and_publish` with no send budget.
+async fn component_publish(
+    session: &RelayedSession,
+    topic: &str,
+    payload: &[u8],
+) -> Result<(), MqttEgressError> {
+    let SpawnedClient {
+        svc, client_slug, ..
+    } = &session.spawned;
+    enforce_and_publish(
+        svc,
+        &wasm_egress_policy(client_slug),
+        &MqttAddress {
+            client: client_slug.clone(),
+            topic: topic.to_string(),
+        },
+        payload.to_vec(),
+        PublishProps {
+            qos: 1,
+            ..Default::default()
+        },
+        SendBudget::None,
+    )
+    .await
+}
+
+/// The next payload the direct subscriber receives, within 5 s.
+async fn next_delivery(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    what: &str,
+) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: no delivery within 5s"))
+        .expect("delivery channel closed")
+}
+
+/// The direct subscriber receives nothing more within 500 ms.
+async fn no_more_deliveries(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, what: &str) {
+    match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        Err(_) => {}
+        Ok(Some(p)) => panic!("{what}: unexpected delivery {p:?}"),
+        Ok(None) => panic!("{what}: delivery channel closed"),
+    }
+}
+
+async fn assert_no_publish_waiters(handle: &brenn_mqtt::MqttClientHandle) {
+    assert!(handle.pending_publishes.lock().unwrap().is_empty());
+    assert!(handle.inflight_publishes.lock().await.is_empty());
+}
+
+fn assert_timed_out(result: &Result<(), MqttEgressError>, what: &str) {
+    assert!(
+        matches!(
+            result,
+            Err(MqttEgressError::Broker(
+                brenn_lib::mqtt::MqttError::TimedOut { .. }
+            ))
+        ),
+        "{what}: expected Broker(TimedOut), got {result:?}"
+    );
+}
+
+/// A silent connection: the component's call and the conversation's call both
+/// return `TimedOut` after the bound, well before keepalive would notice, and
+/// the session stays Connected. Once the connection forwards again both
+/// messages are delivered, though their callers were told of a timeout, each
+/// late acknowledgement removes its own entry, and a third publish is
+/// resolved by its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_connection_times_out_both_callers_within_the_bound() {
+    broker_gate!();
+
+    let topic = "brenn/itest/silent/t";
+    let mut session = relayed_session("testbroker-silent", topic).await;
+    let db = brenn_messaging_store::db::init_db_memory();
+    {
+        let conn = db.lock().await;
+        brenn_messaging_store::testutils::ensure_user_and_conv(&conn, 1);
+    }
+
+    session.relay.stall().await;
+    let start = std::time::Instant::now();
+    let SpawnedClient {
+        svc, client_slug, ..
+    } = &session.spawned;
+    let policy = wasm_egress_policy(client_slug);
+    let addr = MqttAddress {
+        client: client_slug.clone(),
+        topic: topic.to_string(),
+    };
+    let conversation = async {
+        brenn_mqtt::egress::authorize(svc, &policy, &addr)
+            .expect("authorized")
+            .publish(
+                svc,
+                b"conversation".to_vec(),
+                PublishProps {
+                    qos: 1,
+                    ..Default::default()
+                },
+                SendBudget::Conversation {
+                    db: &db,
+                    conversation_id: 1,
+                    default_budget: 5,
+                },
+            )
+            .await
+    };
+    let (component, conversation) = tokio::join!(
+        component_publish(&session, topic, b"component"),
+        conversation
+    );
+    let elapsed = start.elapsed();
+    assert_timed_out(&component, "component publish");
+    assert_timed_out(&conversation, "conversation publish");
+    assert!(elapsed >= PUBLISH_WAIT, "returned after {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "returned after {elapsed:?}"
+    );
+    assert_eq!(
+        svc.ingress_health(client_slug).await.0,
+        ConnectorHealthLabel::Connected
+    );
+    assert_eq!(
+        brenn_messaging_store::db::read_send_budget(&db.lock().await as &rusqlite::Connection, 1),
+        Some(4),
+        "the conversation's send budget is spent and not refunded"
+    );
+
+    session.relay.resume().await;
+    let mut stalled = vec![
+        next_delivery(&mut session.deliver_rx, "first stalled message").await,
+        next_delivery(&mut session.deliver_rx, "second stalled message").await,
+    ];
+    stalled.sort();
+    assert_eq!(
+        stalled,
+        vec![b"component".to_vec(), b"conversation".to_vec()]
+    );
+
+    let third = component_publish(&session, topic, b"third").await;
+    assert!(matches!(third, Ok(())), "third publish: {third:?}");
+    assert_eq!(
+        next_delivery(&mut session.deliver_rx, "third message").await,
+        b"third"
+    );
+    no_more_deliveries(&mut session.deliver_rx, "after the third message").await;
+    assert_no_publish_waiters(&session.spawned.handle).await;
+
+    session.spawned.handle.stop();
+}
+
+/// An acknowledgement that arrives late but within the bound completes the
+/// publish normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_acknowledgement_within_the_bound_completes_the_publish() {
+    broker_gate!();
+
+    let topic = "brenn/itest/late/t";
+    let mut session = relayed_session("testbroker-late", topic).await;
+
+    session.relay.stall().await;
+    let publish = component_publish(&session, topic, b"late");
+    let resume = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        session.relay.resume().await;
+    };
+    let (result, ()) = tokio::join!(publish, resume);
+    assert!(matches!(result, Ok(())), "late publish: {result:?}");
+    assert_eq!(
+        next_delivery(&mut session.deliver_rx, "late message").await,
+        b"late"
+    );
+    no_more_deliveries(&mut session.deliver_rx, "after the late message").await;
+    assert_no_publish_waiters(&session.spawned.handle).await;
+
+    session.spawned.handle.stop();
+}
+
+/// A timed-out publish is not resent when the session reconnects: the client
+/// side keeps nothing across connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_publish_is_not_resent_after_a_reconnect() {
+    broker_gate!();
+
+    let topic = "brenn/itest/noresend/t";
+    let mut session = relayed_session("testbroker-noresend", topic).await;
+
+    session.relay.stall().await;
+    let first = component_publish(&session, topic, b"first").await;
+    assert_timed_out(&first, "stalled publish");
+    session.relay.sever().await;
+
+    let SpawnedClient {
+        svc, client_slug, ..
+    } = &session.spawned;
+    // The supervisor backs off at least a second before it redials, so the
+    // Disconnected state is there to be seen.
+    wait_for_health(
+        svc,
+        client_slug,
+        &[ConnectorHealthLabel::Disconnected],
+        10,
+        "session never noticed the sever",
+    )
+    .await;
+    wait_for_health(
+        svc,
+        client_slug,
+        &[ConnectorHealthLabel::Connected],
+        10,
+        "session never reconnected through the relay after sever",
+    )
+    .await;
+
+    let second = component_publish(&session, topic, b"second").await;
+    assert!(matches!(second, Ok(())), "second publish: {second:?}");
+    assert_eq!(
+        next_delivery(&mut session.deliver_rx, "second message").await,
+        b"second"
+    );
+    no_more_deliveries(&mut session.deliver_rx, "after the second message").await;
+    assert_no_publish_waiters(&session.spawned.handle).await;
+
+    session.spawned.handle.stop();
+}
+
+/// Forwards each inbound payload, except that the first payload `panic`
+/// panics the supervisor body delivering it.
+struct PanicOnceRouter {
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    panicked: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl MqttEventRouter for PanicOnceRouter {
+    async fn deliver_inbound(
+        &self,
+        _client_slug: &str,
+        _topic: &str,
+        payload: InboundPayload,
+        _qos: u8,
+    ) {
+        if payload.bytes.as_ref() == b"panic"
+            && !self
+                .panicked
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("supervisor body panic injected by the test router");
+        }
+        // The receiver outlives every delivery the test awaits; a retained
+        // redelivery during teardown may find it gone.
+        self.tx.send(payload.bytes.to_vec()).ok();
+    }
+}
+
+/// A supervisor body that panics while connected leaves its publish waiters
+/// behind. The watchdog's respawned body fails every one of them as it
+/// installs its new connection, and the first publish on that connection is
+/// resolved by its own acknowledgement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_respawned_supervisor_fails_the_dead_bodys_publish_waiters() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let trigger_topic = "brenn/itest/respawn/trigger";
+    let publish_topic = "brenn/itest/respawn/out";
+
+    // A retained message on the trigger topic, delivered when the session's
+    // subscription goes live.
+    let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca.clone()).await;
+    pubc.publish(
+        trigger_topic.to_string(),
+        QoS::AtLeastOnce,
+        true,
+        b"ready".to_vec(),
+    )
+    .await
+    .expect("retained ready publish failed");
+    await_puback(&mut ack_rx, "retained ready").await;
+    let mut deliver_rx = direct_subscriber_every(harness.port, ca.clone(), publish_topic).await;
+
+    let (tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let router: Arc<dyn MqttEventRouter> = Arc::new(PanicOnceRouter {
+        tx,
+        panicked: std::sync::atomic::AtomicBool::new(false),
+    });
+    let svc = MqttService::new();
+    svc.set_router(router.clone()).await;
+    let config = Arc::new(test_client_config(
+        "testbroker-respawn",
+        harness.port,
+        ca,
+        TlsVersionMin::Tls12,
+    ));
+    let client_slug = config.identity.slug.clone();
+    let handle = register_and_spawn(
+        &svc,
+        config,
+        ArrivingFilters::Declared(vec![IngressSubscription {
+            topic_filter: trigger_topic.to_string(),
+            qos: 1,
+            sub_id: 1,
+        }]),
+        router,
+    )
+    .await;
+    let ready = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+        .await
+        .expect("retained ready not delivered within 5s")
+        .expect("router channel closed");
+    assert_eq!(ready, b"ready");
+
+    // What a body that panics mid-session leaves: waiters in both maps whose
+    // packets went on its event loop.
+    let mut stale = Vec::new();
+    {
+        let mut pending = handle.pending_publishes.lock().unwrap();
+        for _ in 0..2 {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            pending.push_back(PendingPublish { ack_tx });
+            stale.push(ack_rx);
+        }
+    }
+    let (ack_tx, inflight_rx) = tokio::sync::oneshot::channel();
+    handle
+        .inflight_publishes
+        .lock()
+        .await
+        .insert(1, PendingPublish { ack_tx });
+    stale.push(inflight_rx);
+
+    pubc.publish(
+        trigger_topic.to_string(),
+        QoS::AtLeastOnce,
+        false,
+        b"panic".to_vec(),
+    )
+    .await
+    .expect("panic trigger publish failed");
+    await_puback(&mut ack_rx, "panic trigger").await;
+
+    // The watchdog delays its respawn, so this wait must allow for that delay.
+    for rx in stale {
+        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(Err(brenn_lib::mqtt::MqttError::NotConnected {
+                last_error: Some(e),
+                ..
+            }))) => assert_eq!(e, SUPERSEDED_BY_NEW_CONNECTION),
+            other => panic!("stale waiter resolved to {other:?}"),
+        }
+    }
+    wait_for_health(
+        &svc,
+        &client_slug,
+        &[ConnectorHealthLabel::Connected],
+        5,
+        "the respawned body never reached Connected",
+    )
+    .await;
+
+    let outcome = svc
+        .publish_on_handle(
+            &handle,
+            publish_topic.to_string(),
+            b"after".to_vec(),
+            PublishProps {
+                qos: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("publish on the new connection failed");
+    assert!(
+        matches!(outcome, brenn_mqtt::state::PubackOutcome::Success),
+        "publish outcome: {outcome:?}"
+    );
+    assert_eq!(next_delivery(&mut deliver_rx, "after").await, b"after");
+    assert_no_publish_waiters(&handle).await;
 
     handle.stop();
 }

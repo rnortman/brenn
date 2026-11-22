@@ -1,11 +1,11 @@
-//! Constructor for the WASM MQTT-egress publish callback.
+//! Constructor for the WASM MQTT-egress publisher.
 //!
 //! This is the brenn-lib-free seam the WASM host calls for `mqtt:publish`. It
 //! closes over the consumer's `AppPolicy`, the consumer slug (the
 //! connector-namespace key), and the `MqttService`, owns the
 //! `mqtt:<client>:<topic>` parse, and bridges the async `enforce_and_publish`
-//! into the synchronous `MqttPublishFn`. `brenn-wasm` never sees a `brenn-lib`
-//! type — the closure maps `MqttEgressError` into the `brenn-wasm`-local
+//! into the synchronous `MqttPublisher`. `brenn-wasm` never sees a `brenn-lib`
+//! type — the publisher maps `MqttEgressError` into the `brenn-wasm`-local
 //! `MqttPublishOutcome`.
 
 use std::sync::Arc;
@@ -19,175 +19,190 @@ use brenn_obs::security::{DenialKind, DenialOrigin, SecurityEventType, signal_pu
 /// size: no broker-derived number.
 const PACKET_TOO_LARGE_TEXT: &str = "the packet exceeds the broker's maximum packet size";
 
-/// Build the synchronous MQTT-egress callback for a WASM consumer holding the
+// `PUBLISH_WAIT` bounds one call; the wait budget is spent by accumulated
+// time per client. One call that times out spends the whole budget only while
+// the budget is no larger than the bound.
+const _: () = assert!(
+    brenn_wasm::PROCESSOR_MQTT_WAIT_BUDGET.as_millis() <= brenn_mqtt::PUBLISH_WAIT.as_millis()
+);
+
+/// Build the synchronous MQTT-egress publisher for a WASM consumer holding the
 /// `Mqtt` grant.
 ///
 /// A matcher's client is validated as declared and a declared client has a
 /// broker session registered before anything holding that matcher runs, so a
 /// consumer with a publish matcher always finds one.
 ///
-/// The returned closure bridges async → sync via `block_on`, which is correct
-/// **only** because the WASM guest invocation runs on a `spawn_blocking`
-/// (blocking-pool) thread — see the `brenn-wasm-dispatch` crate — not a tokio async
-/// worker; `block_on` panics on a worker thread but is supported on a
-/// blocking-pool thread. This coupling to `spawn_blocking` is structural — the
-/// closure is linked only into the guest-host dispatch path — and is enforced by
+/// `publish` bridges async → sync via `block_on`, which is correct **only**
+/// because the WASM guest invocation runs on a `spawn_blocking` (blocking-pool)
+/// thread — see the `brenn-wasm-dispatch` crate — not a tokio async worker;
+/// `block_on` panics on a worker thread but is supported on a blocking-pool
+/// thread. This coupling to `spawn_blocking` is structural — the publisher is
+/// linked only into the guest-host dispatch path — and is enforced by
 /// `block_on`'s own runtime panic rather than an explicit assert. Callers
-/// (including tests) must invoke the returned fn from a blocking-pool thread.
+/// (including tests) must invoke `publish` from a blocking-pool thread.
 pub(crate) fn make_wasm_mqtt_publish_fn(
     policy: brenn_lib::access::AppPolicy,
     slug: String,
     svc: Arc<MqttService>,
     alerts: AlertDispatcher,
 ) -> brenn_wasm::MqttPublishFn {
-    Arc::new(
-        move |client: String,
-              topic: String,
-              payload: Vec<u8>,
-              props: brenn_wasm::MqttPublishProps|
-              -> brenn_wasm::MqttPublishOutcome {
-            use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
-            // Input validation owned by the caller: build and parse
-            // `mqtt:<client>:<topic>` (rejects wildcards in publish
-            // context). A parse failure is `InvalidPayload`.
-            let raw = format!("mqtt:{client}:{topic}");
-            let addr = match brenn_lib::mqtt::address::parse_topic_name(&raw) {
-                Ok(a) => a,
-                Err(e) => {
-                    return brenn_wasm::MqttPublishOutcome::InvalidPayload(e.to_string());
-                }
-            };
-            // Bridge async → sync via `block_on` — safe only on a
-            // blocking-pool thread; see this fn's doc for the full
-            // constraint.
-            //
-            // WASM has no conversation budget; its per-activation quota is enforced
-            // upstream at the host-fn boundary. That quota bounds one activation
-            // only. Cross-activation pacing — which bounds a self-echo/runaway loop
-            // where a consumer republishes into a bridge filter it also subscribes
-            // to — lives upstream at the activation gate in `brenn-wasm-dispatch`
-            // (`ActivationPacer`), not here: one activation-level knob paces every
-            // egress path this component has (MQTT, bus, webhooks), so the host fn
-            // itself intentionally stays limiter-free.
-            let brenn_wasm::MqttPublishProps {
-                content_type,
-                qos,
-                retain,
-                message_expiry_s,
-            } = props;
-            let props = brenn_mqtt::PublishProps {
-                content_type,
-                qos,
-                retain,
-                message_expiry_s,
-            };
-            let result = tokio::runtime::Handle::current().block_on(enforce_and_publish(
-                &svc,
-                &policy,
-                &addr,
-                payload,
-                props,
-                SendBudget::None,
-            ));
-            match result {
-                Ok(()) => brenn_wasm::MqttPublishOutcome::Ok,
-                Err(MqttEgressError::AclDenied { .. }) => {
-                    // An operator policy actively blocked a WASM egress publish
-                    // to a client outside the consumer's `mqtt_publish` ACL — a
-                    // security-relevant event, not guest-input error. Signal it
-                    // the same way the LLM caller does: an app/component-
-                    // attributed security-log line (every occurrence) plus a
-                    // once-per-process phone alert via the shared helper. `kind` is
-                    // always `acl_denied` here: the `Mqtt` grant gates whether this
-                    // callback is even linked, so a no-grant guest cannot reach this
-                    // path. `client` is guest-supplied — the helper sanitizes it; the
-                    // trusted `mqtt:` prefix makes the `address=mqtt:<client>` detail
-                    // self-describing at the ACL's per-client granularity.
-                    signal_publish_denial(
-                        &alerts,
-                        SecurityEventType::MqttPublishDenied,
-                        DenialOrigin::Component { slug: &slug },
-                        DenialKind::AclDenied,
-                        &format!("mqtt:{client}"),
-                    );
-                    brenn_wasm::MqttPublishOutcome::NotPermitted
-                }
-                // Structurally impossible: the WASM path always
-                // passes `SendBudget::None`, for which
-                // `enforce_and_publish` compiles out the budget
-                // gate. Reaching this arm is a host wiring/invariant
-                // violation (e.g. a future refactor passing a
-                // budget-gating variant on the WASM path), NOT a
-                // guest-input error — so panic per the project
-                // posture ("panic if anything unexpected happens").
-                // The `MqttPublishFn` no-panic contract governs
-                // guest-supplied inputs; a host invariant break must
-                // crash loudly rather than masquerade as a transient
-                // `broker` error the guest may retry forever.
-                Err(MqttEgressError::BudgetExhausted) => {
-                    unreachable!(
-                        "BudgetExhausted returned on the WASM MQTT path \
+    Arc::new(WasmMqttPublisher {
+        policy,
+        slug,
+        svc,
+        alerts,
+    })
+}
+
+/// The in-tree [`brenn_wasm::MqttPublisher`]: the `mqtt:<client>:<topic>`
+/// parse, and the shared enforcement pipeline under the consumer's policy.
+struct WasmMqttPublisher {
+    policy: brenn_lib::access::AppPolicy,
+    /// The consumer's slug, the connector-namespace key.
+    slug: String,
+    svc: Arc<MqttService>,
+    alerts: AlertDispatcher,
+}
+
+impl brenn_wasm::MqttPublisher for WasmMqttPublisher {
+    /// Build and parse `mqtt:<client>:<topic>`, rejecting wildcards in publish
+    /// context. The parse splits at the first `:`, so `("home:a", "b")` and
+    /// `("home", "a:b")` are one target.
+    fn resolve(&self, client: &str, topic: &str) -> Result<brenn_wasm::MqttTarget, String> {
+        let raw = format!("mqtt:{client}:{topic}");
+        brenn_lib::mqtt::address::parse_topic_name(&raw)
+            .map(|addr| brenn_wasm::MqttTarget {
+                client: addr.client,
+                topic: addr.topic,
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn publish(
+        &self,
+        target: brenn_wasm::MqttTarget,
+        payload: Vec<u8>,
+        props: brenn_wasm::MqttPublishProps,
+    ) -> brenn_wasm::MqttPublishOutcome {
+        use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
+        let Self {
+            policy,
+            slug,
+            svc,
+            alerts,
+        } = self;
+        let addr = brenn_lib::mqtt::address::MqttAddress {
+            client: target.client,
+            topic: target.topic,
+        };
+        let client = &addr.client;
+        // `block_on` is safe only on a blocking-pool thread; see
+        // `make_wasm_mqtt_publish_fn`'s doc.
+        //
+        // No limiter here by design: pacing belongs at the activation level,
+        // which covers every egress path a component has, so this fn relies on
+        // the caller to bound call volume.
+        let brenn_wasm::MqttPublishProps {
+            content_type,
+            qos,
+            retain,
+            message_expiry_s,
+        } = props;
+        let props = brenn_mqtt::PublishProps {
+            content_type,
+            qos,
+            retain,
+            message_expiry_s,
+        };
+        let result = tokio::runtime::Handle::current().block_on(enforce_and_publish(
+            svc,
+            policy,
+            &addr,
+            payload,
+            props,
+            SendBudget::None,
+        ));
+        match result {
+            Ok(()) => brenn_wasm::MqttPublishOutcome::Ok,
+            Err(MqttEgressError::AclDenied { .. }) => {
+                // An ACL denial is a security event, not a guest-input error.
+                // `kind` is always `acl_denied`: without the `Mqtt` grant this
+                // callback is never linked. `client` is guest-derived and must
+                // be sanitized by `signal_publish_denial`.
+                signal_publish_denial(
+                    alerts,
+                    SecurityEventType::MqttPublishDenied,
+                    DenialOrigin::Component { slug },
+                    DenialKind::AclDenied,
+                    &format!("mqtt:{client}"),
+                );
+                brenn_wasm::MqttPublishOutcome::NotPermitted
+            }
+            // Unreachable: this path always passes `SendBudget::None`. Reaching
+            // it is a host invariant violation, not guest input, so it panics
+            // rather than surface as a `broker` error the guest may retry.
+            Err(MqttEgressError::BudgetExhausted) => {
+                unreachable!(
+                    "BudgetExhausted returned on the WASM MQTT path \
                              (SendBudget::None): enforce_and_publish contract \
                              violation — the budget gate must never fire when no \
                              budget is supplied"
-                    )
-                }
-                Err(MqttEgressError::Broker(e)) => {
-                    // The guest (untrusted out-of-tree) gets only a stable
-                    // coarse kind — the full `Display` embeds host-internal
-                    // topology (connector/app slugs, raw rumqttc last-error
-                    // text) it was never granted. The full detail lands
-                    // host-side here, where the on-call engineer needs it. The
-                    // `Display` carries broker-derived external text, so it is
-                    // sanitized per the log-integrity posture even though it is
-                    // not guest-supplied; `client` is guest-supplied.
-                    let safe_client = sanitize_untrusted_str(&client, MAX_LOGGED_UNTRUSTED_BYTES);
-                    tracing::warn!(
-                        slug = %slug,
-                        client = %safe_client,
-                        detail = %sanitize_untrusted_str(&e.to_string(), MAX_LOGGED_UNTRUSTED_BYTES),
-                        "wasm mqtt-publish: broker error (guest sees coarse kind only)"
-                    );
-                    brenn_wasm::MqttPublishOutcome::Broker(e.coarse_kind().to_string())
-                }
-                Err(MqttEgressError::BrokerRejected { reason }) => {
-                    brenn_wasm::MqttPublishOutcome::BrokerRejected(reason)
-                }
-                Err(MqttEgressError::PacketTooLarge {
+                )
+            }
+            Err(MqttEgressError::Broker(e)) => {
+                // The guest (untrusted out-of-tree) gets only a stable
+                // coarse kind — the full `Display` embeds host-internal
+                // topology (connector/app slugs, raw rumqttc last-error
+                // text) it was never granted. The full detail lands
+                // host-side here, where the on-call engineer needs it. The
+                // `Display` carries broker-derived external text, so it is
+                // sanitized per the log-integrity posture even though it is
+                // not guest-supplied; `client` is guest-supplied.
+                let safe_client = sanitize_untrusted_str(client, MAX_LOGGED_UNTRUSTED_BYTES);
+                tracing::warn!(
+                    slug = %slug,
+                    client = %safe_client,
+                    detail = %sanitize_untrusted_str(&e.to_string(), MAX_LOGGED_UNTRUSTED_BYTES),
+                    "wasm mqtt-publish: broker error (guest sees coarse kind only)"
+                );
+                brenn_wasm::MqttPublishOutcome::Broker(e.coarse_kind().to_string())
+            }
+            Err(MqttEgressError::BrokerRejected { reason }) => {
+                brenn_wasm::MqttPublishOutcome::BrokerRejected(reason)
+            }
+            Err(MqttEgressError::PacketTooLarge {
+                packet_bytes,
+                broker_max,
+            }) => {
+                // The guest gets a fixed text: the broker's maximum is
+                // broker-derived detail it was never granted. The numbers
+                // land host-side. `invalid-payload` tells it not to retry.
+                let safe_client = sanitize_untrusted_str(client, MAX_LOGGED_UNTRUSTED_BYTES);
+                tracing::warn!(
+                    slug = %slug,
+                    client = %safe_client,
                     packet_bytes,
                     broker_max,
-                }) => {
-                    // The guest gets a fixed text: the broker's maximum is
-                    // broker-derived detail it was never granted. The numbers
-                    // land host-side. `invalid-payload` tells it not to retry.
-                    let safe_client = sanitize_untrusted_str(&client, MAX_LOGGED_UNTRUSTED_BYTES);
-                    tracing::warn!(
-                        slug = %slug,
-                        client = %safe_client,
-                        packet_bytes,
-                        broker_max,
-                        "wasm mqtt-publish: packet exceeds the broker's maximum packet size"
-                    );
-                    brenn_wasm::MqttPublishOutcome::InvalidPayload(
-                        PACKET_TOO_LARGE_TEXT.to_string(),
-                    )
-                }
-                // Structurally impossible on this path, unlike the LLM one: a
-                // consumer whose ACL names a client is retired — task joined —
-                // before a reload's commit stops any session, and the planner
-                // refuses a matcher on an undeclared client, so no live
-                // consumer can hold an authority the registry has moved past.
-                // A miss here means a consumer outlived its retirement.
-                Err(MqttEgressError::ClientNotRegistered { client }) => {
-                    unreachable!(
-                        "wasm mqtt-publish: no session registered for client {client:?} while \
+                    "wasm mqtt-publish: packet exceeds the broker's maximum packet size"
+                );
+                brenn_wasm::MqttPublishOutcome::InvalidPayload(PACKET_TOO_LARGE_TEXT.to_string())
+            }
+            // Structurally impossible on this path, unlike the LLM one: a
+            // consumer whose ACL names a client is retired — task joined —
+            // before a reload's commit stops any session, and the planner
+            // refuses a matcher on an undeclared client, so no live
+            // consumer can hold an authority the registry has moved past.
+            // A miss here means a consumer outlived its retirement.
+            Err(MqttEgressError::ClientNotRegistered { client }) => {
+                unreachable!(
+                    "wasm mqtt-publish: no session registered for client {client:?} while \
                          consumer {slug:?} is live — a consumer naming a client is retired \
                          before any session is stopped (host bug)"
-                    )
-                }
+                )
             }
-        },
-    )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,19 +254,61 @@ mod tests {
         svc
     }
 
-    /// Invoke the callback from a blocking-pool thread — required because it
-    /// `block_on`s and panics on a tokio async worker (see the fn's doc).
-    async fn call(f: &brenn_wasm::MqttPublishFn, client: &str, topic: &str) -> MqttPublishOutcome {
+    /// Resolve and publish `payload` from a blocking-pool thread, as
+    /// `do_mqtt_publish` does — required because `publish` `block_on`s and
+    /// panics on a tokio async worker (see the fn's doc). A `resolve` error is
+    /// the `invalid-payload` the host would return.
+    async fn call_with(
+        f: &brenn_wasm::MqttPublishFn,
+        client: &str,
+        topic: &str,
+        payload: Vec<u8>,
+        props: brenn_wasm::MqttPublishProps,
+    ) -> MqttPublishOutcome {
+        let target = match f.resolve(client, topic) {
+            Ok(target) => target,
+            Err(reason) => return MqttPublishOutcome::InvalidPayload(reason),
+        };
         let f = f.clone();
-        let client = client.to_string();
-        let topic = topic.to_string();
+        tokio::task::spawn_blocking(move || f.publish(target, payload, props))
+            .await
+            .expect("spawn_blocking join failed")
+    }
+
+    /// [`call_with`] a one-byte QoS 1 publish.
+    async fn call(f: &brenn_wasm::MqttPublishFn, client: &str, topic: &str) -> MqttPublishOutcome {
         let props = brenn_wasm::MqttPublishProps {
             qos: 1,
             ..Default::default()
         };
-        tokio::task::spawn_blocking(move || f(client, topic, b"x".to_vec(), props))
-            .await
-            .expect("spawn_blocking join failed")
+        call_with(f, client, topic, b"x".to_vec(), props).await
+    }
+
+    /// The parse splits the joined address at its first `:`, so the same
+    /// publish spelled two ways is one target — the key the host charges per
+    /// client. An address outside the grammar is refused.
+    #[tokio::test]
+    async fn resolve_returns_the_session_the_publish_reaches() {
+        let f = make_wasm_mqtt_publish_fn(
+            policy_allowing(&["home"]),
+            "slug".to_string(),
+            MqttService::new(),
+            noop_dispatcher(),
+        );
+        let expected = brenn_wasm::MqttTarget {
+            client: "home".to_string(),
+            topic: "a:b".to_string(),
+        };
+        assert_eq!(f.resolve("home", "a:b"), Ok(expected.clone()));
+        assert_eq!(f.resolve("home:a", "b"), Ok(expected));
+        assert!(
+            f.resolve("ho me", "t").is_err(),
+            "client outside the slug grammar"
+        );
+        assert!(
+            f.resolve("home", "cmd/#").is_err(),
+            "wildcard in a publish topic"
+        );
     }
 
     /// A wildcard in a publish topic is rejected by `parse_topic_name` before the
@@ -354,16 +411,14 @@ mod tests {
             svc,
             noop_dispatcher(),
         );
-        let out = tokio::task::spawn_blocking(move || {
-            f(
-                "home".to_string(),
-                "cmd/light".to_string(),
-                vec![0x5a; 64],
-                brenn_wasm::MqttPublishProps::default(),
-            )
-        })
-        .await
-        .expect("spawn_blocking join failed");
+        let out = call_with(
+            &f,
+            "home",
+            "cmd/light",
+            vec![0x5a; 64],
+            brenn_wasm::MqttPublishProps::default(),
+        )
+        .await;
         assert!(
             matches!(out, MqttPublishOutcome::Ok),
             "expected Ok, got {out:?}"

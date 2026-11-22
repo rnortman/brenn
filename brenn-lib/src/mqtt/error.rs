@@ -1,6 +1,7 @@
 //! MQTT error types with LLM-facing string representations.
 
 use std::fmt;
+use std::time::Duration;
 
 /// Errors surfaced from the MQTT subsystem to tool intercepts and the LLM.
 ///
@@ -44,6 +45,14 @@ pub enum MqttError {
         packet_bytes: usize,
         broker_max: u32,
     },
+    /// The publish did not complete within the host's bound on the wait for
+    /// the session: room on its request channel at QoS 0, or the broker's
+    /// acknowledgement at QoS 1/2. The packet may already have been handed to
+    /// the client library, so it may still be delivered.
+    TimedOut {
+        client_slug: String,
+        waited: Duration,
+    },
 }
 
 impl MqttError {
@@ -61,6 +70,7 @@ impl MqttError {
     pub fn coarse_kind(&self) -> &'static str {
         match self {
             MqttError::NotConnected { .. } => "not connected",
+            MqttError::TimedOut { .. } => "timed out",
             _ => "publish failed",
         }
     }
@@ -136,6 +146,18 @@ impl fmt::Display for MqttError {
                      the broker accepts at most {broker_max} bytes",
                 )
             }
+            MqttError::TimedOut {
+                client_slug,
+                waited,
+            } => {
+                write!(
+                    f,
+                    "the publish on MQTT client '{client_slug}' did not complete within {} s: \
+                     the broker did not answer. The message may still be delivered; \
+                     sending it again can deliver it twice.",
+                    waited.as_secs(),
+                )
+            }
         }
     }
 }
@@ -192,5 +214,21 @@ mod tests {
              the broker accepts at most 1024 bytes"
         );
         assert_eq!(e.coarse_kind(), "publish failed");
+    }
+
+    #[test]
+    fn timed_out_names_the_client_and_the_wait_and_its_coarse_kind_leaks_neither() {
+        let e = MqttError::TimedOut {
+            client_slug: "home".to_string(),
+            waited: Duration::from_secs(10),
+        };
+        assert_eq!(
+            e.to_string(),
+            "the publish on MQTT client 'home' did not complete within 10 s: \
+             the broker did not answer. The message may still be delivered; \
+             sending it again can deliver it twice."
+        );
+        assert_eq!(e.coarse_kind(), "timed out");
+        assert!(!e.coarse_kind().contains("home"));
     }
 }

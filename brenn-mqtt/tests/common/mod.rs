@@ -287,26 +287,7 @@ pub async fn direct_subscriber_publish(
     ca_pem: Vec<u8>,
     topic: &str,
 ) -> mpsc::Receiver<rumqttc::mqttbytes::v5::Publish> {
-    let client_id = format!("brenn-direct-sub-{}", uuid_v4_simple());
-    let mut opts = MqttOptions::new(client_id, ("127.0.0.1", broker_port));
-    opts.set_clean_start(true);
-    opts.set_transport(Transport::tls(ca_pem, None, None));
-    let (client, mut eventloop) = AsyncClient::builder(opts).capacity(16).build();
-
-    client
-        .subscribe(topic, rumqttc::mqttbytes::QoS::AtLeastOnce)
-        .await
-        .expect("direct_subscriber: subscribe failed");
-
-    // Drain the eventloop until SubAck so the subscription is registered before
-    // the caller publishes, then hand off to a task collecting the first Publish.
-    drain_until_incoming(
-        &mut eventloop,
-        |pkt| matches!(pkt, rumqttc::Incoming::SubAck(_)),
-        "direct_subscriber: SubAck",
-    )
-    .await;
-
+    let (client, mut eventloop) = direct_subscription(broker_port, ca_pem, topic).await;
     let (deliver_tx, deliver_rx) = mpsc::channel::<rumqttc::mqttbytes::v5::Publish>(1);
     tokio::spawn(async move {
         // Keep the client alive so the eventloop keeps servicing the connection.
@@ -327,6 +308,66 @@ pub async fn direct_subscriber_publish(
     });
 
     deliver_rx
+}
+
+/// [`direct_subscriber`], handing over the payload of every PUBLISH delivered
+/// on `topic`, in arrival order, for a test that counts deliveries.
+pub async fn direct_subscriber_every(
+    broker_port: u16,
+    ca_pem: Vec<u8>,
+    topic: &str,
+) -> mpsc::UnboundedReceiver<Vec<u8>> {
+    let (client, mut eventloop) = direct_subscription(broker_port, ca_pem, topic).await;
+    let (deliver_tx, deliver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        // Keep the client alive so the eventloop keeps servicing the connection.
+        let _client = client;
+        loop {
+            match eventloop.poll().await {
+                Ok(rumqttc::Event::Incoming(rumqttc::Incoming::Publish(p))) => {
+                    if deliver_tx.send(p.payload.to_vec()).is_err() {
+                        return; // the test is done with it
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("direct_subscriber_every: eventloop error: {e}");
+                    return;
+                }
+            }
+        }
+    });
+    deliver_rx
+}
+
+/// A direct rumqttc v5 client subscribed to `topic` at QoS 1, returned once
+/// its SubAck has arrived so a publish issued afterward cannot race ahead of
+/// the subscription.
+async fn direct_subscription(
+    broker_port: u16,
+    ca_pem: Vec<u8>,
+    topic: &str,
+) -> (AsyncClient, rumqttc::EventLoop) {
+    let client_id = format!("brenn-direct-sub-{}", uuid_v4_simple());
+    let mut opts = MqttOptions::new(client_id, ("127.0.0.1", broker_port));
+    opts.set_clean_start(true);
+    opts.set_transport(Transport::tls(ca_pem, None, None));
+    let (client, mut eventloop) = AsyncClient::builder(opts).capacity(16).build();
+
+    client
+        .subscribe(topic, rumqttc::mqttbytes::QoS::AtLeastOnce)
+        .await
+        .expect("direct_subscriber: subscribe failed");
+
+    // Drain the eventloop until SubAck so the subscription is registered before
+    // the caller publishes, then hand off to a task collecting the first Publish.
+    drain_until_incoming(
+        &mut eventloop,
+        |pkt| matches!(pkt, rumqttc::Incoming::SubAck(_)),
+        "direct_subscriber: SubAck",
+    )
+    .await;
+    (client, eventloop)
 }
 
 // ---------------------------------------------------------------------------

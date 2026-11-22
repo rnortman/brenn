@@ -496,11 +496,13 @@ interface mqtt {
         invalid-payload(string),
         /// Per-activation publish quota hit (shared with `ports.publish`).
         quota-exceeded,
-        /// Broker disconnect / submit failure / ack drop. Transient — MAY be
-        /// retried on a later activation. The payload is a stable coarse kind
-        /// (e.g. `"not connected"` / `"publish failed"`) suitable for logging
-        /// and retry classification; it is NOT the full host-side error detail
-        /// and MUST NOT be parsed beyond that classification.
+        /// Broker disconnect / submit failure / ack drop / no answer in time.
+        /// Transient — MAY be retried on a later activation. The payload is a
+        /// stable coarse kind (e.g. `"not connected"` / `"publish failed"` /
+        /// `"timed out"` / `"wait budget spent"`) suitable for logging and retry
+        /// classification; it is NOT the full host-side error detail and MUST
+        /// NOT be parsed beyond that classification. After `"timed out"` the
+        /// message may still reach the broker, so a retry can deliver it twice.
         broker(string),
         /// Broker accepted the connection but rejected the publish (PUBACK
         /// reason code != success). Diagnostic string.
@@ -524,7 +526,13 @@ interface mqtt {
     /// tool's `<client>` address segment); `topic` is the topic under that
     /// client and MUST NOT contain wildcards. The consumer's `mqtt_publish` ACL
     /// gates which clients are reachable. For QoS >= 1 the call awaits the
-    /// PUBACK before returning.
+    /// PUBACK for a bounded time set by the host, and fails with
+    /// `broker("timed out")` past it.
+    ///
+    /// Time stopped in this call is not counted against the activation's
+    /// running-time limit. The host instead limits the total time one
+    /// activation waits on one client; past it, further publishes to that
+    /// client in the activation fail at once with `broker("wait budget spent")`.
     mqtt-publish: func(
         client: string,
         topic: string,

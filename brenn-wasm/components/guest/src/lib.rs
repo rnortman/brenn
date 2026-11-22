@@ -2105,7 +2105,14 @@ pub mod mqtt {
     //!
     //! `client` is the `[[mqtt_client]]` slug; `topic` is a concrete topic
     //! under that client and must contain no wildcard. For QoS >= 1 the call
-    //! awaits the PUBACK before returning.
+    //! awaits the PUBACK for a bounded time set by the host; past it the call
+    //! fails with `broker("timed out")`, and the message may still be
+    //! delivered.
+    //!
+    //! Time stopped in a publish is not counted against the activation's
+    //! running-time limit. The host limits the total time one activation waits
+    //! on one client instead: past it, further publishes to that client in the
+    //! activation fail at once with `broker("wait budget spent")`.
 
     use super::Error;
     use crate::contract::mqtt::{self as raw};
@@ -2116,9 +2123,11 @@ pub mod mqtt {
     pub use crate::contract::mqtt::MqttPublishError as PublishError;
 
     /// Whether a later activation may retry this failure. Only a broker
-    /// disconnect / submit failure / dropped ack is transient; a denial, an
-    /// absent service, a malformed address, an exhausted quota and a
-    /// broker-side rejection are all permanent for this config.
+    /// disconnect / submit failure / dropped ack / timeout / spent wait budget
+    /// is transient; a denial, an absent service, a malformed address, an
+    /// exhausted quota and a broker-side rejection are all permanent for this
+    /// config. A transient failure may still have been delivered — a timed-out
+    /// publish can reach the broker late — so a retry can deliver twice.
     pub fn is_transient(e: &PublishError) -> bool {
         matches!(e, PublishError::Broker(_))
     }

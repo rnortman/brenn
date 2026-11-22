@@ -80,7 +80,9 @@ pub enum MqttEgressError {
     /// The conversation budget hit zero (only reachable for
     /// [`SendBudget::Conversation`]).
     BudgetExhausted,
-    /// Disconnect / submit failure / ack-channel drop from the broker layer.
+    /// Disconnect / submit failure / ack-channel drop from the broker layer,
+    /// or `MqttError::TimedOut` when the session did not complete the publish
+    /// within `PUBLISH_WAIT`; a timed-out message may still be delivered.
     Broker(MqttError),
     /// The broker returned a PUBACK/PUBCOMP reason code other than success.
     BrokerRejected {

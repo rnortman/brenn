@@ -42,6 +42,13 @@
 // refusal); `CLASSIFY` runs the bounded loop and reports how the SDK
 // classified and rendered the first failure.
 //
+// Three hold shapes measure how long the host lets a component wait in
+// `mqtt-publish`: `HOLD` buffers one `ports.publish` on `out`, calls
+// `mqtt::try_publish` `HOLD_CALLS` times at QoS 1 without stopping at an error,
+// then buffers a second publish on `out` carrying the tally; `HOLD_SPELL` does
+// the same with call `i` naming the client `home:<i>`; `HOLD_SPIN` publishes
+// once and then spins until the host interrupts it.
+//
 // Addressing constants used by the fixture:
 //   client : "test-client"
 //   topic  : "test/topic"
@@ -90,6 +97,60 @@ const PUBLISH_ZERO_EXPIRY: &str = "PUBLISH_ZERO_EXPIRY";
 /// variant no callback can.
 const CLASSIFY: &str = "CLASSIFY";
 
+/// Sentinel selecting the hold path with a fixed client string.
+const HOLD: &str = "HOLD";
+
+/// Sentinel selecting the hold path with a different client string per call,
+/// all of them spellings of `home` under the host's address parser. Checked
+/// before `HOLD`, which it contains.
+const HOLD_SPELL: &str = "HOLD_SPELL";
+
+/// Sentinel selecting one publish followed by a spin. Checked before `HOLD`,
+/// which it contains.
+const HOLD_SPIN: &str = "HOLD_SPIN";
+
+/// How many `mqtt-publish` calls the hold path makes.
+const HOLD_CALLS: usize = 20;
+
+/// The hold path: buffer a publish on `out`, make `HOLD_CALLS` MQTT publishes
+/// whatever each returns, then buffer the tally on `out`:
+/// `ok=<n> broker=<n> other=<n> kinds=<distinct kinds, |-separated>`.
+fn hold(spell: bool) -> Result<Option<Body>, Error> {
+    brenn_guest::publish("out", "before")?;
+    let (mut ok, mut broker, mut other) = (0usize, 0usize, 0usize);
+    let mut kinds: Vec<String> = Vec::new();
+    for i in 0..HOLD_CALLS {
+        let client = if spell {
+            format!("home:{i}")
+        } else {
+            String::from("test-client")
+        };
+        let kind = match mqtt::try_publish(&client, "test/topic", b"x", None, 1, false) {
+            Ok(()) => {
+                ok += 1;
+                continue;
+            }
+            Err(PublishError::Broker(kind)) => {
+                broker += 1;
+                kind
+            }
+            Err(e) => {
+                other += 1;
+                format!("{e:?}")
+            }
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    let tally = format!(
+        "ok={ok} broker={broker} other={other} kinds={}",
+        kinds.join("|")
+    );
+    brenn_guest::publish("out", &tally)?;
+    Ok(None)
+}
+
 impl Processor for ProcessorMqttTest {
     fn receive(a: Activation) -> Result<Option<Body>, Error> {
         let Some(first_new) = a.port_windows().find_map(|w| w.new_messages().first()) else {
@@ -99,6 +160,20 @@ impl Processor for ProcessorMqttTest {
         // The sentinels are text; a non-text body carries none.
         let text = first_new.body().as_text().ok();
         let has = |sentinel: &str| text.is_some_and(|t| t.contains(sentinel));
+
+        if has(HOLD_SPIN) {
+            // The outcome is irrelevant: what is under test is the spin after it.
+            let _outcome = mqtt::try_publish("test-client", "test/topic", b"x", None, 1, false);
+            loop {
+                core::hint::black_box(());
+            }
+        }
+        if has(HOLD_SPELL) {
+            return hold(true);
+        }
+        if has(HOLD) {
+            return hold(false);
+        }
 
         // Trap-after-publish path: publish ONCE (expecting Ok), then panic. The
         // panic becomes a wasm trap → `ProcessorOutcome::Trap`. The synchronous

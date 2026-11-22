@@ -1500,31 +1500,37 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         tools.push(VirtualToolDef {
             name: "MqttSend".to_string(),
             cli: CliAccess::Available,
-            description: concat!(
-                "Publish a message to an MQTT topic. Address format: `mqtt:<client>:<topic>`. ",
-                "Example: `mqtt:homeassistant:home/sensor/temperature`.\n\n",
-                "Give the payload in exactly one of three forms. `body` as a string publishes ",
-                "text, its UTF-8 bytes. `body` as `{ binary_base64: string, content_type?: string }` ",
-                "publishes bytes you compose yourself, decoded, with `content_type` sent as the ",
-                "MQTT Content Type. `attachment` as `{\"message_id\": …, \"name\": …}` publishes ",
-                "an attachment of a message you were shown, by reference: its bytes never enter ",
-                "this conversation, and its content type is sent as the MQTT Content Type. Give ",
-                "the `message_id` and the attachment's name exactly as the message showed them. ",
-                "The source message must still be retained on its channel and must have been ",
-                "shown to this conversation since its context was last reset; otherwise read it ",
-                "again with MessageChannelGet.\n\n",
-                "A payload over the MQTT client's outbound bound (4 MiB unless the deployment ",
-                "sets `outbound_payload_cap_bytes`) is refused with reason `payload_too_large`. ",
-                "A refused attachment or an over-bound payload refuses the call with a `reason` ",
-                "and spends no budget.\n\n",
-                "`qos` is 0, 1, or 2 (default 1). `retain` is true/false (default false).\n\n",
-                "QoS 1/2: blocks until PUBACK/PUBCOMP. QoS 0: fire-and-forget (no broker ack). ",
-                "Wildcards (`+` or `#`) in the topic are rejected — use a concrete topic name. ",
-                "Cross-protocol misuse: `brenn:` addresses → BrennSend; `pwa_push:` → PwaPushSend. ",
-                "Returns `{ ok: true }` on success or `{ ok: false, error: \"...\" }` on failure. ",
-                "Counts against the per-conversation send budget."
-            )
-            .to_string(),
+            description: format!(
+                "{}QoS 1/2: waits for PUBACK/PUBCOMP, at most {} s; on a timeout the call fails \
+                 and the message may still have been delivered. {}",
+                concat!(
+                    "Publish a message to an MQTT topic. Address format: `mqtt:<client>:<topic>`. ",
+                    "Example: `mqtt:homeassistant:home/sensor/temperature`.\n\n",
+                    "Give the payload in exactly one of three forms. `body` as a string publishes ",
+                    "text, its UTF-8 bytes. `body` as `{ binary_base64: string, content_type?: string }` ",
+                    "publishes bytes you compose yourself, decoded, with `content_type` sent as the ",
+                    "MQTT Content Type. `attachment` as `{\"message_id\": …, \"name\": …}` publishes ",
+                    "an attachment of a message you were shown, by reference: its bytes never enter ",
+                    "this conversation, and its content type is sent as the MQTT Content Type. Give ",
+                    "the `message_id` and the attachment's name exactly as the message showed them. ",
+                    "The source message must still be retained on its channel and must have been ",
+                    "shown to this conversation since its context was last reset; otherwise read it ",
+                    "again with MessageChannelGet.\n\n",
+                    "A payload over the MQTT client's outbound bound (4 MiB unless the deployment ",
+                    "sets `outbound_payload_cap_bytes`) is refused with reason `payload_too_large`. ",
+                    "A refused attachment or an over-bound payload refuses the call with a `reason` ",
+                    "and spends no budget.\n\n",
+                    "`qos` is 0, 1, or 2 (default 1). `retain` is true/false (default false).\n\n",
+                ),
+                crate::mqtt::PUBLISH_WAIT.as_secs(),
+                concat!(
+                    "QoS 0: fire-and-forget (no broker ack). ",
+                    "Wildcards (`+` or `#`) in the topic are rejected — use a concrete topic name. ",
+                    "Cross-protocol misuse: `brenn:` addresses → BrennSend; `pwa_push:` → PwaPushSend. ",
+                    "Returns `{ ok: true }` on success or `{ ok: false, error: \"...\" }` on failure. ",
+                    "Counts against the per-conversation send budget."
+                ),
+            ),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2188,6 +2194,29 @@ mod tests {
         assert!(
             to_desc.contains("ephemeral:"),
             "to schema must mention the ephemeral: scheme: {to_desc}"
+        );
+    }
+
+    /// `MqttSend`'s description states the publish wait bound and that a
+    /// timed-out message may still have been delivered, so the conversation
+    /// knows a retry can deliver it twice.
+    #[test]
+    fn mqtt_send_description_states_the_wait_bound_and_possible_delivery() {
+        let tools = mqtt_virtual_tools(true);
+        let send = tools
+            .iter()
+            .find(|t| t.name == "MqttSend")
+            .expect("MqttSend offered when MQTT is enabled");
+
+        let desc = &send.description;
+        let bound = format!("at most {} s", crate::mqtt::PUBLISH_WAIT.as_secs());
+        assert!(
+            desc.contains(&bound),
+            "description must state {bound:?}: {desc}"
+        );
+        assert!(
+            desc.contains("the message may still have been delivered"),
+            "description must warn a timed-out message may be delivered: {desc}"
         );
     }
 
