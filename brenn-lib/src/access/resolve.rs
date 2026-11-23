@@ -12,8 +12,8 @@
 
 use indexmap::IndexMap;
 
-use crate::access::acl::{AclSet, ChannelMatcher, MqttPubMatcher, MqttSubMatcher, WebhookMatcher};
-use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
+use crate::access::acl::{AclSet, ChannelMatcher, MqttMatcher, WebhookMatcher};
+use crate::access::raw::{AppAclRaw, ChannelMatcherRaw, MqttMatcherRaw};
 use crate::access::{AppPolicy, GrantSet};
 use crate::mqtt::config::MqttClientIdentity;
 use brenn_envelope::grants::AppCapability;
@@ -69,29 +69,22 @@ pub fn build_app_policy(
     }
 
     let owner = format!("app {app_slug:?}");
+    // One MQTT list resolved: each client checked against the configured
+    // clients, each filter validated; `list` names the list in diagnostics.
+    let mqtt_matchers = |list: &str, raw: &[MqttMatcherRaw]| -> Vec<MqttMatcher> {
+        raw.iter()
+            .map(|m| {
+                validate_mqtt_client(app_slug, list, &m.client, mqtt_clients);
+                MqttMatcher {
+                    client: m.client.clone(),
+                    topic_filter: validated_topic_filter(&owner, list, &m.topic_filter),
+                }
+            })
+            .collect()
+    };
     let acls = AclSet {
-        mqtt_subscribe: acl
-            .mqtt_subscribe
-            .iter()
-            .map(|m| {
-                validate_mqtt_client(app_slug, "mqtt_subscribe", &m.client, mqtt_clients);
-                MqttSubMatcher {
-                    client: m.client.clone(),
-                    topic_filter: validated_topic_filter(&owner, "mqtt_subscribe", &m.topic_filter),
-                }
-            })
-            .collect(),
-        mqtt_publish: acl
-            .mqtt_publish
-            .iter()
-            .map(|m| {
-                validate_mqtt_client(app_slug, "mqtt_publish", &m.client, mqtt_clients);
-                MqttPubMatcher {
-                    client: m.client.clone(),
-                    topic_filter: validated_topic_filter(&owner, "mqtt_publish", &m.topic_filter),
-                }
-            })
-            .collect(),
+        mqtt_subscribe: mqtt_matchers("mqtt_subscribe", &acl.mqtt_subscribe),
+        mqtt_publish: mqtt_matchers("mqtt_publish", &acl.mqtt_publish),
         brenn_subscribe: acl
             .brenn_subscribe
             .iter()
@@ -164,7 +157,7 @@ fn validated_topic_filter(owner: &str, list: &str, filter: &str) -> String {
 /// unified policy model spans both app kinds. WASM publishes to / subscribes from
 /// `brenn:` channels (`brenn_subscribe`/`brenn_publish`, validated identically to
 /// the LLM side via `resolve_channel`); with the `mqtt` grant, publishes MQTT
-/// (`mqtt_publish`, the same `(client, topic_filter)` `MqttPubMatcher` as the LLM
+/// (`mqtt_publish`, the same `(client, topic_filter)` `MqttMatcher` as the LLM
 /// side);
 /// and subscribes to inbound `mqtt:`/`webhook:`
 /// channels (`mqtt_subscribe`/`webhook`, the same matcher types the LLM side
@@ -318,6 +311,25 @@ pub fn build_wasm_policy(
     }
 
     let owner = format!("wasm consumer {slug:?}");
+    // One MQTT list resolved into the same `(client, topic_filter)` `MqttMatcher`
+    // the LLM side resolves into: the client slug charset-validated, the filter
+    // validated; `list` names the list in diagnostics. The configured-client
+    // cross-check is a boot validation where the resolved client set is in scope.
+    let mqtt_matchers = |list: &str, raw: &[MqttMatcherRaw]| -> Vec<MqttMatcher> {
+        raw.iter()
+            .map(|m| {
+                assert!(
+                    crate::mqtt::config::is_valid_client_slug(&m.client),
+                    "{owner}: {list} matcher has invalid client slug {:?}",
+                    m.client,
+                );
+                MqttMatcher {
+                    client: m.client.clone(),
+                    topic_filter: validated_topic_filter(&owner, list, &m.topic_filter),
+                }
+            })
+            .collect()
+    };
     let acls = AclSet {
         brenn_subscribe: subscribe_acl
             .iter()
@@ -343,50 +355,8 @@ pub fn build_wasm_policy(
             .iter()
             .map(|m| resolve_channel(&owner, "local_subscribe_acl", m))
             .collect(),
-        // MQTT publish ACL: the same `(client, topic_filter)` `MqttPubMatcher` the
-        // LLM side resolves into. Charset-validate the client slug and validate the
-        // topic filter here; the configured-client cross-check is a boot validation
-        // where the resolved client set is in scope.
-        mqtt_publish: mqtt_publish_acl
-            .iter()
-            .map(|m| {
-                assert!(
-                    crate::mqtt::config::is_valid_client_slug(&m.client),
-                    "{owner}: mqtt_publish_acl matcher has invalid client slug {:?}",
-                    m.client,
-                );
-                MqttPubMatcher {
-                    client: m.client.clone(),
-                    topic_filter: validated_topic_filter(
-                        &owner,
-                        "mqtt_publish_acl",
-                        &m.topic_filter,
-                    ),
-                }
-            })
-            .collect(),
-        // MQTT subscribe ACL: the same `(client, topic_filter)` `MqttSubMatcher`
-        // the LLM side resolves into. Charset-validate the client slug and validate
-        // the topic filter here; the configured-client cross-check is a boot
-        // validation where the resolved client set is in scope.
-        mqtt_subscribe: mqtt_subscribe_acl
-            .iter()
-            .map(|m| {
-                assert!(
-                    crate::mqtt::config::is_valid_client_slug(&m.client),
-                    "{owner}: mqtt_subscribe_acl matcher has invalid client slug {:?}",
-                    m.client,
-                );
-                MqttSubMatcher {
-                    client: m.client.clone(),
-                    topic_filter: validated_topic_filter(
-                        &owner,
-                        "mqtt_subscribe_acl",
-                        &m.topic_filter,
-                    ),
-                }
-            })
-            .collect(),
+        mqtt_publish: mqtt_matchers("mqtt_publish_acl", mqtt_publish_acl),
+        mqtt_subscribe: mqtt_matchers("mqtt_subscribe_acl", mqtt_subscribe_acl),
         // Webhook subscribe ACL: the same endpoint-slug `WebhookMatcher` the LLM
         // side resolves into. Validate non-emptiness (parity with the LLM side).
         webhook: webhook_acl
@@ -649,9 +619,7 @@ fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::raw::{
-        AttachAclsRaw, MqttPubMatcherRaw, MqttSubMatcherRaw, WasmAclsRaw, WebhookMatcherRaw,
-    };
+    use crate::access::raw::{AttachAclsRaw, MqttMatcherRaw, WasmAclsRaw, WebhookMatcherRaw};
 
     /// A minimal client identity for the given slug, for the matcher-client
     /// cross-check (only the map key matters).
@@ -676,11 +644,11 @@ mod tests {
             AppCapability::Webhook,
         ];
         let acl = AppAclRaw {
-            mqtt_subscribe: vec![MqttSubMatcherRaw {
+            mqtt_subscribe: vec![MqttMatcherRaw {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             }],
-            mqtt_publish: vec![MqttPubMatcherRaw {
+            mqtt_publish: vec![MqttMatcherRaw {
                 client: "office".to_string(),
                 topic_filter: "lights/+/set".to_string(),
             }],
@@ -709,14 +677,14 @@ mod tests {
         // Matchers convert to their resolved forms.
         assert_eq!(
             policy.acls.mqtt_subscribe,
-            vec![MqttSubMatcher {
+            vec![MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             }]
         );
         assert_eq!(
             policy.acls.mqtt_publish,
-            vec![MqttPubMatcher {
+            vec![MqttMatcher {
                 client: "office".to_string(),
                 topic_filter: "lights/+/set".to_string(),
             }]
@@ -858,7 +826,7 @@ mod tests {
     #[should_panic(expected = "invalid client slug")]
     fn invalid_mqtt_subscribe_client_slug_panics() {
         let acl = AppAclRaw {
-            mqtt_subscribe: vec![MqttSubMatcherRaw {
+            mqtt_subscribe: vec![MqttMatcherRaw {
                 // Spaces are not in the valid slug charset.
                 client: "not a slug".to_string(),
                 topic_filter: "sensors/#".to_string(),
@@ -875,7 +843,7 @@ mod tests {
         // never-match (deny where the operator intended allow) at runtime, so
         // reject at resolution.
         let acl = AppAclRaw {
-            mqtt_subscribe: vec![MqttSubMatcherRaw {
+            mqtt_subscribe: vec![MqttMatcherRaw {
                 client: "nonexistent".to_string(),
                 topic_filter: "sensors/#".to_string(),
             }],
@@ -888,7 +856,7 @@ mod tests {
     #[should_panic(expected = "invalid topic filter")]
     fn malformed_mqtt_subscribe_filter_panics() {
         let acl = AppAclRaw {
-            mqtt_subscribe: vec![MqttSubMatcherRaw {
+            mqtt_subscribe: vec![MqttMatcherRaw {
                 client: "home".to_string(),
                 // `#` must be terminal — this is malformed.
                 topic_filter: "sensors/#/extra".to_string(),
@@ -902,7 +870,7 @@ mod tests {
     #[should_panic(expected = "invalid client slug")]
     fn invalid_mqtt_publish_client_slug_panics() {
         let acl = AppAclRaw {
-            mqtt_publish: vec![MqttPubMatcherRaw {
+            mqtt_publish: vec![MqttMatcherRaw {
                 client: "bad slug".to_string(),
                 topic_filter: "#".to_string(),
             }],
@@ -915,7 +883,7 @@ mod tests {
     #[should_panic(expected = "unconfigured MQTT client")]
     fn mqtt_publish_matcher_names_unconfigured_client_panics() {
         let acl = AppAclRaw {
-            mqtt_publish: vec![MqttPubMatcherRaw {
+            mqtt_publish: vec![MqttMatcherRaw {
                 client: "nonexistent".to_string(),
                 topic_filter: "#".to_string(),
             }],
@@ -1528,14 +1496,14 @@ mod tests {
     fn wasm_mqtt_publish_acl_resolves_to_mqtt_publish_list() {
         // A WASM consumer's `mqtt_publish_acl` resolves into the same
         // `AppPolicy.acls.mqtt_publish` list, with the same `(client,
-        // topic_filter)` `MqttPubMatcher`, that the LLM `[[app.acl.mqtt_publish]]`
+        // topic_filter)` `MqttMatcher`, that the LLM `[[app.acl.mqtt_publish]]`
         // block does.
         let mqtt_publish_acl = vec![
-            MqttPubMatcherRaw {
+            MqttMatcherRaw {
                 client: "home".to_string(),
                 topic_filter: "lights/+/set".to_string(),
             },
-            MqttPubMatcherRaw {
+            MqttMatcherRaw {
                 client: "office".to_string(),
                 topic_filter: "#".to_string(),
             },
@@ -1551,16 +1519,19 @@ mod tests {
         assert_eq!(
             policy.acls.mqtt_publish,
             vec![
-                MqttPubMatcher {
+                MqttMatcher {
                     client: "home".to_string(),
                     topic_filter: "lights/+/set".to_string(),
                 },
-                MqttPubMatcher {
+                MqttMatcher {
                     client: "office".to_string(),
                     topic_filter: "#".to_string(),
                 },
             ]
         );
+        // Both MQTT lists hold the same type: a transposition would land the
+        // entries in the subscribe list instead.
+        assert!(policy.acls.mqtt_subscribe.is_empty());
         // The grant + a matcher whose filter matches the topic authorize it;
         // deny-by-default holds for an unlisted topic or client.
         assert!(policy.allows_mqtt_publish("home", "lights/hall/set"));
@@ -1576,7 +1547,7 @@ mod tests {
             "proc",
             [ComponentGrant::Mqtt],
             WasmAclsRaw {
-                mqtt_publish: &[MqttPubMatcherRaw {
+                mqtt_publish: &[MqttMatcherRaw {
                     client: "home".to_string(),
                     topic_filter: "lights/#/set".to_string(),
                 }],
@@ -1589,7 +1560,7 @@ mod tests {
     #[should_panic(expected = "mqtt_publish matcher has invalid topic filter")]
     fn invalid_mqtt_publish_topic_filter_panics() {
         let acl = AppAclRaw {
-            mqtt_publish: vec![MqttPubMatcherRaw {
+            mqtt_publish: vec![MqttMatcherRaw {
                 client: "home".to_string(),
                 topic_filter: "lights/#/set".to_string(),
             }],
@@ -1617,7 +1588,7 @@ mod tests {
             "proc",
             [ComponentGrant::Mqtt],
             WasmAclsRaw {
-                mqtt_publish: &[MqttPubMatcherRaw {
+                mqtt_publish: &[MqttMatcherRaw {
                     client: "bad:slug".to_string(),
                     topic_filter: "#".to_string(),
                 }],
@@ -1630,9 +1601,9 @@ mod tests {
     fn wasm_mqtt_subscribe_acl_derives_grant_resolves_and_gates_delivery() {
         // A non-empty `mqtt_subscribe_acl` derives the `MqttSubscribe` grant (no
         // ComponentGrant maps to it) and resolves into the same `(client, topic_filter)`
-        // `MqttSubMatcher` the LLM side uses. The delivery gate passes for a covered
+        // `MqttMatcher` the LLM side uses. The delivery gate passes for a covered
         // `mqtt:` channel and denies wrong-client / broader-filter requests.
-        let mqtt_subscribe_acl = vec![MqttSubMatcherRaw {
+        let mqtt_subscribe_acl = vec![MqttMatcherRaw {
             client: "home".to_string(),
             topic_filter: "sensors/+/temp".to_string(),
         }];
@@ -1650,15 +1621,50 @@ mod tests {
         );
         assert_eq!(
             policy.acls.mqtt_subscribe,
-            vec![MqttSubMatcher {
+            vec![MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             }]
         );
+        // Both MQTT lists hold the same type: a transposition would land the
+        // entry in the publish list instead.
+        assert!(policy.acls.mqtt_publish.is_empty());
         // Covered inbound channel delivers; wrong client / broader filter deny.
         assert!(policy.allows_channel_access("mqtt:home:sensors/kitchen/temp"));
         assert!(!policy.allows_channel_access("mqtt:other:sensors/kitchen/temp"));
         assert!(!policy.allows_channel_access("mqtt:home:sensors/kitchen/humidity"));
+    }
+
+    /// An LLM app's two MQTT lists hold the same type, so only the field names
+    /// keep them apart: each raw list resolves into its own `AclSet` list.
+    #[test]
+    fn app_mqtt_lists_resolve_each_into_its_own_list() {
+        let acl = AppAclRaw {
+            mqtt_subscribe: vec![MqttMatcherRaw {
+                client: "home".to_string(),
+                topic_filter: "sensors/#".to_string(),
+            }],
+            mqtt_publish: vec![MqttMatcherRaw {
+                client: "home".to_string(),
+                topic_filter: "lights/+/set".to_string(),
+            }],
+            ..AppAclRaw::default()
+        };
+        let policy = build_app_policy("alice", &[], &acl, &clients(&["home"]));
+        assert_eq!(
+            policy.acls.mqtt_subscribe,
+            vec![MqttMatcher {
+                client: "home".to_string(),
+                topic_filter: "sensors/#".to_string(),
+            }]
+        );
+        assert_eq!(
+            policy.acls.mqtt_publish,
+            vec![MqttMatcher {
+                client: "home".to_string(),
+                topic_filter: "lights/+/set".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -1677,7 +1683,7 @@ mod tests {
             "proc",
             [],
             WasmAclsRaw {
-                mqtt_subscribe: &[MqttSubMatcherRaw {
+                mqtt_subscribe: &[MqttMatcherRaw {
                     client: "bad:slug".to_string(),
                     topic_filter: "sensors/#".to_string(),
                 }],
@@ -1693,7 +1699,7 @@ mod tests {
             "proc",
             [],
             WasmAclsRaw {
-                mqtt_subscribe: &[MqttSubMatcherRaw {
+                mqtt_subscribe: &[MqttMatcherRaw {
                     client: "home".to_string(),
                     // `#` must be terminal — malformed.
                     topic_filter: "sensors/#/extra".to_string(),

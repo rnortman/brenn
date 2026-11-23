@@ -48,9 +48,7 @@ use brenn_dsl::resolved::{
 };
 use brenn_dsl::{Span, Spanned};
 
-use crate::access::raw::{
-    AppAclRaw, ChannelMatcherRaw, MqttPubMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
-};
+use crate::access::raw::{AppAclRaw, ChannelMatcherRaw, MqttMatcherRaw, WebhookMatcherRaw};
 use crate::messaging::config::{
     BACKEND_FATAL_NOISE_REFUSAL, ChannelConfigRaw, Depth, LinkConfigRaw, LinkEndpointRaw,
     LinkHostRaw, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw, NoiseLevel,
@@ -4483,10 +4481,10 @@ fn app_acl(acl: &DAclSet, label: &str) -> AppAclRaw {
 }
 
 /// Inbound MQTT matchers: each entry carries both a client and a topic filter.
-fn mqtt_sub_matchers(entries: &[DMqttSub]) -> Vec<MqttSubMatcherRaw> {
+fn mqtt_sub_matchers(entries: &[DMqttSub]) -> Vec<MqttMatcherRaw> {
     entries
         .iter()
-        .map(|entry| MqttSubMatcherRaw {
+        .map(|entry| MqttMatcherRaw {
             client: entry.client.value().clone(),
             topic_filter: entry.topic_filter.value().clone(),
         })
@@ -4494,10 +4492,10 @@ fn mqtt_sub_matchers(entries: &[DMqttSub]) -> Vec<MqttSubMatcherRaw> {
 }
 
 /// Outbound MQTT matchers: each entry carries both a client and a topic filter.
-fn mqtt_pub_matchers(entries: &[DMqttPub]) -> Vec<MqttPubMatcherRaw> {
+fn mqtt_pub_matchers(entries: &[DMqttPub]) -> Vec<MqttMatcherRaw> {
     entries
         .iter()
-        .map(|entry| MqttPubMatcherRaw {
+        .map(|entry| MqttMatcherRaw {
             client: entry.client.value().clone(),
             topic_filter: entry.topic_filter.value().clone(),
         })

@@ -2384,12 +2384,18 @@ acl publish [
   topic_filter "mqtt:broker:alice/cmd" { publish_per_activation = 2.0, publish_capacity = 4.0 }];
 ```
 
-A publish is admitted when some entry names its client and its filter matches
-the concrete topic, by the MQTT matching rules: `#` and a leading `+` match no
-topic whose first level starts with `$`, so `topic_filter "mqtt:broker:#"`
-admits every topic on `broker` except those, and a `$SYS/…` topic is written
-out (`topic_filter "mqtt:broker:$SYS/#"`). The filter's syntax is checked when
-the document is loaded. A `client "mqtt:<c>"` entry, which names a client and no
+A subscribe entry covers a subscription when, level by level, each of the
+subscription's levels is matched by the entry's; a `#` in the subscription is
+matched only by a `#` in the entry at the same level or earlier. So `topic_filter
+"mqtt:broker:+/#"` does not cover a subscription to `#`, although the two
+filters match the same topics: write `#`. A publish is
+admitted when some entry names its client and its filter matches the concrete
+topic. On both planes the MQTT matching rules apply: `#` and a leading `+`
+reach nothing whose first level starts with `$`, so `topic_filter
+"mqtt:broker:#"` covers every subscription and admits every topic on `broker`
+except those, and a `$SYS/…` subscription or topic needs an entry that spells
+the first level (`topic_filter "mqtt:broker:$SYS/#"`). The filter's syntax is
+checked when the document is loaded. A `client "mqtt:<c>"` entry, which names a client and no
 topics, is refused in deployment text with the `topic_filter` line to write;
 packaged text is read differently (*Stamps*, above).
 

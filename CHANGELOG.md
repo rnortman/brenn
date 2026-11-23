@@ -4,6 +4,20 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **BREAKING for operators:** an MQTT subscribe ACL entry whose filter starts
+  with `#` or `+` no longer covers a subscription whose first level starts
+  with `$` (`$SYS/…`, `$share/…`), matching what publish entries already do.
+  Write an entry that spells the first level, for example
+  `topic_filter "mqtt:<c>:$SYS/#"`. What you see if a subscription is no
+  longer covered: a static subscription or a surface binding stops the server
+  at start with a message naming the subscriber and the channel; a stored
+  dynamic subscription is kept but goes dormant, with a `warn` line "dynamic
+  subscription revoked", and resumes once a covering entry is added; a new
+  dynamic subscribe is refused as not permitted. On a client with a non-zero
+  `session_expiry_secs`, the broker can resume its session with the dormant
+  subscription's filter still in place and keep sending on it: each such
+  message is dropped with a `warn` line "inbound topic matched no channel",
+  until the broker's session for the client ends or a covering entry is added.
 - **New: recurring automations can send MQTT messages.** A scheduled job
   (created with `AutoCreate`, changed with `AutoEdit`) can now publish to an
   MQTT topic on a cron schedule with no LLM involved — for example lighting
@@ -179,6 +193,9 @@ All notable changes to Brenn are documented here.
   is set, as it is in CI and deploy builds. See `docs/build-timing.md`.
 - The policy check no longer scans a local database's blob store directory
   (`*.db.blobs`) left in the source tree by a dev server.
+- An MQTT message arriving from a broker whose topic contains a wildcard
+  character (`+` or `#`), which no valid topic can, is now logged and dropped
+  instead of possibly being routed to a channel.
 
 ## [0.38.0] — 2026-11-21
 

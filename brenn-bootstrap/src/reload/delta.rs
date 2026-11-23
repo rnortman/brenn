@@ -1569,7 +1569,7 @@ mod tests {
             publisher
                 .grants
                 .push(brenn_lib::messaging::ComponentGrant::Mqtt);
-            publisher.mqtt_publish_acl = vec![brenn_lib::access::raw::MqttPubMatcherRaw {
+            publisher.mqtt_publish_acl = vec![brenn_lib::access::raw::MqttMatcherRaw {
                 client: "ha".to_string(),
                 topic_filter: filter.to_string(),
             }];
@@ -1713,7 +1713,7 @@ mod tests {
                     amplification: None,
                     non_text: false,
                 }];
-            listener.mqtt_subscribe_acl = vec![brenn_lib::access::raw::MqttSubMatcherRaw {
+            listener.mqtt_subscribe_acl = vec![brenn_lib::access::raw::MqttMatcherRaw {
                 client: "ha".to_string(),
                 topic_filter: "home/#".to_string(),
             }];
@@ -3050,7 +3050,7 @@ mod tests {
             amplification: None,
             non_text: true,
         }];
-        listener.mqtt_subscribe_acl = vec![brenn_lib::access::raw::MqttSubMatcherRaw {
+        listener.mqtt_subscribe_acl = vec![brenn_lib::access::raw::MqttMatcherRaw {
             client: "ha".to_string(),
             topic_filter: "cam/#".to_string(),
         }];

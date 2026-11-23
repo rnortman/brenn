@@ -20,7 +20,7 @@ use crate::messaging::ChannelEntry;
 pub fn delivery_policy_for_addresses<'a>(
     addresses: impl IntoIterator<Item = &'a str>,
 ) -> AppPolicy {
-    use crate::access::acl::{ChannelMatcher, MqttSubMatcher, WebhookMatcher};
+    use crate::access::acl::{ChannelMatcher, MqttMatcher, WebhookMatcher};
     use crate::messaging::ChannelScheme;
     use brenn_envelope::grants::AppCapability;
 
@@ -31,7 +31,7 @@ pub fn delivery_policy_for_addresses<'a>(
                 let parsed = crate::mqtt::address::parse_mqtt_address(address)
                     .expect("delivery_policy_for_addresses: valid mqtt address");
                 policy.grants.insert(AppCapability::MqttSubscribe);
-                policy.acls.mqtt_subscribe.push(MqttSubMatcher {
+                policy.acls.mqtt_subscribe.push(MqttMatcher {
                     client: parsed.client,
                     topic_filter: parsed.topic,
                 });

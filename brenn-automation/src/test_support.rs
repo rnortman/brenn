@@ -359,7 +359,7 @@ pub(super) fn mqtt_sender_policy() -> brenn_lib::access::AppPolicy {
         policy
             .acls
             .mqtt_publish
-            .push(brenn_lib::access::acl::MqttPubMatcher {
+            .push(brenn_lib::access::acl::MqttMatcher {
                 client: client.to_string(),
                 topic_filter: "lights/+/set".to_string(),
             });

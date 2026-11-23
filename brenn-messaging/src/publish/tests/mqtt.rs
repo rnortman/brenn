@@ -20,7 +20,7 @@ use crate::{
     MqttPublishTransport, SubscriberEntry, SubscriberEntryKind, TransportMeta, WakeRouter,
 };
 use brenn_envelope::grants::AppCapability;
-use brenn_lib::access::acl::{ChannelMatcher, MqttPubMatcher};
+use brenn_lib::access::acl::{ChannelMatcher, MqttMatcher};
 use brenn_lib::mqtt::{MqttLifetime, MqttPublishOptions};
 use chrono::{Duration, Utc};
 use indexmap::IndexMap;
@@ -75,7 +75,7 @@ fn publisher() -> brenn_lib::config::AppConfig {
     let policy = cfg.policy_mut();
     policy.grants.insert(AppCapability::MqttPublish);
     for client in [CLIENT, OTHER, UNCHANNELLED] {
-        policy.acls.mqtt_publish.push(MqttPubMatcher {
+        policy.acls.mqtt_publish.push(MqttMatcher {
             client: client.to_string(),
             topic_filter: "lights/+/set".to_string(),
         });
@@ -429,7 +429,7 @@ async fn an_unregistered_client_is_unknown() {
             .policy_mut()
             .acls
             .mqtt_publish
-            .push(MqttPubMatcher {
+            .push(MqttMatcher {
                 client: "attic".to_string(),
                 topic_filter: "#".to_string(),
             });

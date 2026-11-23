@@ -20,9 +20,9 @@
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppAclRaw {
     /// `[[app.acl.mqtt_subscribe]]` entries: `(client, topic_filter)` pairs.
-    pub mqtt_subscribe: Vec<MqttSubMatcherRaw>,
+    pub mqtt_subscribe: Vec<MqttMatcherRaw>,
     /// `[[app.acl.mqtt_publish]]` entries: `(client, topic_filter)` pairs.
-    pub mqtt_publish: Vec<MqttPubMatcherRaw>,
+    pub mqtt_publish: Vec<MqttMatcherRaw>,
     /// `[[app.acl.brenn_subscribe]]` entries: channel matchers.
     pub brenn_subscribe: Vec<ChannelMatcherRaw>,
     /// `[[app.acl.brenn_publish]]` entries: channel matchers.
@@ -53,20 +53,11 @@ pub struct AppAclRaw {
     pub webhook: Vec<WebhookMatcherRaw>,
 }
 
-/// Raw MQTT subscribe matcher: `{ client = "...", topic_filter = "..." }`.
-/// Strings are validated and converted to `acl::MqttSubMatcher` at resolution.
+/// Raw MQTT matcher: `{ client = "...", topic_filter = "..." }`, held by both
+/// the subscribe and the publish list. Strings are validated and converted to
+/// `acl::MqttMatcher` at resolution.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MqttSubMatcherRaw {
-    /// MQTT client slug (validated at resolution time).
-    pub client: String,
-    /// MQTT topic filter (validated at resolution time).
-    pub topic_filter: String,
-}
-
-/// Raw MQTT publish matcher: `{ client = "...", topic_filter = "..." }`.
-/// Strings are validated and converted to `acl::MqttPubMatcher` at resolution.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MqttPubMatcherRaw {
+pub struct MqttMatcherRaw {
     /// MQTT client slug (validated at resolution time).
     pub client: String,
     /// MQTT topic filter (validated at resolution time).
@@ -116,9 +107,10 @@ pub struct AttachAclsRaw<'a> {
 /// Borrowed view of a WASM consumer's ACL lists, passed as one argument to
 /// [`build_wasm_policy`](crate::access::resolve::build_wasm_policy).
 ///
-/// Named fields prevent transposing the two same-typed slices (`subscribe` and
-/// `publish` are both `&[ChannelMatcherRaw]`, so a positional swap would silently
-/// exchange subscribe/publish authorization). [`Default`] yields all-empty lists
+/// Named fields prevent transposing same-typed slices: `subscribe` and
+/// `publish` are both `&[ChannelMatcherRaw]`, and `mqtt_subscribe` and
+/// `mqtt_publish` are both `&[MqttMatcherRaw]`, so a positional swap would
+/// silently exchange subscribe/publish authorization. [`Default`] yields all-empty lists
 /// for the common case; `..Default::default()` isolates the one or two lists a
 /// caller actually populates.
 #[derive(Debug, Clone, Copy, Default)]
@@ -136,9 +128,9 @@ pub struct WasmAclsRaw<'a> {
     /// `local:` subscribe matchers (non-empty derives the `LocalSubscribe` grant).
     pub local_subscribe: &'a [ChannelMatcherRaw],
     /// MQTT publish matchers: `(client, topic_filter)` pairs.
-    pub mqtt_publish: &'a [MqttPubMatcherRaw],
+    pub mqtt_publish: &'a [MqttMatcherRaw],
     /// MQTT subscribe matchers (non-empty derives the `MqttSubscribe` grant).
-    pub mqtt_subscribe: &'a [MqttSubMatcherRaw],
+    pub mqtt_subscribe: &'a [MqttMatcherRaw],
     /// Inbound webhook matchers (non-empty derives the `Webhook` grant).
     pub webhook: &'a [WebhookMatcherRaw],
 }
@@ -251,14 +243,14 @@ webhook push_alice {
 
         assert_eq!(
             acl.mqtt_subscribe,
-            vec![MqttSubMatcherRaw {
+            vec![MqttMatcherRaw {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             }]
         );
         assert_eq!(
             acl.mqtt_publish,
-            vec![MqttPubMatcherRaw {
+            vec![MqttMatcherRaw {
                 client: "office".to_string(),
                 topic_filter: "lights/+/set".to_string(),
             }]

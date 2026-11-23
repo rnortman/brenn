@@ -1011,7 +1011,7 @@ pub mod tests {
         use crate::ChannelScheme;
         use brenn_envelope::grants::AppCapability;
         use brenn_lib::access::AppPolicy;
-        use brenn_lib::access::acl::{ChannelMatcher, MqttSubMatcher, WebhookMatcher};
+        use brenn_lib::access::acl::{ChannelMatcher, MqttMatcher, WebhookMatcher};
 
         let mut p = AppPolicy::default();
         match ChannelScheme::split(address) {
@@ -1027,7 +1027,7 @@ pub mod tests {
                 // rest == "<client>:<topic>"; cover the client with a `#` filter.
                 let client = rest.split(':').next().unwrap_or_default().to_string();
                 p.grants.insert(AppCapability::MqttSubscribe);
-                p.acls.mqtt_subscribe = vec![MqttSubMatcher {
+                p.acls.mqtt_subscribe = vec![MqttMatcher {
                     client,
                     topic_filter: "#".to_string(),
                 }];

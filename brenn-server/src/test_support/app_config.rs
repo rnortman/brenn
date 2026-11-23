@@ -44,14 +44,14 @@ pub fn single_app(cfg: AppConfig) -> Arc<IndexMap<String, AppConfig>> {
 /// webhook-gate coverage uses targeted policies built inline by those tests.
 pub fn mqtt_acl_policy(client: &str, filter: &str) -> brenn_lib::access::AppPolicy {
     use brenn_envelope::grants::AppCapability;
-    use brenn_lib::access::acl::{AclSet, ChannelMatcher, MqttSubMatcher};
+    use brenn_lib::access::acl::{AclSet, ChannelMatcher, MqttMatcher};
 
     let mut policy = brenn_lib::access::AppPolicy::default();
     policy.grants.insert(AppCapability::DynamicSubscribe);
     policy.grants.insert(AppCapability::MqttSubscribe);
     policy.grants.insert(AppCapability::MessagingSubscribe);
     policy.acls = AclSet {
-        mqtt_subscribe: vec![MqttSubMatcher {
+        mqtt_subscribe: vec![MqttMatcher {
             client: client.to_string(),
             topic_filter: filter.to_string(),
         }],

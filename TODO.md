@@ -149,6 +149,18 @@ under the full parallel `make check`; a retry is not a fix. Code site
 (`TODO(blob-restart-test-flaky-under-load)`): the usage assertion in
 `assert_nothing_outlives`.
 
+A third sighting, in a `make check` on the same stack, on top of `13baad4c`,
+of a change that touches no blob code (the one MQTT matcher type and match
+function): the failure was reported at `blob_tool_call_tests.rs:328`, which
+is the same usage assertion in `assert_nothing_outlives` as the first two,
+and a rerun of the target passed. The panic text was not kept, so the usage
+it saw is not known. The same report called the failure a provider
+`not-pending` race; `not-pending` is what a different assertion of this test
+expects of the provider's late completion, earlier in the test, and nothing
+kept shows that assertion failing. On the location given this is the same
+failure point as before, not a second one, and it adds nothing to what is
+known of the cause.
+
 ## `calendar-write-blob-body-unconfirmed-against-live-google`
 
 `CalendarCreate` and `CalendarUpdate` admit a description of up to 8,000
@@ -403,6 +415,38 @@ observed. Done = the forms include such a part, fetched through
 does not answer body text by reference, and the note removed. The comment
 sits in `GmailBody`'s body reader in
 `brenn-wasm/components/google-gmail-read/src/logic.rs`.
+
+## `gmail-compose-late-answers-test-flaky-under-load`
+
+`five_late_answers_to_the_widest_draft_settle_inside_the_margin` in
+`brenn-server` (`src/wasm_dispatch_tests/google_gmail_compose_e2e.rs`) failed
+once under the full parallel `make check`: a pre-commit run on the
+make-mqtt-great-again stack, on top of `13baad4c`, of the one MQTT matcher
+type and match function (the ACL builders in `brenn-lib/src/access`, the MQTT
+router and subscribe paths), at its commit that reworded one log line in the
+MQTT router. The panic was the rig's
+bounded wait giving up, `provider_rig.rs`, "… was never owed 1 rows", followed
+by blob-file unlink panics during teardown. The full panic text was not kept:
+which subscriber the wait was for, and the text of the teardown panics, are
+not known. The rerun, with nothing changed, passed in full. The cause is not
+established. What the source shows: the wait (`owed`) polls up to 1000 times
+with a `tokio::task::yield_now` between polls, so it is bounded by scheduler
+turns and not by time, on a multi-threaded runtime where the awaited row is
+published by another task; the test reaches it with a count of one through
+`requested_id`, `run_nested` and `start_nested`, five times each. Its sibling
+`five_late_answers_to_the_widest_replys_read_settle_inside_the_margin` runs
+the same staging helper (`late_answers`) and rests on the same wait, as does
+every test in `wasm_dispatch_tests` that calls `owed` or `requested_id`.
+Not checked: which of those waits gave up; whether the row would have arrived
+had the wait gone on, or was never going to; whether the teardown panics are
+only a consequence of the first panic; whether the fuel margin the test
+measures played any part. `make check` is the pre-commit gate, and a test
+that fails there at random teaches retry-until-green. Done = the cause is
+found, and either the test waits for what it depends on or, if the failure
+shows a real defect, that defect is fixed, with the test passing reliably
+under the full parallel `make check`; a retry is not a fix. Code site
+(`TODO(gmail-compose-late-answers-test-flaky-under-load)`): the panic that
+ends `owed` in `brenn-server/src/wasm_dispatch_tests/provider_rig.rs`.
 
 ## `gmail-draft-upload-unconfirmed-against-live-google`
 
@@ -889,6 +933,23 @@ removed or explained in the timings document. Changing the server's socket
 options affects every HTTP and websocket route and wants a ruling. Code site
 (`TODO(surface-small-row-delivery-latency)`): `axum::serve` in
 `brenn-bootstrap/src/shutdown.rs`.
+
+## `efficiency-covers-allocates-two-vecs-per-call-on-ingress-path`
+
+`mqtt::topic_filter::covers` collects both filters' levels into a `Vec` on
+every call, two heap allocations per call. It runs once per route for every
+inbound broker PUBLISH (inside the router's routes read lock) and once per
+subscribe matcher on each delivery-time ACL decision. The loop only walks both
+level lists forward in step, so two `split('/')` iterators advanced together
+would do. The cost is unmeasured. The function is the one MQTT ACL decision,
+and a wrong `true` is a grant, so a rewrite wants a ruling on the evidence it
+needs first: a test that enumerates every pair of valid filters up to three
+levels over `a`, `$s`, empty, `+` and `#` and checks the rewritten body
+against the current one (or against the subset definition with its documented
+`+/#`-against-`#` exception). Done when `covers` allocates nothing and that
+enumeration test is in the tree. Code site
+(`TODO(efficiency-covers-allocates-two-vecs-per-call-on-ingress-path)`):
+`brenn-lib/src/mqtt/topic_filter.rs`, `covers`.
 
 ## `efficiency-surface-type-check-recompiles-every-kind-every-scan`
 
@@ -3092,13 +3153,24 @@ Code site (`TODO(export-usage-broken-mount-test)`):
 
 ---
 
-## `mqtt-dynamic-subscribe-acl`
+## `mqtt-shared-subscription-filters-unrouted`
 
-A documented pre-Phase-1 hole in dynamic MQTT subscribe ACL coverage, retained as a
-regression marker on the test that pins the current (closed) behavior. Done when the
-marker's premise is re-verified and it can be deleted.
+A subscription whose filter is an MQTT shared subscription
+(`$share/<group>/<filter>`) passes filter validation, which checks only
+wildcard placement, and is covered by an ACL entry that spells
+`$share/<group>/…`. Nothing else knows about the form: the filter is
+handed to the broker as written, and inbound routing compares the route's
+filter with the delivered topic level by level, so the literal first level
+`$share` never equals the first level of a delivered topic and every
+message on such a subscription is logged as matching no channel and
+dropped. Done when either a `$share/…` filter is refused where filters are
+validated, with a reason that says shared subscriptions are unsupported,
+or shared subscriptions are supported end to end: the ACL decided on the
+inner filter, the route matched on the inner filter, and a test delivers a
+message through one.
 
-Code site (`TODO(mqtt-dynamic-subscribe-acl)`): `brenn-server/src/mqtt_subscribe.rs`.
+Code site (`TODO(mqtt-shared-subscription-filters-unrouted)`):
+`brenn-server/src/mqtt_router.rs`.
 
 ---
 
@@ -5160,6 +5232,14 @@ reconnect drains with UNSUBSCRIBEs when the broker reports `session_present`,
 cleared on send, and reconciled against a filter re-subscribed in the meantime.
 The status vocabulary follows: a deferred withdrawal is a different fact from a
 deferred assertion and should not share `mqtt_deferred`'s wording.
+
+A restart has the same outcome with no UNSUBSCRIBE ever requested: a filter the
+previous run asserted, whose channel the new run does not route (a stored dynamic
+subscription the boot fold holds dormant because the ACL no longer covers it, a
+removed static subscription), stays in the resumed session. The
+pending-withdrawals set above starts empty in the new process, so it does not
+cover this case; MQTT offers no way to list a session's filters, so withdrawing
+them needs the asserted set to outlive the process.
 
 Code sites (`TODO(mqtt-deferred-unsubscribe-not-withdrawn)`):
 `brenn-mqtt/src/service.rs`, at `unsubscribe_filter`'s disconnected arm.

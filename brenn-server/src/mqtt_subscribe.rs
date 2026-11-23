@@ -278,7 +278,7 @@ pub async fn subscribe_dynamic_activated(
         // which on this path is only called later inside the lib core's
         // resolve_or_create_channel. So the requested filter may be syntactically
         // invalid here (e.g. `sensors/#/extra`, `home/+x`), which would violate
-        // filter_covers' validated-input precondition and risk a mis-split
+        // mqtt::topic_filter::covers' validated-input precondition and risk a mis-split
         // over-match (a silent authorization bug). Validate it FIRST; on failure
         // skip the ACL check and fall through to the core, which returns the
         // canonical InvalidMqttFilter — never PolicyDenied a malformed filter
@@ -914,9 +914,7 @@ mod tests {
 
     /// An app that lacks the `DynamicSubscribe` grant is `PolicyDenied` for an
     /// `mqtt:` subscribe — and the deny fires **before any persistence** (no
-    /// durable row, no channel). This is the regression test for the closed
-    /// `TODO(mqtt-dynamic-subscribe-acl)` hole: pre-Phase-1 this subscribe would
-    /// have activated unconditionally.
+    /// durable row, no channel).
     #[tokio::test]
     async fn subscribe_mqtt_denied_without_dynamic_subscribe_grant() {
         // Empty policy: no DynamicSubscribe, no MqttSubscribe, no matchers.
@@ -988,6 +986,41 @@ mod tests {
         assert_eq!(dynamic_rows(&bridge).await.len(), 1);
     }
 
+    /// A subscribe entry of `#` does not cover a filter whose first level starts
+    /// with `$`: `mqtt:home:$SYS/#` is `PolicyDenied` with nothing persisted,
+    /// while `mqtt:home:#` itself is admitted.
+    #[tokio::test]
+    async fn subscribe_mqtt_hash_entry_denies_a_dollar_first_level() {
+        let policy = crate::test_support::app_config::mqtt_acl_policy("home", "#");
+        let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
+
+        let sys = "mqtt:home:$SYS/#";
+        let err = subscribe_dynamic_activated(&bridge, "testapp", sys, pull_only(None))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SubscribeActivateError::PolicyDenied {
+                address: sys.to_string()
+            }
+        );
+        assert!(dynamic_rows(&bridge).await.is_empty());
+        assert!(
+            bridge
+                .messenger()
+                .unwrap()
+                .directory()
+                .resolve(sys)
+                .is_none(),
+            "no channel created on a policy-denied `$` subscribe"
+        );
+
+        subscribe_dynamic_activated(&bridge, "testapp", "mqtt:home:#", pull_only(None))
+            .await
+            .expect("`#` under a `#` entry is admitted");
+        assert_eq!(dynamic_rows(&bridge).await.len(), 1);
+    }
+
     /// A subscribe to a **different client** than the app's `mqtt_subscribe`
     /// matcher names is `PolicyDenied` — and, because the ACL gate runs *before*
     /// the configured-client guard, a denied subscribe to
@@ -1040,7 +1073,7 @@ mod tests {
     /// failure, falls through to the lib core, which returns the canonical
     /// `Core(InvalidMqttFilter)`. (Policy-denying a malformed address would both
     /// pre-empt the proper error and risk a mis-split over-match inside
-    /// `filter_covers`, whose precondition is validated input.) Asserted even with
+    /// `mqtt::topic_filter::covers`, whose precondition is validated input.) Asserted even with
     /// an empty policy: the malformed filter must short-circuit to the core
     /// *before* the ACL check is consulted.
     #[tokio::test]

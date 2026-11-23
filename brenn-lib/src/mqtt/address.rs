@@ -117,12 +117,19 @@ pub fn parse_topic_filter(addr: &str) -> Result<MqttAddress, MqttError> {
 /// Reject any `+` or `#` in the topic. Called for `MqttSend` (publish) context.
 pub fn parse_topic_name(addr: &str) -> Result<MqttAddress, MqttError> {
     let parsed = parse_mqtt_address(addr)?;
-    if parsed.topic.contains('+') || parsed.topic.contains('#') {
+    if topic_name_has_wildcard(&parsed.topic) {
         return Err(MqttError::WildcardNotAllowed {
             address: addr.to_string(),
         });
     }
     Ok(parsed)
+}
+
+/// Whether `topic` contains `+` or `#` anywhere. MQTT forbids both characters
+/// in a topic name, so a topic for which this is `true` is not a valid name.
+/// The publish side and inbound routing both decide wildcard-freedom here.
+pub fn topic_name_has_wildcard(topic: &str) -> bool {
+    topic.contains('+') || topic.contains('#')
 }
 
 /// Validate MQTT wildcard rules in a bare topic filter string (no `mqtt:` prefix).
@@ -175,68 +182,6 @@ fn validate_topic_filter(topic: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Match a concrete published topic against an MQTT topic filter.
-///
-/// Implements the standard MQTT subscription wildcard semantics:
-/// - A `+` filter segment matches exactly one topic level (any value), and
-///   never crosses a `/` boundary.
-/// - A terminal `#` filter segment matches the parent level and all of its
-///   descendant levels (zero or more remaining topic segments). Per the MQTT
-///   spec, `sport/#` matches both `sport` and `sport/anything`.
-/// - Any other filter segment must equal the corresponding topic segment.
-/// - A filter whose *first* segment is a wildcard (`#` or `+`) does not match a
-///   topic whose *first* segment starts with `$` (system topics such as
-///   `$SYS/...`). The rule applies only to the first level: `a/#` still matches
-///   `a/$weird`, and `$SYS/#` still matches `$SYS/broker/load` because its first
-///   segment is the literal `$SYS`.
-///
-/// `filter` is assumed already validated by `validate_topic_filter` (so `#` is
-/// terminal and `+`/`#` occupy complete segments); this function does not
-/// re-validate filter syntax. `topic` is a concrete topic name (no wildcards).
-///
-/// Returns `true` iff `topic` matches `filter`.
-pub fn mqtt_topic_matches(filter: &str, topic: &str) -> bool {
-    let filter_segments: Vec<&str> = filter.split('/').collect();
-    let topic_segments: Vec<&str> = topic.split('/').collect();
-
-    // A leading wildcard must not match a `$`-prefixed system topic. `split`
-    // on a non-empty pattern always yields at least one segment.
-    let first_filter = filter_segments[0];
-    if (first_filter == "#" || first_filter == "+") && topic_segments[0].starts_with('$') {
-        return false;
-    }
-
-    let mut fi = 0;
-    let mut ti = 0;
-
-    while fi < filter_segments.len() {
-        let fseg = filter_segments[fi];
-
-        if fseg == "#" {
-            // Terminal multi-level wildcard: matches all remaining levels,
-            // including zero (so `sport/#` matches `sport`).
-            return true;
-        }
-
-        // For every non-`#` filter segment we need a topic segment to match.
-        if ti >= topic_segments.len() {
-            return false;
-        }
-
-        if fseg == "+" {
-            // Single-level wildcard: matches exactly one topic segment.
-        } else if fseg != topic_segments[ti] {
-            return false;
-        }
-
-        fi += 1;
-        ti += 1;
-    }
-
-    // Filter exhausted: match iff topic is also exhausted (no trailing levels).
-    ti == topic_segments.len()
 }
 
 #[cfg(test)]
@@ -417,108 +362,15 @@ mod tests {
         assert!(matches!(err, MqttError::WildcardNotAllowed { .. }));
     }
 
-    // --- mqtt_topic_matches ---
+    // --- topic_name_has_wildcard ---
 
     #[test]
-    fn match_exact() {
-        assert!(mqtt_topic_matches("home/switch/state", "home/switch/state"));
-        assert!(!mqtt_topic_matches(
-            "home/switch/state",
-            "home/switch/other"
-        ));
-    }
-
-    #[test]
-    fn match_exact_differing_length_non_match() {
-        // Same prefix but topic has an extra trailing level.
-        assert!(!mqtt_topic_matches("home/switch", "home/switch/state"));
-        // Topic shorter than filter.
-        assert!(!mqtt_topic_matches("home/switch/state", "home/switch"));
-    }
-
-    #[test]
-    fn match_single_level_plus() {
-        assert!(mqtt_topic_matches("home/+/state", "home/switch/state"));
-        assert!(mqtt_topic_matches("home/+/state", "home/lamp/state"));
-        // Wrong tail.
-        assert!(!mqtt_topic_matches("home/+/state", "home/switch/level"));
-    }
-
-    #[test]
-    fn match_plus_does_not_cross_slash() {
-        // `+` matches exactly one level; `a/b` is two levels, so a single `+`
-        // in that position must not match.
-        assert!(!mqtt_topic_matches("home/+/state", "home/a/b/state"));
-        assert!(!mqtt_topic_matches("home/+", "home/a/b"));
-    }
-
-    #[test]
-    fn match_plus_requires_a_level() {
-        // `+` must consume exactly one level; a missing level is not a match.
-        assert!(!mqtt_topic_matches("home/+/state", "home/state"));
-    }
-
-    #[test]
-    fn match_multi_level_hash_terminal() {
-        assert!(mqtt_topic_matches("home/#", "home/switch/state"));
-        assert!(mqtt_topic_matches("home/#", "home/switch"));
-        // Non-match: different root.
-        assert!(!mqtt_topic_matches("home/#", "office/switch"));
-    }
-
-    #[test]
-    fn match_hash_matches_parent_and_descendants() {
-        // Per MQTT spec, `sport/#` matches the parent level `sport` itself,
-        // and every descendant level.
-        assert!(mqtt_topic_matches("sport/#", "sport"));
-        assert!(mqtt_topic_matches("sport/#", "sport/tennis"));
-        assert!(mqtt_topic_matches("sport/#", "sport/tennis/player1"));
-        // But not a sibling of the parent.
-        assert!(!mqtt_topic_matches("sport/#", "sporting"));
-    }
-
-    #[test]
-    fn match_bare_hash_matches_everything() {
-        assert!(mqtt_topic_matches("#", "anything"));
-        assert!(mqtt_topic_matches("#", "a/b/c"));
-        assert!(mqtt_topic_matches("#", "a"));
-    }
-
-    #[test]
-    fn match_bare_plus() {
-        assert!(mqtt_topic_matches("+", "a"));
-        assert!(!mqtt_topic_matches("+", "a/b"));
-    }
-
-    #[test]
-    fn match_leading_plus() {
-        assert!(mqtt_topic_matches("+/state", "home/state"));
-        assert!(!mqtt_topic_matches("+/state", "home/switch/state"));
-    }
-
-    #[test]
-    fn match_leading_wildcard_excludes_dollar_topics() {
-        // A leading `#`/`+` must not match a `$`-prefixed system topic.
-        assert!(!mqtt_topic_matches("#", "$SYS/broker/load"));
-        assert!(!mqtt_topic_matches("#", "$SYS"));
-        assert!(!mqtt_topic_matches("+", "$SYS"));
-        assert!(!mqtt_topic_matches("+/monitor", "$SYS/monitor"));
-    }
-
-    #[test]
-    fn match_literal_dollar_anchor_bypasses_guard() {
-        // A literal `$SYS` first segment lets an operator deliberately bridge
-        // system topics; the guard only fires on a leading wildcard.
-        assert!(mqtt_topic_matches("$SYS/#", "$SYS/broker/load"));
-        assert!(mqtt_topic_matches("$SYS/+", "$SYS/broker"));
-        assert!(mqtt_topic_matches("$SYS/broker", "$SYS/broker"));
-    }
-
-    #[test]
-    fn match_dollar_guard_is_first_level_only() {
-        // The rule applies only to the first level; `$` deeper in the topic is
-        // unaffected, and a broad filter still matches normal topics.
-        assert!(mqtt_topic_matches("a/#", "a/$weird"));
-        assert!(mqtt_topic_matches("#", "sport/tennis"));
+    fn topic_name_has_wildcard_detects_either_character_anywhere() {
+        assert!(topic_name_has_wildcard("a/+"));
+        assert!(topic_name_has_wildcard("a/#"));
+        assert!(topic_name_has_wildcard("a#b"));
+        assert!(topic_name_has_wildcard("+"));
+        assert!(!topic_name_has_wildcard("a/b"));
+        assert!(!topic_name_has_wildcard("$SYS/x"));
     }
 }

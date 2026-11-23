@@ -507,6 +507,7 @@ impl ProviderRig {
             }
             tokio::task::yield_now().await;
         }
+        // TODO(gmail-compose-late-answers-test-flaky-under-load): once failed here under full `make check`, for one row.
         panic!("{sub:?} was never owed {n} rows");
     }
 

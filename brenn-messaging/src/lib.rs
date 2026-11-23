@@ -3804,14 +3804,14 @@ mod tests {
         policy
             .acls
             .mqtt_subscribe
-            .push(brenn_lib::access::acl::MqttSubMatcher {
+            .push(brenn_lib::access::acl::MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "sensors/#".to_string(),
             });
         policy
             .acls
             .mqtt_subscribe
-            .push(brenn_lib::access::acl::MqttSubMatcher {
+            .push(brenn_lib::access::acl::MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "lights/+/state".to_string(),
             });

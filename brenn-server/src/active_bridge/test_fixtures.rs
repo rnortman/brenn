@@ -957,7 +957,7 @@ impl ActiveBridge {
             .policy_mut()
             .acls
             .mqtt_subscribe
-            .push(brenn_lib::access::acl::MqttSubMatcher {
+            .push(brenn_lib::access::acl::MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             });
@@ -1973,7 +1973,7 @@ async fn make_test_messenger_with_mqtt_publish(
             .policy_mut()
             .acls
             .mqtt_publish
-            .push(brenn_lib::access::acl::MqttPubMatcher {
+            .push(brenn_lib::access::acl::MqttMatcher {
                 client: (*client).to_string(),
                 topic_filter: (*topic_filter).to_string(),
             });

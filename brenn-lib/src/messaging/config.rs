@@ -660,8 +660,8 @@ pub struct WasmConsumerConfigRaw {
     pub local_publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Layer-2 MQTT publish ACL: `(client, topic_filter)` allowlist narrowing
     /// which topics on which `[[mqtt_client]]` slugs this component's
-    /// `mqtt-publish` host call may target. Reuses the **same**
-    /// `MqttPubMatcherRaw` matcher as the LLM `[[app.acl.mqtt_publish]]` block,
+    /// `mqtt-publish` host call may target. Holds `MqttMatcherRaw`, the one MQTT
+    /// matcher type, as the LLM `[[app.acl.mqtt_publish]]` block does,
     /// resolving into `AppPolicy.acls.mqtt_publish` exactly as the LLM side does;
     /// the ACL is the attenuation boundary. Same flat top-level `Vec` authoring convention as
     /// `subscribe_acl`/`publish_acl` (the table-nesting asymmetry vs. the LLM
@@ -669,19 +669,20 @@ pub struct WasmConsumerConfigRaw {
     /// same `AppPolicy`). A non-empty list derives no grant on its own — the
     /// `"mqtt"` grant must be authored explicitly in `grants`; an empty list
     /// means the consumer holds no MQTT-publish authorization (deny-by-default).
-    pub mqtt_publish_acl: Vec<crate::access::raw::MqttPubMatcherRaw>,
+    pub mqtt_publish_acl: Vec<crate::access::raw::MqttMatcherRaw>,
     /// Layer-2 MQTT *subscribe* ACL: `(client, topic_filter)` matchers narrowing
     /// which inbound `mqtt:` channels this component may hold a (static)
-    /// subscription to. Reuses the **same** `MqttSubMatcherRaw` matcher as the LLM
-    /// `[[app.acl.mqtt_subscribe]]` block, resolving into `AppPolicy.acls.mqtt_subscribe`
-    /// exactly as the LLM side does; coverage is filter-subset per `mqtt_match`
-    /// (a matcher's `topic_filter` must be a superset of the subscribed filter).
+    /// subscription to. Holds `MqttMatcherRaw`, the one MQTT matcher type, as the
+    /// LLM `[[app.acl.mqtt_subscribe]]` block does, resolving into
+    /// `AppPolicy.acls.mqtt_subscribe` exactly as the LLM side does; coverage is
+    /// `mqtt::topic_filter::covers` (a matcher's `topic_filter` must cover the
+    /// subscribed filter, `$` first-level rule included).
     /// Same flat top-level `Vec` authoring convention as `subscribe_acl`. A
     /// non-empty list derives the `MqttSubscribe` transport grant (there is no
     /// `ComponentGrant` for inbound subscribe, mirroring `subscribe_acl`'s
     /// `MessagingSubscribe` derivation); an empty list means the consumer holds no
     /// MQTT-subscribe authorization (deny-by-default at delivery).
-    pub mqtt_subscribe_acl: Vec<crate::access::raw::MqttSubMatcherRaw>,
+    pub mqtt_subscribe_acl: Vec<crate::access::raw::MqttMatcherRaw>,
     /// Layer-2 webhook subscribe ACL: endpoint-slug matchers narrowing which
     /// inbound `webhook:` channels this component may hold a (static) subscription
     /// to. Reuses the **same** `WebhookMatcherRaw` matcher as the LLM
@@ -6646,6 +6647,51 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
         assert!(
             dir.by_uuid(&undeclared_uuid).is_none(),
             "the channel is not conjured into the directory",
+        );
+    }
+
+    /// A stored dynamic row on `mqtt:<c>:$SYS/#` for an app whose only subscribe
+    /// entry is `#` is held dormant: a leading `#` covers no `$` first level, so
+    /// the row is neither folded nor pruned.
+    #[test]
+    fn merge_holds_a_dollar_mqtt_row_dormant_under_a_hash_entry() {
+        use brenn_envelope::grants::AppCapability;
+
+        let address = "mqtt:home:$SYS/#";
+        let mut ch = raw_channel("5b0c2f0e-8f7a-4d3e-a6a1-3f2d9c4b7e10", "ch");
+        ch.standing_retain_depth = Some(Depth::Bounded(16));
+        let mut entries = build_channel_entries(&[ch], &global_defaults());
+        entries[0].address = address.to_string();
+        entries[0].transport_type = crate::messaging::ChannelScheme::Mqtt;
+        let dir = MessagingDirectory::with_entries(entries);
+        let chan_uuid = dir.list()[0].uuid;
+        let rows = vec![dyn_row(
+            chan_uuid,
+            "graf",
+            Depth::Bounded(0),
+            Depth::Bounded(1),
+        )];
+
+        let mut p = crate::access::AppPolicy::default();
+        p.grants.insert(AppCapability::MqttSubscribe);
+        p.acls.mqtt_subscribe.push(crate::access::acl::MqttMatcher {
+            client: "home".to_string(),
+            topic_filter: "#".to_string(),
+        });
+        let outcome = merge_with_policy(&dir, &rows, &p);
+
+        assert!(outcome.kept.is_empty(), "a `$` row must not fold under `#`");
+        assert!(
+            outcome.dropped.is_empty(),
+            "the durable row must not be pruned"
+        );
+        assert_eq!(outcome.revoked, vec![dormant_of(&rows[0], address)]);
+        assert!(
+            dir.by_uuid(&chan_uuid)
+                .expect("channel still present")
+                .subscribers
+                .is_empty(),
+            "no subscriber folded",
         );
     }
 

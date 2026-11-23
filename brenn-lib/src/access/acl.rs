@@ -15,10 +15,10 @@
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AclSet {
     /// MQTT subscribe allowlist: `(client, topic-filter)` pairs.
-    pub mqtt_subscribe: Vec<MqttSubMatcher>,
+    pub mqtt_subscribe: Vec<MqttMatcher>,
     /// MQTT publish allowlist: `(client, topic-filter)` pairs, each matched
     /// against the concrete topic a publish names.
-    pub mqtt_publish: Vec<MqttPubMatcher>,
+    pub mqtt_publish: Vec<MqttMatcher>,
     /// `brenn:` subscribe allowlist.
     pub brenn_subscribe: Vec<ChannelMatcher>,
     /// `brenn:` publish allowlist.
@@ -45,22 +45,12 @@ pub struct AclSet {
     pub webhook: Vec<WebhookMatcher>,
 }
 
-/// MQTT subscribe matcher: a `(client, topic_filter)` pair. The `topic_filter`
-/// uses MQTT wildcard semantics and is subset-matched against a requested filter
-/// by `mqtt_match::filter_covers` at enforcement time.
+/// A `(client, topic_filter)` pair an MQTT ACL list holds. Which permission it
+/// grants is the list it is in (`AclSet::mqtt_subscribe` or
+/// `AclSet::mqtt_publish`). Coverage on both planes is
+/// [`crate::mqtt::topic_filter::covers`], `$` first-level rule included.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MqttSubMatcher {
-    /// MQTT client slug this matcher scopes to.
-    pub client: String,
-    /// Allowed MQTT topic filter (validated at resolution time).
-    pub topic_filter: String,
-}
-
-/// MQTT publish matcher: a `(client, topic_filter)` pair. A publish names a
-/// concrete topic, which `mqtt::address::mqtt_topic_matches` tests against the
-/// filter at enforcement time, `$` first-level rule included.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MqttPubMatcher {
+pub struct MqttMatcher {
     /// MQTT client slug this matcher scopes to.
     pub client: String,
     /// Allowed MQTT topic filter (validated at resolution time).
@@ -170,16 +160,14 @@ mod tests {
 
     #[test]
     fn acl_set_construction() {
-        // API-surface pinning for the data-only matcher structs (no behavioral
-        // logic yet — their `allows_*` consumers land with `AppPolicy` in a later
-        // increment). Catches a field rename here rather than at the distant
-        // enforcement-site consumer.
+        // Pins the field names of the data-only matcher structs, so a rename
+        // fails here rather than at a distant enforcement-site consumer.
         let mut acl = AclSet::default();
-        acl.mqtt_subscribe.push(MqttSubMatcher {
+        acl.mqtt_subscribe.push(MqttMatcher {
             client: "home".to_string(),
             topic_filter: "sensors/#".to_string(),
         });
-        acl.mqtt_publish.push(MqttPubMatcher {
+        acl.mqtt_publish.push(MqttMatcher {
             client: "home".to_string(),
             topic_filter: "lights/+/set".to_string(),
         });

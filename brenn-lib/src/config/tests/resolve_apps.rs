@@ -322,7 +322,7 @@ fn acl_naming_an_unknown_mqtt_client_panics() {
     config.apps[0]
         .acl
         .mqtt_publish
-        .push(crate::access::raw::MqttPubMatcherRaw {
+        .push(crate::access::raw::MqttMatcherRaw {
             client: "ha".to_string(),
             topic_filter: "#".to_string(),
         });

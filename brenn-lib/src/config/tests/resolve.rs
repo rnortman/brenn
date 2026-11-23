@@ -921,7 +921,7 @@ fn validate_resolves_app_mqtt_subscriptions() {
 #[test]
 #[should_panic(expected = "collides with an [[app]] slug")]
 fn validate_wasm_consumer_slug_colliding_with_app_panics() {
-    use crate::access::raw::MqttPubMatcherRaw;
+    use crate::access::raw::MqttMatcherRaw;
     use crate::messaging::ComponentGrant;
     use crate::messaging::config::WasmConsumerConfigRaw;
 
@@ -947,7 +947,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
         publish_acl: vec![],
         ephemeral_publish_acl: vec![],
         local_publish_acl: vec![],
-        mqtt_publish_acl: vec![MqttPubMatcherRaw {
+        mqtt_publish_acl: vec![MqttMatcherRaw {
             client: "ha".to_string(),
             topic_filter: "#".to_string(),
         }],
@@ -1047,10 +1047,8 @@ fn ingress_test_broker(slug: &str) -> crate::mqtt::config::MqttClientConfigRaw {
 /// `AppPolicy` whose grants and matchers match the authored config exactly.
 #[test]
 fn validate_resolves_explicit_grants_and_acl_into_policy() {
-    use crate::access::acl::{ChannelMatcher, MqttPubMatcher, MqttSubMatcher, WebhookMatcher};
-    use crate::access::raw::{
-        AppAclRaw, ChannelMatcherRaw, MqttPubMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
-    };
+    use crate::access::acl::{ChannelMatcher, MqttMatcher, WebhookMatcher};
+    use crate::access::raw::{AppAclRaw, ChannelMatcherRaw, MqttMatcherRaw, WebhookMatcherRaw};
     use brenn_envelope::grants::AppCapability;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1070,14 +1068,14 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
                 AppCapability::Webhook,
             ],
             acl: AppAclRaw {
-                mqtt_subscribe: vec![MqttSubMatcherRaw {
+                mqtt_subscribe: vec![MqttMatcherRaw {
                     client: "home".to_string(),
                     topic_filter: "sensors/+/temp".to_string(),
                 }],
                 // mqtt_publish + brenn_publish authored so the integration path
                 // exercises those lists too (guards against a list-swap or silent
                 // drop in `resolve_access_policies`).
-                mqtt_publish: vec![MqttPubMatcherRaw {
+                mqtt_publish: vec![MqttMatcherRaw {
                     client: "office".to_string(),
                     topic_filter: "#".to_string(),
                 }],
@@ -1111,14 +1109,14 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
 
     assert_eq!(
         policy.acls.mqtt_subscribe,
-        vec![MqttSubMatcher {
+        vec![MqttMatcher {
             client: "home".to_string(),
             topic_filter: "sensors/+/temp".to_string(),
         }]
     );
     assert_eq!(
         policy.acls.mqtt_publish,
-        vec![MqttPubMatcher {
+        vec![MqttMatcher {
             client: "office".to_string(),
             topic_filter: "#".to_string(),
         }]
@@ -1455,7 +1453,7 @@ fn validate_mqtt_publish_grant_without_matcher_resolves_deny_all_no_panic() {
 #[test]
 #[should_panic(expected = "invalid topic filter")]
 fn validate_malformed_mqtt_subscribe_filter_panics() {
-    use crate::access::raw::{AppAclRaw, MqttSubMatcherRaw};
+    use crate::access::raw::{AppAclRaw, MqttMatcherRaw};
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1467,7 +1465,7 @@ fn validate_malformed_mqtt_subscribe_filter_panics() {
             slug: "home".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
             acl: AppAclRaw {
-                mqtt_subscribe: vec![MqttSubMatcherRaw {
+                mqtt_subscribe: vec![MqttMatcherRaw {
                     client: "home".to_string(),
                     // `#` must be terminal.
                     topic_filter: "sensors/#/extra".to_string(),
@@ -1492,7 +1490,7 @@ fn validate_malformed_mqtt_subscribe_filter_panics() {
 #[test]
 #[should_panic(expected = "unconfigured MQTT client")]
 fn validate_acl_unconfigured_mqtt_client_panics() {
-    use crate::access::raw::{AppAclRaw, MqttSubMatcherRaw};
+    use crate::access::raw::{AppAclRaw, MqttMatcherRaw};
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1503,7 +1501,7 @@ fn validate_acl_unconfigured_mqtt_client_panics() {
             slug: "home".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
             acl: AppAclRaw {
-                mqtt_subscribe: vec![MqttSubMatcherRaw {
+                mqtt_subscribe: vec![MqttMatcherRaw {
                     client: "typo".to_string(),
                     topic_filter: "sensors/#".to_string(),
                 }],

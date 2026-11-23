@@ -215,7 +215,7 @@ async fn build_mqtt_messenger(
             .policy_mut()
             .acls
             .mqtt_subscribe
-            .push(brenn_lib::access::acl::MqttSubMatcher {
+            .push(brenn_lib::access::acl::MqttMatcher {
                 client: "homeassistant".to_string(),
                 topic_filter: "home/+/state".to_string(),
             });

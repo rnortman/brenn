@@ -29,7 +29,8 @@ use brenn_lib::messaging::{
     BodyError, ChannelEntry, MessageBody, MqttEnvelope, MqttPayloadBody, MqttTransport,
     TransportMeta, Urgency,
 };
-use brenn_lib::mqtt::address::mqtt_topic_matches;
+use brenn_lib::mqtt::address::topic_name_has_wildcard;
+use brenn_lib::mqtt::topic_filter;
 use brenn_messaging::IngressMessage;
 use brenn_mqtt::payload::{InboundClass, InboundPayload, classify_inbound};
 use brenn_mqtt::service::MqttEventRouter;
@@ -228,11 +229,23 @@ impl MqttEventRouter for MqttEventRouterImpl {
         };
         let state = &router_state.app_state;
 
-        // Find every channel on this client whose topic filter matches the actual
-        // published topic. Standard MQTT `+`/`#` matching. Clone the
-        // matched routes out of the read-lock so the lock is released before the
-        // publish loop below `.await`s (a std `RwLockReadGuard` is not `Send`, and
-        // routes are small and rarely added).
+        // A PUBLISH topic name holding `+` or `#` is malformed MQTT, and the match
+        // below requires a wildcard-free topic. Broker input: warn and drop, never
+        // panic.
+        if topic_name_has_wildcard(topic) {
+            tracing::warn!(
+                client = client_slug,
+                topic,
+                "mqtt_router: inbound PUBLISH topic name contains a wildcard character \
+                 ('+' or '#'), which is malformed MQTT — dropping unrouted."
+            );
+            return;
+        }
+
+        // Find every channel on this client whose topic filter covers the actual
+        // published topic. Clone the matched routes out of the read-lock so the
+        // lock is released before the publish loop below `.await`s (a std
+        // `RwLockReadGuard` is not `Send`, and routes are small and rarely added).
         let matches: Vec<IngressRoute> = {
             let routes = router_state
                 .routes
@@ -240,8 +253,10 @@ impl MqttEventRouter for MqttEventRouterImpl {
                 .expect("mqtt router routes lock poisoned");
             routes
                 .iter()
+                // TODO(mqtt-shared-subscription-filters-unrouted): a `$share/<group>/…`
+                // route filter never covers a delivered topic, so its messages drop.
                 .filter(|r| {
-                    r.client_slug == client_slug && mqtt_topic_matches(&r.topic_filter, topic)
+                    r.client_slug == client_slug && topic_filter::covers(&r.topic_filter, topic)
                 })
                 .cloned()
                 .collect()
@@ -616,7 +631,7 @@ mod tests {
         db: brenn_db::Db,
         entries: Vec<ChannelEntry>,
         wasm_slug: &str,
-        mqtt_subscribe_acl: Vec<brenn_lib::access::raw::MqttSubMatcherRaw>,
+        mqtt_subscribe_acl: Vec<brenn_lib::access::raw::MqttMatcherRaw>,
     ) -> Arc<brenn_messaging::Messenger> {
         let policy = brenn_lib::access::resolve::build_wasm_policy(
             wasm_slug,
@@ -780,7 +795,7 @@ mod tests {
             db.clone(),
             vec![mqtt_channel_entry_wasm(addr, "consume-demo")],
             "consume-demo",
-            vec![brenn_lib::access::raw::MqttSubMatcherRaw {
+            vec![brenn_lib::access::raw::MqttMatcherRaw {
                 client: "homeassistant".to_string(),
                 topic_filter: "home/+/state".to_string(),
             }],
@@ -912,7 +927,7 @@ mod tests {
             db.clone(),
             vec![mqtt_channel_entry_wasm(addr, "consume-demo")],
             "consume-demo",
-            vec![brenn_lib::access::raw::MqttSubMatcherRaw {
+            vec![brenn_lib::access::raw::MqttMatcherRaw {
                 client: "homeassistant".to_string(),
                 topic_filter: "home/+/state".to_string(),
             }],
@@ -1024,6 +1039,54 @@ mod tests {
                 .expect("count")
         };
         assert_eq!(count, 0, "no-match delivery must store no row");
+    }
+
+    /// A broker topic holding `+` or `#` is malformed MQTT and is dropped before
+    /// routing, without a panic. The route `home/#` would cover both topics if
+    /// they were matched, so a stored row here means the check was skipped; the
+    /// wildcard-free delivery afterwards shows the route itself is live.
+    #[tokio::test]
+    async fn deliver_inbound_drops_a_topic_holding_a_wildcard() {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        state.messenger = Some(messenger_with_channels(
+            db.clone(),
+            vec![mqtt_channel_entry("mqtt:homeassistant:home/#", None)],
+            None,
+        ));
+        let router = MqttEventRouterImpl::new();
+        router.set_state(
+            state,
+            vec![route("homeassistant", "home/#", Urgency::Normal)],
+        );
+
+        let count = || async {
+            let conn = db.lock().await;
+            conn.query_row("SELECT COUNT(*) FROM messaging_messages", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("count")
+        };
+
+        for topic in ["home/+", "home/#"] {
+            router
+                .deliver_inbound("homeassistant", topic, InboundPayload::new("x", None), 0)
+                .await;
+        }
+        assert_eq!(count().await, 0, "a wildcard topic must store no row");
+
+        router
+            .deliver_inbound(
+                "homeassistant",
+                "home/kitchen",
+                InboundPayload::new("x", None),
+                0,
+            )
+            .await;
+        assert_eq!(
+            count().await,
+            1,
+            "a wildcard-free topic under the route is stored"
+        );
     }
 
     /// A channel filter on a *different* client must not match — the client is

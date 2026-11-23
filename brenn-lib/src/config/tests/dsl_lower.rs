@@ -15,9 +15,7 @@ use brenn_dsl::diag::{Diagnostic, render_all};
 use brenn_dsl::{processor_needs, surface_any};
 use brenn_surface_schema::LogLevel;
 
-use crate::access::raw::{
-    AppAclRaw, ChannelMatcherRaw, MqttPubMatcherRaw, MqttSubMatcherRaw, WebhookMatcherRaw,
-};
+use crate::access::raw::{AppAclRaw, ChannelMatcherRaw, MqttMatcherRaw, WebhookMatcherRaw};
 use crate::config::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
 use crate::config::api_key_provider::{ApiKeyAccountRaw, ApiKeyProviderRaw, ApiKeySourceRaw};
 use crate::config::app::AppConfigRaw;
@@ -3026,7 +3024,7 @@ new alice: Assistant();
                     ephemeral_subscribe: vec![ChannelMatcherRaw::Exact(
                         "alice.presence".to_string(),
                     )],
-                    mqtt_subscribe: vec![MqttSubMatcherRaw {
+                    mqtt_subscribe: vec![MqttMatcherRaw {
                         client: "broker".to_string(),
                         topic_filter: "alice/lamp".to_string(),
                     }],
@@ -4086,11 +4084,11 @@ new router: Router {
                     ChannelMatcherRaw::Prefix("router.out.".to_string()),
                     ChannelMatcherRaw::Exact("router.acks".to_string()),
                 ],
-                mqtt_publish_acl: vec![MqttPubMatcherRaw {
+                mqtt_publish_acl: vec![MqttMatcherRaw {
                     client: "broker".to_string(),
                     topic_filter: "#".to_string(),
                 }],
-                mqtt_subscribe_acl: vec![MqttSubMatcherRaw {
+                mqtt_subscribe_acl: vec![MqttMatcherRaw {
                     client: "broker".to_string(),
                     topic_filter: "alice/#".to_string(),
                 }],

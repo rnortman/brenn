@@ -23,8 +23,7 @@ use brenn_dsl::derive::{Family, MQTT_SINK_KEYS, REMOTE_CEILING_KEYS};
 use brenn_envelope::grants::{ComponentHost, EntityKind};
 
 use crate::access::raw::{
-    AppAclRaw, AttachAclsRaw, ChannelMatcherRaw, MqttPubMatcherRaw, MqttSubMatcherRaw, WasmAclsRaw,
-    WebhookMatcherRaw,
+    AppAclRaw, AttachAclsRaw, ChannelMatcherRaw, MqttMatcherRaw, WasmAclsRaw, WebhookMatcherRaw,
 };
 use crate::messaging::config::{
     SurfaceConfigRaw, WasmConsumerConfigRaw, WasmConsumerMqttOutputRaw,
@@ -350,8 +349,8 @@ fn each_list_carries_its_matcher_kind(app: AppAclRaw, wasm: WasmAclsRaw<'_>) {
         app.ephemeral_publish,
         app.local_publish,
     ];
-    let _mqtt_subs: [Vec<MqttSubMatcherRaw>; 1] = [app.mqtt_subscribe];
-    let _mqtt_clients: [Vec<MqttPubMatcherRaw>; 1] = [app.mqtt_publish];
+    let _mqtt: [Vec<MqttMatcherRaw>; 2] = [app.mqtt_subscribe, app.mqtt_publish];
+    let _wasm_mqtt: [&[MqttMatcherRaw]; 2] = [wasm.mqtt_subscribe, wasm.mqtt_publish];
     let _webhooks: [Vec<WebhookMatcherRaw>; 1] = [app.webhook];
     let _local_subscribe: &[ChannelMatcherRaw] = wasm.local_subscribe;
 }

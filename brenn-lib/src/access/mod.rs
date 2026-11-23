@@ -5,16 +5,11 @@
 //! operator-authored config consumed by backend enforcement; it never crosses the
 //! backend↔frontend boundary, so it carries **no** `ts-rs` derive.
 //!
-//! The model and resolution land incrementally. So far this module hosts the
-//! MQTT topic-filter subset matcher (`mqtt_match`), the layer-1 grant model
-//! (`AppCapability`, `GrantSet`), the layer-2 ACL matchers (`acl`), the
-//! `AppPolicy` struct + decision API, the operator-authored *raw* ACL config
-//! shapes for LLM apps (`raw`), and the validation/conversion of those raw shapes
-//! into a resolved `AppPolicy` (`resolve::build_app_policy`); the
-//! enforcement-site wiring follows in later increments.
+//! The `AppPolicy` decision API (`allows_*`) is the live gate the enforcement
+//! sites call. MQTT topic-filter coverage is decided by
+//! [`crate::mqtt::topic_filter::covers`].
 
 pub mod acl;
-pub mod mqtt_match;
 pub mod raw;
 pub mod resolve;
 #[cfg(any(test, feature = "testutils"))]
@@ -26,7 +21,7 @@ use brenn_envelope::grants::AppCapability;
 
 use crate::access::acl::AclSet;
 use crate::messaging::ChannelScheme;
-use crate::mqtt::address::mqtt_topic_matches;
+use crate::mqtt::topic_filter;
 use crate::tools::ResolvedToolGrant;
 
 /// The unified, app-kind-independent record of "what an app may do": a layer-1
@@ -110,10 +105,10 @@ impl AppPolicy {
     /// require the `DynamicSubscribe` grant. With no matcher
     /// the `.any(...)` is `false` — deny-by-default.
     fn mqtt_acl_covers(&self, client: &str, requested_filter: &str) -> bool {
-        self.acls.mqtt_subscribe.iter().any(|m| {
-            m.client == client
-                && crate::access::mqtt_match::filter_covers(&m.topic_filter, requested_filter)
-        })
+        self.acls
+            .mqtt_subscribe
+            .iter()
+            .any(|m| m.client == client && topic_filter::covers(&m.topic_filter, requested_filter))
     }
 
     /// Does some matcher in `list` cover `channel`? The single covering-matcher
@@ -149,7 +144,8 @@ impl AppPolicy {
     /// Both layers must agree: the `DynamicSubscribe` grant (the runtime
     /// `MessageSubscribe` tool) **and** the `MqttSubscribe` transport grant
     /// **and** at least one `mqtt_subscribe` matcher whose `(client,
-    /// allowed_filter)` covers the request (filter subset per `mqtt_match`). With
+    /// allowed_filter)` covers the request ([`topic_filter::covers`], `$` rule
+    /// included). With
     /// no matcher the `.any(...)` is `false` — deny-by-default.
     ///
     /// Precondition: `requested_filter` is a *validated* MQTT topic filter; the
@@ -197,7 +193,8 @@ impl AppPolicy {
         self.grants.has(AppCapability::DynamicSubscribe) && self.allows_local_delivery(channel)
     }
 
-    /// May this app still *receive a delivery* on MQTT `(client, topic)`?
+    /// May this app still *receive a delivery* on MQTT `(client, filter)`, where
+    /// `filter` is a channel's validated topic filter?
     ///
     /// The subscription-**holding** decision: the `MqttSubscribe`
     /// transport grant **plus** a covering `mqtt_subscribe` matcher, but **not**
@@ -205,8 +202,8 @@ impl AppPolicy {
     /// `MessageSubscribe` *tool*, not holding a subscription, so a static
     /// subscriber (operator config) that never holds it must still be authorized to
     /// receive. This is the per-transport piece `allows_channel_access` composes.
-    pub fn allows_mqtt_delivery(&self, client: &str, topic: &str) -> bool {
-        self.grants.has(AppCapability::MqttSubscribe) && self.mqtt_acl_covers(client, topic)
+    pub fn allows_mqtt_delivery(&self, client: &str, filter: &str) -> bool {
+        self.grants.has(AppCapability::MqttSubscribe) && self.mqtt_acl_covers(client, filter)
     }
 
     /// May this app still receive a delivery on `brenn:` `channel`? The
@@ -291,7 +288,7 @@ impl AppPolicy {
     /// and components alike.
     ///
     /// `topic` is a topic *name*, wildcard-free; the caller parses it. Matching is
-    /// [`mqtt_topic_matches`], so an entry of `#` or `+/…` admits no topic whose
+    /// [`topic_filter::covers`] with `topic` as the inner filter, so an entry of `#` or `+/…` admits no topic whose
     /// first level starts with `$`: such a topic is admitted only by a filter that
     /// spells its first level.
     pub fn allows_mqtt_publish(&self, client: &str, topic: &str) -> bool {
@@ -300,7 +297,7 @@ impl AppPolicy {
                 .acls
                 .mqtt_publish
                 .iter()
-                .any(|m| m.client == client && mqtt_topic_matches(&m.topic_filter, topic))
+                .any(|m| m.client == client && topic_filter::covers(&m.topic_filter, topic))
     }
 
     /// May `self` (any subscriber — static or dynamic) access this channel — hold
@@ -381,7 +378,7 @@ impl GrantSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::acl::{ChannelMatcher, MqttPubMatcher, MqttSubMatcher, WebhookMatcher};
+    use crate::access::acl::{ChannelMatcher, MqttMatcher, WebhookMatcher};
 
     #[test]
     fn empty_grant_set_denies_everything() {
@@ -476,7 +473,7 @@ mod tests {
     #[test]
     fn mqtt_dynamic_subscribe_requires_both_grants() {
         let acls = AclSet {
-            mqtt_subscribe: vec![MqttSubMatcher {
+            mqtt_subscribe: vec![MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             }],
@@ -520,7 +517,7 @@ mod tests {
                 AppCapability::MqttSubscribe,
             ],
             AclSet {
-                mqtt_subscribe: vec![MqttSubMatcher {
+                mqtt_subscribe: vec![MqttMatcher {
                     client: "home".to_string(),
                     topic_filter: "sensors/+/temp".to_string(),
                 }],
@@ -693,7 +690,7 @@ mod tests {
     #[test]
     fn mqtt_delivery_requires_grant_and_matcher_not_dynamic() {
         let acls = AclSet {
-            mqtt_subscribe: vec![MqttSubMatcher {
+            mqtt_subscribe: vec![MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             }],
@@ -865,7 +862,7 @@ mod tests {
         // One policy carrying a covering matcher + transport grant for each
         // transport; `allows_channel_access` must route each address to the right one.
         let acls = AclSet {
-            mqtt_subscribe: vec![MqttSubMatcher {
+            mqtt_subscribe: vec![MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "sensors/+/temp".to_string(),
             }],
@@ -963,7 +960,7 @@ mod tests {
         // A policy that would grant broadly if the address parsed — proves the
         // deny comes from classification failure, not from a missing grant.
         let acls = AclSet {
-            mqtt_subscribe: vec![MqttSubMatcher {
+            mqtt_subscribe: vec![MqttMatcher {
                 client: "home".to_string(),
                 topic_filter: "#".to_string(),
             }],
@@ -1026,8 +1023,8 @@ mod tests {
         assert!(!granted.allows_brenn_publish("status.ready.extra"));
     }
 
-    fn pub_matcher(client: &str, topic_filter: &str) -> MqttPubMatcher {
-        MqttPubMatcher {
+    fn mqtt_matcher(client: &str, topic_filter: &str) -> MqttMatcher {
+        MqttMatcher {
             client: client.to_string(),
             topic_filter: topic_filter.to_string(),
         }
@@ -1036,7 +1033,7 @@ mod tests {
     #[test]
     fn mqtt_publish_requires_grant_and_matcher() {
         let acls = AclSet {
-            mqtt_publish: vec![pub_matcher("home", "a/+/set")],
+            mqtt_publish: vec![mqtt_matcher("home", "a/+/set")],
             ..AclSet::default()
         };
         // Listed client and topic, but missing the MqttPublish grant ⇒ deny.
@@ -1060,7 +1057,7 @@ mod tests {
         let hash = policy(
             &[AppCapability::MqttPublish],
             AclSet {
-                mqtt_publish: vec![pub_matcher("home", "#")],
+                mqtt_publish: vec![mqtt_matcher("home", "#")],
                 ..AclSet::default()
             },
         );
@@ -1070,7 +1067,7 @@ mod tests {
         let plus = policy(
             &[AppCapability::MqttPublish],
             AclSet {
-                mqtt_publish: vec![pub_matcher("home", "+/x")],
+                mqtt_publish: vec![mqtt_matcher("home", "+/x")],
                 ..AclSet::default()
             },
         );
@@ -1080,12 +1077,57 @@ mod tests {
         let sys = policy(
             &[AppCapability::MqttPublish],
             AclSet {
-                mqtt_publish: vec![pub_matcher("home", "$SYS/#")],
+                mqtt_publish: vec![mqtt_matcher("home", "$SYS/#")],
                 ..AclSet::default()
             },
         );
         assert!(sys.allows_mqtt_publish("home", "$SYS/x"));
         assert!(!sys.allows_mqtt_publish("home", "a/b"));
+    }
+
+    /// A subscribe entry whose first level is `#` or `+` covers no filter whose
+    /// first level starts with `$`, for a dynamic subscribe and for channel
+    /// access alike; an entry that spells the `$` first level does.
+    #[test]
+    fn mqtt_subscribe_leading_wildcard_skips_dollar_filters() {
+        let subscriber = |filter: &str| {
+            policy(
+                &[
+                    AppCapability::DynamicSubscribe,
+                    AppCapability::MqttSubscribe,
+                ],
+                AclSet {
+                    mqtt_subscribe: vec![mqtt_matcher("home", filter)],
+                    ..AclSet::default()
+                },
+            )
+        };
+
+        let hash = subscriber("#");
+        for denied in ["$SYS/#", "$SYS/broker", "$share/g/a"] {
+            assert!(
+                !hash.allows_mqtt_dynamic_subscribe("home", denied),
+                "`#` must not cover {denied:?}",
+            );
+        }
+        for admitted in ["#", "a/#", "a/b"] {
+            assert!(
+                hash.allows_mqtt_dynamic_subscribe("home", admitted),
+                "`#` must cover {admitted:?}",
+            );
+        }
+        assert!(!hash.allows_channel_access("mqtt:home:$SYS/#"));
+        assert!(hash.allows_channel_access("mqtt:home:#"));
+        assert!(hash.allows_channel_access("mqtt:home:a/#"));
+
+        let plus = subscriber("+/x");
+        assert!(!plus.allows_mqtt_dynamic_subscribe("home", "$SYS/x"));
+        assert!(plus.allows_mqtt_dynamic_subscribe("home", "a/x"));
+
+        let sys = subscriber("$SYS/#");
+        assert!(sys.allows_mqtt_dynamic_subscribe("home", "$SYS/#"));
+        assert!(sys.allows_mqtt_dynamic_subscribe("home", "$SYS/broker"));
+        assert!(!sys.allows_mqtt_dynamic_subscribe("home", "a/b"));
     }
 
     #[test]
@@ -1094,9 +1136,9 @@ mod tests {
             &[AppCapability::MqttPublish],
             AclSet {
                 mqtt_publish: vec![
-                    pub_matcher("home", "lights/+/set"),
-                    pub_matcher("home", "blinds/cmd"),
-                    pub_matcher("office", "door/open"),
+                    mqtt_matcher("home", "lights/+/set"),
+                    mqtt_matcher("home", "blinds/cmd"),
+                    mqtt_matcher("office", "door/open"),
                 ],
                 ..AclSet::default()
             },

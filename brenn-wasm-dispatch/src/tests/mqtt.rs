@@ -14,7 +14,7 @@ use super::*;
 use brenn_envelope::grants::AppCapability;
 use brenn_envelope::{MqttExpiry, MqttPublishTransport, TransportMeta};
 use brenn_lib::access::AppPolicy;
-use brenn_lib::access::acl::MqttPubMatcher;
+use brenn_lib::access::acl::MqttMatcher;
 use brenn_lib::mqtt::MqttClientDirectory;
 use brenn_messaging::Messenger;
 use brenn_messaging::mqtt_outbound::mqtt_egress_entry;
@@ -50,7 +50,7 @@ impl MqttClientDirectory for StubClients {
 fn policy() -> AppPolicy {
     let mut policy = AppPolicy::with_grants(&[AppCapability::MqttPublish]);
     for filter in [TOPIC, "allowed/#"] {
-        policy.acls.mqtt_publish.push(MqttPubMatcher {
+        policy.acls.mqtt_publish.push(MqttMatcher {
             client: CLIENT.to_string(),
             topic_filter: filter.to_string(),
         });
@@ -453,7 +453,7 @@ async fn the_seam_panics_on_a_policy_without_the_grant() {
 async fn the_seam_panics_on_a_client_with_no_session_or_channel() {
     let rig = rig("mq-absent").await;
     let mut policy = policy();
-    policy.acls.mqtt_publish.push(MqttPubMatcher {
+    policy.acls.mqtt_publish.push(MqttMatcher {
         client: "absent".to_string(),
         topic_filter: TOPIC.to_string(),
     });

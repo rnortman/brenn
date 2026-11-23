@@ -1043,7 +1043,7 @@ mod tests {
     async fn the_delivery_gate_checks_each_transport_against_its_own_acl() {
         use brenn_envelope::grants::AppCapability;
         use brenn_lib::access::AppPolicy;
-        use brenn_lib::access::acl::{MqttSubMatcher, WebhookMatcher};
+        use brenn_lib::access::acl::{MqttMatcher, WebhookMatcher};
 
         let covered_mqtt = transport_channel(
             "mqtt:home:sensors/kitchen/temp",
@@ -1069,7 +1069,7 @@ mod tests {
         let mut policy = AppPolicy::default();
         policy.grants.insert(AppCapability::MqttSubscribe);
         policy.grants.insert(AppCapability::Webhook);
-        policy.acls.mqtt_subscribe.push(MqttSubMatcher {
+        policy.acls.mqtt_subscribe.push(MqttMatcher {
             client: "home".to_string(),
             topic_filter: "sensors/+/temp".to_string(),
         });
