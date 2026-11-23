@@ -1623,11 +1623,60 @@ names the attachment from that answer in `MqttSend`'s `attachment`.
 
 **The lifetime.** `lifetime_s` is required: a whole number of seconds from 1
 to 4294967295, or the string `"forever"`. It is how long Brenn keeps trying to
-hand the message to the broker, counted from the commit, and what is left of
+hand the message to the broker, counted from the commit, or from
+`deliver_after` when one is given, and what is left of
 it when the message is handed over is sent as the MQTT 5 Message Expiry
 Interval, rounded up to whole seconds. `"forever"` sends no expiry. A missing,
 zero, negative, fractional or otherwise malformed value is an argument error
 naming both forms.
+
+**The reply address.** `reply_to`, optional, names a topic as a full
+`mqtt:<client>:<topic>` address and is sent as the MQTT 5 Response Topic, so a
+responder knows where to answer. It is admitted only when it is a concrete
+topic name (no wildcard), on the client the message is published through, and
+covered by the app's own `acl publish` entries: a sender needs publish rights
+on its own reply topic, so that it cannot get a responder to publish where it
+may not. A malformed or wildcard address and one on another client are
+argument errors; a topic the ACL does not cover is refused with the security
+signal a denied target raises. The topic is stored with the message in its
+`MqttPublish` transport metadata, not as the envelope's `reply_to`, which
+names a bus channel. No Correlation Data is sent, so a sender matches a
+response to its request by the response's payload; an inbound PUBLISH's
+Response Topic and Correlation Data are not read (`TODO.md`'s
+`mqtt-correlation-data-and-inbound-response-topic`). The Response Topic counts
+toward the packet size the broker's maximum is checked against.
+
+**A scheduled publish.** `deliver_after`, optional, is an RFC 3339 time in
+`BrennSend`'s forms: absent, `null` or `""` is none, and a time at or before
+now publishes at once. A later time parks the message on the client's egress
+channel with the bus's ordinary deferral (§2.4): it is committed, admitted and
+charged its send-rate token and budget unit at the call, holds no place in
+the channel until its release time, and is invisible to the reader until
+then. At release the dispatcher moves it into retention, where it takes its
+place in channel order after whatever was committed before that moment, and
+the reader hands it on like any commit. Its lifetime counts from the stated
+release time, so its expiry is fixed at the commit; release rewrites nothing.
+The dispatcher releases a moment after the stated time and the reader then
+needs a connection, so a lifetime of a second or two can expire unsent, and a
+server down across the whole of `[deliver_after, deliver_after + lifetime]`
+releases the message at its next start and reports it `expired`. Its
+statuses, when it names a `status_to`, begin at release. Until release the
+sender's `BrennPendingList` lists it — its `transport` names the client, the
+topic and the expiry — and `BrennMessageCancel` withdraws it by the
+`message_id` the call returned, under the lock every release takes, so a
+cancelled message is never retained, never handed and told nothing;
+`BrennMessageEdit` refuses it (cancel and send again). The three tools serve
+an app holding only the `mqtt_publish` grant. `BrennPendingList`'s `channel`
+filter never names an egress channel; the unfiltered list shows these
+messages. A client removed while its channel holds a parked message reports
+it `dropped`, `removed`, as an unread one (§2.7.3, *Reload*). The client's
+deferred cap is its egress channel's retain depth, shared by every sender to
+that client, so one sender can fill it; a call over it is refused naming the
+cap and refunds its budget unit. Admission happens once, at the commit: an
+app whose ACL is narrowed, or that is removed from the configuration, after
+it parked a publish still has it released and sent; the operator's recall is
+removing the client, or the message's row. There is no bound on how far
+ahead `deliver_after` may be, as for `BrennSend`.
 
 **Commit, not delivery.** A call that passes every check is committed to the
 client's egress channel (§2.7.3) and answers at once:
@@ -1667,11 +1716,15 @@ reason.
 budget spends none: the arguments; the attachment's admission, which takes a
 hold on the blob and reads no byte; then the bus's admission — the address,
 the app's `mqtt_publish` grant and per-topic ACL, the client and its egress
-channel, the `status_to` when one is named, QoS and content type, the
+channel, the `reply_to` when one is named, the `status_to` when one is named,
+QoS and content type, the
 payload's shape, the bound, the body cap's
 need for a blob store; the send rate; the send budget; the write of an
 over-cap inline payload to the blob store, whose refusal refunds the budget
-unit; then the commit. A denied call learns nothing of the client's bound. A
+unit; then the commit, or for a future `deliver_after` the park, which checks
+the reader's position and the client's deferred cap in the same step as the
+write and refunds the budget unit on either refusal. A denied call learns nothing of the client's bound, and a call
+refused on its target answers the same whether or not it names a `reply_to`. A
 client the server does not configure is answered as not configured, which is
 not a security event. A source attachment's message evicted after admission
 does not affect the call: the hold keeps the bytes.
@@ -1693,7 +1746,7 @@ committed together: its MQTT publishes and its publishes to durable channels
 in one transaction, in call order. When it errs or traps the buffer is
 discarded. The call answers the admission and never a broker outcome; what
 happens after commit goes to the operator (§2.7.3), with `wasm:<slug>` as the
-sender: a component cannot name a `status_to`. `mqtt-publish` is committed with no lifetime and
+sender: a component cannot name a `status_to` or a `reply_to`. `mqtt-publish` is committed with no lifetime and
 `mqtt-publish-expiring` with a lifetime of its seconds, counted from the
 commit. Nothing in the call waits on the broker or its session.
 
@@ -1703,15 +1756,17 @@ commit. Nothing in the call waits on the broker or its session.
 text, a JSON object or array stored as its JSON text, or bytes given as
 base64; never an attachment, since a job that fires for months would have
 to hold a blob — and `MqttSend`'s `content_type`, `qos`, `retain`,
-`lifetime_s` and `status_to`. Its arguments are read by the same parser as
-`MqttSend`'s. At create and edit the action is put to the same bus admission,
+`lifetime_s`, `status_to` and `reply_to`. Its arguments are read by the same parser as
+`MqttSend`'s; `deliver_after` is refused by name, since the job's trigger is
+its time. At create and edit the action is put to the same bus admission,
 spending nothing, under the owner app; a refusal is answered as `MqttSend`'s
 is, security signal included, and the payload is also held to the body cap.
 At each fire the engine commits the message through the same admission as
 `MqttSend`, under the owner app, with the lifetime counted from that commit;
 the fire is `ok` at commit and never reports delivery, which goes to the
 operator or to the action's `status_to`. A refused fire is recorded with an
-outcome naming the cause — `auth` for a grant, ACL or client that is gone,
+outcome naming the cause — `auth` for a grant, ACL or client that is gone
+(an ACL that no longer covers the stored `reply_to` included),
 `action_error` for an argument the admission no longer accepts or the send
 rate, `budget` for an empty send budget — counts toward the job's
 consecutive failures and auto-disable, and raises the job's error report.
@@ -1748,8 +1803,10 @@ output may name it. A component's
 publish in the envelope's `transport` key — `{"mqtt_publish": {"client_slug",
 "topic", "qos", "retain", "content_type", "expires"}}`, where `expires` is
 `{"at": "<rfc3339>"}` or `"never"`, `content_type` is absent when the call
-stated none, and `status_to` is the canonical `brenn:` address the call named
-for its delivery statuses, absent when it named none — and its payload as the body or as one attachment (§2.7.2).
+stated none, `status_to` is the canonical `brenn:` address the call named
+for its delivery statuses, absent when it named none, and `response_topic` is
+the bare reply topic sent as the Response Topic, absent when the call named no
+`reply_to` — and its payload as the body or as one attachment (§2.7.2).
 
 **Admission.** `MqttSend`'s publish, and an automation's fire, is admitted by
 the bus as any publish is,
@@ -1891,10 +1948,13 @@ durable and the cursor survives, so the restart loses nothing.
 position on it and starts the reader before any policy can name the client.
 One that removes a client retires the reader before the channel leaves: the
 reader hands nothing more and reports what it had outstanding. The reload
-then closes the channel: in one step with respect to commits it drops the
-position and takes everything the channel held unread, and reports all of
+then closes the channel: in one step with respect to commits, parks and
+releases it drops the position, takes everything the channel held unread and
+removes every message still parked on it, whoever sent it, and reports all of
 it `dropped`, `removed` — by count to the operator, and to each message's
-`status_to` when it names one. The subscriber entry is removed, and the
+`status_to` when it names one: the unread in channel order, then the parked in
+release order. A release before the close lands among the unread; a park after
+it is answered as for an unknown client. The subscriber entry is removed, and the
 channel leaves the directory. The close is the same whether or not the reader
 was still running, so a removal that races a server shutdown is reported the
 same way. A reload that removes or changes a client waits for that
@@ -1904,8 +1964,9 @@ changed clients' sessions are stopped together, under the same rule. A reload
 that both removes and changes clients against brokers that do not answer can
 therefore wait up to two bounds. A client deleted from the configuration
 while the server is down is not reported: no reader is started for it at the
-next start, and what its channel holds is told nothing
-(`TODO(mqtt-egress-removed-client-rows)`). The removed
+next start, and what its channel holds, retained or parked, is told nothing
+(`TODO(mqtt-egress-removed-client-rows)`); a parked message there is never
+released, since its channel is not in the directory. The removed
 channel's stored row and retained messages stay in the database
 (`TODO(mqtt-egress-removed-client-rows)`). One that changes a client keeps the
 channel and the cursor and starts a reader on the successor session.
@@ -1915,7 +1976,12 @@ messages — a client added again under a slug that was removed — skips them:
 they were committed for the earlier client and are not published. Each was
 already reported, an outcome while its client ran or `dropped`, `removed` at
 the removal, except what a client deleted while the server was down left
-unread (Reload, above). The skip is logged at `warn` with the count. A restart resumes an existing position and
+unread (Reload, above). The same position first deletes every message still
+parked on the channel, which only such a client can have left: a parked
+message would otherwise be released above the new position and published to
+the new client's broker. The deletion comes before the skip, so a release
+racing the open is either skipped or finds nothing to release. Both are logged at
+`warn` with their counts, and neither is reported to a sender. A restart resumes an existing position and
 hands off exactly what was not handed.
 
 #### Delivery status
@@ -2016,7 +2082,7 @@ the rest.
   comes when a connection next lets the reader reach the message — hours
   later if the client is down that long, never if it stays down or the window
   drops the message first. What a removed client's channel still holds
-  unread is told nothing when the client is deleted from the configuration
+  unread or parked is told nothing when the client is deleted from the configuration
   while the server is down (Reload, above;
   `TODO(mqtt-egress-removed-client-rows)`); a message sent with `lifetime_s`
   `"forever"` then has no end of lifetime to infer from. A clean shutdown is not a silence: it waits for every session's

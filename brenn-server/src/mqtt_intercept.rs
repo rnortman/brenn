@@ -18,7 +18,8 @@ use brenn_envelope::AttachmentName;
 use brenn_lib::mqtt::MqttPublishOptions;
 use brenn_lib::mqtt::address::{MqttAddress, parse_topic_name};
 use brenn_messaging::{
-    MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, StatusToRefusal,
+    MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, ReplyToRefusal,
+    StatusToRefusal,
 };
 use brenn_messaging_store::blob::HeldAttachments;
 use brenn_mqtt::ConnectorHealthLabel;
@@ -96,6 +97,7 @@ struct PreparedPublish {
     address: MqttAddress,
     payload: MqttPayload,
     options: MqttPublishOptions,
+    deliver_after: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The answer to a committed `MqttSend`.
@@ -121,6 +123,7 @@ async fn execute_send(
         address,
         payload,
         options,
+        deliver_after,
     } = match prepare(bridge, tool_name, input).await {
         Ok(prepared) => prepared,
         Err(answer) => return answer,
@@ -135,6 +138,7 @@ async fn execute_send(
             &to,
             payload,
             &options,
+            deliver_after,
         )
         .await;
     match result {
@@ -219,6 +223,9 @@ pub(crate) fn answer_refused(
         PublishResult::MqttRefused(MqttRefusal::StatusTo { address, why }) => {
             answer_status_to_refused(bridge, rejection_context, tool_name, &address, why)
         }
+        PublishResult::MqttRefused(MqttRefusal::ReplyTo { address, why }) => {
+            answer_reply_to_refused(bridge, rejection_context, tool_name, &address, client, why)
+        }
         PublishResult::MqttRefused(MqttRefusal::InvalidQos { .. }) => {
             reject("invalid `qos`: must be 0, 1, or 2")
         }
@@ -258,15 +265,16 @@ pub(crate) fn answer_refused(
         PublishResult::BudgetExhausted => outcome_err(Cow::Borrowed(
             "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
         )),
+        PublishResult::DeferredQuotaExceeded { cap } => outcome_err(Cow::Owned(format!(
+            "deferred-message quota exceeded: MQTT client `{client}` already holds its cap of \
+             {cap} scheduled messages; retry after some are released, or cancel one"
+        ))),
         e @ (PublishResult::Ok { .. }
         | PublishResult::BodyTooLarge { .. }
-        | PublishResult::DeferredQuotaExceeded { .. }
         | PublishResult::ImpetusUnauthorized
-        | PublishResult::MqttRefused(
-            MqttRefusal::DeliverAfter | MqttRefusal::ReplyTo | MqttRefusal::DeliveryDeadline,
-        )) => unreachable!(
-            "MqttSend states no release time, reply_to, deadline or impetus, and an \
-             inline payload over the body cap rides as a blob, so the bus cannot answer {e:?}"
+        | PublishResult::MqttRefused(MqttRefusal::DeliveryDeadline)) => unreachable!(
+            "MqttSend states no deadline or impetus, and an inline payload over the body cap \
+             rides as a blob, so the bus cannot answer {e:?}"
         ),
     }
 }
@@ -328,6 +336,53 @@ fn answer_status_to_refused(
     }
 }
 
+/// The answer to a `reply_to` the MQTT admission refused. A reply topic the
+/// app's MQTT publish ACL does not cover raises the signal a denied target
+/// raises; a malformed address or one on another client is an argument
+/// rejection and signals nothing.
+fn answer_reply_to_refused(
+    bridge: &ActiveBridge,
+    rejection_context: &str,
+    tool_name: &str,
+    address: &str,
+    client: &str,
+    why: ReplyToRefusal,
+) -> ToolOutcome {
+    let shown = sanitize_untrusted_str(address, MAX_LOGGED_UNTRUSTED_BYTES);
+    match why {
+        ReplyToRefusal::Malformed { detail } => outcome_rejection(
+            rejection_context,
+            tool_name,
+            &format!(
+                "invalid `reply_to` {shown:?}: {detail}; give a concrete topic as \
+                 `mqtt:<client>:<topic>`"
+            ),
+        ),
+        ReplyToRefusal::OtherClient => outcome_rejection(
+            rejection_context,
+            tool_name,
+            &format!(
+                "`reply_to` must name a topic on the client the message is published through \
+                 (`{client}`)"
+            ),
+        ),
+        ReplyToRefusal::AclDenied => {
+            signal_publish_denial(
+                bridge.alert_dispatcher(),
+                SecurityEventType::MqttPublishDenied,
+                bridge.denial_origin(),
+                DenialKind::AclDenied,
+                address,
+            );
+            outcome_err(Cow::Owned(format!(
+                "`reply_to` {shown:?} is not allowed for this app: no `acl publish` entry admits \
+                 that topic on client `{client}`; a reply topic must be one this app may publish \
+                 to"
+            )))
+        }
+    }
+}
+
 /// The bridge's messenger. The MQTT tool is only offered on a server with
 /// messaging configured, so a missing one is a host wiring bug.
 fn messenger(bridge: &ActiveBridge) -> &std::sync::Arc<brenn_messaging::Messenger> {
@@ -385,6 +440,8 @@ async fn prepare(
         retain,
         lifetime,
         status_to,
+        reply_to,
+        deliver_after,
     } = mqtt_publish_args::parse(input).map_err(|e| reject(tool_name, &e))?;
 
     let messenger = messenger(bridge);
@@ -420,7 +477,9 @@ async fn prepare(
             lifetime,
             content_type,
             status_to,
+            reply_to,
         },
+        deliver_after,
     })
 }
 

@@ -18,6 +18,23 @@ All notable changes to Brenn are documented here.
   subscription's filter still in place and keep sending on it: each such
   message is dropped with a `warn` line "inbound topic matched no channel",
   until the broker's session for the client ends or a covering entry is added.
+- **New: an MQTT publish can name a reply topic.** `MqttSend` and an
+  automation's `mqtt_publish` action take an optional `reply_to`, written
+  `mqtt:<client>:<topic>`, which is sent to the broker as the MQTT 5 Response
+  Topic. It must be a concrete topic on the same client as `to`, and the app
+  must itself be allowed to publish to it by its `acl publish` entries, so an
+  operator who wants an app to ask for replies grants it publish on the reply
+  topic too. No Correlation Data is sent.
+- **New: `MqttSend` can schedule a publish.** An optional `deliver_after`
+  (RFC 3339) commits the message now and publishes it at that time; a past
+  time publishes at once. The lifetime counts from `deliver_after`. Until
+  then `BrennPendingList` lists it and `BrennMessageCancel` withdraws it,
+  including for an app that holds only the MQTT publish grant;
+  `BrennMessageEdit` refuses it. A client removed from the configuration
+  first reports its scheduled messages `dropped`, `removed`. Each client
+  holds at most its egress channel's retain depth (256 by default) of
+  scheduled messages, across every sender. An automation's `mqtt_publish`
+  action refuses `deliver_after`.
 - **New: recurring automations can send MQTT messages.** A scheduled job
   (created with `AutoCreate`, changed with `AutoEdit`) can now publish to an
   MQTT topic on a cron schedule with no LLM involved — for example lighting

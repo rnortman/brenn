@@ -473,6 +473,12 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
         self.deferred.cancel(id)
     }
 
+    /// Unpark every entry, whoever parked it and whether or not it is due,
+    /// release order.
+    pub fn take_deferred(&mut self) -> Vec<Deferred<M>> {
+        self.deferred.take_all()
+    }
+
     /// Replace one parked entry's payload, its release time, or both, keeping
     /// its identity. Errs on the same release race `cancel_deferred` reports as
     /// `None`.

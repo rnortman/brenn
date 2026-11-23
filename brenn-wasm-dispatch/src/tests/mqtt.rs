@@ -238,6 +238,7 @@ async fn an_activations_mqtt_publishes_commit_to_the_egress_channel_in_call_orde
                 content_type: None,
                 expires: MqttExpiry::Never,
                 status_to: None,
+                response_topic: None,
             }
         );
     }
@@ -287,6 +288,7 @@ async fn an_expiring_publish_expires_its_seconds_after_commit() {
             content_type: Some("application/json".to_string()),
             expires: MqttExpiry::At(row.publish_ts + chrono::Duration::seconds(90)),
             status_to: None,
+            response_topic: None,
         }
     );
     assert!(failures(&rig.alerts().await).is_empty());

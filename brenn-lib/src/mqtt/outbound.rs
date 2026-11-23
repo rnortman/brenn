@@ -4,7 +4,7 @@
 use std::num::NonZeroU32;
 
 /// How long an outbound MQTT message is worth delivering, counted from its
-/// commit. What is left of it at hand-off is sent as the MQTT 5 Message
+/// commit, or from its release time when it was parked. What is left of it at hand-off is sent as the MQTT 5 Message
 /// Expiry Interval; `Forever` sends none. There is no default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MqttLifetime {
@@ -24,6 +24,9 @@ pub struct MqttPublishOptions {
     /// The `brenn:` channel the host publishes this message's delivery
     /// statuses to, as stated; absent asks for none.
     pub status_to: Option<String>,
+    /// The reply address as stated, a full `mqtt:<client>:<topic>`, sent as
+    /// the MQTT 5 Response Topic; absent sends none.
+    pub reply_to: Option<String>,
 }
 
 /// The declared MQTT clients, as the publish path needs them.

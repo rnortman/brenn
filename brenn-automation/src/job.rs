@@ -94,14 +94,16 @@ pub struct SendMessageAction {
 }
 
 /// MQTT publish action parameters: what an `MqttSend` call carries, with the
-/// payload fixed when the job is created or edited. It has no urgency,
-/// `reply_to` or delivery deadline, which a broker cannot carry.
+/// payload fixed when the job is created or edited. It has no urgency or
+/// delivery deadline, which a broker cannot carry, and no release time: the
+/// job's trigger is its time.
 ///
 /// Stored under the tool's own argument names, so a listed action given back
 /// to `AutoEdit` publishes the same bytes: the payload as exactly one of
 /// `body` (its text, when the bytes are UTF-8) and `body_base64` (standard
 /// base64 of the bytes otherwise); `lifetime_s` as a whole number of seconds
-/// or `"forever"`; `content_type` and `status_to` omitted when not set.
+/// or `"forever"`; `content_type`, `status_to` and `reply_to` omitted when not
+/// set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "MqttPublishWire", into = "MqttPublishWire")]
 pub struct MqttPublishAction {
@@ -116,6 +118,9 @@ pub struct MqttPublishAction {
     pub content_type: Option<String>,
     /// The `brenn:` channel that receives each fire's delivery statuses.
     pub status_to: Option<String>,
+    /// The reply address as given, `mqtt:<client>:<topic>`, sent as each
+    /// fire's MQTT 5 Response Topic.
+    pub reply_to: Option<String>,
 }
 
 impl MqttPublishAction {
@@ -127,6 +132,7 @@ impl MqttPublishAction {
             lifetime: self.lifetime,
             content_type: self.content_type.clone(),
             status_to: self.status_to.clone(),
+            reply_to: self.reply_to.clone(),
         }
     }
 }
@@ -168,6 +174,8 @@ struct MqttPublishWire {
     content_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     status_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_to: Option<String>,
 }
 
 impl TryFrom<MqttPublishWire> for MqttPublishAction {
@@ -191,6 +199,7 @@ impl TryFrom<MqttPublishWire> for MqttPublishAction {
             lifetime: wire.lifetime_s.0,
             content_type: wire.content_type,
             status_to: wire.status_to,
+            reply_to: wire.reply_to,
         })
     }
 }
@@ -211,6 +220,7 @@ impl From<MqttPublishAction> for MqttPublishWire {
             lifetime_s: StoredLifetime(action.lifetime),
             content_type: action.content_type,
             status_to: action.status_to,
+            reply_to: action.reply_to,
         }
     }
 }
@@ -579,6 +589,7 @@ mod tests {
             lifetime,
             content_type: Some("application/json".to_string()),
             status_to: Some("brenn:light-status".to_string()),
+            reply_to: Some("mqtt:home:lights/kitchen/result".to_string()),
         })
     }
 
@@ -602,7 +613,7 @@ mod tests {
                 MqttActionPayload::from_bytes(br#"{"state":"ON"}"#.to_vec()),
                 secs(300),
             ),
-            r#"{"kind":"mqtt_publish","to":"mqtt:home:lights/kitchen/set","body":"{\"state\":\"ON\"}","qos":1,"retain":false,"lifetime_s":300,"content_type":"application/json","status_to":"brenn:light-status"}"#,
+            r#"{"kind":"mqtt_publish","to":"mqtt:home:lights/kitchen/set","body":"{\"state\":\"ON\"}","qos":1,"retain":false,"lifetime_s":300,"content_type":"application/json","status_to":"brenn:light-status","reply_to":"mqtt:home:lights/kitchen/result"}"#,
         );
     }
 
@@ -611,7 +622,7 @@ mod tests {
         let payload = MqttActionPayload::from_bytes(vec![0xff, 0x00, 0xfe]);
         assert_stored(
             &mqtt_action(payload, secs(300)),
-            r#"{"kind":"mqtt_publish","to":"mqtt:home:lights/kitchen/set","body_base64":"/wD+","qos":1,"retain":false,"lifetime_s":300,"content_type":"application/json","status_to":"brenn:light-status"}"#,
+            r#"{"kind":"mqtt_publish","to":"mqtt:home:lights/kitchen/set","body_base64":"/wD+","qos":1,"retain":false,"lifetime_s":300,"content_type":"application/json","status_to":"brenn:light-status","reply_to":"mqtt:home:lights/kitchen/result"}"#,
         );
     }
 
@@ -625,6 +636,7 @@ mod tests {
             lifetime: MqttLifetime::Forever,
             content_type: None,
             status_to: None,
+            reply_to: None,
         });
         assert_stored(
             &action,
@@ -707,6 +719,7 @@ mod tests {
                 lifetime: secs(9),
                 content_type: Some("application/json".to_string()),
                 status_to: Some("brenn:light-status".to_string()),
+                reply_to: Some("mqtt:home:lights/kitchen/result".to_string()),
             }
         );
     }

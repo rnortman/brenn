@@ -37,7 +37,7 @@ use brenn_obs::security::{DenialKind, SecurityEventType, log_component_security_
 mod delivery_status;
 mod mqtt;
 pub use delivery_status::{DeliveryStatusPublish, DeliveryStatusRefusal};
-pub use mqtt::{MqttCommitted, MqttPayload, MqttRefusal, StatusToRefusal};
+pub use mqtt::{MqttCommitted, MqttPayload, MqttRefusal, ReplyToRefusal, StatusToRefusal};
 
 /// Per-channel memoized resolution for a batch flush: the channel entry and its
 /// live attacher-feed targets.
@@ -125,7 +125,9 @@ impl PublishResult {
     /// their own counters and LLM-facing recovery paths, not policy denials.
     /// `MqttRefused` returns `None` too: it is an argument error, except a
     /// `status_to` refused on its shape or the publisher's authority, which
-    /// carries the kind the same refusal of a `reply_to` carries.
+    /// carries the kind the same refusal of a `brenn:` `reply_to` carries, and
+    /// an MQTT `reply_to` outside the publisher's MQTT publish ACL, which
+    /// carries the kind of a denied MQTT target.
     pub fn signal_kind(&self) -> Option<DenialKind> {
         match self {
             Self::MqttRefused(MqttRefusal::StatusTo { why, .. }) => match why {
@@ -135,6 +137,10 @@ impl PublishResult {
                 StatusToRefusal::Unknown => Some(DenialKind::UnknownChannel),
                 StatusToRefusal::StatusOverBodyCap { .. } => None,
             },
+            Self::MqttRefused(MqttRefusal::ReplyTo {
+                why: ReplyToRefusal::AclDenied,
+                ..
+            }) => Some(DenialKind::AclDenied),
             Self::MalformedAddress(_) => Some(DenialKind::MalformedAddress),
             Self::UnknownChannel(_) => Some(DenialKind::UnknownChannel),
             Self::MissingSender => Some(DenialKind::MissingSender),
@@ -1096,15 +1102,12 @@ impl Messenger {
                     }
                     None => mqtt::mqtt_payload_len(&body, &attachments),
                 };
-                match self.admit_mqtt(
-                    policy,
-                    addr,
-                    options,
-                    payload_len,
-                    reply_to,
-                    deliver_after,
-                    delivery_deadline,
-                ) {
+                assert!(
+                    reply_to.is_none(),
+                    "an MQTT publish to {addr} carries an envelope reply_to; its reply address \
+                     travels in its MQTT options"
+                );
+                match self.admit_mqtt(policy, addr, options, payload_len, delivery_deadline) {
                     Ok(admitted) => (Arc::clone(&admitted.channel), Some(admitted)),
                     Err(refusal) => return refusal,
                 }
@@ -1322,8 +1325,12 @@ impl Messenger {
 
         let publish_ts_ns = db::utc_to_ns(Utc::now());
         let is_mqtt = mqtt_admitted.is_some();
+        // An MQTT publish's lifetime counts from when it may first be sent: its
+        // release time when parked, its commit otherwise. Final here, so a
+        // release rewrites nothing.
         let transport = mqtt_admitted.map(|admitted| {
-            super::TransportMeta::MqttPublish(admitted.transport(db::ns_to_utc(publish_ts_ns)))
+            let good_from = deliver_after.unwrap_or_else(|| db::ns_to_utc(publish_ts_ns));
+            super::TransportMeta::MqttPublish(admitted.transport(good_from))
         });
 
         // 6. Commit into the channel's retention through its store. One fork for
@@ -1347,21 +1354,37 @@ impl Messenger {
             publish_ts_ns,
             attachments,
         };
-        assert!(
-            deliver_after.is_none() || !is_mqtt,
-            "an MQTT publish to {addr} carries a release time its admission refuses"
-        );
         let (message_id, retained_seq) = match deliver_after {
-            Some(release_at) => match store.park(message, release_at).await {
-                Ok(parked) => (parked.message_uuid, None),
-                Err(brenn_queue::QuotaExceeded { cap }) => {
-                    // The cap is only knowable at the park, after the budget
-                    // draw: a sender retrying against a full deferred set must
-                    // not drain its budget without landing a message.
-                    self.refund_draw(origin, conversation_send_budget).await;
-                    return PublishResult::DeferredQuotaExceeded { cap };
+            Some(release_at) => {
+                // An MQTT park, like an MQTT commit, lands only while the egress
+                // reader holds its position on the channel, checked with the
+                // write; without one it is answered as for an unknown client.
+                let parked = if is_mqtt {
+                    let reader = mqtt_outbound_participant();
+                    match store
+                        .park_while_attached(message, release_at, &reader)
+                        .await
+                    {
+                        Some(parked) => parked,
+                        None => {
+                            self.refund_draw(origin, conversation_send_budget).await;
+                            return PublishResult::UnknownChannel(addr.to_string());
+                        }
+                    }
+                } else {
+                    store.park(message, release_at).await
+                };
+                match parked {
+                    Ok(parked) => (parked.message_uuid, None),
+                    Err(brenn_queue::QuotaExceeded { cap }) => {
+                        // The cap is only knowable at the park, after the budget
+                        // draw: a sender retrying against a full deferred set
+                        // must not drain its budget without landing a message.
+                        self.refund_draw(origin, conversation_send_budget).await;
+                        return PublishResult::DeferredQuotaExceeded { cap };
+                    }
                 }
-            },
+            }
             None => {
                 // An MQTT commit lands only while the egress reader holds its
                 // position on the channel, checked with the write: a client
@@ -1897,8 +1920,8 @@ pub struct WasmMqttPublish<'a> {
 
 /// Panic unless `publish` is a well-formed entry for the egress namespace: an
 /// MQTT entry is aimed at its own client's egress channel and carries no
-/// `reply_to`, release time, attachment or `status_to`, and an entry aimed anywhere in the
-/// egress namespace is an MQTT entry.
+/// `reply_to` (envelope or MQTT), release time, attachment or `status_to`, and
+/// an entry aimed anywhere in the egress namespace is an MQTT entry.
 fn assert_wasm_egress_entry(consumer_slug: &str, publish: &WasmPublish<'_>) {
     let addr = publish.channel_address;
     match &publish.mqtt {
@@ -1920,6 +1943,11 @@ fn assert_wasm_egress_entry(consumer_slug: &str, publish: &WasmPublish<'_>) {
             assert!(
                 mqtt.options.status_to.is_none(),
                 "publish_from_wasm: MQTT entry for {addr:?} names a status_to, which a \
+                 component cannot (slug={consumer_slug})"
+            );
+            assert!(
+                mqtt.options.reply_to.is_none(),
+                "publish_from_wasm: MQTT entry for {addr:?} names an MQTT reply_to, which a \
                  component cannot (slug={consumer_slug})"
             );
         }
@@ -2169,6 +2197,7 @@ impl Messenger {
                         m.client,
                         m.topic,
                         &m.options,
+                        None,
                         db::ns_to_utc(publish_ts_ns),
                     ))
                 });

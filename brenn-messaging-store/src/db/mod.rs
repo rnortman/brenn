@@ -129,7 +129,7 @@ mod deferral;
 pub use deferral::{
     DeferredLookup, DeferredRow, ReleasedRow, count_deferred, deferred_cap_refusal,
     delete_deferred, earliest_channel_release, edit_deferred, list_deferred_for_sender,
-    list_deferred_senders, lookup_deferred, release_due_for_channel,
+    list_deferred_senders, lookup_deferred, release_due_for_channel, take_deferred_for_channel,
 };
 
 #[cfg(test)]

@@ -531,13 +531,25 @@ impl Reader {
             message.id,
             publish.topic,
         );
+        if let Some(response_topic) = &publish.response_topic {
+            assert!(
+                rumqttc::valid_topic(response_topic),
+                "egress message {} names response topic {:?}, which the admission refuses",
+                message.id,
+                response_topic,
+            );
+        }
         let qos = qos_of(publish.qos).unwrap_or_else(|| {
             panic!(
                 "egress message {} with QoS {}, which the admission refuses",
                 message.id, publish.qos
             )
         });
-        let properties = publish_properties(publish.content_type.clone(), expiry);
+        let properties = publish_properties(
+            publish.content_type.clone(),
+            expiry,
+            publish.response_topic.clone(),
+        );
 
         let guard = self.handle.client.lock().await;
         let Some(client) = guard.as_ref() else {
@@ -858,16 +870,23 @@ pub(crate) fn expiry_interval(expires: &MqttExpiry, now: DateTime<Utc>) -> Optio
     Some(Some(u32::try_from(seconds).unwrap_or(u32::MAX)))
 }
 
-/// The PUBLISH properties carrying `content_type` and the Message Expiry
-/// Interval `expiry`; `None` when there is neither.
+/// The PUBLISH properties carrying `content_type`, the Message Expiry
+/// Interval `expiry` and the Response Topic `response_topic`; `None` when
+/// there is none of them. No Correlation Data is sent.
+// TODO(mqtt-correlation-data-and-inbound-response-topic): send Correlation
+// Data a sender can match a response on.
 fn publish_properties(
     content_type: Option<String>,
     expiry: Option<u32>,
+    response_topic: Option<String>,
 ) -> Option<rumqttc::PublishProperties> {
-    (content_type.is_some() || expiry.is_some()).then(|| rumqttc::PublishProperties {
-        content_type,
-        message_expiry_interval: expiry,
-        ..Default::default()
+    (content_type.is_some() || expiry.is_some() || response_topic.is_some()).then(|| {
+        rumqttc::PublishProperties {
+            content_type,
+            message_expiry_interval: expiry,
+            response_topic,
+            ..Default::default()
+        }
     })
 }
 

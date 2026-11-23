@@ -15,7 +15,7 @@ use brenn_db::auth::user::get_user_by_username;
 use brenn_db::conversation::{create_conversation, get_or_create_singleton_conversation};
 use brenn_lib::messaging::Urgency;
 use brenn_messaging::publish::{
-    MqttPayload, MqttRefusal, PublishOrigin, PublishResult, StatusToRefusal,
+    MqttPayload, MqttRefusal, PublishOrigin, PublishResult, ReplyToRefusal, StatusToRefusal,
 };
 
 use crate::schema::{
@@ -305,7 +305,8 @@ async fn fire_send_message(
 
 /// Fire an `mqtt_publish` action: one publish through the MQTT admission
 /// under the owner app, which decides against the current policy and client
-/// table. The lifetime counts from the commit. Every answer a configuration
+/// table. A fire states no release time, so the lifetime counts from the
+/// commit. Every answer a configuration
 /// change or a stored row can cause is a recorded outcome; only answers the
 /// call's own construction excludes panic.
 async fn fire_mqtt_publish(
@@ -323,6 +324,7 @@ async fn fire_mqtt_publish(
             to,
             MqttPayload::Inline(mpa.payload.as_bytes().to_vec()),
             &mpa.options(),
+            None,
         )
         .await;
     let refused = match result {
@@ -355,7 +357,7 @@ async fn fire_mqtt_publish(
         | PublishResult::DeferredQuotaExceeded { .. }
         | PublishResult::ImpetusUnauthorized) => unreachable!(
             "automation MQTT fire got {other:?}: its publish carries an inline payload and no \
-             release time, reply address, deadline or impetus; job uuid={}",
+             release time, deadline or impetus; job uuid={}",
             job.uuid
         ),
     }
@@ -385,6 +387,18 @@ fn mqtt_refusal_outcome(job: &JobSnapshot, refusal: MqttRefusal) -> FireOutcome 
                  {max}"
             )),
         },
+        MqttRefusal::ReplyTo { address, why } => match why {
+            ReplyToRefusal::AclDenied => auth_failure(format!(
+                "reply_to {address:?}: owner app {:?} MQTT publish ACL denies it",
+                job.owner_app_slug
+            )),
+            ReplyToRefusal::Malformed { detail } => {
+                action_error(format!("reply_to {address:?}: {detail}"))
+            }
+            ReplyToRefusal::OtherClient => action_error(format!(
+                "reply_to {address:?}: not on the client the message is published through"
+            )),
+        },
         MqttRefusal::InvalidQos { qos } => action_error(format!("invalid QoS {qos}")),
         MqttRefusal::InvalidContentType { reason } => {
             action_error(format!("invalid content type: {reason}"))
@@ -399,12 +413,9 @@ fn mqtt_refusal_outcome(job: &JobSnapshot, refusal: MqttRefusal) -> FireOutcome 
         MqttRefusal::BlobRefused { reason } => {
             action_error(format!("payload blob refused: {reason}"))
         }
-        other @ (MqttRefusal::DeliverAfter
-        | MqttRefusal::ReplyTo
-        | MqttRefusal::DeliveryDeadline
-        | MqttRefusal::PayloadShape) => unreachable!(
+        other @ (MqttRefusal::DeliveryDeadline | MqttRefusal::PayloadShape) => unreachable!(
             "automation MQTT fire refused with {other:?}: its publish carries an inline payload \
-             and no release time, reply address or deadline; job uuid={}",
+             and no deadline; job uuid={}",
             job.uuid
         ),
     }
@@ -2701,6 +2712,51 @@ mod tests {
                 assert!(egress_rows(&engine, client).await.is_empty(), "{case}");
             }
         }
+    }
+
+    /// A stored reply address is admitted at every fire: it rides as the
+    /// Response Topic while the ACL covers it, and a fire after the ACL stops
+    /// covering it records an `auth` failure and commits nothing.
+    #[tokio::test]
+    async fn mqtt_fire_carries_the_reply_topic_and_records_an_acl_narrowed_since() {
+        let ingress = FakeIngressRouter::new();
+        let (engine, apps) = make_mqtt_engine(
+            mqtt_sender_policy(),
+            ingress.clone() as Arc<dyn IngressRouter>,
+        )
+        .await;
+        let mut action = mqtt_action(KITCHEN, b"on");
+        action.reply_to = Some("mqtt:home:lights/result/set".to_string());
+        let job = mqtt_job(action);
+        insert_job_row(&*engine.db.lock().await, &job);
+        fire_one(&engine, job.clone()).await;
+        assert_eq!(last_fire(&engine).await, ("ok".into(), String::new(), 0));
+        let row = egress_rows(&engine, "home").await.pop().unwrap();
+        let Some(TransportMeta::MqttPublish(t)) = row.transport else {
+            panic!("no MQTT transport: {:?}", row.transport)
+        };
+        assert_eq!(t.response_topic.as_deref(), Some("lights/result/set"));
+        assert_eq!(row.reply_to, None);
+
+        edit_app_policy(&apps, |p| {
+            p.acls.mqtt_publish = vec![brenn_lib::access::acl::MqttMatcher {
+                client: "home".to_string(),
+                topic_filter: "lights/kitchen/set".to_string(),
+            }];
+        });
+        fire_one(&engine, job).await;
+        let (outcome, detail, failures) = last_fire(&engine).await;
+        assert_eq!((outcome.as_str(), failures), ("auth", 1), "{detail}");
+        assert!(
+            detail.contains("reply_to \"mqtt:home:lights/result/set\"")
+                && detail.contains("MQTT publish ACL denies it"),
+            "{detail}"
+        );
+        assert_eq!(
+            egress_rows(&engine, "home").await.len(),
+            1,
+            "nothing more committed"
+        );
     }
 
     /// A committed fire draws one unit of the send budget; an exhausted

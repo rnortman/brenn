@@ -128,6 +128,11 @@ impl<M> DeferredSet<M> {
         self.entries.drain(..due).collect()
     }
 
+    /// Remove and return every entry, due or not, in release order.
+    pub fn take_all(&mut self) -> Vec<Deferred<M>> {
+        std::mem::take(&mut self.entries)
+    }
+
     /// Every entry, release order, oldest release first.
     pub fn iter(&self) -> impl Iterator<Item = &Deferred<M>> {
         self.entries.iter()
@@ -226,6 +231,25 @@ mod tests {
         );
         assert_eq!(s.len(), 1);
         assert_eq!(s.next_release(), Some(300));
+    }
+
+    #[test]
+    fn take_all_empties_the_set_in_release_order_and_ids_stay_retired() {
+        let mut s = set(Some(3));
+        s.park("alice", "late", 300).unwrap();
+        let early = s.park("bob", "early", 100).unwrap();
+        s.park("alice", "mid", 200).unwrap();
+        let taken = s.take_all();
+        assert_eq!(
+            taken.iter().map(|e| e.message).collect::<Vec<_>>(),
+            vec!["early", "mid", "late"]
+        );
+        assert!(s.is_empty());
+        assert_eq!(s.next_release(), None);
+        // The cap slots are free again and no id is reused.
+        let next = s.park("alice", "again", 100).unwrap();
+        assert!(taken.iter().all(|e| e.id != next));
+        assert_ne!(next, early);
     }
 
     #[test]

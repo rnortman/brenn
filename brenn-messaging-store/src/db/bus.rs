@@ -1041,6 +1041,9 @@ pub struct MessageLookup {
     /// past recall: every subscriber reads it from its own position, and no
     /// server-side record of who has read it exists to revoke.
     pub parked: bool,
+    /// The row's stored transport is an outbound MQTT publish: a message on a
+    /// client's egress channel, which the reader hands to the broker.
+    pub mqtt_publish: bool,
 }
 
 /// Look up a message by UUID for authorship / status checks.
@@ -1048,15 +1051,17 @@ pub struct MessageLookup {
 pub fn lookup_message_for_authorship(conn: &Connection, uuid: Uuid) -> Option<MessageLookup> {
     let uuid_bytes = uuid.as_bytes().to_vec();
     conn.query_row(
-        "SELECT id, sender, deliver_after IS NOT NULL
+        "SELECT id, sender, deliver_after IS NOT NULL, transport
          FROM messaging_messages
          WHERE uuid = ?1",
         rusqlite::params![uuid_bytes],
         |row| {
+            let transport = super::read_transport(row, 3, uuid)?;
             Ok(MessageLookup {
                 message_id: row.get(0)?,
                 sender: row.get(1)?,
                 parked: row.get(2)?,
+                mqtt_publish: matches!(transport, Some(TransportMeta::MqttPublish(_))),
             })
         },
     )

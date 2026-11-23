@@ -199,6 +199,10 @@ fn lookup_message_for_authorship_reports_whether_the_message_is_still_parked() {
     assert_eq!(parked.message_id, parked_id);
     assert_eq!(parked.sender, "alice");
     assert!(parked.parked, "a scheduled message is still the sender's");
+    assert!(
+        !parked.mqtt_publish,
+        "a row with no transport is no MQTT publish"
+    );
 
     let live = lookup_message_for_authorship(&conn, live_uuid).unwrap();
     assert_eq!(live.message_id, live_id);

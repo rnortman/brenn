@@ -302,6 +302,12 @@ pub const CANCEL_ALREADY_PUBLISHED_ERR: &str =
 pub const EDIT_ALREADY_PUBLISHED_ERR: &str =
     "this message is already published; only a scheduled message can be edited";
 
+/// What `BrennMessageEdit` returns for a scheduled `MqttSend` publish, which
+/// is cancelled and sent again rather than edited. Quoted by the description
+/// as the two constants above are.
+pub const EDIT_MQTT_PUBLISH_ERR: &str = "a scheduled MQTT publish cannot be edited: cancel it with \
+     BrennMessageCancel and send it again with MqttSend";
+
 /// The lead-in of the second-cancel error, which appends the message UUID. The
 /// description quotes it as `"unknown message <uuid>"`.
 pub const UNKNOWN_MESSAGE_ERR: &str = "unknown message";
@@ -418,18 +424,20 @@ pub fn core_virtual_tools(app_config: &AppConfig) -> Vec<VirtualToolDef> {
             }),
         },
     ];
+    let brenn_send = app_config
+        .policy
+        .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
+        || app_config
+            .policy
+            .has_grant(brenn_envelope::grants::AppCapability::EphemeralPublish);
+    let mqtt = app_config
+        .policy
+        .has_grant(brenn_envelope::grants::AppCapability::MqttPublish);
+    let has_shell = !app_config.disabled_tools.iter().any(|tool| tool == "Bash");
     // Each builder below is told only whether its own send tool is offered,
     // and some of their texts name another builder's send tool.
     // TODO(tool-text-names-unoffered-tools)
-    tools.extend(messaging_virtual_tools(
-        app_config
-            .policy
-            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
-            || app_config
-                .policy
-                .has_grant(brenn_envelope::grants::AppCapability::EphemeralPublish),
-        !app_config.disabled_tools.iter().any(|tool| tool == "Bash"),
-    ));
+    tools.extend(messaging_virtual_tools(brenn_send, mqtt, has_shell));
     tools.extend(pwa_push_virtual_tools(
         app_config
             .policy
@@ -437,9 +445,6 @@ pub fn core_virtual_tools(app_config: &AppConfig) -> Vec<VirtualToolDef> {
     ));
     tools.extend(device_virtual_tools());
     tools.extend(usage_virtual_tools());
-    let mqtt = app_config
-        .policy
-        .has_grant(brenn_envelope::grants::AppCapability::MqttPublish);
     tools.extend(automation_virtual_tools(mqtt));
     tools.extend(mqtt_virtual_tools(mqtt));
     tools
@@ -456,22 +461,54 @@ pub fn core_virtual_tools(app_config: &AppConfig) -> Vec<VirtualToolDef> {
 /// over-offer the tool to subscribe-only apps: subscribe-only apps are never
 /// offered `BrennSend`.
 ///
+/// `mqtt` is whether the app holds `MqttPublish`, and so is offered `MqttSend`
+/// and may have parked a publish with it: the pending, cancel and edit texts
+/// name `MqttSend` and say how they treat such a publish only then.
+///
 /// `has_shell` is whether the conversation has the `Bash` tool, which the
 /// `brenn-tool save` and `send` commands need. The descriptions name a command,
 /// or `BrennSend`'s forwarding, only when both arguments allow it
 /// (`blob_files_sentence`). No text of these tools names `BrennSend` unless
 /// `enabled`.
-fn messaging_virtual_tools(enabled: bool, has_shell: bool) -> Vec<VirtualToolDef> {
+fn messaging_virtual_tools(enabled: bool, mqtt: bool, has_shell: bool) -> Vec<VirtualToolDef> {
     // `enabled` holds for an app with only `EphemeralPublish`, so the `brenn:`
     // send sentences below and `BrennSend`'s own description are shown to an app
     // whose `brenn:` sends are refused.
     // TODO(correctness-brenn-scheme-send-text-shown-to-ephemeral-only-app)
     let files = blob_files_sentence(has_shell, enabled);
-    let cancel_id_source = if enabled {
-        "UUID of the message to cancel (from BrennSend / BrennPendingList)."
-    } else {
-        "UUID of the message to cancel (from BrennPendingList)."
+    let cancel_id_source = format!(
+        "UUID of the message to cancel (from {}).",
+        [
+            enabled.then_some("BrennSend"),
+            mqtt.then_some("MqttSend"),
+            Some("BrennPendingList"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" / ")
+    );
+    let mqtt_text = |text: &str| {
+        if mqtt {
+            text.to_string()
+        } else {
+            String::new()
+        }
     };
+    let pending_mqtt = mqtt_text(concat!(
+        "Also lists this app's scheduled MqttSend publishes (sent with a future ",
+        "`deliver_after`): each is recognised by its `transport`, `mqtt_publish` with the ",
+        "`client_slug`, `topic` and `expires` it will be published with. The `channel` ",
+        "filter never selects them; list without it to see them. ",
+    ));
+    let cancel_mqtt = mqtt_text(concat!(
+        "A scheduled MqttSend publish is cancelled the same way, by the `message_id` ",
+        "MqttSend returned: it is never handed to the broker and no status is published ",
+        "for it.\n\n",
+    ));
+    let edit_mqtt = mqtt_text(&format!(
+        "A scheduled MqttSend publish is not editable: it answers \"{EDIT_MQTT_PUBLISH_ERR}\".\n\n"
+    ));
     let mut tools = vec![
         VirtualToolDef {
             name: "MessageChannelList".to_string(),
@@ -723,6 +760,7 @@ fn messaging_virtual_tools(enabled: bool, has_shell: bool) -> Vec<VirtualToolDef
                 "A message may carry `content_type` beside its `body`; a body that is not text is shown as a `{\"binary\": true, \"content_type\": ..., \"size\": ...}` placeholder, never as its bytes. ",
             )
             .to_owned()
+                + &pending_mqtt
                 + files,
             input_schema: serde_json::json!({
                 "type": "object",
@@ -753,6 +791,7 @@ fn messaging_virtual_tools(enabled: bool, has_shell: bool) -> Vec<VirtualToolDef
                 "an `ephemeral:` channel cannot be cancelled: it answers \"",
                 UNKNOWN_MESSAGE_ERR,
                 " <uuid>\" even while still parked.\n\n",
+                cancel_mqtt.as_str(),
                 "Success: `{ ok: true, cancelled: true, message_id }`. ",
                 "Errors: `{ ok: false, error: \"...\" }`."
             ]
@@ -795,6 +834,7 @@ fn messaging_virtual_tools(enabled: bool, has_shell: bool) -> Vec<VirtualToolDef
                 "`content_type` leaves the message untyped, and `content_type` without `body` ",
                 "is an error. The message's attachments cannot be changed: it keeps what it ",
                 "was sent with.\n\n",
+                edit_mqtt.as_str(),
                 "Success: returns updated MessageEnvelope. ",
                 "Errors: `{ ok: false, error: \"...\" }`. ",
                 "A message may carry `content_type` beside its `body`; a body that is not text is shown as a `{\"binary\": true, \"content_type\": ..., \"size\": ...}` placeholder, never as its bytes. ",
@@ -1402,12 +1442,15 @@ fn automation_virtual_tools(mqtt: bool) -> Vec<VirtualToolDef> {
             "together after an outage.\n",
             "  - `status_to`: optional brenn: channel for each fire's delivery statuses; ",
             "they mean what they mean for MqttSend.\n",
+            "  - `reply_to`: optional `mqtt:<client>:<topic>` on the same client as `to`, ",
+            "sent as the MQTT 5 Response Topic; this app must itself be allowed to publish ",
+            "to it, as for MqttSend.\n",
             "  The action needs this app's MQTT publish grant and an `acl publish` entry ",
-            "covering the topic, and the brenn: publish grant only for `status_to`. It is ",
-            "checked when the job is created or edited and again at every fire. A fire ",
-            "succeeds when the message is committed for the client and does not report ",
-            "delivery. `attachment`, `reply_to`, `urgency` and `delivery_deadline_secs` ",
-            "are refused on this kind.\n",
+            "covering the topic (and the reply topic), and the brenn: publish grant only for ",
+            "`status_to`. It is checked when the job is created or edited and again at every ",
+            "fire. A fire succeeds when the message is committed for the client and does not ",
+            "report delivery. `attachment`, `deliver_after`, `urgency` and ",
+            "`delivery_deadline_secs` are refused on this kind.\n",
         ));
     }
     create_description.push_str(concat!(
@@ -1440,7 +1483,7 @@ fn automation_virtual_tools(mqtt: bool) -> Vec<VirtualToolDef> {
                 },
                 "status_to": { "type": "string", "description": "mqtt_publish: optional brenn:<channel> this app may publish to; each fire's delivery statuses are published there." },
                 "urgency": { "type": "string", "enum": ["very-low", "low", "normal", "high"], "default": "low", "description": "send_message: urgency intent for this message; whether subscribers wake is their own wake_min policy." },
-                "reply_to": { "type": "string", "description": "send_message: optional brenn: reply address." },
+                "reply_to": { "type": "string", "description": "send_message: optional brenn: reply address. mqtt_publish: optional mqtt:<client>:<topic> on the same client, a topic this app may publish to, sent as the MQTT 5 Response Topic." },
                 "delivery_deadline_secs": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "send_message: optional delivery deadline." }
             },
             "required": ["kind", "to"]
@@ -1601,10 +1644,20 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 "A refused attachment or an over-bound payload refuses the call with a `reason` ",
                 "and spends no budget.\n\n",
                 "`qos` is 0, 1, or 2 (default 1). `retain` is true/false (default false). ",
-                "`lifetime_s` is required: a whole number of seconds (at least 1) or \"forever\". ",
+                "`lifetime_s` is required: a whole number of seconds (at least 1) or \"forever\", ",
+                "counted from the commit, or from `deliver_after` when one is given. ",
                 "It is how long Brenn keeps trying to deliver the message, and what is left of it ",
                 "when the message goes out is sent as the MQTT Message Expiry Interval (none for ",
                 "\"forever\").\n\n",
+                "`deliver_after` (RFC 3339) schedules the publish: the message is committed now ",
+                "and published at that time; a past or present time publishes now. Until then ",
+                "BrennPendingList lists it and BrennMessageCancel withdraws it by its ",
+                "`message_id`; it cannot be edited. Its statuses begin at release. The publish is ",
+                "released a moment after the stated time and then needs a connection, so a ",
+                "lifetime of a second or two can pass before it is sent. If its client is removed ",
+                "from the configuration first, it is reported `dropped` with cause `removed`. A ",
+                "client holds a bounded number of scheduled messages across every sender; a ",
+                "publish over that cap is refused.\n\n",
                 "The call returns once the message is committed for delivery, with its ",
                 "`message_id`, and never reports delivery. `client_connected` says whether the ",
                 "client is connected now; when it is not, the message waits for a connection ",
@@ -1642,6 +1695,11 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 "missing `handed` alone if a duplicate is worse than a loss. A message the ",
                 "client's channel window dropped, or one sent as its client was being removed, ",
                 "gets no status at all.\n\n",
+                "`reply_to` names a topic as `mqtt:<client>:<topic>`, on the same client as ",
+                "`to`, and is sent as the MQTT 5 Response Topic, so a responder knows where to ",
+                "answer. It must be a concrete topic that this app may itself publish to under ",
+                "its `acl publish` entries; any other is refused. No Correlation Data is sent, ",
+                "so match a response to its request by the response's payload.\n\n",
                 "Wildcards (`+` or `#`) in the topic are rejected — use a concrete topic name. ",
                 "The app publishes only to topics its `acl publish` entries admit; a refusal ",
                 "names the topic. ",
@@ -1694,6 +1752,15 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                     "status_to": {
                         "type": "string",
                         "description": "Optional brenn:<channel> this app may publish to; Brenn publishes the message's delivery statuses there"
+                    },
+                    "reply_to": {
+                        "type": "string",
+                        "description": "Optional mqtt:<client>:<topic> on the same client, a concrete topic this app may publish to; sent as the MQTT 5 Response Topic"
+                    },
+                    "deliver_after": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "Optional RFC 3339 time to publish at; the lifetime counts from it. Listed by BrennPendingList and cancellable until then"
                     }
                 },
                 "required": ["to", "lifetime_s"]
@@ -2879,6 +2946,50 @@ mod tests {
         );
     }
 
+    /// The pending, cancel and edit texts name `MqttSend` and say how they
+    /// treat its scheduled publishes exactly when the app holds `MqttPublish`.
+    #[test]
+    fn the_management_texts_name_mqttsend_only_with_its_grant() {
+        let cases: [(&[AppCapability], &str); 4] = [
+            (
+                &[AppCapability::MqttPublish],
+                "UUID of the message to cancel (from MqttSend / BrennPendingList).",
+            ),
+            (
+                &[AppCapability::MqttPublish, AppCapability::MessagingPublish],
+                "UUID of the message to cancel (from BrennSend / MqttSend / BrennPendingList).",
+            ),
+            (
+                &[AppCapability::MessagingPublish],
+                "UUID of the message to cancel (from BrennSend / BrennPendingList).",
+            ),
+            (
+                &[AppCapability::MessagingSubscribe],
+                "UUID of the message to cancel (from BrennPendingList).",
+            ),
+        ];
+        for (grants, source) in cases {
+            let tools = tools_for(grants, &["WebFetch"]);
+            assert_eq!(cancel_id_description(&tools), source, "{grants:?}");
+            let mqtt = grants.contains(&AppCapability::MqttPublish);
+            for name in ["BrennPendingList", "BrennMessageCancel", "BrennMessageEdit"] {
+                let description = &tool(&tools, name).description;
+                assert_eq!(
+                    description.contains("MqttSend"),
+                    mqtt,
+                    "{grants:?} {name}: {description}"
+                );
+            }
+            assert_eq!(
+                tool(&tools, "BrennMessageEdit")
+                    .description
+                    .contains(EDIT_MQTT_PUBLISH_ERR),
+                mqtt,
+                "{grants:?}"
+            );
+        }
+    }
+
     #[test]
     fn with_brennsend_the_messaging_texts_name_it() {
         for publish in [
@@ -3369,6 +3480,7 @@ mod tests {
             "retain",
             "lifetime_s",
             "status_to",
+            "reply_to",
         ] {
             assert_eq!(shape(&action[key]), shape(&send[key]), "{key}");
         }

@@ -83,8 +83,8 @@ pub use ingress::{
 pub use live::{GapReason, PrepaidDestination, PrepaidEntry, Replay};
 pub use publish::{
     AttachBatchPublish, AttachSendDraw, AttachSendVerdict, IngressMessage, MissingChannelPosture,
-    MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, StatusToRefusal,
-    WasmMqttPublish, WasmPublish, is_well_formed_address,
+    MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, ReplyToRefusal,
+    StatusToRefusal, WasmMqttPublish, WasmPublish, is_well_formed_address,
 };
 pub use query::{MessageQuery, QueryError};
 pub use retained_part::{AdmittedPart, NamedPart, PartRefusal, ToolChannelAttachments};
@@ -677,6 +677,17 @@ pub struct ParkedSet {
 // ---------------------------------------------------------------------------
 // Messenger
 // ---------------------------------------------------------------------------
+
+/// What [`Messenger::detach_subscriber_taking_all`] took with the position.
+#[derive(Debug)]
+pub struct DetachedTaking {
+    /// What the subscriber had not been served at its `push_depth`, oldest
+    /// first.
+    pub unseen: Vec<(store::MessageSeq, Arc<MessageEnvelope>)>,
+    /// Every message that was parked on the channel, whoever sent it, removed,
+    /// soonest release first.
+    pub parked: Vec<store::DeferredMessage>,
+}
 
 /// What one release sweep across every channel moved into retention.
 #[derive(Debug, Default)]
@@ -1932,25 +1943,28 @@ impl Messenger {
         dropped
     }
 
-    /// Give up `subscriber`'s position on `channel_address` and return what it
-    /// had not been served at `push_depth`, oldest first — read and dropped in
-    /// one store step, so no commit lands between the two. The outrun the read
+    /// Give up `subscriber`'s position on `channel_address`; return what it had
+    /// not been served at `push_depth`, oldest first, and every message parked
+    /// on the channel, removed, soonest release first — all in one store step,
+    /// so no commit, release or park lands between them. The outrun the read
     /// passed is enacted under `noise`, as an advance over it would have, and
     /// the metered tally then goes with the position, as for
-    /// [`Messenger::detach_subscriber`].
+    /// [`Messenger::detach_subscriber`]. When a parked message was removed, the
+    /// blobs it alone named are reaped after the store has let go.
     ///
-    /// `None` when the subscriber held no position: nothing is enacted.
+    /// `None` when the subscriber held no position: nothing is enacted and
+    /// nothing removed.
     ///
     /// # Panics
     ///
     /// If `channel_address` resolves to no channel, or `push_depth` is sampled.
-    pub async fn detach_subscriber_taking_unseen(
+    pub async fn detach_subscriber_taking_all(
         &self,
         channel_address: &str,
         subscriber: &ParticipantId,
         push_depth: config::Depth,
         noise: config::NoiseLevel,
-    ) -> Option<Vec<(store::MessageSeq, Arc<MessageEnvelope>)>> {
+    ) -> Option<DetachedTaking> {
         let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
             panic!(
                 "messaging: detach requested for channel {channel_address:?} not in the directory"
@@ -1958,11 +1972,36 @@ impl Messenger {
         });
         let taken = self
             .store_for(&entry)
-            .detach_taking_unseen(subscriber, push_depth)
+            .detach_taking_all(subscriber, push_depth)
             .await?;
         self.enact_overflow_noise(&entry.address, subscriber, noise, taken.outrun.noise_charge);
         self.forget_metered_drops(&entry.address, subscriber);
-        Some(taken.unseen)
+        if !taken.parked.is_empty() {
+            self.reap_blobs().await;
+        }
+        Some(DetachedTaking {
+            unseen: taken.unseen,
+            parked: taken.parked,
+        })
+    }
+
+    /// Remove and return every message parked on `channel_address`, whoever
+    /// sent it and whether or not it is due, soonest release first. When one
+    /// was removed, the blobs it alone named are reaped after the store has
+    /// let go.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel.
+    pub async fn take_deferred(&self, channel_address: &str) -> Vec<store::DeferredMessage> {
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!("messaging: take_deferred for channel {channel_address:?} not in the directory")
+        });
+        let taken = self.store_for(&entry).take_deferred().await;
+        if !taken.is_empty() {
+            self.reap_blobs().await;
+        }
+        taken
     }
 
     /// Advance `subscriber`'s position on `channel_address` over a window it

@@ -461,12 +461,10 @@ fn parse_mqtt_publish(
                 .to_string(),
         );
     }
-    // TODO(mqtt-publish-reply-to-and-deliver-after-refused): accept `reply_to`
-    // under the rule every MQTT publish takes it by.
-    if action_obj.contains_key("reply_to") {
+    if action_obj.contains_key("deliver_after") {
         return Err(
-            "action.reply_to does not apply to an mqtt_publish action: an MQTT publish \
-             takes no reply address"
+            "action.deliver_after does not apply to an mqtt_publish action: the job's trigger \
+             is its time"
                 .to_string(),
         );
     }
@@ -493,6 +491,7 @@ fn parse_mqtt_publish(
         retain,
         lifetime,
         status_to,
+        reply_to,
         ..
     } = mqtt_publish_args::parse(action_value).map_err(|e| format!("action: {e}"))?;
     let outbound = match payload {
@@ -513,6 +512,7 @@ fn parse_mqtt_publish(
         lifetime,
         content_type: outbound.content_type,
         status_to,
+        reply_to,
     }))
 }
 

@@ -646,7 +646,9 @@ impl AppConfig {
     /// app can no longer publish, fire, or author SendMessage jobs. This `OR`
     /// is retained only for participation-wide concerns: the identity-uniqueness
     /// assertion in `Messenger::new`, the `resolve_sender` read/management path,
-    /// and the subsystem-boot gate.
+    /// and the subsystem-boot gate. `resolve_sender` additionally admits an app
+    /// holding only `MqttPublish`, on its own condition and not through this
+    /// method.
     ///
     /// `BrennSend` tool *visibility* gates on the
     /// `MessagingPublish` grant directly (`integration.rs`,

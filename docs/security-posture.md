@@ -139,6 +139,27 @@ In rough order of severity if compromised:
   not alert; each is still a `warn` line and a per-client count, as every
   egress failure is. A broker refusal can only concern a topic the app's own
   `acl publish` entries admit, and is not a security event, told or not.
+- **MQTT reply topics.** A `reply_to` on an MQTT publish is sent as the MQTT
+  5 Response Topic, which asks whoever answers to publish there. It is
+  admitted only as a concrete topic on the client the message goes through
+  that the sender's own `acl publish` entries cover, so a sender cannot get
+  a responder to publish where the sender itself may not; a sender therefore
+  needs publish rights on its own reply topic. A reply topic the ACL does
+  not cover is refused as an MQTT publish denial, the same security event as
+  a denied target; an automation's stored reply topic is judged again at
+  every fire.
+- **Scheduled MQTT publishes.** An `MqttSend` with a future `deliver_after`
+  is admitted once, at the call — target, ACL, reply topic, `status_to` —
+  and parked on the client's egress channel until its release time. An app
+  whose `acl publish` entries are narrowed, or that is removed from the
+  configuration, after it parked a publish still has that publish released
+  and sent: nothing re-admits it at release. The operator's recall is
+  removing the client (which reports the parked messages `dropped`,
+  `removed`) or deleting the message's row. Only the sender's own app can
+  list, cancel or see the parked message through the tools. The client's
+  deferred cap is shared by every sender to it, so one sender can fill it
+  and refuse others' scheduled publishes until some release; immediate
+  publishes are unaffected.
 - **Cross-user and cross-app isolation.** Conversation history, per-app data,
   per-app filesystem scope, per-component WASM storage. One user or one app must
   not reach another's data.

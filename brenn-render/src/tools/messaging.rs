@@ -464,6 +464,7 @@ mod tests {
                         content_type: None,
                         expires: brenn_lib::messaging::MqttExpiry::Never,
                         status_to: None,
+                        response_topic: None,
                     },
                 )),
                 ..fake_envelope("on")

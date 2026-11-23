@@ -1113,6 +1113,10 @@ async fn execute_edit(
         EditResult::AlreadyDelivered => outcome_err(Cow::Borrowed(
             brenn_lib::integration::EDIT_ALREADY_PUBLISHED_ERR,
         )),
+        // The tool description quotes this constant.
+        EditResult::MqttPublish => {
+            outcome_err(Cow::Borrowed(brenn_lib::integration::EDIT_MQTT_PUBLISH_ERR))
+        }
         EditResult::NoFieldsProvided => outcome_err(Cow::Borrowed(NO_EDIT_FIELDS_ERR)),
         EditResult::BodyTooLarge { len, max } => outcome_err(Cow::Owned(format!(
             "body too large: {len} bytes (max {max})"
@@ -1166,7 +1170,9 @@ fn parse_present_rfc3339(v: &serde_json::Value) -> Result<Option<DateTime<Utc>>,
 /// Prefer `parse_present_rfc3339` at call sites that have already done a
 /// `contains_key` guard: it takes `&serde_json::Value` directly and makes
 /// the key-presence contract explicit in the type.
-fn parse_optional_rfc3339(v: Option<&serde_json::Value>) -> Result<Option<DateTime<Utc>>, String> {
+pub(crate) fn parse_optional_rfc3339(
+    v: Option<&serde_json::Value>,
+) -> Result<Option<DateTime<Utc>>, String> {
     match v {
         None => Ok(None),
         Some(v) => parse_present_rfc3339(v),

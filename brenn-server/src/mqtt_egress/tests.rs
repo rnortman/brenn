@@ -291,6 +291,7 @@ fn transport(topic: &str) -> MqttPublishTransport {
         content_type: Some("text/plain".to_string()),
         expires: MqttExpiry::Never,
         status_to: None,
+        response_topic: None,
     }
 }
 
@@ -1684,4 +1685,247 @@ async fn a_removal_whose_status_is_refused_alerts_the_refusal() {
         "{}",
         alerts[1].1
     );
+}
+
+// ── Parked messages ─────────────────────────────────────────────────────
+
+impl Fixture {
+    /// Park one message from `sender` on the client's channel until
+    /// `release_at`, published as `publish`, as a deferred `MqttSend` does.
+    async fn park_as(
+        &self,
+        sender: &str,
+        publish: MqttPublishTransport,
+        release_at: chrono::DateTime<Utc>,
+    ) -> Uuid {
+        self.messenger
+            .store_for_address(ADDRESS)
+            .park(
+                NewMessage {
+                    source: "test".to_string(),
+                    sender: sender.to_string(),
+                    body: MessageBody::from_parts(Some("application/octet-stream"), b"later")
+                        .unwrap(),
+                    urgency: Urgency::Normal,
+                    envelope_type: ChannelScheme::Brenn,
+                    transport: Some(TransportMeta::MqttPublish(publish)),
+                    reply_to: None,
+                    delivery_deadline: None,
+                    impetus: None,
+                    publish_ts_ns: utc_to_ns(Utc::now()),
+                    attachments: HeldAttachments::none(),
+                },
+                release_at,
+            )
+            .await
+            .expect("under the channel's deferred cap")
+            .message_uuid
+    }
+
+    async fn parked_count(&self) -> u64 {
+        let store = self.messenger.store_for_address(ADDRESS);
+        store.deferred_len().await
+    }
+
+    async fn release_due(&self) -> usize {
+        let store = self.messenger.store_for_address(ADDRESS);
+        store.release_due(Utc::now()).await.released.len()
+    }
+}
+
+/// Polls `fut` once with a waker that does nothing and asserts it is pending.
+/// A future pending on the database lock holds its place in the lock's queue,
+/// and a later `.await` finds the lock handed to it.
+fn poll_pending<F: std::future::Future + ?Sized>(fut: std::pin::Pin<&mut F>, what: &str) {
+    use std::task::{Context, Poll, Waker};
+    assert!(
+        matches!(
+            fut.poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ),
+        "{what}"
+    );
+}
+
+/// A parked message is invisible to the reader until a release pass moves it
+/// into retention; it is then handed like any commit.
+#[tokio::test]
+async fn a_parked_message_is_handed_only_after_its_release() {
+    let f = Fixture::new().await;
+    let bus = f.hub.open(CLIENT).await;
+    let later = f
+        .park_as(
+            "app:pa-bob",
+            transport("lights/kitchen/set"),
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+    let due = f
+        .park_as(
+            "app:pa-bob",
+            transport("lights/hall/set"),
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await;
+    assert!(bus.unhanded(10).await.is_empty(), "nothing before release");
+
+    assert_eq!(f.release_due().await, 1);
+    assert_eq!(ids(&bus.unhanded(10).await), vec![due]);
+    assert_eq!(f.parked_count().await, 1, "{later} is still parked");
+}
+
+/// `close` reports parked messages with the unread: the count covers both,
+/// then each named retained message in channel order, then each named parked
+/// message in release order. The parked rows are gone, and a client opened
+/// again under the slug finds nothing to release.
+#[tokio::test]
+async fn close_reports_parked_messages_after_the_unread_and_removes_them() {
+    use delivery::{DeliveryDropCause as D, DeliveryKind as K};
+    let f = Fixture::new().await;
+    let _bus = f.hub.open(CLIENT).await;
+    let named = |topic: &str| MqttPublishTransport {
+        status_to: Some(BOB_STATUS.to_string()),
+        ..transport(topic)
+    };
+    let soon = Utc::now() + chrono::Duration::hours(1);
+    let parked_late = f
+        .park_as(
+            &identity(BOB),
+            named("lights/c/set"),
+            soon + chrono::Duration::hours(1),
+        )
+        .await;
+    let parked_early = f.park_as(&identity(BOB), named("lights/b/set"), soon).await;
+    f.park_as("app:pa-bob", transport("lights/x/set"), soon)
+        .await;
+    let retained = f
+        .commit_publish_as(&identity(BOB), b"on", named("lights/a/set"))
+        .await;
+    f.commit_n(1).await;
+
+    f.hub.close(CLIENT).await;
+    let statuses = f.statuses().await;
+    assert_eq!(
+        statuses.iter().map(|s| s.message_id).collect::<Vec<_>>(),
+        [retained, parked_early, parked_late],
+        "the retained in channel order, then the parked in release order"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|s| s.kind == K::Dropped { cause: D::Removed })
+    );
+    let alerts = f.alerts().await;
+    assert_eq!(alerts[0].0, "MQTT egress: dropped (home)");
+    assert!(
+        alerts[0].1.contains("2 message(s)"),
+        "one unread and one parked, unnamed: {}",
+        alerts[0].1
+    );
+    assert_eq!(f.parked_count().await, 0, "the parked rows are gone");
+
+    let _bus = f.hub.open(CLIENT).await;
+    assert_eq!(f.release_due().await, 0, "nothing old to release");
+}
+
+/// A fresh position over a channel still holding parked messages — an earlier
+/// client of the slug, removed while the server was down — deletes them, and
+/// none is ever handed.
+#[tokio::test]
+async fn a_fresh_position_deletes_what_is_still_parked() {
+    let f = Fixture::new().await;
+    f.park_as(
+        "app:pa-bob",
+        transport("lights/a/set"),
+        Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+    f.park_as(
+        "app:pa-bob",
+        transport("lights/b/set"),
+        Utc::now() + chrono::Duration::hours(1),
+    )
+    .await;
+    f.commit_n(1).await;
+
+    let bus = f.hub.open(CLIENT).await;
+    assert_eq!(f.parked_count().await, 0, "the parked rows are deleted");
+    assert_eq!(f.release_due().await, 0);
+    assert!(bus.unhanded(10).await.is_empty());
+    assert!(f.statuses().await.is_empty(), "nothing is reported");
+}
+
+/// A release queued on the database lock between the fresh position's attach
+/// and its take lands in retention above the new position; the skip after the
+/// take passes it, and it is not handed.
+#[tokio::test]
+async fn a_release_between_the_attach_and_the_take_is_skipped() {
+    let f = Fixture::new().await;
+    f.park_as(
+        "app:pa-bob",
+        transport("lights/a/set"),
+        Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+    let store = f.messenger.store_for_address(ADDRESS);
+
+    let held = f.messenger.db().lock().await;
+    let mut open = Box::pin(f.hub.open(CLIENT));
+    poll_pending(open.as_mut(), "the open waits at its attach");
+    let mut release = Box::pin(store.release_due(Utc::now()));
+    poll_pending(release.as_mut(), "the release queues behind the attach");
+    drop(held);
+    poll_pending(
+        open.as_mut(),
+        "the open attaches and waits at its take, behind the release",
+    );
+    assert_eq!(release.await.released.len(), 1, "released before the take");
+    let bus = open.await;
+    assert!(
+        bus.unhanded(10).await.is_empty(),
+        "the skip passed the released message"
+    );
+    assert_eq!(f.parked_count().await, 0);
+}
+
+/// A release queued on the database lock between the fresh position's take
+/// and its skip finds nothing to release: the take already deleted the row.
+/// Skipping before taking would let that release land above the position and
+/// be handed.
+#[tokio::test]
+async fn a_release_between_the_take_and_the_skip_finds_nothing() {
+    let f = Fixture::new().await;
+    f.park_as(
+        "app:pa-bob",
+        transport("lights/a/set"),
+        Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+    let store = f.messenger.store_for_address(ADDRESS);
+
+    let held = f.messenger.db().lock().await;
+    let mut open = Box::pin(f.hub.open(CLIENT));
+    poll_pending(open.as_mut(), "the open waits at its attach");
+    let mut holder = Box::pin(f.messenger.db().lock());
+    poll_pending(holder.as_mut(), "the holder queues behind the attach");
+    drop(held);
+    poll_pending(
+        open.as_mut(),
+        "the open attaches and waits at its next step, behind the holder",
+    );
+    let held = holder.await;
+    let mut release = Box::pin(store.release_due(Utc::now()));
+    poll_pending(release.as_mut(), "the release queues behind that step");
+    drop(held);
+    poll_pending(
+        open.as_mut(),
+        "the open takes one step and waits behind the release",
+    );
+    assert!(
+        release.await.released.is_empty(),
+        "the take ran before the release"
+    );
+    let bus = open.await;
+    assert!(bus.unhanded(10).await.is_empty(), "nothing is handed");
+    assert_eq!(f.parked_count().await, 0);
 }

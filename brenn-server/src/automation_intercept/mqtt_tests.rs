@@ -58,6 +58,7 @@ fn an_mqtt_publish_action_parses_every_field() {
         "retain": true,
         "lifetime_s": "forever",
         "status_to": "brenn:light-status",
+        "reply_to": "mqtt:home:cmd/light/result",
     })) }))
     .unwrap();
     assert_eq!(
@@ -70,6 +71,7 @@ fn an_mqtt_publish_action_parses_every_field() {
             lifetime: MqttLifetime::Forever,
             content_type: Some("application/json".to_string()),
             status_to: Some("brenn:light-status".to_string()),
+            reply_to: Some("mqtt:home:cmd/light/result".to_string()),
         })
     );
     let action =
@@ -85,6 +87,7 @@ fn an_mqtt_publish_action_parses_every_field() {
             lifetime: MqttLifetime::Seconds(NonZeroU32::new(60).unwrap()),
             content_type: None,
             status_to: None,
+            reply_to: None,
         })
     );
 }
@@ -104,7 +107,7 @@ fn an_mqtt_publish_action_refuses_what_does_not_apply() {
         "action.attachment is not available in an automation: a job holds its payload \
          itself; give body or body_base64"
     );
-    for key in ["urgency", "reply_to", "delivery_deadline_secs"] {
+    for key in ["urgency", "deliver_after", "delivery_deadline_secs"] {
         let err = action_err(mqtt(json!({ key: "x" })));
         assert!(
             err.starts_with(&format!(
@@ -124,6 +127,10 @@ fn an_mqtt_publish_action_refuses_what_does_not_apply() {
     assert_eq!(
         action_err(mqtt(json!({ "to": "brenn:test-channel" }))),
         "action.to is a brenn: address: use action kind \"send_message\""
+    );
+    assert_eq!(
+        action_err(mqtt(json!({ "reply_to": 7 }))),
+        "action: invalid `reply_to` argument: give an `mqtt:<client>:<topic>` address as a string"
     );
     assert_eq!(
         action_err(mqtt(json!({ "retain": "yes" }))),
@@ -395,4 +402,121 @@ async fn an_admission_argument_refusal_is_logged_as_an_automation_tool_rejection
     );
     assert!(logs_contain("automation tool rejected"));
     assert!(!logs_contain("mqtt tool rejected"));
+}
+
+// ── reply_to ────────────────────────────────────────────────────────────
+
+/// The Response Topic of each row committed to `client`'s egress channel,
+/// oldest first.
+async fn committed_response_topics(bridge: &ActiveBridge, client: &str) -> Vec<Option<String>> {
+    let messenger = bridge.messenger().expect("an MQTT bridge has a messenger");
+    let conn = messenger.db().lock().await;
+    brenn_messaging_store::db::load_channel_retained_tail(
+        &conn,
+        egress_channel_uuid(&mqtt_egress_address(client)),
+        Depth::Unbounded,
+    )
+    .into_iter()
+    .map(|(_, envelope)| match envelope.transport {
+        Some(brenn_envelope::TransportMeta::MqttPublish(t)) => t.response_topic,
+        other => panic!("expected MqttPublish metadata, got {other:?}"),
+    })
+    .collect()
+}
+
+/// A `reply_to` is accepted at create, listed as given, accepted back by
+/// `AutoEdit` as listed, and sent as each fire's Response Topic.
+#[tokio::test]
+async fn a_reply_to_is_stored_listed_and_fired() {
+    let bridge = mqtt_bridge().await;
+    let id = create(
+        &bridge,
+        mqtt(json!({ "reply_to": "mqtt:home:cmd/light/result" })),
+    )
+    .await;
+    let listed = listed_action(&bridge).await;
+    assert_eq!(
+        listed,
+        json!({
+            "kind": "mqtt_publish",
+            "to": "mqtt:home:cmd/light",
+            "body": "on",
+            "qos": 1,
+            "retain": false,
+            "lifetime_s": 60,
+            "reply_to": "mqtt:home:cmd/light/result",
+        })
+    );
+    let v = answer(
+        &bridge,
+        MCP_AUTO_EDIT_TOOL,
+        json!({ "id": id, "action": listed.clone() }),
+    )
+    .await;
+    assert_eq!(v["ok"], json!(true), "{v}");
+    assert_eq!(listed_action(&bridge).await, listed);
+    fire_all(&bridge).await;
+    assert_eq!(
+        committed_response_topics(&bridge, "home").await,
+        vec![Some("cmd/light/result".to_string())]
+    );
+}
+
+/// A reply topic outside the app's MQTT publish ACL is refused at create
+/// with `MqttSend`'s answer and signal, and no job is made.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_reply_topic_outside_the_acl_is_refused_at_create() {
+    let bridge = ActiveBridge::test_new_for_mqtt_automation(
+        &[("home", "lights/#")],
+        &["home"],
+        &BrennStatusChannels::default(),
+    )
+    .await;
+    let v = answer(
+        &bridge,
+        MCP_AUTO_CREATE_TOOL,
+        create_input(mqtt(json!({
+            "to": "mqtt:home:lights/kitchen",
+            "reply_to": "mqtt:home:locks/front",
+        }))),
+    )
+    .await;
+    assert_eq!(
+        v,
+        json!({
+            "ok": false,
+            "error": "`reply_to` \"mqtt:home:locks/front\" is not allowed for this app: no \
+                      `acl publish` entry admits that topic on client `home`; a reply topic \
+                      must be one this app may publish to",
+        })
+    );
+    assert!(logs_contain(
+        "kind=acl_denied address=mqtt:home:locks/front"
+    ));
+    let list = answer(&bridge, MCP_AUTO_LIST_TOOL, json!({})).await;
+    assert_eq!(list["jobs"], json!([]));
+}
+
+/// A reply address on another client is an argument rejection at create.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_reply_to_on_another_client_is_rejected_at_create() {
+    let bridge = mqtt_bridge().await;
+    let v = answer(
+        &bridge,
+        MCP_AUTO_CREATE_TOOL,
+        create_input(mqtt(json!({ "reply_to": "mqtt:away:cmd/light/result" }))),
+    )
+    .await;
+    assert_eq!(
+        v,
+        json!({
+            "ok": false,
+            "error": "`reply_to` must name a topic on the client the message is published \
+                      through (`home`)",
+        })
+    );
+    assert!(logs_contain("automation tool rejected"));
+    assert!(!logs_contain("mqtt_publish_denied"));
 }

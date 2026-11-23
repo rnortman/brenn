@@ -977,3 +977,296 @@ async fn a_target_refusal_answers_before_the_status_to() {
         "{error}"
     );
 }
+
+// ── reply_to ────────────────────────────────────────────────────────────
+
+/// A publish to `mqtt:home:a/x/set` on [`bridge_publishing_to_a_set`] stating
+/// `reply_to`.
+fn replying(reply_to: serde_json::Value) -> serde_json::Value {
+    json!({
+        "to": "mqtt:home:a/x/set",
+        "body": "on",
+        "lifetime_s": 60,
+        "reply_to": reply_to,
+    })
+}
+
+#[tokio::test]
+async fn a_reply_to_rides_on_the_committed_row_as_the_response_topic() {
+    let bridge = bridge_publishing_to_a_set().await;
+    let row = commit(
+        &bridge,
+        json!({ "to": "mqtt:home:a/x/set", "body": "on", "reply_to": "mqtt:home:a/result/set" }),
+    )
+    .await;
+    assert_eq!(
+        transport(&row).response_topic.as_deref(),
+        Some("a/result/set")
+    );
+    assert_eq!(row.reply_to, None);
+    let row = commit(&bridge, json!({ "to": "mqtt:home:a/x/set", "body": "off" })).await;
+    assert_eq!(transport(&row).response_topic, None);
+}
+
+#[tokio::test]
+async fn a_reply_to_that_is_not_a_nonempty_string_is_an_argument_error() {
+    let bridge = bridge_publishing_to_a_set().await;
+    for value in [
+        json!(""),
+        json!(7),
+        json!(null),
+        json!(["mqtt:home:a/r/set"]),
+    ] {
+        assert_rejected(
+            &bridge,
+            replying(value),
+            "invalid `reply_to` argument: give an `mqtt:<client>:<topic>` address as a string",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_malformed_or_wildcard_reply_to_is_rejected_and_no_security_event() {
+    let bridge = bridge_publishing_to_a_set().await;
+    for address in ["mqtt:home:a/+/set", "mqtt:home", "brenn:replies"] {
+        let detail = parse_topic_name(address).unwrap_err().to_string();
+        assert_rejected(
+            &bridge,
+            replying(json!(address)),
+            &format!(
+                "invalid `reply_to` {address:?}: {detail}; give a concrete topic as \
+                 `mqtt:<client>:<topic>`"
+            ),
+        )
+        .await;
+    }
+    assert!(!logs_contain("mqtt_publish_denied"));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_reply_to_on_another_client_is_rejected_and_no_security_event() {
+    let bridge = bridge_publishing_to_a_set().await;
+    assert_rejected(
+        &bridge,
+        replying(json!("mqtt:office:a/x/set")),
+        "`reply_to` must name a topic on the client the message is published through (`home`)",
+    )
+    .await;
+    assert!(!logs_contain("mqtt_publish_denied"));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_reply_topic_outside_the_acl_is_refused_as_a_security_event() {
+    let bridge = bridge_publishing_to_a_set().await;
+    let v = through_hook(&bridge, replying(json!("mqtt:home:a/x/get"))).await;
+    assert_eq!(
+        v,
+        json!({
+            "ok": false,
+            "error": "`reply_to` \"mqtt:home:a/x/get\" is not allowed for this app: no \
+                      `acl publish` entry admits that topic on client `home`; a reply topic \
+                      must be one this app may publish to",
+        })
+    );
+    assert!(committed(&bridge, "home").await.is_empty());
+    assert_eq!(send_budget_row(&bridge).await, None);
+    assert!(logs_contain("mqtt_publish_denied"));
+    assert!(logs_contain("kind=acl_denied address=mqtt:home:a/x/get"));
+}
+
+// ── deliver_after ───────────────────────────────────────────────────────
+
+/// A whole-second instant `secs` from now: the database keeps release times
+/// at second granularity.
+fn whole_seconds_from_now(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    let at = chrono::Utc::now() + chrono::Duration::seconds(secs);
+    chrono::DateTime::from_timestamp(at.timestamp(), 0).expect("representable")
+}
+
+/// Run messaging tool `tool` with `input` for the bridge's app.
+async fn messaging(bridge: &ActiveBridge, tool: &str, input: serde_json::Value) -> ToolOutcome {
+    crate::messaging_intercept::execute_messaging_tool(bridge, tool, &input)
+        .await
+        .expect("a messaging tool")
+}
+
+/// A future `deliver_after` commits the call parked: the answer carries its
+/// message id, nothing is retained, and the app — holding only the MQTT
+/// publish grant — finds it with BrennPendingList, cannot edit it, and
+/// withdraws it with BrennMessageCancel.
+#[tokio::test]
+async fn a_deferred_call_parks_and_is_listed_refused_an_edit_and_cancelled() {
+    use brenn_render::tools::messaging::{
+        MCP_MESSAGE_CANCEL_TOOL, MCP_MESSAGE_EDIT_TOOL, MCP_MESSAGE_PENDING_LIST_TOOL,
+    };
+    let bridge = bridge_with_bound(1024).await;
+    let release_at = whole_seconds_from_now(3600);
+    let answer = call(
+        &bridge,
+        json!({
+            "to": "mqtt:home:cmd/light",
+            "body": "on",
+            "lifetime_s": 60,
+            "deliver_after": release_at.to_rfc3339(),
+        }),
+    )
+    .await;
+    let Some(ToolOutcome::Ok(v)) = answer else {
+        panic!("expected a commit, got {answer:?}");
+    };
+    assert_eq!(v["ok"], json!(true), "{v}");
+    let message_id = v["message_id"].as_str().expect("a message id").to_string();
+    assert!(
+        committed(&bridge, "home").await.is_empty(),
+        "nothing retained"
+    );
+
+    let ToolOutcome::Ok(listed) =
+        messaging(&bridge, MCP_MESSAGE_PENDING_LIST_TOOL, json!({})).await
+    else {
+        panic!("the list answers");
+    };
+    let messages = listed["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "{listed}");
+    assert_eq!(messages[0]["message_id"], json!(message_id), "{listed}");
+    let t = &messages[0]["transport"]["mqtt_publish"];
+    assert_eq!(t["client_slug"], json!("home"), "{listed}");
+    assert_eq!(t["topic"], json!("cmd/light"), "{listed}");
+    let ToolOutcome::Ok(filtered) = messaging(
+        &bridge,
+        MCP_MESSAGE_PENDING_LIST_TOOL,
+        json!({ "channel": mqtt_egress_address("home") }),
+    )
+    .await
+    else {
+        panic!("the list answers");
+    };
+    assert_eq!(
+        filtered["messages"],
+        json!([]),
+        "the filter never selects it"
+    );
+
+    assert_eq!(
+        messaging(
+            &bridge,
+            MCP_MESSAGE_EDIT_TOOL,
+            json!({ "message_id": message_id, "body": "off" }),
+        )
+        .await,
+        ToolOutcome::Err(json!({
+            "ok": false,
+            "error": brenn_lib::integration::EDIT_MQTT_PUBLISH_ERR,
+        }))
+    );
+
+    let ToolOutcome::Ok(cancelled) = messaging(
+        &bridge,
+        MCP_MESSAGE_CANCEL_TOOL,
+        json!({ "message_id": message_id }),
+    )
+    .await
+    else {
+        panic!("the cancel succeeds");
+    };
+    assert_eq!(cancelled["cancelled"], json!(true), "{cancelled}");
+    let ToolOutcome::Ok(listed) =
+        messaging(&bridge, MCP_MESSAGE_PENDING_LIST_TOOL, json!({})).await
+    else {
+        panic!("the list answers");
+    };
+    assert_eq!(listed["messages"], json!([]));
+    assert!(committed(&bridge, "home").await.is_empty());
+}
+
+/// A past `deliver_after` publishes at once.
+#[tokio::test]
+async fn a_past_deliver_after_commits_at_once() {
+    let bridge = bridge_with_bound(1024).await;
+    let row = commit(
+        &bridge,
+        json!({ "body": "on", "deliver_after": "2020-01-01T00:00:00Z" }),
+    )
+    .await;
+    assert_eq!(row.body.as_bytes(), b"on");
+}
+
+#[tokio::test]
+async fn a_malformed_deliver_after_is_an_argument_error() {
+    let bridge = bridge_with_bound(1024).await;
+    let v = call(
+        &bridge,
+        json!({ "to": "mqtt:home:cmd/light", "body": "on", "lifetime_s": 60, "deliver_after": 7 }),
+    )
+    .await;
+    let Some(ToolOutcome::Err(v)) = v else {
+        panic!("expected a rejection, got {v:?}");
+    };
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid `deliver_after` argument: "),
+        "{v}"
+    );
+    assert!(committed(&bridge, "home").await.is_empty());
+    assert_eq!(send_budget_row(&bridge).await, None);
+}
+
+/// A client whose deferred set is full refuses a further deferred call with
+/// the cap named, and refunds the budget it drew.
+#[tokio::test]
+async fn a_full_deferred_set_answers_the_quota() {
+    let bridge = bridge_with_bound(1024).await;
+    let messenger = bridge.messenger().expect("an MQTT bridge has a messenger");
+    let channel = messenger
+        .directory()
+        .resolve(&mqtt_egress_address("home"))
+        .expect("home's egress channel");
+    let Depth::Bounded(cap) = channel.resolved_channel.retain_depth else {
+        panic!("an egress channel's retain depth is bounded");
+    };
+    let later = Some(whole_seconds_from_now(7200));
+    for i in 0..cap {
+        brenn_messaging::testutils::insert_bus_body_from(
+            messenger,
+            &channel,
+            "someone-else",
+            &format!("{i}").as_str().into(),
+            brenn_lib::messaging::ChannelScheme::Brenn,
+            later,
+            brenn_messaging_store::db::utc_to_ns(chrono::Utc::now()),
+        )
+        .await;
+    }
+    let answer = call(
+        &bridge,
+        json!({
+            "to": "mqtt:home:cmd/light",
+            "body": "on",
+            "lifetime_s": 60,
+            "deliver_after": whole_seconds_from_now(3600).to_rfc3339(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        answer,
+        Some(ToolOutcome::Err(json!({
+            "ok": false,
+            "error": format!(
+                "deferred-message quota exceeded: MQTT client `home` already holds its cap of \
+                 {cap} scheduled messages; retry after some are released, or cancel one"
+            ),
+        })))
+    );
+    assert!(committed(&bridge, "home").await.is_empty());
+    assert_eq!(
+        send_budget_row(&bridge).await,
+        Some(bridge.app_config_default_send_budget()),
+        "the draw is refunded"
+    );
+}

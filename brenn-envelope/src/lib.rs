@@ -513,6 +513,10 @@ pub struct MqttPublishTransport {
     /// as its sender named it; absent asks for none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_to: Option<String>,
+    /// Bare topic name sent as the MQTT 5 Response Topic, on `client_slug`;
+    /// absent sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_topic: Option<String>,
 }
 
 /// When an outbound MQTT message's lifetime ends: `{"at":"<rfc3339>"}` or
@@ -939,8 +943,9 @@ mod tests {
     }
 
     /// The outbound variant's wire form, pinned literally beside the ingress
-    /// ones; the content type and `status_to` are omitted when absent, the
-    /// expiry never is. A row written without `status_to` decodes to none.
+    /// ones; the content type, `status_to` and `response_topic` are omitted
+    /// when absent, the expiry never is. A row written without `status_to` or
+    /// `response_topic` decodes to none.
     #[test]
     fn mqtt_publish_transport_wire_form_is_pinned_and_round_trips() {
         let at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
@@ -952,6 +957,7 @@ mod tests {
             content_type: Some("application/json".to_string()),
             expires: MqttExpiry::At(at),
             status_to: Some("brenn:light-status".to_string()),
+            response_topic: Some("lights/kitchen/result".to_string()),
         });
         let bare = TransportMeta::MqttPublish(MqttPublishTransport {
             client_slug: "broker".to_string(),
@@ -961,6 +967,7 @@ mod tests {
             content_type: None,
             expires: MqttExpiry::Never,
             status_to: None,
+            response_topic: None,
         });
         for (meta, wire) in [
             (
@@ -968,7 +975,8 @@ mod tests {
                 concat!(
                     r#"{"mqtt_publish":{"client_slug":"broker","topic":"lights/kitchen/set","#,
                     r#""qos":2,"retain":true,"content_type":"application/json","#,
-                    r#""expires":{"at":"2023-11-14T22:13:20Z"},"status_to":"brenn:light-status"}}"#
+                    r#""expires":{"at":"2023-11-14T22:13:20Z"},"status_to":"brenn:light-status","#,
+                    r#""response_topic":"lights/kitchen/result"}}"#
                 ),
             ),
             (

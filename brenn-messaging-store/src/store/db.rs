@@ -234,6 +234,15 @@ impl DbStore {
         }
     }
 
+    fn deferred_messages(rows: Vec<db::DeferredRow>) -> Vec<DeferredMessage> {
+        rows.into_iter()
+            .map(|row| DeferredMessage {
+                release_at: row.release_at,
+                envelope: Arc::new(row.envelope),
+            })
+            .collect()
+    }
+
     /// Whether a parked row is `sender`'s to cancel or edit.
     fn owned_by(lookup: &db::DeferredLookup, sender: &str) -> bool {
         lookup.sender == sender
@@ -420,10 +429,10 @@ impl RetentionStore for DbStore {
         dropped
     }
 
-    /// The cursor is read, the window cut from it, and the row deleted under one
-    /// connection hold; the cursor's depth cache is not retuned, since the row
-    /// is about to go.
-    async fn detach_taking_unseen(
+    /// The cursor is read, the window cut from it, the parked rows taken and
+    /// the cursor row deleted under one connection hold; the cursor's depth
+    /// cache is not retuned, since the row is about to go.
+    async fn detach_taking_all(
         &self,
         subscriber: &ParticipantId,
         push_limit: Depth,
@@ -442,8 +451,19 @@ impl RetentionStore for DbStore {
             Some((floor, _)) => self.passed_over(&conn, next_owed.0, *floor),
             None => AdvanceOutcome::default(),
         };
+        let parked =
+            Self::deferred_messages(db::take_deferred_for_channel(&conn, self.channel_uuid));
         db::delete_subscriber_cursor(&conn, self.channel_uuid, subscriber);
-        Some(Relinquished { unseen, outrun })
+        Some(Relinquished {
+            unseen,
+            outrun,
+            parked,
+        })
+    }
+
+    async fn take_deferred(&self) -> Vec<DeferredMessage> {
+        let conn = self.db.lock().await;
+        Self::deferred_messages(db::take_deferred_for_channel(&conn, self.channel_uuid))
     }
 
     /// Writes the message row, and nothing per subscriber.
@@ -497,6 +517,26 @@ impl RetentionStore for DbStore {
         Ok(Parked {
             message_uuid: inserted.uuid,
         })
+    }
+
+    /// The cursor lookup, the cap check and the insert share one connection
+    /// hold, in that order.
+    async fn park_while_attached(
+        &self,
+        msg: NewMessage,
+        release_at: DateTime<Utc>,
+        subscriber: &ParticipantId,
+    ) -> Option<Result<Parked, QuotaExceeded>> {
+        msg.attachments.make_durable();
+        let conn = self.db.lock().await;
+        db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)?;
+        if let Some(cap) = db::deferred_cap_refusal(&conn, self.channel_uuid, self.deferred_cap) {
+            return Some(Err(QuotaExceeded { cap }));
+        }
+        let inserted = self.insert(&conn, &msg, Some(release_at));
+        Some(Ok(Parked {
+            message_uuid: inserted.uuid,
+        }))
     }
 
     async fn retained_tail(&self, limit: Depth) -> Vec<Arc<MessageEnvelope>> {
@@ -619,13 +659,11 @@ impl RetentionStore for DbStore {
 
     async fn deferred_for_sender(&self, sender: &str) -> Vec<DeferredMessage> {
         let conn = self.db.lock().await;
-        db::list_deferred_for_sender(&conn, self.channel_uuid, sender)
-            .into_iter()
-            .map(|row| DeferredMessage {
-                release_at: row.release_at,
-                envelope: Arc::new(row.envelope),
-            })
-            .collect()
+        Self::deferred_messages(db::list_deferred_for_sender(
+            &conn,
+            self.channel_uuid,
+            sender,
+        ))
     }
 
     async fn deferred_senders(&self, now: DateTime<Utc>) -> Vec<String> {

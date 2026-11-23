@@ -34,10 +34,12 @@ const PAYLOAD_ATTACHMENT: &str = "payload";
 /// Why the MQTT admission refused a publish on its options or payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MqttRefusal {
-    /// A release time was stated. An MQTT publish is not deferred.
-    DeliverAfter,
-    /// A `reply_to` was stated, which a broker cannot carry.
-    ReplyTo,
+    /// The stated `reply_to` is not a topic the publisher may name as its
+    /// Response Topic. `address` is the address as stated.
+    ReplyTo {
+        address: String,
+        why: ReplyToRefusal,
+    },
     /// A `delivery_deadline` was stated, which a broker cannot honour.
     DeliveryDeadline,
     /// The stated `status_to` is not a channel the publisher may name for its
@@ -79,6 +81,20 @@ pub enum StatusToRefusal {
     StatusOverBodyCap { len: usize, max: usize },
 }
 
+/// Why the MQTT admission refused a publish's `reply_to`, in the order the
+/// admission asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyToRefusal {
+    /// Not a well-formed `mqtt:<client>:<topic>` naming a concrete topic.
+    /// `detail` is `parse_topic_name`'s error text, which tells a wildcard
+    /// from a malformed address.
+    Malformed { detail: String },
+    /// A well-formed address on a client other than the target's.
+    OtherClient,
+    /// The publisher's MQTT publish ACL does not cover the reply topic.
+    AclDenied,
+}
+
 /// The payload of a conversation's MQTT publish.
 #[derive(Debug)]
 pub enum MqttPayload {
@@ -115,27 +131,39 @@ pub(crate) struct MqttAdmitted {
     client: String,
     topic: String,
     options: MqttPublishOptions,
+    /// The bare reply topic parsed from `options.reply_to`, on `client`.
+    response_topic: Option<String>,
 }
 
 impl MqttAdmitted {
-    /// The transport metadata for a message committed at `committed_at`.
-    pub(crate) fn transport(&self, committed_at: DateTime<Utc>) -> MqttPublishTransport {
-        mqtt_transport(&self.client, &self.topic, &self.options, committed_at)
+    /// The transport metadata for a message that may first be sent at
+    /// `good_from`.
+    pub(crate) fn transport(&self, good_from: DateTime<Utc>) -> MqttPublishTransport {
+        mqtt_transport(
+            &self.client,
+            &self.topic,
+            &self.options,
+            self.response_topic.as_deref(),
+            good_from,
+        )
     }
 }
 
-/// The transport metadata of an MQTT publish to `client`'s `topic` committed at
-/// `committed_at`: the options as stated, and an expiry of the commit time plus
-/// the lifetime. The one rule for every sender's committed row.
+/// The transport metadata of an MQTT publish to `client`'s `topic` that may
+/// first be sent at `good_from` — its release time when parked, its commit
+/// otherwise: the options as stated, the admitted bare reply topic, and an
+/// expiry of `good_from` plus the lifetime. The one rule for every sender's
+/// committed row.
 pub(crate) fn mqtt_transport(
     client: &str,
     topic: &str,
     options: &MqttPublishOptions,
-    committed_at: DateTime<Utc>,
+    response_topic: Option<&str>,
+    good_from: DateTime<Utc>,
 ) -> MqttPublishTransport {
     let expires = match options.lifetime {
         MqttLifetime::Seconds(s) => {
-            MqttExpiry::At(committed_at + chrono::Duration::seconds(i64::from(s.get())))
+            MqttExpiry::At(good_from + chrono::Duration::seconds(i64::from(s.get())))
         }
         MqttLifetime::Forever => MqttExpiry::Never,
     };
@@ -147,6 +175,7 @@ pub(crate) fn mqtt_transport(
         content_type: options.content_type.clone(),
         expires,
         status_to: options.status_to.clone(),
+        response_topic: response_topic.map(str::to_owned),
     }
 }
 
@@ -197,20 +226,30 @@ impl Messenger {
     ///    directory → `UnknownChannel`. Either can be absent for a moment
     ///    while a reload adds or removes the client, and "unknown client" is
     ///    the true answer in that moment.
-    /// 5. no `deliver_after`, `reply_to` or `delivery_deadline` → `MqttRefused`.
-    /// 6. a stated `status_to` is a channel the publisher could publish to
+    /// 5. no `delivery_deadline` → `MqttRefused(DeliveryDeadline)`.
+    /// 6. a stated `options.reply_to` is a concrete `mqtt:` topic name on the
+    ///    target's client that the publisher's MQTT publish ACL covers →
+    ///    `MqttRefused(ReplyTo)`, in [`ReplyToRefusal`]'s order. It reads the
+    ///    stated address and the policy only, so it reveals nothing of the
+    ///    directory or the client table; placed after steps 1–4, a publish
+    ///    refused there answers the same with or without a reply address.
+    /// 7. a stated `status_to` is a channel the publisher could publish to
     ///    itself, and a status about this topic fits the body cap →
     ///    `MqttRefused(StatusTo)`. Its own checks run in [`StatusToRefusal`]'s
     ///    order; the ACL precedes the directory, so a channel the publisher may
     ///    not publish to answers the same whether or not it exists.
-    /// 7. QoS ≤ 2, a stated content type well formed.
-    /// 8. the payload is the body, or one attachment beside an empty body.
-    /// 9. the payload's length is within the client's outbound cap.
+    /// 8. QoS ≤ 2, a stated content type well formed.
+    /// 9. the payload is the body, or one attachment beside an empty body.
+    /// 10. the payload's length is within the client's outbound cap.
+    ///
+    /// A release time needs no admission: whether to park is the commit's
+    /// decision, as for every scheme.
     ///
     /// A commit needs a third thing besides the client and its channel: the
     /// egress reader's position on the channel. That is not checked here but
-    /// at the commit, with the write, so a publish admitted before a reload
-    /// closes the client's channel and committed after is still refused.
+    /// at the commit or the park, with the write, so a publish admitted before
+    /// a reload closes the client's channel and committed after is still
+    /// refused.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_mqtt(
         &self,
@@ -218,8 +257,6 @@ impl Messenger {
         addr: &str,
         options: &MqttPublishOptions,
         payload_len: Option<u64>,
-        reply_to: Option<&str>,
-        deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
     ) -> Result<MqttAdmitted, PublishResult> {
         let refuse = |r: MqttRefusal| Err(PublishResult::MqttRefused(r));
@@ -245,17 +282,22 @@ impl Messenger {
         };
 
         // A stated option the broker cannot carry is refused, never silently dropped.
-        // TODO(mqtt-publish-reply-to-and-deliver-after-refused): `deliver_after`
-        // and `reply_to` are refused here until the egress path carries them.
-        if deliver_after.is_some() {
-            return refuse(MqttRefusal::DeliverAfter);
-        }
-        if reply_to.is_some() {
-            return refuse(MqttRefusal::ReplyTo);
-        }
         if delivery_deadline.is_some() {
             return refuse(MqttRefusal::DeliveryDeadline);
         }
+
+        let response_topic = match options.reply_to.as_deref() {
+            None => None,
+            Some(address) => match admit_reply_to(policy, address, &parsed.client) {
+                Ok(topic) => Some(topic),
+                Err(why) => {
+                    return refuse(MqttRefusal::ReplyTo {
+                        address: address.to_owned(),
+                        why,
+                    });
+                }
+            },
+        };
 
         if let Some(address) = options.status_to.as_deref()
             && let Err(why) = self.admit_status_to(policy, address, &parsed.client, &parsed.topic)
@@ -289,10 +331,11 @@ impl Messenger {
             client: parsed.client,
             topic: parsed.topic,
             options: options.clone(),
+            response_topic,
         })
     }
 
-    /// Step 6 of [`Self::admit_mqtt`]: may `policy` name `address` as the
+    /// Step 7 of [`Self::admit_mqtt`]: may `policy` name `address` as the
     /// `status_to` of a publish to `client`'s `topic`. The right is the publish
     /// right, not the wider visibility a `reply_to` is held to.
     fn admit_status_to(
@@ -324,9 +367,9 @@ impl Messenger {
 
     /// Decide whether a component under `policy` may publish `payload_len`
     /// bytes to `mqtt:<client>:<topic>` with `options`. Spends nothing. The
-    /// decision is [`Self::admit_mqtt`]'s, with no `reply_to`, `deliver_after`
-    /// or `delivery_deadline`; the commit is the activation's flush, through
-    /// [`Self::publish_from_wasm`].
+    /// decision is [`Self::admit_mqtt`]'s, with no `delivery_deadline`; a
+    /// component's options state no `reply_to`. The commit is the activation's
+    /// flush, through [`Self::publish_from_wasm`].
     pub fn admit_mqtt_from_wasm(
         &self,
         policy: &AppPolicy,
@@ -341,8 +384,6 @@ impl Messenger {
             options,
             Some(payload_len),
             None,
-            None,
-            None,
         )
         .map(|_| ())
     }
@@ -351,8 +392,8 @@ impl Messenger {
     /// MQTT topic address `addr` with `options`, against its policy in this
     /// messenger's app table as it stands now. Spends nothing. An app the table
     /// does not hold is `MissingSender`; otherwise the decision is
-    /// [`Self::admit_mqtt`]'s, with no `reply_to`, `deliver_after` or
-    /// `delivery_deadline`.
+    /// [`Self::admit_mqtt`]'s, with no `delivery_deadline`; a `reply_to` in
+    /// `options` is judged as for any sender.
     pub fn admit_mqtt_for_app(
         &self,
         app_slug: &str,
@@ -364,16 +405,8 @@ impl Messenger {
         let Some(app) = apps.get(app_slug) else {
             return Err(PublishResult::MissingSender);
         };
-        self.admit_mqtt(
-            &app.policy,
-            addr,
-            options,
-            Some(payload_len),
-            None,
-            None,
-            None,
-        )
-        .map(|_| ())
+        self.admit_mqtt(&app.policy, addr, options, Some(payload_len), None)
+            .map(|_| ())
     }
 
     /// Publish `payload` to the MQTT topic address `addr` on behalf of an app's
@@ -397,6 +430,13 @@ impl Messenger {
     /// `options.content_type`, never the body's or the blob's type. An
     /// attached payload rides beside an empty body.
     ///
+    /// A `deliver_after` in the future parks the publish on the egress channel
+    /// until then, invisible to the egress reader, counted against the
+    /// channel's deferred cap (`DeferredQuotaExceeded` when full, budget
+    /// refunded) and refused as above when the reader holds no position; its
+    /// lifetime counts from `deliver_after`. One at or before now publishes at
+    /// once.
+    ///
     /// # Panics
     ///
     /// Panics on a `System` origin: an app's publish is priced by its
@@ -408,6 +448,7 @@ impl Messenger {
         addr: &str,
         payload: MqttPayload,
         options: &MqttPublishOptions,
+        deliver_after: Option<DateTime<Utc>>,
     ) -> Result<MqttCommitted, PublishResult> {
         assert!(
             !matches!(origin, PublishOrigin::System),
@@ -437,7 +478,7 @@ impl Messenger {
                 body,
                 Urgency::Normal,
                 None,
-                None,
+                deliver_after,
                 None,
                 None,
                 attachments,
@@ -456,6 +497,25 @@ impl Messenger {
             refused => Err(refused),
         }
     }
+}
+
+/// Step 6 of [`Messenger::admit_mqtt`]: may `policy` name `address` as the
+/// Response Topic of a publish through `client`. Answers the bare reply topic.
+fn admit_reply_to(
+    policy: &AppPolicy,
+    address: &str,
+    client: &str,
+) -> Result<String, ReplyToRefusal> {
+    let parsed = parse_topic_name(address).map_err(|e| ReplyToRefusal::Malformed {
+        detail: e.to_string(),
+    })?;
+    if parsed.client != client {
+        return Err(ReplyToRefusal::OtherClient);
+    }
+    if !policy.allows_mqtt_publish(&parsed.client, &parsed.topic) {
+        return Err(ReplyToRefusal::AclDenied);
+    }
+    Ok(parsed.topic)
 }
 
 /// Write `bytes` to a new blob in `store` on the blocking pool and return it

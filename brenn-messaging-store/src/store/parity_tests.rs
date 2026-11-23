@@ -199,6 +199,7 @@ fn outbound_transport() -> brenn_envelope::TransportMeta {
         content_type: Some("application/json".to_string()),
         expires: brenn_envelope::MqttExpiry::At(now() + Duration::seconds(30)),
         status_to: None,
+        response_topic: None,
     })
 }
 
@@ -1848,7 +1849,7 @@ async fn append_while_attached_writes_nothing_without_a_position() {
 /// moment before, reports the outrun an advance over it would have, and leaves
 /// no position behind.
 #[tokio::test]
-async fn detach_taking_unseen_takes_the_windows_new_entries_and_the_position() {
+async fn detach_taking_all_takes_the_windows_new_entries_and_the_position() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("proc");
         store.attach(&sub, "proc", ATTACH_DEPTH).await;
@@ -1873,10 +1874,11 @@ async fn detach_taking_unseen_takes_the_windows_new_entries_and_the_position() {
         );
 
         let taken = store
-            .detach_taking_unseen(&sub, push)
+            .detach_taking_all(&sub, push)
             .await
             .expect("the subscriber held a position");
         assert_eq!(head_entries(&taken.unseen), expected, "{}", store.address());
+        assert!(taken.parked.is_empty(), "{}", store.address());
         assert_eq!(
             taken.outrun,
             AdvanceOutcome {
@@ -1894,7 +1896,7 @@ async fn detach_taking_unseen_takes_the_windows_new_entries_and_the_position() {
         );
         assert_eq!(store.detach(&sub).await, None, "{}", store.address());
         assert!(
-            store.detach_taking_unseen(&sub, push).await.is_none(),
+            store.detach_taking_all(&sub, push).await.is_none(),
             "{}",
             store.address()
         );
@@ -1910,7 +1912,7 @@ async fn detach_taking_unseen_takes_the_windows_new_entries_and_the_position() {
 /// A position with nothing unseen gives up an empty set and a zero outrun; a
 /// subscriber never attached gives up nothing at all.
 #[tokio::test]
-async fn detach_taking_unseen_with_nothing_unseen_or_no_position() {
+async fn detach_taking_all_with_nothing_unseen_or_no_position() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("proc");
         store.attach(&sub, "proc", ATTACH_DEPTH).await;
@@ -1919,7 +1921,7 @@ async fn detach_taking_unseen_with_nothing_unseen_or_no_position() {
         }
         serve(store.as_ref(), &sub, DEPTH, 0).await;
         let taken = store
-            .detach_taking_unseen(&sub, ATTACH_DEPTH)
+            .detach_taking_all(&sub, ATTACH_DEPTH)
             .await
             .expect("the subscriber held a position");
         assert!(taken.unseen.is_empty(), "{}", store.address());
@@ -1931,7 +1933,7 @@ async fn detach_taking_unseen_with_nothing_unseen_or_no_position() {
         );
         assert!(
             store
-                .detach_taking_unseen(&wasm_sub("ghost"), ATTACH_DEPTH)
+                .detach_taking_all(&wasm_sub("ghost"), ATTACH_DEPTH)
                 .await
                 .is_none(),
             "{}",
@@ -1949,7 +1951,7 @@ async fn append_while_attached_is_refused_after_the_take() {
         store.attach(&sub, "proc", ATTACH_DEPTH).await;
         append_seq(store.as_ref(), "a").await;
         let taken = store
-            .detach_taking_unseen(&sub, ATTACH_DEPTH)
+            .detach_taking_all(&sub, ATTACH_DEPTH)
             .await
             .expect("the subscriber held a position");
         assert_eq!(
@@ -1977,20 +1979,266 @@ async fn append_while_attached_is_refused_after_the_take() {
     }
 }
 
+/// The detach also removes every parked message, whoever sent it and whether
+/// or not it is due, soonest release first; the unseen it returns beside them
+/// is unchanged by their presence.
+#[tokio::test]
+async fn detach_taking_all_removes_every_senders_parked_messages_in_release_order() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        append_seq(store.as_ref(), "a").await;
+        for (sender, body, offset) in [
+            ("alice", "late", 300),
+            ("bob", "due", -10),
+            ("alice", "mid", 120),
+        ] {
+            store
+                .park(
+                    message_for(store.as_ref(), sender, body),
+                    now() + Duration::seconds(offset),
+                )
+                .await
+                .expect("within cap");
+        }
+
+        let taken = store
+            .detach_taking_all(&sub, ATTACH_DEPTH)
+            .await
+            .expect("the subscriber held a position");
+        assert_eq!(
+            head_entries(&taken.unseen)
+                .into_iter()
+                .map(|(_, b)| b)
+                .collect::<Vec<_>>(),
+            vec!["a"],
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            taken
+                .parked
+                .iter()
+                .map(|d| (
+                    d.envelope.sender.as_str(),
+                    d.envelope.body.as_text().unwrap(),
+                    d.release_at
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("bob", "due", now() - Duration::seconds(10)),
+                ("alice", "mid", now() + Duration::seconds(120)),
+                ("alice", "late", now() + Duration::seconds(300)),
+            ],
+            "{}",
+            store.address()
+        );
+        assert_eq!(store.deferred_len().await, 0, "{}", store.address());
+        assert_eq!(store.next_release().await, None, "{}", store.address());
+        assert!(
+            store
+                .release_due(now() + Duration::days(1))
+                .await
+                .released
+                .is_empty(),
+            "nothing is left to release: {}",
+            store.address()
+        );
+        assert_eq!(
+            retained_bodies(store.as_ref()).await,
+            vec!["a"],
+            "{}",
+            store.address()
+        );
+    }
+}
+
+/// A subscriber holding no position takes nothing: the parked messages stay.
+#[tokio::test]
+async fn detach_taking_all_without_a_position_leaves_the_parked_messages() {
+    for store in stores(DEPTH).await {
+        store
+            .park(message_for(store.as_ref(), "alice", "kept"), soon())
+            .await
+            .expect("within cap");
+        assert!(
+            store
+                .detach_taking_all(&wasm_sub("ghost"), ATTACH_DEPTH)
+                .await
+                .is_none(),
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            deferred_bodies(store.as_ref(), "alice").await,
+            vec!["kept"],
+            "{}",
+            store.address()
+        );
+    }
+}
+
+/// `take_deferred` removes every parked message, every sender, due or not,
+/// soonest release first, and touches neither retention nor any position.
+#[tokio::test]
+async fn take_deferred_removes_every_parked_message_and_nothing_else() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        append_seq(store.as_ref(), "a").await;
+        for (sender, body, offset) in [("alice", "second", 60), ("bob", "first", -5)] {
+            store
+                .park(
+                    message_for(store.as_ref(), sender, body),
+                    now() + Duration::seconds(offset),
+                )
+                .await
+                .expect("within cap");
+        }
+
+        let taken = store.take_deferred().await;
+        assert_eq!(
+            taken
+                .iter()
+                .map(|d| d.envelope.body.as_text().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"],
+            "{}",
+            store.address()
+        );
+        assert_eq!(store.deferred_len().await, 0, "{}", store.address());
+        assert!(
+            store.take_deferred().await.is_empty(),
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            retained_bodies(store.as_ref()).await,
+            vec!["a"],
+            "{}",
+            store.address()
+        );
+        assert!(
+            store
+                .window(&sub, ATTACH_DEPTH, Depth::Bounded(0))
+                .await
+                .is_some(),
+            "the position stays: {}",
+            store.address()
+        );
+        // The cap slots are free again.
+        for i in 0..DEPTH {
+            store
+                .park(
+                    message_for(store.as_ref(), "alice", &format!("p{i}")),
+                    soon(),
+                )
+                .await
+                .expect("the take freed every slot");
+        }
+    }
+}
+
+/// The guarded park parks while the subscriber holds a position, answers the
+/// cap like `park`, and refuses with nothing written when it holds none — the
+/// position judged before the cap.
+#[tokio::test]
+async fn park_while_attached_parks_only_under_a_position() {
+    for store in stores(2).await {
+        let sub = wasm_sub("proc");
+        let ghost = wasm_sub("ghost");
+
+        assert!(
+            store
+                .park_while_attached(message_for(store.as_ref(), "alice", "early"), soon(), &sub)
+                .await
+                .is_none(),
+            "not attached yet: {}",
+            store.address()
+        );
+        assert_eq!(store.deferred_len().await, 0, "{}", store.address());
+
+        store.attach(&sub, "proc", Depth::Bounded(2)).await;
+        let parked = store
+            .park_while_attached(message_for(store.as_ref(), "alice", "one"), soon(), &sub)
+            .await
+            .expect("attached")
+            .expect("within cap");
+        store
+            .park_while_attached(message_for(store.as_ref(), "bob", "two"), soon(), &sub)
+            .await
+            .expect("attached")
+            .expect("within cap");
+        let refused = store
+            .park_while_attached(message_for(store.as_ref(), "alice", "three"), soon(), &sub)
+            .await
+            .expect("attached")
+            .expect_err("at the cap");
+        assert_eq!(refused.cap, 2, "{}", store.address());
+        assert!(
+            store
+                .park_while_attached(message_for(store.as_ref(), "alice", "x"), soon(), &ghost)
+                .await
+                .is_none(),
+            "no position answers before the cap: {}",
+            store.address()
+        );
+        assert_eq!(
+            store
+                .deferred_for_sender("alice")
+                .await
+                .iter()
+                .map(|d| d.message_uuid())
+                .collect::<Vec<_>>(),
+            vec![parked.message_uuid],
+            "{}",
+            store.address()
+        );
+        assert!(
+            retained_bodies(store.as_ref()).await.is_empty(),
+            "a park is not retained: {}",
+            store.address()
+        );
+    }
+}
+
+/// Once the take has run, the guarded park for that subscriber is refused
+/// and nothing is parked.
+#[tokio::test]
+async fn park_while_attached_is_refused_after_the_take() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        store
+            .detach_taking_all(&sub, ATTACH_DEPTH)
+            .await
+            .expect("the subscriber held a position");
+        assert!(
+            store
+                .park_while_attached(message_for(store.as_ref(), "alice", "late"), soon(), &sub)
+                .await
+                .is_none(),
+            "{}",
+            store.address()
+        );
+        assert_eq!(store.deferred_len().await, 0, "{}", store.address());
+    }
+}
+
 #[tokio::test]
 #[should_panic(expected = "a detach taking the unseen of a sampled subscriber")]
-async fn durable_detach_taking_unseen_at_a_sampled_depth_panics() {
+async fn durable_detach_taking_all_at_a_sampled_depth_panics() {
     let (store, _db) = durable_store(DEPTH).await;
     store
-        .detach_taking_unseen(&wasm_sub("proc"), Depth::Bounded(0))
+        .detach_taking_all(&wasm_sub("proc"), Depth::Bounded(0))
         .await;
 }
 
 #[tokio::test]
 #[should_panic(expected = "a detach taking the unseen of a sampled subscriber")]
-async fn ring_detach_taking_unseen_at_a_sampled_depth_panics() {
+async fn ring_detach_taking_all_at_a_sampled_depth_panics() {
     let store = parity_ring();
-    RetentionStore::detach_taking_unseen(&store, &wasm_sub("proc"), Depth::Bounded(0)).await;
+    RetentionStore::detach_taking_all(&store, &wasm_sub("proc"), Depth::Bounded(0)).await;
 }
 
 fn parity_ring() -> RingStore {

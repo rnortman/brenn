@@ -3,6 +3,7 @@
 //! Authorship is keyed on `messaging_messages.sender` (the derived
 //! `ParticipantId::for_app` identity).
 
+use brenn_envelope::grants::AppCapability;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -28,7 +29,7 @@ pub enum CancelResult {
     /// reads it from its own position, and the server keeps no per-subscriber
     /// record of the delivery to revoke.
     AlreadyDelivered,
-    /// Calling app has no `[app.messaging]` section or `sender` is absent/empty.
+    /// The calling app holds none of the grants `resolve_sender` requires.
     MissingSender,
 }
 
@@ -61,6 +62,10 @@ pub enum EditResult {
     /// The message has entered retention and is past editing, on the same rule
     /// [`CancelResult::AlreadyDelivered`] states.
     AlreadyDelivered,
+    /// The message is a parked MQTT publish. Its transport was built and
+    /// admitted at commit, so it is not edited in place: the sender cancels it
+    /// and sends it again.
+    MqttPublish,
     /// No mutable fields were specified.
     NoFieldsProvided,
     /// `body` exceeds `max_body_bytes`.
@@ -74,7 +79,9 @@ pub enum EditResult {
     AclDenied(String),
     /// `reply_to` address failed shape validation.
     MalformedAddress(String),
-    /// Calling app has no `[app.messaging]` section or `sender` is absent/empty.
+    /// The calling app holds none of the grants `resolve_sender` requires, or
+    /// the message is a bus message and the app holds neither
+    /// `MessagingPublish` nor `MessagingSubscribe`.
     MissingSender,
 }
 
@@ -188,6 +195,31 @@ impl Messenger {
         // recall, on the same rule cancel applies.
         if !lookup.parked {
             return EditResult::AlreadyDelivered;
+        }
+        // A parked MQTT publish carries a transport admitted at commit (target,
+        // reply topic, lifetime counted from its release time); no field here
+        // re-admits it.
+        if lookup.mqtt_publish {
+            return EditResult::MqttPublish;
+        }
+        // Rewriting a bus message takes a messaging grant. `resolve_sender`
+        // also admits an app holding only `MqttPublish`, so it can list and
+        // cancel what it parked; that grant does not let it rewrite a message
+        // it parked while it held one.
+        //
+        // TODO(message-edit-skips-publish-authority): holding either messaging
+        // grant is all that is asked. The row's channel is not checked against
+        // the sender's publish grant and ACL as they stand now, so a sender
+        // that lost either since the park can still rewrite the message and
+        // release it.
+        if !self
+            .apps
+            .load()
+            .get(sender_app_slug)
+            .expect("edit: sender app resolved at step 2 must be present")
+            .messaging_enabled()
+        {
+            return EditResult::MissingSender;
         }
 
         // 4. Body size check.
@@ -329,14 +361,15 @@ impl Messenger {
     // Private helpers
     // ---------------------------------------------------------------------------
 
-    /// Resolve the sender identity string for an app slug. Returns `None` if
-    /// the app holds no messaging grant (`messaging_publish` or
-    /// `messaging_subscribe`), i.e. `messaging_enabled()` is false.
+    /// Resolve the sender identity string for an app slug. Returns `None` when
+    /// the app holds none of `MessagingPublish`, `MessagingSubscribe` and
+    /// `MqttPublish` — the participation OR of `messaging_enabled()`, or the
+    /// MQTT publish grant, whose holder may have parked an `MqttSend`.
     /// Host-derived from app slug + server origin.
     pub(crate) fn resolve_sender(&self, app_slug: &str) -> Option<String> {
         let apps = self.apps.load();
         let app = apps.get(app_slug)?;
-        if !app.messaging_enabled() {
+        if !(app.messaging_enabled() || app.policy.has_grant(AppCapability::MqttPublish)) {
             return None;
         }
         Some(

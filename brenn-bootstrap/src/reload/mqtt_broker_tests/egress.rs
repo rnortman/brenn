@@ -196,6 +196,7 @@ fn options(retain: bool, content_type: Option<&str>, lifetime: MqttLifetime) -> 
         lifetime,
         content_type: content_type.map(str::to_string),
         status_to: None,
+        reply_to: None,
     }
 }
 
@@ -221,6 +222,7 @@ async fn send(
             &format!("mqtt:{client}:{topic}"),
             MqttPayload::Inline(payload.to_vec()),
             options,
+            None,
         )
         .await
         .unwrap_or_else(|refused| panic!("the publish to {client} was refused: {refused:?}"))
@@ -1318,4 +1320,145 @@ async fn a_changed_clients_stop_statuses_to_a_channel_the_reload_removes_are_ref
 
     harness.resume();
     booted.stop_mqtt();
+}
+
+/// Publish as [`send`] does, parked until `release_at`.
+async fn send_at(
+    booted: &Booted,
+    conversation: i64,
+    topic: &str,
+    options: &MqttPublishOptions,
+    release_at: chrono::DateTime<chrono::Utc>,
+) -> Uuid {
+    booted
+        .messenger
+        .publish_mqtt(
+            PublishOrigin::Conversation { id: conversation },
+            SENDER,
+            &format!("mqtt:ha:{topic}"),
+            MqttPayload::Inline(b"later".to_vec()),
+            options,
+            Some(release_at),
+        )
+        .await
+        .unwrap_or_else(|refused| panic!("the deferred publish was refused: {refused:?}"))
+        .message_id
+}
+
+/// A whole-second instant `secs` from now: the database keeps release times
+/// at second granularity.
+fn whole_seconds_from_now(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    let at = chrono::Utc::now() + chrono::Duration::seconds(secs);
+    chrono::DateTime::from_timestamp(at.timestamp(), 0).expect("representable")
+}
+
+/// A deferred publish naming a `status_to` is told nothing and reaches no
+/// broker before its release time; at release the dispatcher moves it into
+/// the channel, and it is told `handed` then `delivered` and received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_publish_is_sent_and_told_only_after_its_release() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let tree = Tree::holding(&status_document(harness.port, &ca_file, Some(""), 1));
+    let booted = boot_dispatching(&tree, None).await;
+    wait_for_health(
+        &booted.mqtt.0,
+        "ha",
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the client never connected",
+    )
+    .await;
+    let conversation = sender_conversation(&booted).await;
+    let topic = format!("{TOPIC_PREFIX}/deferred-told");
+
+    let since = harness.log_len();
+    let release_at = whole_seconds_from_now(3);
+    let parked = send_at(
+        &booted,
+        conversation,
+        &topic,
+        &telling(Some(STATUS), seconds(60)),
+        release_at,
+    )
+    .await;
+    assert!(
+        retained_seqs(&booted, "ha").await.is_empty(),
+        "a parked publish holds no place on the channel"
+    );
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        statuses(&booted).await.is_empty(),
+        "nothing told before release"
+    );
+    assert!(
+        !log_records_publish_from(&harness.log()[since..], &session_client_id("ha"), &topic),
+        "nothing sent before release"
+    );
+
+    await_received(&harness, since, "ha", &[&topic]).await;
+    assert!(chrono::Utc::now() >= release_at, "sent at or after release");
+    let found = await_statuses(&booted, 2).await;
+    assert_eq!(
+        kinds(&found),
+        vec![
+            (parked, DeliveryKind::Handed),
+            (parked, DeliveryKind::Delivered)
+        ],
+    );
+
+    booted.stop_mqtt();
+}
+
+/// A publish parked by one process is released by the next one over the same
+/// database: one whose lifetime is still running is sent, and one whose
+/// lifetime, counted from its release time, ended while no process ran is
+/// told `expired` with no `handed` and not sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_releases_what_was_parked_and_expires_what_outlived_its_lifetime() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let tree = Tree::holding(&status_document(harness.port, &ca_file, Some(""), 1));
+    let db = brenn_server::test_support::init_db_memory();
+
+    let first = boot_dispatching(&tree, Some(db.clone())).await;
+    let conversation = sender_conversation(&first).await;
+    let kept = format!("{TOPIC_PREFIX}/parked-kept");
+    let lapsed = format!("{TOPIC_PREFIX}/parked-lapsed");
+    let release_at = whole_seconds_from_now(4);
+    send_at(
+        &first,
+        conversation,
+        &kept,
+        &telling(None, MqttLifetime::Forever),
+        release_at,
+    )
+    .await;
+    let lapsed_id = send_at(
+        &first,
+        conversation,
+        &lapsed,
+        &telling(Some(STATUS), seconds(1)),
+        release_at,
+    )
+    .await;
+    shut_down(first).await;
+    let wait = release_at + chrono::Duration::seconds(2) - chrono::Utc::now();
+    tokio::time::sleep(wait.to_std().unwrap_or_default()).await;
+
+    let since = harness.log_len();
+    let second = boot_dispatching(&tree, Some(db)).await;
+    await_received(&harness, since, "ha", &[&kept]).await;
+    let found = await_statuses(&second, 1).await;
+    assert_eq!(kinds(&found), vec![(lapsed_id, DeliveryKind::Expired)]);
+    assert!(
+        !log_records_publish_from(&harness.log()[since..], &session_client_id("ha"), &lapsed),
+        "the lapsed publish was not sent"
+    );
+
+    second.stop_mqtt();
 }

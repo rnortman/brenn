@@ -219,6 +219,7 @@ fn message(seq: u64, qos: u8, expires: MqttExpiry) -> EgressMessage {
             content_type: None,
             expires,
             status_to: None,
+            response_topic: None,
         },
         payload: Bytes::from(format!("m{seq}")),
     }
@@ -724,18 +725,28 @@ fn expiry_interval_rounds_the_remainder_up_and_never_sends_none() {
 }
 
 #[test]
-fn publish_properties_carry_the_content_type_and_expiry() {
-    assert_eq!(publish_properties(None, None), None);
-    let props = publish_properties(None, Some(7)).unwrap();
+fn publish_properties_carry_the_content_type_expiry_and_response_topic() {
+    assert_eq!(publish_properties(None, None, None), None);
+    let props = publish_properties(None, Some(7), None).unwrap();
     assert_eq!(props.message_expiry_interval, Some(7));
     assert_eq!(props.content_type, None);
-    let props = publish_properties(Some("application/json".to_string()), None).unwrap();
+    assert_eq!(props.response_topic, None);
+    let props = publish_properties(Some("application/json".to_string()), None, None).unwrap();
     assert_eq!(props.content_type.as_deref(), Some("application/json"));
     assert_eq!(props.message_expiry_interval, None);
+    let props = publish_properties(None, None, Some("lights/result".to_string()))
+        .expect("a reply topic alone yields properties");
+    assert_eq!(props.response_topic.as_deref(), Some("lights/result"));
+    assert_eq!(props.correlation_data, None);
+    assert_eq!(
+        (props.content_type, props.message_expiry_interval),
+        (None, None)
+    );
 }
 
 /// Messages go out in channel order with their topic, QoS, retain flag,
-/// content type and remaining lifetime, and each is reported delivered.
+/// content type, remaining lifetime and Response Topic, and each is reported
+/// delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn messages_go_out_in_channel_order_with_their_options() {
     let handle = make_handle();
@@ -746,7 +757,9 @@ async fn messages_go_out_in_channel_order_with_their_options() {
     first.publish.content_type = Some("text/plain".to_string());
     bus.commit_quietly(EgressItem::Message(first));
     let lifetime = Utc::now() + TimeDelta::seconds(600);
-    bus.commit_quietly(EgressItem::Message(message(2, 1, MqttExpiry::At(lifetime))));
+    let mut second = message(2, 1, MqttExpiry::At(lifetime));
+    second.publish.response_topic = Some("lights/2/result".to_string());
+    bus.commit_quietly(EgressItem::Message(second));
     bus.commit_quietly(item(3, 2));
     start_egress_reader(&handle, bus.clone());
 
@@ -766,11 +779,13 @@ async fn messages_go_out_in_channel_order_with_their_options() {
     let props = received[0].properties.as_ref().unwrap();
     assert_eq!(props.content_type.as_deref(), Some("text/plain"));
     assert_eq!(props.message_expiry_interval, None, "Never sends no expiry");
-    let expiry = received[1]
-        .properties
-        .as_ref()
-        .unwrap()
-        .message_expiry_interval;
+    assert_eq!(props.response_topic, None, "no reply topic sends none");
+    let second_props = received[1].properties.as_ref().unwrap();
+    assert_eq!(
+        second_props.response_topic.as_deref(),
+        Some("lights/2/result")
+    );
+    let expiry = second_props.message_expiry_interval;
     assert!(
         matches!(expiry, Some(s) if (590..=600).contains(&s)),
         "the remaining lifetime is sent: {expiry:?}"

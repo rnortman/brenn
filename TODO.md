@@ -516,6 +516,23 @@ in-flight and backlog rows than the floor and the guest's memory cover read
 whole completes, each with a test. The comment sits at `sweep` in
 `brenn-provider-kit/src/activation.rs`.
 
+## `message-edit-skips-publish-authority`
+
+`Messenger::edit` (`brenn-messaging/src/edit.rs`) rewrites any field of a
+parked message that `EditFields` carries — its body and release time
+among them — after checking that the caller is the row's sender and holds
+a messaging grant. It does not
+check that the sender may still publish to the row's channel. An app that
+kept `MessagingSubscribe` after losing `MessagingPublish`, or whose
+`brenn:` publish ACL was narrowed, can therefore replace the content of a
+message it parked earlier and release it at once: new content published
+under a right it no longer holds. "Admission once, at commit" covers
+releasing what was admitted; it does not cover this. Done = edit re-checks
+the row's channel publish authority before writing, with a test of a
+sender whose grant was revoked and one whose ACL was narrowed. The comment
+sits at the messaging-grant check in `Messenger::edit` in
+`brenn-messaging/src/edit.rs`.
+
 ## `mqtt-component-publish-behaviour-cut-unconfirmed`
 
 `brenn:processor/mqtt@0.1.0`'s `mqtt-publish`/`mqtt-publish-expiring` now
@@ -552,6 +569,22 @@ comment in the prod switcher configuration that claims a refused publish
 traps the activation, false from that release. Done = both repositories
 are on the release with those changes. The comment sits at
 `MqttPublisher::admit` in `brenn-wasm/src/lib.rs`.
+
+## `mqtt-correlation-data-and-inbound-response-topic`
+
+An MQTT publish with a `reply_to` is sent with the MQTT 5 Response
+Topic and no Correlation Data, and an inbound PUBLISH's Response Topic
+and Correlation Data are dropped: the inbound handler reads topic,
+payload, QoS and Content Type only. A sender that names a reply topic
+therefore matches a response to its request by the response's payload
+alone, and a Brenn subscriber cannot answer a request-response
+publisher on the topic it asked for. Done when either outbound
+publishes carry Correlation Data a sender can match on (the bus
+message id is the candidate) and an inbound PUBLISH's Response Topic
+and Correlation Data reach the subscriber on the bus envelope or its
+transport metadata, with a test of a round trip; or this is closed as
+not wanted, on the ground that payload-level correlation is what the
+brokers' peers in use do.
 
 ## `mqtt-egress-operator-text-unsent-of-possibly-sent`
 
@@ -606,6 +639,15 @@ same report would be made. Done = such messages are reported `dropped`,
 `removed` before the position goes, with a test, or this half is closed as not
 worth that code. Reaping without that report or that decision does not close
 this entry.
+
+The same holds for a deferred publish parked on that channel: its row
+has no retention position and the channel is not in the directory, so no
+release pass visits it and it is never sent and never reported. If a
+client is later added under the same slug, the fresh position deletes
+whatever is still parked and logs the count beside the retained messages
+it skips; those are not reported either. Done for this half includes the
+parked rows.
+
 ## `mqtt-publish-acl-ops-config`
 
 Per-topic MQTT publish ACLs exist (`acl publish [topic_filter …]`), but
@@ -623,19 +665,10 @@ carries the ACLs. Until one happens, every PA can publish
 to every topic on its broker. Done = the production config grants each MQTT
 publisher only the topic filters it needs.
 
-## `mqtt-publish-reply-to-and-deliver-after-refused`
-
-The bus admission of an MQTT publish (`Messenger::admit_mqtt`) refuses
-`reply_to` and `deliver_after`. Done = `reply_to` on an MQTT publish
-names an MQTT topic on the same broker that the sender's ACLs allow it
-to publish to and is sent as the MQTT 5 Response Topic, and
-`deliver_after` on an MQTT publish is accepted, the message parked on
-the bus and released into the client's egress channel with its
-lifetime counted from release. Documenting either refusal as final
-does not close this entry. An automation's `mqtt_publish` action
-(`parse_mqtt_publish`, `brenn-server/src/automation_intercept.rs`) also
-refuses `reply_to`; done includes the action accepting a `reply_to` under
-the same rule as any other MQTT publish.
+A publisher that names a `reply_to` on an MQTT publish needs its
+publish ACL to cover the reply topic as well; the personal-assistant
+app's command-result topic is outside the three filters the wishlist
+names, so the config change decides whether to grant it.
 
 ## `mqtt-qos2-completion-refusal-told-rejected`
 

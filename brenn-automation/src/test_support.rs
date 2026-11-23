@@ -463,5 +463,6 @@ pub(super) fn mqtt_action(to: &str, payload: &[u8]) -> crate::job::MqttPublishAc
         lifetime: brenn_lib::mqtt::MqttLifetime::Seconds(std::num::NonZeroU32::new(300).unwrap()),
         content_type: None,
         status_to: None,
+        reply_to: None,
     }
 }

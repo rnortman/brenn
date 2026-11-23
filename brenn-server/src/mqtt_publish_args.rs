@@ -7,11 +7,12 @@ use std::num::NonZeroU32;
 use brenn_lib::mqtt::MqttLifetime;
 use brenn_lib::mqtt::address::{MqttAddress, parse_topic_name};
 use brenn_mqtt::payload::{OutboundArg, OutboundPayload, decode_outbound};
+use chrono::{DateTime, Utc};
 
 use crate::messaging_intercept;
 
 /// Every argument name an MQTT publish takes.
-pub(crate) const KEYS: [&str; 9] = [
+pub(crate) const KEYS: [&str; 11] = [
     "to",
     "body",
     "body_base64",
@@ -21,6 +22,8 @@ pub(crate) const KEYS: [&str; 9] = [
     "retain",
     "lifetime_s",
     "status_to",
+    "reply_to",
+    "deliver_after",
 ];
 
 /// How `lifetime_s` is given, for every rejection of it.
@@ -38,6 +41,11 @@ pub(crate) struct MqttPublishArgs<'a> {
     pub(crate) retain: bool,
     pub(crate) lifetime: MqttLifetime,
     pub(crate) status_to: Option<String>,
+    /// The reply address as given; the admission judges it.
+    pub(crate) reply_to: Option<String>,
+    /// The release time, in `BrennSend`'s forms; the publish decides whether
+    /// it parks.
+    pub(crate) deliver_after: Option<DateTime<Utc>>,
 }
 
 /// The payload as the arguments give it.
@@ -58,8 +66,8 @@ pub(crate) fn target(args: &serde_json::Value) -> Result<&str, String> {
 }
 
 /// Every argument of an MQTT publish, in this order: `to`, the address, the
-/// payload, `qos`, `retain`, `lifetime_s`, `status_to`. The first refusal is
-/// returned.
+/// payload, `qos`, `retain`, `lifetime_s`, `status_to`, `reply_to`,
+/// `deliver_after`. The first refusal is returned.
 pub(crate) fn parse(args: &serde_json::Value) -> Result<MqttPublishArgs<'_>, String> {
     let to = target(args)?;
     let address = parse_topic_name(to).map_err(|e| e.to_string())?;
@@ -77,16 +85,10 @@ pub(crate) fn parse(args: &serde_json::Value) -> Result<MqttPublishArgs<'_>, Str
         Some(_) => return Err("invalid `retain`: must be true or false".to_string()),
     };
     let lifetime = lifetime(args)?;
-    let status_to = match args.get("status_to") {
-        None => None,
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        Some(_) => {
-            return Err(
-                "invalid `status_to` argument: give a `brenn:<channel>` address as a string"
-                    .to_string(),
-            );
-        }
-    };
+    let status_to = optional_address(args, "status_to", "a `brenn:<channel>`")?;
+    let reply_to = optional_address(args, "reply_to", "an `mqtt:<client>:<topic>`")?;
+    let deliver_after = messaging_intercept::parse_optional_rfc3339(args.get("deliver_after"))
+        .map_err(|e| format!("invalid `deliver_after` argument: {e}"))?;
     Ok(MqttPublishArgs {
         to,
         address,
@@ -95,7 +97,25 @@ pub(crate) fn parse(args: &serde_json::Value) -> Result<MqttPublishArgs<'_>, Str
         retain,
         lifetime,
         status_to,
+        reply_to,
+        deliver_after,
     })
+}
+
+/// The address argument `key`: absent, or a non-empty string. `form` names the
+/// address form in the refusal.
+fn optional_address(
+    args: &serde_json::Value,
+    key: &str,
+    form: &str,
+) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
+        Some(_) => Err(format!(
+            "invalid `{key}` argument: give {form} address as a string"
+        )),
+    }
 }
 
 /// The one payload argument of `body`, `body_base64` and `attachment`, with
@@ -222,6 +242,8 @@ mod tests {
             MqttLifetime::Seconds(NonZeroU32::new(60).unwrap())
         );
         assert_eq!(parsed.status_to, None);
+        assert_eq!(parsed.reply_to, None);
+        assert_eq!(parsed.deliver_after, None);
         let ArgPayload::Inline(p) = parsed.payload else {
             panic!("inline payload expected");
         };
@@ -344,6 +366,59 @@ mod tests {
                 "invalid `status_to` argument: give a `brenn:<channel>` address as a string"
             );
         }
+    }
+
+    /// `reply_to` is read as a non-empty string and judged by the admission,
+    /// not here: a wildcard or another client's address parses.
+    #[test]
+    fn reply_to_is_a_non_empty_string() {
+        for given in ["mqtt:home:cmd/light/result", "mqtt:away:x/#"] {
+            let input = args(json!({ "reply_to": given }));
+            assert_eq!(parse(&input).unwrap().reply_to.as_deref(), Some(given));
+        }
+        for reply_to in [json!(""), json!(7), json!({ "topic": "x" })] {
+            assert_eq!(
+                refusal(json!({ "reply_to": reply_to })),
+                "invalid `reply_to` argument: give an `mqtt:<client>:<topic>` address as a string"
+            );
+        }
+        assert_eq!(
+            refusal(json!({ "status_to": 7, "reply_to": 7 })),
+            "invalid `status_to` argument: give a `brenn:<channel>` address as a string",
+            "`status_to` is read before `reply_to`"
+        );
+    }
+
+    /// `deliver_after` takes `BrennSend`'s forms: absent, `null` or `""` is
+    /// none, an RFC 3339 string is the time, anything else is refused.
+    #[test]
+    fn deliver_after_takes_the_rfc3339_forms() {
+        let input = args(json!({ "deliver_after": "2030-01-02T03:04:05Z" }));
+        assert_eq!(
+            parse(&input).unwrap().deliver_after,
+            Some(
+                DateTime::parse_from_rfc3339("2030-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        for none in [json!(""), json!(null)] {
+            let mut input = args(json!({}));
+            input["deliver_after"] = none.clone();
+            assert_eq!(parse(&input).unwrap().deliver_after, None, "{none}");
+        }
+        for bad in [json!("tomorrow"), json!(7), json!({})] {
+            let err = refusal(json!({ "deliver_after": bad }));
+            assert!(
+                err.starts_with("invalid `deliver_after` argument: "),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(
+            refusal(json!({ "reply_to": 7, "deliver_after": 7 })),
+            "invalid `reply_to` argument: give an `mqtt:<client>:<topic>` address as a string",
+            "`reply_to` is read before `deliver_after`"
+        );
     }
 
     #[test]

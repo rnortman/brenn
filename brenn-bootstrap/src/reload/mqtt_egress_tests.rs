@@ -91,6 +91,7 @@ async fn commit_as(
                     content_type: None,
                     expires: MqttExpiry::Never,
                     status_to: status_to.map(str::to_string),
+                    response_topic: None,
                 })),
                 reply_to: None,
                 delivery_deadline: None,

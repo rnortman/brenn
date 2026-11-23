@@ -7,8 +7,8 @@
 //! position as an [`EgressBus`]; the reader reads, advances and reports
 //! through it and never touches the bus directly. [`MqttEgressHub::close`]
 //! settles a removed client's channel: it gives up the position and reports
-//! every message the channel held unread `dropped`, `removed`, whether or not
-//! the client's reader was still running.
+//! every message the channel held unread or parked `dropped`, `removed`,
+//! whether or not the client's reader was still running.
 //!
 //! Every report but `Delivered`, `Drained`, `Handed` and `PayloadGone` is
 //! logged and counted. One whose message names a `status_to` is first
@@ -41,11 +41,11 @@ use brenn_envelope::delivery::{
 use brenn_envelope::{MessageEnvelope, MqttPublishTransport, TransportMeta};
 use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::{ParticipantId, mqtt_egress_address};
-use brenn_messaging::Messenger;
 use brenn_messaging::mqtt_outbound::{
     MQTT_OUTBOUND_COMPONENT, MQTT_OUTBOUND_NOISE, mqtt_outbound_participant,
 };
 use brenn_messaging::publish::{DeliveryStatusPublish, DeliveryStatusRefusal};
+use brenn_messaging::{DetachedTaking, Messenger};
 use brenn_messaging_store::blob::BlobError;
 use brenn_messaging_store::store::{Attached, MessageSeq};
 use brenn_mqtt::reader::{
@@ -186,8 +186,9 @@ impl MqttEgressHub {
     /// return the reader's view of it.
     ///
     /// An existing position resumes, so a restart or a successor session
-    /// hands off exactly what was not handed. A position created here is
-    /// moved past everything the channel retains: those messages were
+    /// hands off exactly what was not handed. A position created here first
+    /// deletes every message still parked on the channel, then moves past
+    /// everything the channel retains, in that order: those messages were
     /// committed for an earlier client of this slug that was since removed,
     /// and are logged by count and not handed.
     ///
@@ -213,18 +214,21 @@ impl MqttEgressHub {
             )
             .await;
         if matches!(attached, Attached::Created) {
-            // Only the count is logged: every skipped message has had its
-            // report, an outcome while its client ran or `dropped`, `removed`
-            // when the client was removed, except what a client deleted from
-            // the configuration while the server was down left unread, which
-            // nothing reports (TODO(mqtt-egress-removed-client-rows)).
-            let skipped = bus.skip_unhanded().await;
-            if skipped > 0 {
+            // Only the counts are logged: every skipped or deleted message has
+            // had its report, an outcome while its client ran or `dropped`,
+            // `removed` when the client was removed, except what a client
+            // deleted from the configuration while the server was down left
+            // unread or parked, which nothing reports
+            // (TODO(mqtt-egress-removed-client-rows)).
+            let (parked, skipped) = bus.discard_inherited().await;
+            if parked > 0 || skipped > 0 {
                 tracing::warn!(
                     mqtt_client = client,
                     skipped,
-                    "MQTT egress: a new position skipped messages its channel retained from \
-                     before this client was added; they are not published"
+                    parked,
+                    "MQTT egress: a new position deleted messages parked and skipped messages \
+                     retained on its channel from before this client was added; they are not \
+                     published"
                 );
             }
         }
@@ -238,12 +242,13 @@ impl MqttEgressHub {
 
     /// Settle a removed client's egress channel: give up the participant's
     /// position, taking in the same step every message it had not been
-    /// served, report each `dropped`, `removed` — one count for those naming
-    /// no `status_to`, if any, then one report per message naming one, in
-    /// channel order — then close every open episode with its summary alert
-    /// and forget the client's counts. A commit to the
-    /// channel after the take is refused, so nothing committed to it goes
-    /// unreported.
+    /// served and removing every message parked on the channel, report each
+    /// `dropped`, `removed` — one count for those naming no `status_to`, if
+    /// any, then one report per retained message naming one, in channel
+    /// order, then one per parked message naming one, in release order — then
+    /// close every open episode with its summary alert and forget the
+    /// client's counts. A commit or park to the channel after the take is
+    /// refused, so nothing committed to it goes unreported.
     ///
     /// The client's reader must have exited: one still running panics at its
     /// next bus call on the missing position.
@@ -255,14 +260,9 @@ impl MqttEgressHub {
     pub async fn close(&self, client: &str) {
         let address = mqtt_egress_address(client);
         let depth = self.channel_depth(&address);
-        let unseen = self
+        let DetachedTaking { unseen, parked } = self
             .messenger
-            .detach_subscriber_taking_unseen(
-                &address,
-                &self.participant,
-                depth,
-                MQTT_OUTBOUND_NOISE,
-            )
+            .detach_subscriber_taking_all(&address, &self.participant, depth, MQTT_OUTBOUND_NOISE)
             .await
             .unwrap_or_else(|| {
                 panic!(
@@ -272,7 +272,11 @@ impl MqttEgressHub {
             });
         let mut unnamed = 0u64;
         let mut named = Vec::new();
-        for (_, envelope) in &unseen {
+        let taken = unseen
+            .iter()
+            .map(|(_, envelope)| envelope)
+            .chain(parked.iter().map(|message| &message.envelope));
+        for envelope in taken {
             let publish = egress_publish(&address, envelope);
             if publish.status_to.is_some() {
                 named.push(EgressMeta::new(
@@ -833,10 +837,31 @@ struct ClientEgress {
 }
 
 impl ClientEgress {
-    /// Move a fresh position past every retained message the head read would
-    /// serve, and return how many that was. Anything below the first of them
-    /// was outrun by the window and is the bus's to count.
-    async fn skip_unhanded(&self) -> u64 {
+    /// Discard what a fresh position inherits from an earlier client of the
+    /// slug, and return `(parked deleted, retained skipped)`:
+    ///
+    /// 1. delete every message parked on the channel;
+    /// 2. move the position past every retained message the head read would
+    ///    serve. Anything below the first of them was outrun by the window and
+    ///    is the bus's to count.
+    ///
+    /// The order is the guard. The steps are separate holds of the database
+    /// lock, and on a reload the dispatcher is running and the channel is in
+    /// the directory, so a parked message already due can be released at any
+    /// moment between them:
+    ///
+    /// - a release before the take puts the message into retention, and the
+    ///   skip that follows passes it;
+    /// - after the take nothing is parked, so nothing can be released between
+    ///   the take and the skip, or between the skip's read and its advance;
+    /// - skipping first would let a release between the skip and the take land
+    ///   above the new position, where the reader would hand it to this
+    ///   client's broker.
+    ///
+    /// No park for this client can land between the attach and the take: no
+    /// sender can yet name a client being opened.
+    async fn discard_inherited(&self) -> (u64, u64) {
+        let parked = self.hub.messenger.take_deferred(&self.address).await.len() as u64;
         let window = self
             .hub
             .messenger
@@ -846,10 +871,10 @@ impl ClientEgress {
             .unwrap_or_else(|| self.no_position());
         let new = window.new_entries();
         let (Some((first, _)), Some((last, _))) = (new.first(), new.last()) else {
-            return 0;
+            return (parked, 0);
         };
         self.advance_over(*last, *first).await;
-        new.len() as u64
+        (parked, new.len() as u64)
     }
 
     async fn advance_over(&self, through: MessageSeq, seen_floor: MessageSeq) {

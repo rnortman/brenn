@@ -67,6 +67,16 @@ fn deferred_select(cmp: Option<&str>) -> String {
     )
 }
 
+/// One row of a [`deferred_select`] query.
+fn deferred_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeferredRow> {
+    let deliver_after: String = row.get(6)?;
+    Ok(DeferredRow {
+        message_id: row.get(15)?,
+        release_at: parse_release(&deliver_after),
+        envelope: super::bus::row_to_message_envelope(row)?,
+    })
+}
+
 fn parse_release(s: &str) -> DateTime<Utc> {
     parse_rfc3339(s).unwrap_or_else(|| panic!("messaging: malformed deliver_after in db: {s:?}"))
 }
@@ -97,14 +107,7 @@ pub fn list_deferred_for_sender(
     let rows = stmt
         .query_map(
             rusqlite::params![channel_uuid.as_bytes().to_vec(), sender],
-            |row| {
-                let deliver_after: String = row.get(6)?;
-                Ok(DeferredRow {
-                    message_id: row.get(15)?,
-                    release_at: parse_release(&deliver_after),
-                    envelope: super::bus::row_to_message_envelope(row)?,
-                })
-            },
+            deferred_row,
         )
         .expect("query list_deferred_for_sender");
     rows.map(|r| r.expect("read deferred row")).collect()
@@ -301,6 +304,45 @@ pub fn edit_deferred(
     }
     tx.commit().expect("messaging: commit edit_deferred");
     true
+}
+
+/// Remove and return every unreleased message on `channel_uuid`, whoever sent
+/// it and whether or not it is due, soonest release first.
+///
+/// One transaction: the rows returned are the rows deleted. The delete
+/// triggers release the rows' blob references and their search entries; a
+/// channel-backed message holds no push row.
+pub fn take_deferred_for_channel(conn: &Connection, channel_uuid: Uuid) -> Vec<DeferredRow> {
+    let channel_bytes = channel_uuid.as_bytes().to_vec();
+    let tx = conn
+        .unchecked_transaction()
+        .expect("messaging: begin take_deferred_for_channel tx");
+    let taken: Vec<DeferredRow> = {
+        let sql = format!(
+            "{} ORDER BY m.deliver_after ASC, m.id ASC",
+            deferred_select(None)
+        );
+        let mut stmt = tx.prepare(&sql).expect("prepare take_deferred_for_channel");
+        let rows = stmt
+            .query_map(rusqlite::params![channel_bytes], deferred_row)
+            .expect("query take_deferred_for_channel");
+        rows.map(|r| r.expect("read deferred row")).collect()
+    };
+    let deleted = tx
+        .execute(
+            "DELETE FROM messaging_messages
+             WHERE channel_uuid = ?1 AND deliver_after IS NOT NULL",
+            rusqlite::params![channel_bytes],
+        )
+        .expect("messaging: delete taken deferred rows");
+    assert_eq!(
+        deleted,
+        taken.len(),
+        "messaging: take_deferred_for_channel deleted a different set than it read"
+    );
+    tx.commit()
+        .expect("messaging: commit take_deferred_for_channel");
+    taken
 }
 
 /// Soonest release time among this channel's unreleased messages.

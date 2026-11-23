@@ -1644,6 +1644,7 @@ fn egress_message(seq: u64, client: &str, topic: &str, qos: u8, payload: &[u8]) 
             content_type: None,
             expires: MqttExpiry::Never,
             status_to: None,
+            response_topic: None,
         },
         payload: bytes::Bytes::copy_from_slice(payload),
     }

@@ -422,6 +422,7 @@ mod tests {
             lifetime: brenn_lib::mqtt::MqttLifetime::Forever,
             content_type: None,
             status_to: None,
+            reply_to: None,
         });
         let now = chrono::Utc::now();
         crate::db::insert_job(

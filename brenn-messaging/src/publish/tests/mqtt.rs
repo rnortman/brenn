@@ -16,8 +16,9 @@ use crate::testutils::{
     install_blob_store_at, seal_blob, surface_registrations, test_channel_entry,
 };
 use crate::{
-    AttachmentName, ChannelEntry, MessageBody, MessageEnvelope, MessagingDirectory, MqttExpiry,
-    MqttPublishTransport, SubscriberEntry, SubscriberEntryKind, TransportMeta, WakeRouter,
+    AttachmentName, CancelResult, ChannelEntry, EditFields, EditResult, MessageBody,
+    MessageEnvelope, MessagingDirectory, MqttExpiry, MqttPublishTransport, SubscriberEntry,
+    SubscriberEntryKind, TransportMeta, WakeRouter,
 };
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::{ChannelMatcher, MqttMatcher};
@@ -216,6 +217,7 @@ fn options() -> MqttPublishOptions {
         lifetime: seconds(60),
         content_type: None,
         status_to: None,
+        reply_to: None,
     }
 }
 
@@ -282,7 +284,26 @@ impl Fixture {
         options: &MqttPublishOptions,
     ) -> Result<MqttCommitted, PublishResult> {
         self.m
-            .publish_mqtt(ORIGIN, APP, addr, payload, options)
+            .publish_mqtt(ORIGIN, APP, addr, payload, options, None)
+            .await
+    }
+
+    /// An inline publish to [`ADDR`] stating `deliver_after`.
+    async fn send_at(
+        &self,
+        bytes: &[u8],
+        options: &MqttPublishOptions,
+        deliver_after: chrono::DateTime<Utc>,
+    ) -> Result<MqttCommitted, PublishResult> {
+        self.m
+            .publish_mqtt(
+                ORIGIN,
+                APP,
+                ADDR,
+                MqttPayload::Inline(bytes.to_vec()),
+                options,
+                Some(deliver_after),
+            )
             .await
     }
 
@@ -291,13 +312,11 @@ impl Fixture {
             .await
     }
 
-    /// The MQTT admission under the fixture app's policy with every option
-    /// argument a bus publish can carry.
+    /// The MQTT admission under the fixture app's policy with the option
+    /// argument a bus publish can carry beside its MQTT options.
     fn admit(
         &self,
         body: &[u8],
-        reply_to: Option<&str>,
-        deliver_after: Option<chrono::DateTime<Utc>>,
         delivery_deadline: Option<chrono::DateTime<Utc>>,
     ) -> Result<(), PublishResult> {
         let apps = self.m.apps.load();
@@ -308,8 +327,6 @@ impl Fixture {
                 ADDR,
                 &options(),
                 Some(body.len() as u64),
-                reply_to,
-                deliver_after,
                 delivery_deadline,
             )
             .map(|_| ())
@@ -479,38 +496,232 @@ async fn a_messenger_with_no_client_table_knows_no_client() {
     f.assert_spent_nothing().await;
 }
 
-/// `deliver_after` is refused whether it is past or future, and the two other
-/// options a broker cannot carry are refused on the same ground.
+/// A `delivery_deadline`, which a broker cannot carry, is refused whenever
+/// stated.
 #[tokio::test]
-async fn the_bus_options_are_refused_whenever_stated() {
+async fn a_delivery_deadline_is_refused_whenever_stated() {
     let f = fixture().await;
     let future = Utc::now() + Duration::hours(1);
-    let past = Utc::now() - Duration::hours(1);
-    let cases: [(Result<(), PublishResult>, MqttRefusal); 4] = [
-        (
-            f.admit(b"on", None, Some(future), None),
-            MqttRefusal::DeliverAfter,
-        ),
-        (
-            f.admit(b"on", None, Some(past), None),
-            MqttRefusal::DeliverAfter,
-        ),
-        (
-            f.admit(b"on", Some("brenn:replies"), None, None),
-            MqttRefusal::ReplyTo,
-        ),
-        (
-            f.admit(b"on", None, None, Some(future)),
-            MqttRefusal::DeliveryDeadline,
-        ),
+    match f.admit(b"on", Some(future)) {
+        Err(PublishResult::MqttRefused(MqttRefusal::DeliveryDeadline)) => {}
+        other => panic!("expected MqttRefused(DeliveryDeadline), got {other:?}"),
+    }
+    assert!(f.admit(b"on", None).is_ok());
+}
+
+// ── reply_to ─────────────────────────────────────────────────────────────
+
+/// [`options`], stating `reply_to`.
+fn replying(reply_to: &str) -> MqttPublishOptions {
+    MqttPublishOptions {
+        reply_to: Some(reply_to.to_string()),
+        ..options()
+    }
+}
+
+/// `addr` with `reply_to` is refused on its reply address for `why`, spending
+/// nothing. Only an ACL refusal is a denial, counted as `acl_denied`.
+async fn assert_reply_refused(f: &Fixture, reply_to: &str, why: ReplyToRefusal) {
+    let denial = matches!(why, ReplyToRefusal::AclDenied)
+        .then_some(brenn_obs::security::DenialKind::AclDenied);
+    let counted_before = f.m.publish_denied_count(&sender(), "acl_denied");
+    let refusal = expect_refused(
+        f.send(
+            ADDR,
+            MqttPayload::Inline(b"on".to_vec()),
+            &replying(reply_to),
+        )
+        .await,
+    );
+    let expected = PublishResult::MqttRefused(MqttRefusal::ReplyTo {
+        address: reply_to.to_string(),
+        why,
+    });
+    assert_eq!(
+        format!("{refusal:?}"),
+        format!("{expected:?}"),
+        "{reply_to}"
+    );
+    assert_eq!(refusal.signal_kind(), denial, "{reply_to}");
+    assert_eq!(
+        f.m.publish_denied_count(&sender(), "acl_denied"),
+        counted_before + u64::from(denial.is_some()),
+        "{reply_to}"
+    );
+    f.assert_spent_nothing().await;
+}
+
+/// An admitted reply address is stored as the bare topic in the transport,
+/// and the stored envelope carries no bus `reply_to`.
+#[tokio::test]
+async fn an_admitted_reply_to_is_stored_as_the_response_topic() {
+    let f = fixture().await;
+    f.send(
+        ADDR,
+        MqttPayload::Inline(b"on".to_vec()),
+        &replying("mqtt:home:lights/result/set"),
+    )
+    .await
+    .expect("committed");
+    let rows = f.rows(&f.outbound).await;
+    assert_eq!(rows.len(), 1);
+    let t = mqtt_transport(&rows[0]);
+    assert_eq!(t.response_topic.as_deref(), Some("lights/result/set"));
+    assert_eq!(t.topic, "lights/kitchen/set");
+    assert_eq!(
+        rows[0].reply_to, None,
+        "no bus reply address on an egress row"
+    );
+
+    f.send_inline(b"off").await.expect("committed");
+    let rows = f.rows(&f.outbound).await;
+    assert_eq!(mqtt_transport(&rows[1]).response_topic, None);
+}
+
+/// The target topic itself is a reply topic the rule admits.
+#[tokio::test]
+async fn the_target_topic_is_an_admissible_reply_topic() {
+    let f = fixture().await;
+    f.send(ADDR, MqttPayload::Inline(b"on".to_vec()), &replying(ADDR))
+        .await
+        .expect("committed");
+    let rows = f.rows(&f.outbound).await;
+    assert_eq!(
+        mqtt_transport(&rows[0]).response_topic.as_deref(),
+        Some("lights/kitchen/set")
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_or_wildcard_reply_to_is_malformed() {
+    for reply_to in [
+        "mqtt:home:lights/+/set",
+        "mqtt:home:lights/#",
+        "mqtt:home",
+        "brenn:replies",
+        "lights/result",
+    ] {
+        let f = fixture().await;
+        let detail = brenn_lib::mqtt::parse_topic_name(reply_to)
+            .unwrap_err()
+            .to_string();
+        assert_reply_refused(&f, reply_to, ReplyToRefusal::Malformed { detail }).await;
+    }
+}
+
+#[tokio::test]
+async fn a_reply_to_on_another_client_is_refused() {
+    let f = fixture().await;
+    // `away` is a registered client the ACL covers for this topic.
+    assert_reply_refused(&f, OTHER_ADDR, ReplyToRefusal::OtherClient).await;
+}
+
+#[tokio::test]
+async fn a_reply_topic_outside_the_publish_acl_is_refused() {
+    let f = fixture().await;
+    assert_reply_refused(
+        &f,
+        "mqtt:home:lights/kitchen/get",
+        ReplyToRefusal::AclDenied,
+    )
+    .await;
+}
+
+/// A `$`-first-level reply topic is outside an ACL entry whose first level
+/// is a wildcard, and inside one that spells the level.
+#[tokio::test]
+async fn a_dollar_reply_topic_needs_an_entry_that_spells_its_first_level() {
+    let f = fixture().await;
+    let with_entry = |filter: &str| {
+        let mut apps = (*f.m.apps.load()).clone();
+        apps.get_mut(APP)
+            .unwrap()
+            .policy_mut()
+            .acls
+            .mqtt_publish
+            .push(MqttMatcher {
+                client: CLIENT.to_string(),
+                topic_filter: filter.to_string(),
+            });
+        Arc::new(apps)
+    };
+    f.m.apps.store(with_entry("#"));
+    assert_reply_refused(&f, "mqtt:home:$share/result", ReplyToRefusal::AclDenied).await;
+    f.m.apps.store(with_entry("+/result"));
+    assert_reply_refused(&f, "mqtt:home:$share/result", ReplyToRefusal::AclDenied).await;
+    f.m.apps.store(with_entry("$share/#"));
+    f.send(
+        ADDR,
+        MqttPayload::Inline(b"on".to_vec()),
+        &replying("mqtt:home:$share/result"),
+    )
+    .await
+    .expect("committed under an entry that spells `$share`");
+    let rows = f.rows(&f.outbound).await;
+    assert_eq!(
+        mqtt_transport(&rows[0]).response_topic.as_deref(),
+        Some("$share/result")
+    );
+}
+
+/// A publish refused on its target's grant, ACL or client answers the same
+/// whether or not it states a reply address, even an unacceptable one.
+#[tokio::test]
+async fn a_refusal_before_the_reply_check_ignores_the_reply_address() {
+    let f = fixture().await;
+    let targets = [
+        // Step 1: malformed target.
+        "mqtt:home:lights/#",
+        // Step 3: outside the ACL.
+        "mqtt:home:locks/front/set",
+        // Step 4: an unchannelled client.
+        "mqtt:loft:lights/kitchen/set",
     ];
-    for (result, expected) in cases {
-        match result {
-            Err(PublishResult::MqttRefused(r)) => assert_eq!(r, expected),
-            other => panic!("expected MqttRefused({expected:?}), got {other:?}"),
+    for target in targets {
+        let bare = expect_refused(
+            f.send(target, MqttPayload::Inline(b"on".to_vec()), &options())
+                .await,
+        );
+        for reply_to in [
+            "mqtt:home:lights/kitchen/get",
+            "mqtt:away:x",
+            "mqtt:home:x/#",
+        ] {
+            let with = expect_refused(
+                f.send(
+                    target,
+                    MqttPayload::Inline(b"on".to_vec()),
+                    &replying(reply_to),
+                )
+                .await,
+            );
+            assert_eq!(
+                format!("{with:?}"),
+                format!("{bare:?}"),
+                "{target} with {reply_to}"
+            );
         }
     }
-    assert!(f.admit(b"on", None, None, None).is_ok());
+    // Step 2: the grant.
+    let apps = {
+        let mut apps = (*f.m.apps.load()).clone();
+        let policy = apps.get_mut(APP).unwrap().policy_mut();
+        policy.grants = brenn_lib::access::GrantSet::default();
+        policy.grants.insert(AppCapability::MessagingPublish);
+        Arc::new(apps)
+    };
+    f.m.apps.store(apps);
+    for opts in [options(), replying("mqtt:away:x")] {
+        let refusal = expect_refused(
+            f.send(ADDR, MqttPayload::Inline(b"on".to_vec()), &opts)
+                .await,
+        );
+        assert!(
+            matches!(refusal, PublishResult::MissingSender),
+            "{refusal:?}"
+        );
+    }
+    f.assert_spent_nothing().await;
 }
 
 #[tokio::test]
@@ -809,6 +1020,7 @@ async fn a_committed_publish_is_a_brenn_row_on_its_clients_egress_channel() {
         lifetime: seconds(90),
         content_type: Some("application/json".to_string()),
         status_to: None,
+        reply_to: None,
     };
     let before = Utc::now();
     let committed = f
@@ -836,6 +1048,7 @@ async fn a_committed_publish_is_a_brenn_row_on_its_clients_egress_channel() {
             content_type: Some("application/json".to_string()),
             expires: MqttExpiry::At(row.publish_ts + Duration::seconds(90)),
             status_to: None,
+            response_topic: None,
         }
     );
     let MqttExpiry::At(at) = t.expires else {
@@ -1189,6 +1402,10 @@ async fn the_apps_admission_is_the_admissions_decision() {
         (ADDR, naming(STATUS), 2),
         (ADDR, naming("brenn:nowhere"), 2),
         (ADDR, naming("light-status"), 2),
+        (ADDR, replying("mqtt:home:lights/kitchen/set"), 2),
+        (ADDR, replying("mqtt:home:lights/kitchen/get"), 2),
+        (ADDR, replying("mqtt:away:lights/kitchen/set"), 2),
+        (ADDR, replying("mqtt:home:lights/#"), 2),
         (ADDR, options(), u64::from(CLIENT_CAP)),
         (ADDR, options(), u64::from(CLIENT_CAP) + 1),
     ];
@@ -1196,7 +1413,7 @@ async fn the_apps_admission_is_the_admissions_decision() {
     for (addr, opts, len) in cases {
         let answer = f.m.admit_mqtt_for_app(APP, addr, &opts, len);
         let expected =
-            f.m.admit_mqtt(&policy, addr, &opts, Some(len), None, None, None)
+            f.m.admit_mqtt(&policy, addr, &opts, Some(len), None)
                 .map(|_| ());
         assert_eq!(
             format!("{answer:?}"),
@@ -1245,6 +1462,7 @@ async fn a_components_flushed_entry_is_a_row_with_the_agents_transport() {
         lifetime: seconds(90),
         content_type: Some("application/json".to_string()),
         status_to: None,
+        reply_to: None,
     };
     let none = HeldAttachments::none();
     f.m.publish_from_wasm(
@@ -1282,6 +1500,7 @@ async fn a_components_flushed_entry_is_a_row_with_the_agents_transport() {
         content_type: Some("application/json".to_string()),
         expires: MqttExpiry::At(row.publish_ts + Duration::seconds(90)),
         status_to: None,
+        response_topic: None,
     };
     assert_eq!(*mqtt_transport(component), expect(component));
     assert_eq!(*mqtt_transport(agent), expect(agent));
@@ -1705,7 +1924,7 @@ impl Fixture {
     async fn close_home(&self) {
         let taken = self
             .m
-            .detach_subscriber_taking_unseen(
+            .detach_subscriber_taking_all(
                 EGRESS_HOME,
                 &egress_reader(),
                 self.outbound.resolved_channel.retain_depth,
@@ -1817,7 +2036,7 @@ async fn a_commit_queued_before_the_take_is_in_what_the_take_returns() {
     );
     let held = holder.await;
     let reader = egress_reader();
-    let mut take = Box::pin(f.m.detach_subscriber_taking_unseen(
+    let mut take = Box::pin(f.m.detach_subscriber_taking_all(
         EGRESS_HOME,
         &reader,
         f.outbound.resolved_channel.retain_depth,
@@ -1826,9 +2045,9 @@ async fn a_commit_queued_before_the_take_is_in_what_the_take_returns() {
     poll_pending(take.as_mut(), "the take queues behind the commit");
     drop(held);
 
-    let (committed, unseen) = tokio::join!(publish, take);
+    let (committed, taken) = tokio::join!(publish, take);
     let committed = committed.expect("committed ahead of the take");
-    let unseen = unseen.expect("the fixture's reader held a position");
+    let unseen = taken.expect("the fixture's reader held a position").unseen;
     assert_eq!(
         unseen
             .iter()
@@ -1854,7 +2073,7 @@ async fn a_commit_queued_behind_the_take_is_refused_and_not_in_what_it_returns()
         "the publish passed admission before the close"
     );
     let reader = egress_reader();
-    let mut take = Box::pin(f.m.detach_subscriber_taking_unseen(
+    let mut take = Box::pin(f.m.detach_subscriber_taking_all(
         EGRESS_HOME,
         &reader,
         f.outbound.resolved_channel.retain_depth,
@@ -1867,8 +2086,8 @@ async fn a_commit_queued_behind_the_take_is_refused_and_not_in_what_it_returns()
         "the publish draws its budget and waits at its commit, behind the take",
     );
 
-    let (unseen, published) = tokio::join!(take, publish);
-    let unseen = unseen.expect("the fixture's reader held a position");
+    let (taken, published) = tokio::join!(take, publish);
+    let unseen = taken.expect("the fixture's reader held a position").unseen;
     assert!(unseen.is_empty(), "nothing was committed before the take");
     let refusal = expect_refused(published);
     assert!(
@@ -1940,7 +2159,7 @@ async fn a_flushed_mqtt_entry_to_a_closed_channel_after_an_open_one_panics() {
 /// its window passed under the rung it is given, and forgets the tally with the
 /// position.
 #[tokio::test]
-async fn detach_taking_unseen_enacts_the_outrun_and_forgets_the_tally() {
+async fn detach_taking_all_enacts_the_outrun_and_forgets_the_tally() {
     let f = fixture().await;
     let probe = ParticipantId::for_system("probe");
     f.m.attach_subscriber(STATUS, "probe", &probe, Depth::Bounded(8))
@@ -1950,14 +2169,16 @@ async fn detach_taking_unseen_enacts_the_outrun_and_forgets_the_tally() {
             .await;
     }
     let taken =
-        f.m.detach_subscriber_taking_unseen(STATUS, &probe, Depth::Bounded(1), NoiseLevel::Alarm)
+        f.m.detach_subscriber_taking_all(STATUS, &probe, Depth::Bounded(1), NoiseLevel::Alarm)
             .await
             .expect("the probe held a position");
     let bodies: Vec<_> = taken
+        .unseen
         .iter()
         .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
         .collect();
     assert_eq!(bodies, vec!["c"]);
+    assert!(taken.parked.is_empty(), "nothing was parked");
     assert_eq!(
         f.router.alarms.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -1965,8 +2186,504 @@ async fn detach_taking_unseen_enacts_the_outrun_and_forgets_the_tally() {
     );
     assert_eq!(f.m.drop_counter(STATUS, &probe), 0, "the tally went too");
     assert!(
-        f.m.detach_subscriber_taking_unseen(STATUS, &probe, Depth::Bounded(1), NoiseLevel::Alarm)
+        f.m.detach_subscriber_taking_all(STATUS, &probe, Depth::Bounded(1), NoiseLevel::Alarm)
             .await
             .is_none()
     );
+}
+
+// ── deliver_after ───────────────────────────────────────────────────────
+
+impl Fixture {
+    /// Every message parked on `home`'s egress channel, soonest release first.
+    async fn parked_home(&self) -> Vec<brenn_messaging_store::store::DeferredMessage> {
+        let store = self.m.store_for(&self.outbound);
+        store.deferred_for_sender(&sender()).await
+    }
+
+    async fn parked_home_count(&self) -> u64 {
+        let store = self.m.store_for(&self.outbound);
+        store.deferred_len().await
+    }
+}
+
+/// A whole-second instant `secs` from now: the database keeps release times
+/// at second granularity.
+fn whole_seconds_from_now(secs: i64) -> chrono::DateTime<Utc> {
+    let at = Utc::now() + Duration::seconds(secs);
+    chrono::DateTime::from_timestamp(at.timestamp(), 0).expect("representable")
+}
+
+/// A future `deliver_after` parks the publish on the egress channel, invisible
+/// to retention, with its expiry counted from the release time; the budget and
+/// the rate token are spent at the commit.
+#[tokio::test]
+async fn a_future_deliver_after_parks_with_its_lifetime_from_the_release_time() {
+    let f = fixture().await;
+    let release_at = whole_seconds_from_now(3600);
+    let committed = f
+        .send_at(b"on", &options(), release_at)
+        .await
+        .expect("parked");
+
+    assert!(f.rows(&f.outbound).await.is_empty(), "nothing is retained");
+    let parked = f.parked_home().await;
+    let [entry] = parked.as_slice() else {
+        panic!("one parked row, got {}", parked.len());
+    };
+    assert_eq!(entry.message_uuid(), committed.message_id);
+    assert_eq!(entry.release_at, release_at);
+    assert_eq!(entry.envelope.reply_to, None);
+    let t = mqtt_transport(&entry.envelope);
+    assert_eq!(t.client_slug, CLIENT);
+    assert_eq!(t.topic, "lights/kitchen/set");
+    assert_eq!(
+        t.expires,
+        MqttExpiry::At(release_at + Duration::seconds(60)),
+        "the lifetime counts from the release time"
+    );
+    assert_eq!(committed.remaining_budget, Some(99));
+    assert_eq!(f.budget().await, Some(99));
+    assert!(f.rate_drawn());
+}
+
+/// A `deliver_after` at or before now publishes at once, its lifetime counted
+/// from the commit.
+#[tokio::test]
+async fn a_past_deliver_after_commits_at_once_with_its_lifetime_from_the_commit() {
+    let f = fixture().await;
+    let before = Utc::now();
+    let committed = f
+        .send_at(b"on", &options(), before - Duration::hours(1))
+        .await
+        .expect("committed");
+    assert_eq!(f.parked_home_count().await, 0, "nothing parked");
+    let rows = f.rows(&f.outbound).await;
+    let [row] = rows.as_slice() else {
+        panic!("one row, got {}", rows.len());
+    };
+    assert_eq!(row.message_id, committed.message_id);
+    let MqttExpiry::At(at) = mqtt_transport(row).expires else {
+        panic!("a lifetime in seconds expires");
+    };
+    assert!(at >= before + Duration::seconds(60), "{at} from the commit");
+}
+
+/// A park to a channel whose reader holds no position is answered as for an
+/// unknown client: nothing parked, the budget refunded.
+#[tokio::test]
+async fn a_park_to_a_closed_egress_channel_is_unknown_and_refunded() {
+    let f = fixture().await;
+    f.close_home().await;
+    let refusal = expect_refused(
+        f.send_at(b"on", &options(), whole_seconds_from_now(3600))
+            .await,
+    );
+    assert!(
+        matches!(&refusal, PublishResult::UnknownChannel(a) if a == ADDR),
+        "{refusal:?}"
+    );
+    assert_eq!(f.parked_home_count().await, 0, "nothing parked");
+    assert!(f.rows(&f.outbound).await.is_empty(), "nothing stored");
+    assert!(f.rate_drawn(), "the publish passed admission");
+    assert_eq!(f.budget().await, Some(f.full_budget()), "budget refunded");
+}
+
+/// An over-cap payload whose park is refused leaves no blob: the refused park
+/// dropped the only hold on it.
+#[tokio::test]
+async fn an_over_cap_payload_refused_at_the_park_leaves_no_blob() {
+    let f = fixture().await;
+    f.close_home().await;
+    let over = vec![b'x'; f.m.max_body_bytes() + 1];
+    let refusal = expect_refused(
+        f.send_at(&over, &options(), whole_seconds_from_now(3600))
+            .await,
+    );
+    assert!(
+        matches!(refusal, PublishResult::UnknownChannel(_)),
+        "{refusal:?}"
+    );
+    assert_eq!(f.blobs(), (0, 0), "no blob left");
+    assert_eq!(f.budget().await, Some(f.full_budget()), "budget refunded");
+}
+
+/// The egress channel's deferred cap is shared by every sender: a full set
+/// refuses the park with the cap and refunds the budget, and an immediate
+/// publish to the client still commits.
+#[tokio::test]
+async fn a_full_deferred_set_refuses_the_park_and_refunds() {
+    let f = fixture().await;
+    let Depth::Bounded(cap) = f.outbound.resolved_channel.retain_depth else {
+        panic!("an egress channel's retain depth is bounded");
+    };
+    let later = Some(whole_seconds_from_now(7200));
+    for i in 0..cap {
+        crate::testutils::insert_bus_body_from(
+            &f.m,
+            &f.outbound,
+            "someone-else",
+            &format!("{i}").as_str().into(),
+            crate::ChannelScheme::Brenn,
+            later,
+            crate::db::utc_to_ns(Utc::now()),
+        )
+        .await;
+    }
+    let refusal = expect_refused(
+        f.send_at(b"on", &options(), whole_seconds_from_now(3600))
+            .await,
+    );
+    assert!(
+        matches!(refusal, PublishResult::DeferredQuotaExceeded { cap: c } if c == cap),
+        "{refusal:?}"
+    );
+    assert_eq!(f.parked_home_count().await, cap, "nothing more parked");
+    assert_eq!(f.budget().await, Some(f.full_budget()), "budget refunded");
+
+    f.send_inline(b"on").await.expect("an immediate publish");
+    assert_eq!(f.rows(&f.outbound).await.len(), 1);
+}
+
+/// A park queued on the database lock ahead of the close's take is parked and
+/// is in what the take returns, removed from the channel.
+#[tokio::test]
+async fn a_park_queued_before_the_take_is_in_what_the_take_returns() {
+    let f = fixture().await;
+    let release_at = whole_seconds_from_now(3600);
+    let held = f.m.db.lock().await;
+    let opts = options();
+    let mut publish = Box::pin(f.send_at(b"on", &opts, release_at));
+    poll_pending(publish.as_mut(), "the publish waits at its budget draw");
+    let mut holder = Box::pin(f.m.db.lock());
+    poll_pending(holder.as_mut(), "the holder queues behind the publish");
+    drop(held);
+    poll_pending(
+        publish.as_mut(),
+        "the publish draws its budget and waits at its park",
+    );
+    let held = holder.await;
+    let reader = egress_reader();
+    let mut take = Box::pin(f.m.detach_subscriber_taking_all(
+        EGRESS_HOME,
+        &reader,
+        f.outbound.resolved_channel.retain_depth,
+        crate::mqtt_outbound::MQTT_OUTBOUND_NOISE,
+    ));
+    poll_pending(take.as_mut(), "the take queues behind the park");
+    drop(held);
+
+    let (committed, taken) = tokio::join!(publish, take);
+    let committed = committed.expect("parked ahead of the take");
+    let crate::DetachedTaking { unseen, parked } =
+        taken.expect("the fixture's reader held a position");
+    assert!(unseen.is_empty());
+    assert_eq!(
+        parked
+            .iter()
+            .map(|d| (d.message_uuid(), d.release_at))
+            .collect::<Vec<_>>(),
+        vec![(committed.message_id, release_at)],
+        "the take returns the park for its report"
+    );
+    assert_eq!(f.parked_home_count().await, 0, "the take removed it");
+}
+
+/// A park queued on the database lock behind the close's take is refused: the
+/// take removes what is parked and gives up the position in one hold, so no
+/// park lands after it.
+#[tokio::test]
+async fn a_park_queued_behind_the_take_is_refused_and_not_in_what_it_returns() {
+    let f = fixture().await;
+    let held = f.m.db.lock().await;
+    let opts = options();
+    let mut publish = Box::pin(f.send_at(b"on", &opts, whole_seconds_from_now(3600)));
+    poll_pending(publish.as_mut(), "the publish waits at its budget draw");
+    let reader = egress_reader();
+    let mut take = Box::pin(f.m.detach_subscriber_taking_all(
+        EGRESS_HOME,
+        &reader,
+        f.outbound.resolved_channel.retain_depth,
+        crate::mqtt_outbound::MQTT_OUTBOUND_NOISE,
+    ));
+    poll_pending(take.as_mut(), "the take queues behind the budget draw");
+    drop(held);
+    poll_pending(
+        publish.as_mut(),
+        "the publish draws its budget and waits at its park, behind the take",
+    );
+
+    let (taken, published) = tokio::join!(take, publish);
+    let crate::DetachedTaking { unseen, parked } =
+        taken.expect("the fixture's reader held a position");
+    assert!(unseen.is_empty() && parked.is_empty(), "nothing was there");
+    let refusal = expect_refused(published);
+    assert!(
+        matches!(&refusal, PublishResult::UnknownChannel(a) if a == ADDR),
+        "{refusal:?}"
+    );
+    assert_eq!(f.parked_home_count().await, 0, "nothing parked");
+    assert_eq!(f.budget().await, Some(f.full_budget()), "budget refunded");
+}
+
+/// `Messenger::take_deferred` removes every parked row on the channel, every
+/// sender, and leaves retention and the reader's position alone.
+#[tokio::test]
+async fn take_deferred_removes_every_parked_row_and_keeps_the_position() {
+    let f = fixture().await;
+    let first = f
+        .send_at(b"1", &options(), whole_seconds_from_now(60))
+        .await
+        .expect("parked");
+    let second = f
+        .send_at(b"2", &options(), whole_seconds_from_now(120))
+        .await
+        .expect("parked");
+    f.send_inline(b"now").await.expect("committed");
+
+    let taken = f.m.take_deferred(EGRESS_HOME).await;
+    assert_eq!(
+        taken.iter().map(|d| d.message_uuid()).collect::<Vec<_>>(),
+        vec![first.message_id, second.message_id]
+    );
+    assert_eq!(f.parked_home_count().await, 0);
+    assert_eq!(f.rows(&f.outbound).await.len(), 1, "retention untouched");
+    f.send_at(b"3", &options(), whole_seconds_from_now(60))
+        .await
+        .expect("the reader still holds its position");
+}
+
+/// A parked payload over the body cap rides as a blob, which the removal
+/// releases and the reap deletes.
+#[tokio::test]
+async fn a_parked_blob_payload_is_reaped_when_the_take_removes_it() {
+    let f = fixture().await;
+    let over = vec![b'x'; f.m.max_body_bytes() + 1];
+    f.send_at(&over, &options(), whole_seconds_from_now(3600))
+        .await
+        .expect("parked");
+    assert_eq!(f.blobs(), (1, 0), "the parked row holds its blob");
+    let taken = f.m.take_deferred(EGRESS_HOME).await;
+    assert_eq!(taken.len(), 1);
+    assert_eq!(f.blobs(), (0, 0), "the take reaped it");
+}
+
+// --- Managing a parked MQTT publish ---
+
+/// The fixture's app with only `MqttPublish` among its grants, its topic ACL
+/// kept.
+fn only_the_mqtt_grant(f: &Fixture) {
+    let mut apps = (*f.m.apps.load()).clone();
+    let policy = apps.get_mut(APP).unwrap().policy_mut();
+    policy.grants = brenn_lib::access::GrantSet::default();
+    policy.grants.insert(AppCapability::MqttPublish);
+    f.m.apps.store(Arc::new(apps));
+}
+
+/// The fixture with the app holding every grant, and again holding only
+/// `MqttPublish`.
+async fn grant_sets() -> [(Fixture, &'static str); 2] {
+    let only_mqtt = fixture().await;
+    only_the_mqtt_grant(&only_mqtt);
+    [
+        (fixture().await, "all grants"),
+        (only_mqtt, "only MqttPublish"),
+    ]
+}
+
+/// A parked MQTT publish is listed for its sender with the transport naming
+/// its client and topic, by an app holding every grant and by one holding
+/// only `MqttPublish`.
+#[tokio::test]
+async fn a_parked_mqtt_publish_is_listed_with_its_transport() {
+    for (f, label) in grant_sets().await {
+        let release_at = whole_seconds_from_now(3600);
+        let committed = f
+            .send_at(b"on", &options(), release_at)
+            .await
+            .unwrap_or_else(|r| panic!("{label}: {r:?}"));
+        let listed = f.m.list_pending(APP, None).await;
+        let [envelope] = listed.as_slice() else {
+            panic!("{label}: one pending message, got {}", listed.len());
+        };
+        assert_eq!(envelope.message_id, committed.message_id, "{label}");
+        assert_eq!(envelope.deliver_after, Some(release_at), "{label}");
+        let t = mqtt_transport(envelope);
+        assert_eq!(
+            (t.client_slug.as_str(), t.topic.as_str()),
+            (CLIENT, "lights/kitchen/set"),
+            "{label}"
+        );
+        assert!(
+            !crate::is_well_formed_address(EGRESS_HOME),
+            "the tool's channel filter refuses an egress address before it reaches the list"
+        );
+    }
+}
+
+/// Cancelling a parked MQTT publish deletes it before it holds a retention
+/// position: a later release pass finds nothing and the reader never sees it.
+#[tokio::test]
+async fn a_cancelled_mqtt_publish_is_never_released() {
+    for (f, label) in grant_sets().await {
+        let release_at = whole_seconds_from_now(3600);
+        let committed = f
+            .send_at(b"on", &options(), release_at)
+            .await
+            .unwrap_or_else(|r| panic!("{label}: {r:?}"));
+        let result = f.m.cancel(APP, committed.message_id).await;
+        assert!(
+            matches!(result, CancelResult::Ok { message_id } if message_id == committed.message_id),
+            "{label}: {result:?}"
+        );
+        assert_eq!(f.parked_home_count().await, 0, "{label}");
+        f.m.release_due_messages(release_at + Duration::seconds(1))
+            .await;
+        assert!(
+            f.rows(&f.outbound).await.is_empty(),
+            "{label}: never retained"
+        );
+        assert!(f.m.list_pending(APP, None).await.is_empty(), "{label}");
+    }
+}
+
+/// A parked MQTT publish is not edited in place, whatever field is named; the
+/// refusal changes nothing.
+#[tokio::test]
+async fn a_parked_mqtt_publish_cannot_be_edited() {
+    for (f, label) in grant_sets().await {
+        let release_at = whole_seconds_from_now(3600);
+        let committed = f
+            .send_at(b"on", &options(), release_at)
+            .await
+            .unwrap_or_else(|r| panic!("{label}: {r:?}"));
+        let edits = [
+            EditFields {
+                body: Some(MessageBody::text("off")),
+                ..Default::default()
+            },
+            EditFields {
+                deliver_after: Some(None),
+                ..Default::default()
+            },
+            EditFields {
+                reply_to: Some(Some(STATUS.to_string())),
+                ..Default::default()
+            },
+        ];
+        for fields in edits {
+            let result = f.m.edit(APP, committed.message_id, fields).await;
+            assert!(
+                matches!(result, EditResult::MqttPublish),
+                "{label}: {result:?}"
+            );
+        }
+        let parked = f.parked_home().await;
+        let [entry] = parked.as_slice() else {
+            panic!("{label}: still one parked row, got {}", parked.len());
+        };
+        assert_eq!(entry.release_at, release_at, "{label}: schedule unchanged");
+        assert_eq!(
+            entry.envelope.body.as_bytes(),
+            b"on",
+            "{label}: body unchanged"
+        );
+    }
+}
+
+/// A released MQTT publish answers as any retained message: past recall.
+#[tokio::test]
+async fn a_released_mqtt_publish_is_already_delivered() {
+    let f = fixture().await;
+    let committed = f.send_inline(b"on").await.expect("committed");
+    assert!(matches!(
+        f.m.cancel(APP, committed.message_id).await,
+        CancelResult::AlreadyDelivered
+    ));
+    assert!(matches!(
+        f.m.edit(
+            APP,
+            committed.message_id,
+            EditFields {
+                body: Some(MessageBody::text("off")),
+                ..Default::default()
+            }
+        )
+        .await,
+        EditResult::AlreadyDelivered
+    ));
+}
+
+/// An app holding none of the three grants is still refused as having no
+/// sender.
+#[tokio::test]
+async fn an_app_without_the_three_grants_has_no_sender() {
+    let f = fixture().await;
+    let committed = f
+        .send_at(b"on", &options(), whole_seconds_from_now(3600))
+        .await
+        .expect("parked");
+    let mut apps = (*f.m.apps.load()).clone();
+    apps.get_mut(APP).unwrap().policy_mut().grants = brenn_lib::access::GrantSet::default();
+    f.m.apps.store(Arc::new(apps));
+    assert!(f.m.list_pending(APP, None).await.is_empty());
+    assert!(matches!(
+        f.m.cancel(APP, committed.message_id).await,
+        CancelResult::MissingSender
+    ));
+    assert_eq!(f.parked_home_count().await, 1);
+}
+
+/// An app left holding only `MqttPublish` cannot rewrite a `brenn:` message it
+/// parked while it held `MessagingPublish`: the edit is refused as having no
+/// sender and the row is unchanged, though the app still lists and cancels it.
+#[tokio::test]
+async fn the_mqtt_grant_alone_does_not_edit_a_parked_bus_message() {
+    let f = fixture().await;
+    let release_at = whole_seconds_from_now(3600);
+    let result =
+        f.m.publish(
+            ORIGIN,
+            APP,
+            STATUS,
+            "on".into(),
+            Urgency::Normal,
+            None,
+            Some(release_at),
+            None,
+        )
+        .await;
+    let PublishResult::Ok { message_id, .. } = result else {
+        panic!("parked: {result:?}");
+    };
+    only_the_mqtt_grant(&f);
+    let edits = [
+        EditFields {
+            body: Some(MessageBody::text("off")),
+            ..Default::default()
+        },
+        EditFields {
+            deliver_after: Some(None),
+            ..Default::default()
+        },
+    ];
+    for fields in edits {
+        let result = f.m.edit(APP, message_id, fields).await;
+        assert!(matches!(result, EditResult::MissingSender), "{result:?}");
+    }
+    let listed = f.m.list_pending(APP, None).await;
+    let [envelope] = listed.as_slice() else {
+        panic!("one pending message, got {}", listed.len());
+    };
+    assert_eq!(envelope.message_id, message_id);
+    assert_eq!(envelope.body.as_bytes(), b"on", "body unchanged");
+    assert_eq!(
+        envelope.deliver_after,
+        Some(release_at),
+        "schedule unchanged"
+    );
+    assert!(matches!(
+        f.m.cancel(APP, message_id).await,
+        CancelResult::Ok { .. }
+    ));
 }

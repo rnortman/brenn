@@ -512,14 +512,16 @@ impl RingStore {
 
     /// Drop a subscriber's position and return the entries its window at
     /// `push_limit` would have served as new, oldest first, with what an
-    /// advance over them would have reported — all under one state lock.
-    /// `None` when the subscriber held no position. `push_limit` is a pushing
-    /// depth; [`RetentionStore::detach_taking_unseen`] refuses a sampled one.
-    pub fn detach_taking_unseen(
+    /// advance over them would have reported, and every parked message,
+    /// removed, release order — all under one state lock. `None`, with
+    /// nothing removed, when the subscriber held no position. `push_limit` is
+    /// a pushing depth; [`RetentionStore::detach_taking_all`] refuses a
+    /// sampled one.
+    pub fn detach_taking_all(
         &self,
         subscriber: &ParticipantId,
         push_limit: u64,
-    ) -> Option<(Vec<brenn_queue::Retained<Arc<MessageEnvelope>>>, Advance)> {
+    ) -> Option<Relinquished> {
         let mut state = self.state();
         let window = state.core.window(subscriber, push_limit, 0)?;
         let unseen: Vec<_> = window
@@ -538,9 +540,29 @@ impl RingStore {
                 noise_charge: 0,
             },
         };
+        let parked = state.core.take_deferred();
         state.core.detach(subscriber);
         state.app_slugs.remove(subscriber);
-        Some((unseen, outrun))
+        drop(state);
+        Some(Relinquished {
+            unseen: unseen
+                .into_iter()
+                .map(|entry| (MessageSeq(entry.seq), entry.message))
+                .collect(),
+            outrun: AdvanceOutcome {
+                dropped: outrun.dropped,
+                noise_charge: outrun.noise_charge,
+            },
+            parked: parked.iter().map(Self::view).collect(),
+        })
+    }
+
+    /// Remove and return every parked message, whoever parked it and whether
+    /// or not it is due, release order. Each entry's holds are released as it
+    /// is dropped here.
+    pub fn take_deferred(&self) -> Vec<DeferredMessage> {
+        let taken = self.state().core.take_deferred();
+        taken.iter().map(Self::view).collect()
     }
 
     pub fn is_attached(&self, subscriber: &ParticipantId) -> bool {
@@ -705,10 +727,42 @@ impl RingStore {
         holds: BlobHolds,
         release_at: DateTime<Utc>,
     ) -> Result<Uuid, QuotaExceeded> {
+        Self::park_locked(&mut self.state(), envelope, holds, release_at)
+    }
+
+    /// [`RingStore::park`], only while `subscriber` holds a position. The
+    /// check, the cap check and the park share one state lock. `None`, with
+    /// the entry and its holds dropped, when it holds none.
+    ///
+    /// # Panics
+    ///
+    /// If the envelope names a blob `holds` does not cover.
+    pub fn park_while_attached(
+        &self,
+        envelope: MessageEnvelope,
+        holds: BlobHolds,
+        release_at: DateTime<Utc>,
+        subscriber: &ParticipantId,
+    ) -> Option<Result<Uuid, QuotaExceeded>> {
+        let mut state = self.state();
+        if !state.core.is_attached(subscriber) {
+            return None;
+        }
+        Some(Self::park_locked(&mut state, envelope, holds, release_at))
+    }
+
+    /// Park `envelope` under the held state lock; the body of
+    /// [`RingStore::park`].
+    fn park_locked(
+        state: &mut RingState,
+        envelope: MessageEnvelope,
+        holds: BlobHolds,
+        release_at: DateTime<Utc>,
+    ) -> Result<Uuid, QuotaExceeded> {
         let sender = envelope.sender.clone();
         let message_uuid = envelope.message_id;
         let entry = HeldEnvelope::new(envelope, holds);
-        self.state()
+        state
             .core
             .park(sender, entry, release_time_of(release_at))?;
         Ok(message_uuid)
@@ -1059,24 +1113,17 @@ impl RetentionStore for RingStore {
         RingStore::detach(self, subscriber).map(MessageSeq)
     }
 
-    async fn detach_taking_unseen(
+    async fn detach_taking_all(
         &self,
         subscriber: &ParticipantId,
         push_limit: Depth,
     ) -> Option<Relinquished> {
         assert_sampled_detach_unasked(self.address(), push_limit);
-        let (unseen, outrun) =
-            RingStore::detach_taking_unseen(self, subscriber, depth_bound(push_limit))?;
-        Some(Relinquished {
-            unseen: unseen
-                .into_iter()
-                .map(|entry| (MessageSeq(entry.seq), entry.message))
-                .collect(),
-            outrun: AdvanceOutcome {
-                dropped: outrun.dropped,
-                noise_charge: outrun.noise_charge,
-            },
-        })
+        RingStore::detach_taking_all(self, subscriber, depth_bound(push_limit))
+    }
+
+    async fn take_deferred(&self) -> Vec<DeferredMessage> {
+        RingStore::take_deferred(self)
     }
 
     async fn append_while_attached(
@@ -1121,6 +1168,19 @@ impl RetentionStore for RingStore {
         let (envelope, holds) = self.envelope_of(msg);
         let message_uuid = RingStore::park(self, envelope, holds, release_at)?;
         Ok(Parked { message_uuid })
+    }
+
+    async fn park_while_attached(
+        &self,
+        msg: NewMessage,
+        release_at: DateTime<Utc>,
+        subscriber: &ParticipantId,
+    ) -> Option<Result<Parked, QuotaExceeded>> {
+        let (envelope, holds) = self.envelope_of(msg);
+        Some(
+            RingStore::park_while_attached(self, envelope, holds, release_at, subscriber)?
+                .map(|message_uuid| Parked { message_uuid }),
+        )
     }
 
     async fn retained_tail(&self, limit: Depth) -> Vec<Arc<MessageEnvelope>> {

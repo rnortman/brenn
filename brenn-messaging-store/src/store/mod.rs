@@ -195,8 +195,9 @@ pub struct AdvanceOutcome {
     pub noise_charge: u64,
 }
 
-/// What a subscriber had not been served when it gave up its position, as
-/// [`RetentionStore::detach_taking_unseen`] reports it.
+/// What a subscriber had not been served when it gave up its position, and
+/// what was still parked on the channel, as
+/// [`RetentionStore::detach_taking_all`] reports it.
 #[derive(Debug, Clone)]
 pub struct Relinquished {
     /// What `window(subscriber, push_limit, Depth::Bounded(0))` would have
@@ -205,6 +206,9 @@ pub struct Relinquished {
     /// What an advance over `unseen` — through its last, from its first — would
     /// have reported; zero when `unseen` is empty.
     pub outrun: AdvanceOutcome,
+    /// Every message that was parked on the channel, whoever sent it, soonest
+    /// release first. The detach removed them.
+    pub parked: Vec<DeferredMessage>,
 }
 
 /// One subscriber a store currently owes work, with what the wake decision
@@ -656,25 +660,33 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// and is not an error.
     async fn detach(&self, subscriber: &ParticipantId) -> Option<MessageSeq>;
 
-    /// Give up `subscriber`'s position and return what it had not been served
-    /// at `push_limit`, with what an advance over that would have reported.
+    /// Give up `subscriber`'s position; return what it had not been served at
+    /// `push_limit`, with what an advance over that would have reported; and
+    /// remove and return every message parked on the channel, soonest release
+    /// first, whoever sent it. For the one consumer of a channel whose
+    /// departure ends the channel's service.
     ///
-    /// One operation, so that no commit and no advance falls between the read
-    /// and the detach: a message appended before it is in `unseen` (or counted
-    /// in `outrun` when the window passed it), and one appended after it found
-    /// no position. The read does not retune any depth cache.
+    /// One operation: a message appended or released before it is in `unseen`
+    /// (or counted in `outrun` when the window passed it), a message parked
+    /// before it is in `parked`, and a guarded append or park after it finds no
+    /// position. The read does not retune any depth cache.
     ///
-    /// `None` when the store holds no position for this subscriber.
+    /// `None`, with nothing removed, when the store holds no position for this
+    /// subscriber.
     ///
     /// # Panics
     ///
     /// On a sampled (`push_limit = 0`) request: a sampled subscriber holds no
     /// position to give up.
-    async fn detach_taking_unseen(
+    async fn detach_taking_all(
         &self,
         subscriber: &ParticipantId,
         push_limit: Depth,
     ) -> Option<Relinquished>;
+
+    /// Remove and return every message parked on this channel, soonest release
+    /// first, whoever sent it — due or not, until a release pass takes it.
+    async fn take_deferred(&self) -> Vec<DeferredMessage>;
 
     /// Commit a message into retention, immediately deliverable, and report
     /// whatever the message it displaced from the window cost a subscriber.
@@ -686,7 +698,7 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
 
     /// [`RetentionStore::append`], only while `subscriber` holds a position on
     /// this channel. The check and the write are one step, so no
-    /// [`RetentionStore::detach_taking_unseen`] can fall between them.
+    /// [`RetentionStore::detach_taking_all`] can fall between them.
     ///
     /// `None`, with nothing written and no blob adopted, when it holds none:
     /// `msg` is dropped, releasing whatever blob only it held.
@@ -708,6 +720,21 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
         msg: NewMessage,
         release_at: DateTime<Utc>,
     ) -> Result<Parked, QuotaExceeded>;
+
+    /// [`RetentionStore::park`], only while `subscriber` holds a position on
+    /// this channel. The position check, the cap check and the write are one
+    /// step, so no [`RetentionStore::detach_taking_all`] can fall between them.
+    /// The position is checked first: a channel whose reader has left answers
+    /// `None` whether or not it is full.
+    ///
+    /// `None`, with nothing written and no blob adopted, when it holds none:
+    /// `msg` is dropped, releasing whatever blob only it held.
+    async fn park_while_attached(
+        &self,
+        msg: NewMessage,
+        release_at: DateTime<Utc>,
+        subscriber: &ParticipantId,
+    ) -> Option<Result<Parked, QuotaExceeded>>;
 
     /// The most recent retained messages, oldest first, capped by `limit` — the
     /// channel's ambience, independent of any subscriber's position.

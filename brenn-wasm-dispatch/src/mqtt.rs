@@ -62,6 +62,7 @@ pub(crate) fn mqtt_options(props: &MqttPublishProps) -> MqttPublishOptions {
         lifetime,
         content_type: props.content_type.clone(),
         status_to: None,
+        reply_to: None,
     }
 }
 
