@@ -16,7 +16,7 @@ use brenn_messaging_store::store::MessageSeq;
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::reader::{
-    EgressBus, EgressItem, EgressMessage, EgressReport, UnknownCause, start_egress_reader,
+    EgressBus, EgressItem, EgressMessage, EgressReport, Sent, UnknownCause, start_egress_reader,
 };
 use brenn_mqtt::service::MqttEventRouter;
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
@@ -239,8 +239,18 @@ async fn broker_max_packet_size_refuses_over_and_delivers_exact() {
         let message = egress.message(&over_topic, qos, &vec![0u8; over_len]);
         let id = message.id;
         match egress.send(message).await {
-            EgressReport::Rejected { message, reason } => {
+            EgressReport::Rejected {
+                message,
+                reason,
+                code,
+                earlier,
+            } => {
+                assert_eq!(earlier, Sent::Never);
                 assert_eq!(message.id, id);
+                assert_eq!(
+                    code, None,
+                    "the host's own rejection carries no reason code"
+                );
                 assert_eq!(
                     reason,
                     format!(
@@ -1560,7 +1570,7 @@ impl EgressBus for MemBus {
         self.entries.lock().unwrap().1 = seq.0 + 1;
     }
 
-    async fn abandon(&self) -> u64 {
+    async fn abandon(&self) -> brenn_mqtt::reader::Abandoned {
         panic!("no reader in this suite is retired");
     }
 
@@ -1572,7 +1582,7 @@ impl EgressBus for MemBus {
         Some(256)
     }
 
-    fn report(&self, report: EgressReport) {
+    async fn report(&self, report: EgressReport) {
         if report != EgressReport::Drained {
             self.reports.send(report).ok();
         }
@@ -1591,6 +1601,7 @@ fn egress_message(seq: u64, client: &str, topic: &str, qos: u8, payload: &[u8]) 
             retain: false,
             content_type: None,
             expires: MqttExpiry::Never,
+            status_to: None,
         },
         payload: bytes::Bytes::copy_from_slice(payload),
     }
@@ -1680,9 +1691,19 @@ async fn the_reader_reports_a_broker_denied_topic_rejected() {
     start_egress_reader(&handle, bus);
 
     match next_report(&mut reports, 5, "the rejection").await {
-        EgressReport::Rejected { message, reason } => {
+        EgressReport::Rejected {
+            message,
+            reason,
+            code,
+            earlier,
+        } => {
+            assert_eq!(earlier, Sent::Never);
             assert_eq!(message.id, id);
             assert!(!reason.is_empty(), "the rejection carries a reason");
+            assert!(
+                code.is_some(),
+                "the broker's rejection carries its reason code"
+            );
         }
         other => panic!("expected a rejection, got {other:?}"),
     }

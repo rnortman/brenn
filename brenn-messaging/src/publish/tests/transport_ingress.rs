@@ -601,6 +601,7 @@ async fn publish_transport_ingress_panics_on_outbound_mqtt_metadata() {
                     retain: false,
                     content_type: None,
                     expires: crate::MqttExpiry::At(fixture_received_at()),
+                    status_to: None,
                 }),
             },
             Urgency::Normal,

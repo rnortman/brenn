@@ -3,6 +3,7 @@ mod attachments;
 mod body_kinds;
 mod chat_roles;
 mod conversation;
+mod delivery_status;
 mod dispatch_row;
 mod impetus;
 mod ingress;

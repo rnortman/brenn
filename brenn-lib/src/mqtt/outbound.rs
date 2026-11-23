@@ -21,6 +21,9 @@ pub struct MqttPublishOptions {
     pub lifetime: MqttLifetime,
     /// MQTT 5 Content Type to send; absent sends none.
     pub content_type: Option<String>,
+    /// The `brenn:` channel the host publishes this message's delivery
+    /// statuses to, as stated; absent asks for none.
+    pub status_to: Option<String>,
 }
 
 /// The declared MQTT clients, as the publish path needs them.

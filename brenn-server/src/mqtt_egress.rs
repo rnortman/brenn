@@ -7,13 +7,20 @@
 //! position as an [`EgressBus`]; the reader reads, advances and reports
 //! through it and never touches the bus directly.
 //!
-//! Every report but `Delivered` and `Drained` is logged, counted and raised to
-//! the operator. Repeats of a kind while its episode is open are logged and
-//! counted but withheld from the alert path; the episode closes, with one
-//! summary alert for what it withheld, when the client next delivers or runs
-//! dry. A message the channel's window drops before the reader reached it is
-//! not a report: the bus counts and raises it under the participant's `Alarm`
-//! rung.
+//! Every report but `Delivered`, `Drained`, `Handed` and `PayloadGone` is
+//! logged and counted. One whose message names a `status_to` is first
+//! published there as a delivery status, on the authority of the message's
+//! sender; a failure whose status was published told its sender and raises
+//! nothing, except a broker's rejection, which is raised whether or not its
+//! sender was told; any other failure is raised to the operator. Repeats of a kind
+//! while its episode is open are logged and counted but withheld from the
+//! alert path; the episode closes, with one summary alert for what it
+//! withheld, when the client next delivers or runs dry. A status the bus
+//! refused is a failure of its own kind, whose episode only running dry
+//! closes: refusals arrive interleaved with deliveries and with published
+//! statuses. A message the channel's window drops before the reader reached
+//! it is not a report: the bus counts and raises it under the participant's
+//! `Alarm` rung.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,17 +28,24 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 use brenn_common::sanitize_untrusted_str;
-use brenn_envelope::{MessageEnvelope, TransportMeta};
+use brenn_envelope::delivery::{
+    DELIVERY_REASON_MAX_BYTES, DeliveryDropCause, DeliveryKind, DeliveryStatus,
+    DeliveryUnknownCause, MqttDelivery,
+};
+use brenn_envelope::{MessageEnvelope, MqttPublishTransport, TransportMeta};
 use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::{ParticipantId, mqtt_egress_address};
 use brenn_messaging::Messenger;
 use brenn_messaging::mqtt_outbound::{MQTT_OUTBOUND_COMPONENT, MQTT_OUTBOUND_NOISE};
+use brenn_messaging::publish::{DeliveryStatusPublish, DeliveryStatusRefusal};
 use brenn_messaging_store::blob::BlobError;
 use brenn_messaging_store::store::{Attached, MessageSeq};
 use brenn_mqtt::reader::{
-    DropCause, EgressBus, EgressItem, EgressMessage, EgressMeta, EgressReport, UnknownCause,
+    Abandoned, DropCause, EgressBus, EgressItem, EgressMessage, EgressMeta, EgressReport, Sent,
+    UnknownCause,
 };
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 
@@ -52,8 +66,11 @@ pub struct EgressCounts {
     pub rejected: u64,
     pub expired: u64,
     pub unknown: u64,
-    /// Messages dropped unsent, by count, whatever the cause.
+    /// Messages the reader gave up, by count, whatever the cause and whether
+    /// or not the client library ever accepted them.
     pub dropped: u64,
+    /// Delivery statuses the bus refused to publish.
+    pub status_unpublished: u64,
     /// Messages the channel's window dropped before the reader reached them,
     /// as the bus counted them for the participant's position.
     pub overflow: u64,
@@ -66,6 +83,7 @@ enum FailureKind {
     Expired,
     Unknown,
     Dropped,
+    StatusUnpublished,
 }
 
 impl FailureKind {
@@ -75,8 +93,24 @@ impl FailureKind {
             Self::Expired => "expired",
             Self::Unknown => "outcome unknown",
             Self::Dropped => "dropped",
+            Self::StatusUnpublished => "status not published",
         }
     }
+}
+
+/// Whether a report's message was told of it on its `status_to`.
+#[derive(Debug)]
+enum Told {
+    /// The message names no `status_to`, or the report has no status.
+    NoStatus,
+    Published,
+    /// The bus refused the status: what the operator is told of it.
+    Refused {
+        message_id: Uuid,
+        status_to: String,
+        kind: &'static str,
+        refusal: DeliveryStatusRefusal,
+    },
 }
 
 /// One client's tallies and open episodes.
@@ -150,7 +184,10 @@ impl MqttEgressHub {
             )
             .await;
         if matches!(attached, Attached::Created) {
-            let skipped = bus.skip_unhanded().await;
+            // Only the count is logged: a skipped message naming a
+            // `status_to` was told at its client's removal, or was committed
+            // during a retirement and is lost untold.
+            let skipped = bus.skip_unhanded().await.count;
             if skipped > 0 {
                 tracing::warn!(
                     mqtt_client = client,
@@ -211,53 +248,93 @@ impl MqttEgressHub {
             .retain_depth
     }
 
-    /// Log, count and, unless an open episode withholds it, alert `report`
-    /// for `client`.
-    fn record(&self, client: &str, report: EgressReport) {
+    /// Publish `report`'s status, if it has one, then log, count and alert
+    /// `report` for `client`, unless an open episode withholds the alert. A
+    /// failure whose status was published is not alerted, except a broker's
+    /// rejection.
+    async fn record(&self, client: &str, report: EgressReport) {
+        let told = match delivery_status(client, &report) {
+            Some((message, status)) => self.tell(message, &status).await,
+            None => Told::NoStatus,
+        };
         let mut alerts = Vec::new();
         {
             let mut clients = self.clients.lock().expect(HUB_POISONED);
             let state = clients.get_mut(client).unwrap_or_else(|| {
                 panic!("MQTT egress: a report for client {client:?}, whose channel is not open")
             });
+            let mut recording = Recording {
+                client,
+                state,
+                alerts: &mut alerts,
+            };
+            if let Told::Refused {
+                message_id,
+                status_to,
+                kind,
+                refusal,
+            } = &told
+            {
+                recording.status_refused(*message_id, status_to, kind, refusal);
+            }
+            let told = matches!(told, Told::Published);
             match report {
+                EgressReport::Handed(message) => {
+                    tracing::debug!(
+                        mqtt_client = client,
+                        message_id = %message.id,
+                        "MQTT egress: handed"
+                    );
+                }
+                EgressReport::PayloadGone(message) => {
+                    tracing::debug!(
+                        mqtt_client = client,
+                        message_id = %message.id,
+                        "MQTT egress: a message naming a status channel left retention before \
+                         it was read"
+                    );
+                }
                 EgressReport::Delivered(message) => {
                     tracing::debug!(
                         mqtt_client = client,
                         message_id = %message.id,
                         "MQTT egress: delivered"
                     );
-                    state.counts.delivered += 1;
-                    close_episodes(client, state, &mut alerts);
+                    recording.state.counts.delivered += 1;
+                    recording.close_episodes(Closer::Delivered);
                 }
-                EgressReport::Drained => close_episodes(client, state, &mut alerts),
-                EgressReport::Rejected { message, reason } => {
+                EgressReport::Drained => {
+                    recording.close_episodes(Closer::Drained);
+                }
+                EgressReport::Rejected {
+                    message,
+                    reason,
+                    code,
+                    earlier: _,
+                } => {
                     let reason = sanitize_untrusted_str(&reason, UNTRUSTED_TEXT_MAX);
-                    state.counts.rejected += 1;
+                    recording.state.counts.rejected += 1;
+                    // TODO(mqtt-egress-operator-text-unsent-of-possibly-sent)
                     let detail = format!("the broker rejected it: {reason}");
-                    failure(
-                        client,
-                        state,
+                    // A broker's rejection means Brenn's per-topic ACL admits
+                    // what the broker forbids, which only the operator can fix.
+                    let broker_answered = code.is_some();
+                    recording.failure(
                         FailureKind::Rejected,
                         &message,
                         &detail,
-                        &mut alerts,
+                        told,
+                        !told || broker_answered,
                     );
                 }
-                EgressReport::Expired(message) => {
-                    state.counts.expired += 1;
+                EgressReport::Expired { message, sent: _ } => {
+                    recording.state.counts.expired += 1;
+                    // TODO(mqtt-egress-operator-text-unsent-of-possibly-sent)
                     let detail = "its lifetime passed before it could be handed to the broker";
-                    failure(
-                        client,
-                        state,
-                        FailureKind::Expired,
-                        &message,
-                        detail,
-                        &mut alerts,
-                    );
+                    recording.failure(FailureKind::Expired, &message, detail, told, !told);
                 }
                 EgressReport::Unknown { message, cause } => {
-                    state.counts.unknown += 1;
+                    recording.state.counts.unknown += 1;
                     let detail = match cause {
                         UnknownCause::ConnectionLost => {
                             "the connection ended before the broker answered; it is not resent"
@@ -266,18 +343,24 @@ impl MqttEgressHub {
                             "the client session stopped before the broker answered"
                         }
                     };
-                    failure(
-                        client,
-                        state,
-                        FailureKind::Unknown,
-                        &message,
-                        detail,
-                        &mut alerts,
-                    );
+                    recording.failure(FailureKind::Unknown, &message, detail, told, !told);
                 }
                 EgressReport::Dropped { cause, count } => {
-                    state.counts.dropped += count;
-                    dropped(client, state, cause, count, &mut alerts);
+                    recording.state.counts.dropped += count;
+                    recording.dropped(cause, count, false, true);
+                }
+                EgressReport::DroppedMessage {
+                    message,
+                    cause,
+                    sent: _,
+                } => {
+                    recording.state.counts.dropped += 1;
+                    tracing::debug!(
+                        mqtt_client = client,
+                        message_id = %message.id,
+                        "MQTT egress: the dropped message names a status channel"
+                    );
+                    recording.dropped(cause, 1, told, !told);
                 }
             }
         }
@@ -286,100 +369,337 @@ impl MqttEgressHub {
                 .alert(AlertSeverity::Warning, alert.title, alert.body);
         }
     }
-}
 
-/// Log one failure report about `message`, and open its kind's episode with an
-/// alert or count it as withheld.
-fn failure(
-    client: &str,
-    state: &mut ClientState,
-    kind: FailureKind,
-    message: &EgressMeta,
-    detail: &str,
-    alerts: &mut Vec<Alert>,
-) {
-    let sender = sanitize_untrusted_str(&message.sender, UNTRUSTED_TEXT_MAX);
-    let topic = sanitize_untrusted_str(&message.topic, UNTRUSTED_TEXT_MAX);
-    tracing::warn!(
-        mqtt_client = client,
-        kind = kind.label(),
-        message_id = %message.id,
-        sender = %sender,
-        topic = %topic,
-        qos = message.qos,
-        detail,
-        "MQTT egress: message not delivered"
-    );
-    let body = format!(
-        "MQTT client {client:?}: message {} from {sender} for topic {topic} (QoS {}) was not \
-         delivered: {detail}.",
-        message.id, message.qos
-    );
-    open_or_withhold(client, state, kind, 1, body, alerts);
-}
-
-/// Log a drop of `count` messages, and open the dropped episode with an alert
-/// or count them as withheld.
-fn dropped(
-    client: &str,
-    state: &mut ClientState,
-    cause: DropCause,
-    count: u64,
-    alerts: &mut Vec<Alert>,
-) {
-    let detail = match cause {
-        DropCause::SessionStopped => {
-            "the client session stopped while they waited to be resubmitted"
+    /// Publish `status` about `message` to its `status_to`.
+    async fn tell(&self, message: &EgressMeta, status: &DeliveryStatus) -> Told {
+        let status_to = message
+            .status_to
+            .as_deref()
+            .expect("only a message naming a status_to has a status");
+        match self
+            .messenger
+            .publish_delivery_status(&message.sender, status_to, status)
+            .await
+        {
+            DeliveryStatusPublish::Published => Told::Published,
+            DeliveryStatusPublish::Refused(refusal) => Told::Refused {
+                message_id: message.id,
+                status_to: status_to.to_string(),
+                kind: kind_label(&status.kind),
+                refusal,
+            },
         }
-        DropCause::ClientRemoved => "the client was removed with them still on its channel",
-    };
-    tracing::warn!(
-        mqtt_client = client,
-        kind = FailureKind::Dropped.label(),
-        count,
-        detail,
-        "MQTT egress: messages dropped unsent"
-    );
-    let body = format!("MQTT client {client:?}: {count} message(s) dropped unsent: {detail}.");
-    open_or_withhold(client, state, FailureKind::Dropped, count, body, alerts);
+    }
 }
 
-fn open_or_withhold(
+/// The delivery status `report` tells, and the message it concerns, when that
+/// message names a `status_to`. The one mapping from the reader's reports and
+/// causes to the status kinds and causes. A message that ends undelivered
+/// with a copy the library accepted and the broker never answered is told
+/// `unknown`; `rejected`, `expired` and `dropped` only a message with no such
+/// copy.
+///
+/// # Panics
+///
+/// On a message reported removed that the library may have sent: the reader
+/// reports removed only messages it never read.
+fn delivery_status<'a>(
     client: &str,
-    state: &mut ClientState,
-    kind: FailureKind,
-    messages: u64,
-    body: String,
-    alerts: &mut Vec<Alert>,
-) {
-    match state.episodes.get_mut(&kind) {
-        Some(withheld) => *withheld += messages,
-        None => {
-            state.episodes.insert(kind, 0);
-            alerts.push(Alert {
-                title: format!("MQTT egress: {} ({client})", kind.label()),
+    report: &'a EgressReport,
+) -> Option<(&'a EgressMeta, DeliveryStatus)> {
+    let (message, kind, reason_code) = match report {
+        EgressReport::Handed(message) => (message, DeliveryKind::Handed, None),
+        EgressReport::Delivered(message) => (message, DeliveryKind::Delivered, None),
+        EgressReport::Rejected {
+            message,
+            reason,
+            code,
+            earlier: Sent::Never,
+        } => (
+            message,
+            DeliveryKind::Rejected {
+                reason: sanitize_untrusted_str(reason, DELIVERY_REASON_MAX_BYTES),
+            },
+            *code,
+        ),
+        EgressReport::Rejected {
+            message,
+            reason: _,
+            code,
+            earlier: Sent::Possibly,
+        } => (
+            message,
+            DeliveryKind::Unknown {
+                cause: DeliveryUnknownCause::ResendRefused,
+            },
+            *code,
+        ),
+        EgressReport::Expired {
+            message,
+            sent: Sent::Never,
+        } => (message, DeliveryKind::Expired, None),
+        EgressReport::Expired {
+            message,
+            sent: Sent::Possibly,
+        } => (
+            message,
+            DeliveryKind::Unknown {
+                cause: DeliveryUnknownCause::LifetimeEnded,
+            },
+            None,
+        ),
+        EgressReport::Unknown { message, cause } => {
+            let cause = match cause {
+                UnknownCause::ConnectionLost => DeliveryUnknownCause::ConnectionLost,
+                UnknownCause::SessionStopped => DeliveryUnknownCause::Stopped,
+            };
+            (message, DeliveryKind::Unknown { cause }, None)
+        }
+        EgressReport::DroppedMessage {
+            message,
+            cause,
+            sent,
+        } => {
+            let kind = match (cause, sent) {
+                (DropCause::SessionStopped, Sent::Never) => DeliveryKind::Dropped {
+                    cause: DeliveryDropCause::Stopped,
+                },
+                (DropCause::SessionStopped, Sent::Possibly) => DeliveryKind::Unknown {
+                    cause: DeliveryUnknownCause::Stopped,
+                },
+                (DropCause::ClientRemoved, Sent::Never) => DeliveryKind::Dropped {
+                    cause: DeliveryDropCause::Removed,
+                },
+                // TODO(quality-removed-and-possibly-sent-representable-then-panicked)
+                (DropCause::ClientRemoved, Sent::Possibly) => panic!(
+                    "MQTT egress: message {} is reported removed and possibly sent; the reader \
+                     reports removed only messages it never read",
+                    message.id
+                ),
+            };
+            (message, kind, None)
+        }
+        EgressReport::PayloadGone(message) => (
+            message,
+            DeliveryKind::Dropped {
+                cause: DeliveryDropCause::LeftRetention,
+            },
+            None,
+        ),
+        EgressReport::Dropped { .. } | EgressReport::Drained => return None,
+    };
+    message.status_to.as_ref()?;
+    let status = DeliveryStatus {
+        message_id: message.id,
+        kind,
+        mqtt: Some(MqttDelivery {
+            client: client.to_string(),
+            topic: message.topic.clone(),
+            qos: message.qos,
+            reason_code,
+        }),
+    };
+    Some((message, status))
+}
+
+/// A status kind's wire word.
+fn kind_label(kind: &DeliveryKind) -> &'static str {
+    match kind {
+        DeliveryKind::Handed => "handed",
+        DeliveryKind::Delivered => "delivered",
+        DeliveryKind::Rejected { .. } => "rejected",
+        DeliveryKind::Expired => "expired",
+        DeliveryKind::Unknown { .. } => "unknown",
+        DeliveryKind::Dropped { .. } => "dropped",
+    }
+}
+
+/// What a refusal means, for the operator.
+fn refusal_text(refusal: &DeliveryStatusRefusal) -> String {
+    match refusal {
+        DeliveryStatusRefusal::ChannelGone => "the channel is no longer declared".to_string(),
+        DeliveryStatusRefusal::SenderGone => {
+            "no app with the sender's identity holds the publish grant any more".to_string()
+        }
+        DeliveryStatusRefusal::SenderNotPermitted => {
+            "the sender's publish ACL no longer admits the channel".to_string()
+        }
+        DeliveryStatusRefusal::RateLimited => {
+            "the channel's send rate for delivery statuses refused it".to_string()
+        }
+        DeliveryStatusRefusal::BodyTooLarge { len, max } => {
+            format!("the status is {len} bytes and the bus's body cap is {max} bytes")
+        }
+    }
+}
+
+/// One report's accounting for one client: its state under the hub's lock,
+/// and the alerts to raise once the lock is dropped.
+struct Recording<'a> {
+    client: &'a str,
+    state: &'a mut ClientState,
+    alerts: &'a mut Vec<Alert>,
+}
+
+impl Recording<'_> {
+    /// Log the `kind` status about message `message_id` that the bus refused
+    /// on `status_to`, count it, and open the "status not published" episode
+    /// with an alert or count it as withheld.
+    fn status_refused(
+        &mut self,
+        message_id: Uuid,
+        status_to: &str,
+        kind: &str,
+        refusal: &DeliveryStatusRefusal,
+    ) {
+        let client = self.client;
+        self.state.counts.status_unpublished += 1;
+        let address = sanitize_untrusted_str(status_to, UNTRUSTED_TEXT_MAX);
+        let why = refusal_text(refusal);
+        tracing::warn!(
+            mqtt_client = client,
+            message_id = %message_id,
+            status = kind,
+            status_to = %address,
+            refusal = %why,
+            "MQTT egress: a delivery status was not published"
+        );
+        let body = format!(
+            "MQTT client {client:?}: the {kind:?} status of message {} could not be published \
+             to {address}: {why}. Its sender was not told.",
+            message_id
+        );
+        self.open_or_withhold(FailureKind::StatusUnpublished, 1, body);
+    }
+
+    /// Log one failure report about `message`, whose sender was `told` of it
+    /// on its `status_to`, and, when `alert`, open its kind's episode with an
+    /// alert or count it as withheld.
+    fn failure(
+        &mut self,
+        kind: FailureKind,
+        message: &EgressMeta,
+        detail: &str,
+        told: bool,
+        alert: bool,
+    ) {
+        let client = self.client;
+        let sender = sanitize_untrusted_str(&message.sender, UNTRUSTED_TEXT_MAX);
+        let topic = sanitize_untrusted_str(&message.topic, UNTRUSTED_TEXT_MAX);
+        tracing::warn!(
+            mqtt_client = client,
+            kind = kind.label(),
+            message_id = %message.id,
+            sender = %sender,
+            topic = %topic,
+            qos = message.qos,
+            detail,
+            told,
+            "MQTT egress: message not delivered"
+        );
+        if !alert {
+            return;
+        }
+        let mut body = format!(
+            "MQTT client {client:?}: message {} from {sender} for topic {topic} (QoS {}) was \
+             not delivered: {detail}.",
+            message.id, message.qos
+        );
+        if told {
+            body.push_str(" Its sender was told on its status channel.");
+        }
+        self.open_or_withhold(kind, 1, body);
+    }
+
+    /// Log a drop of `count` messages, whose sender was `told` of them on its
+    /// `status_to`, and, when `alert`, open the dropped episode with an alert
+    /// or count them as withheld.
+    fn dropped(&mut self, cause: DropCause, count: u64, told: bool, alert: bool) {
+        let client = self.client;
+        let detail = match cause {
+            DropCause::SessionStopped => {
+                "the client session stopped while they waited to be resubmitted"
+            }
+            DropCause::ClientRemoved => "the client was removed with them still on its channel",
+        };
+        // TODO(mqtt-egress-operator-text-unsent-of-possibly-sent)
+        tracing::warn!(
+            mqtt_client = client,
+            kind = FailureKind::Dropped.label(),
+            count,
+            detail,
+            told,
+            "MQTT egress: messages dropped unsent"
+        );
+        if !alert {
+            return;
+        }
+        let body = format!("MQTT client {client:?}: {count} message(s) dropped unsent: {detail}.");
+        self.open_or_withhold(FailureKind::Dropped, count, body);
+    }
+
+    fn open_or_withhold(&mut self, kind: FailureKind, messages: u64, body: String) {
+        match self.state.episodes.get_mut(&kind) {
+            Some(withheld) => *withheld += messages,
+            None => {
+                self.state.episodes.insert(kind, 0);
+                self.alerts.push(Alert {
+                    title: format!("MQTT egress: {} ({})", kind.label(), self.client),
+                    body,
+                });
+            }
+        }
+    }
+
+    /// Close the open episodes that `closer` closes, raising one summary
+    /// alert for each that withheld anything.
+    fn close_episodes(&mut self, closer: Closer) {
+        let client = self.client;
+        let closing: Vec<FailureKind> = self
+            .state
+            .episodes
+            .keys()
+            .copied()
+            .filter(|kind| closer == Closer::Drained || *kind != FailureKind::StatusUnpublished)
+            .collect();
+        for kind in closing {
+            let withheld = self
+                .state
+                .episodes
+                .remove(&kind)
+                .expect("a kind just listed from the map");
+            if withheld == 0 {
+                continue;
+            }
+            let body = if kind == FailureKind::StatusUnpublished {
+                format!(
+                    "MQTT client {client:?}: {withheld} more delivery status(es) could not be \
+                     published after the first was reported; the client's reader has since run \
+                     dry."
+                )
+            } else {
+                format!(
+                    "MQTT client {client:?}: {withheld} more message(s) {} after the first was \
+                     reported; the client has since delivered or run dry.",
+                    kind.label()
+                )
+            };
+            self.alerts.push(Alert {
+                title: format!("MQTT egress: {} ({client}), summary", kind.label()),
                 body,
             });
         }
     }
 }
 
-/// Close every open episode of `client`, raising one summary alert for each
-/// that withheld anything.
-fn close_episodes(client: &str, state: &mut ClientState, alerts: &mut Vec<Alert>) {
-    for (kind, withheld) in state.episodes.drain() {
-        if withheld == 0 {
-            continue;
-        }
-        alerts.push(Alert {
-            title: format!("MQTT egress: {} ({client}), summary", kind.label()),
-            body: format!(
-                "MQTT client {client:?}: {withheld} more message(s) {} after the first was \
-                 reported; the client has since delivered or run dry.",
-                kind.label()
-            ),
-        });
-    }
+/// What closes episodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closer {
+    /// A delivery: every episode but "status not published", whose refusals
+    /// arrive interleaved with deliveries.
+    Delivered,
+    /// The reader ran dry: every episode.
+    Drained,
 }
 
 /// One client's reader's view of its egress channel.
@@ -392,9 +712,10 @@ struct ClientEgress {
 
 impl ClientEgress {
     /// Move the position past every retained message the head read would
-    /// serve, and return how many that was. Anything below the first of them
-    /// was outrun by the window and is the bus's to count.
-    async fn skip_unhanded(&self) -> u64 {
+    /// serve, and return how many that was and the metadata of those naming
+    /// a `status_to`. Anything below the first of them was outrun by the
+    /// window and is the bus's to count.
+    async fn skip_unhanded(&self) -> Abandoned {
         let window = self
             .hub
             .messenger
@@ -404,11 +725,24 @@ impl ClientEgress {
             .unwrap_or_else(|| self.no_position());
         let new = window.new_entries();
         let (Some((first, _)), Some((last, _))) = (new.first(), new.last()) else {
-            return 0;
+            return Abandoned {
+                count: 0,
+                named: Vec::new(),
+            };
         };
         let count = new.len() as u64;
+        let named = new
+            .iter()
+            .filter_map(|(_, envelope)| {
+                let publish = self.publish(envelope);
+                publish
+                    .status_to
+                    .is_some()
+                    .then(|| EgressMeta::new(envelope.message_id, &envelope.sender, publish))
+            })
+            .collect();
         self.advance_over(*last, *first).await;
-        count
+        Abandoned { count, named }
     }
 
     async fn advance_over(&self, through: MessageSeq, seen_floor: MessageSeq) {
@@ -433,17 +767,22 @@ impl ClientEgress {
         )
     }
 
-    /// The reader's message for one retained entry: its transport and its
-    /// payload, from the body or from its one attachment.
-    async fn item(&self, seq: MessageSeq, envelope: &MessageEnvelope) -> EgressItem {
-        let publish = match &envelope.transport {
-            Some(TransportMeta::MqttPublish(publish)) => publish.clone(),
+    /// The MQTT publish metadata of a message on this channel.
+    fn publish<'a>(&self, envelope: &'a MessageEnvelope) -> &'a MqttPublishTransport {
+        match &envelope.transport {
+            Some(TransportMeta::MqttPublish(publish)) => publish,
             other => panic!(
                 "MQTT egress: message {} on the host-written channel {} carries {other:?}, not \
                  MQTT publish metadata",
                 envelope.message_id, self.address
             ),
-        };
+        }
+    }
+
+    /// The reader's message for one retained entry: its transport and its
+    /// payload, from the body or from its one attachment.
+    async fn item(&self, seq: MessageSeq, envelope: &MessageEnvelope) -> EgressItem {
+        let publish = self.publish(envelope).clone();
         let payload = match envelope.attachments.len() {
             0 => Bytes::copy_from_slice(envelope.body.as_bytes()),
             1 => match self.attached_payload(envelope).await {
@@ -456,7 +795,7 @@ impl ClientEgress {
                     );
                     return EgressItem::PayloadGone {
                         seq,
-                        id: envelope.message_id,
+                        meta: EgressMeta::new(envelope.message_id, &envelope.sender, &publish),
                     };
                 }
             },
@@ -523,7 +862,7 @@ impl EgressBus for ClientEgress {
         self.advance_over(seq, seq).await;
     }
 
-    async fn abandon(&self) -> u64 {
+    async fn abandon(&self) -> Abandoned {
         self.skip_unhanded().await
     }
 
@@ -540,7 +879,7 @@ impl EgressBus for ClientEgress {
         }
     }
 
-    fn report(&self, report: EgressReport) {
-        self.hub.record(&self.client, report);
+    async fn report(&self, report: EgressReport) {
+        self.hub.record(&self.client, report).await;
     }
 }

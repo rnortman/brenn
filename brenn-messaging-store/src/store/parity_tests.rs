@@ -198,6 +198,7 @@ fn outbound_transport() -> brenn_envelope::TransportMeta {
         retain: true,
         content_type: Some("application/json".to_string()),
         expires: brenn_envelope::MqttExpiry::At(now() + Duration::seconds(30)),
+        status_to: None,
     })
 }
 

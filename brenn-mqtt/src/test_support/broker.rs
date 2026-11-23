@@ -352,6 +352,44 @@ impl BrokerHarness {
         eprintln!("[BrokerHarness] mosquitto stopped");
     }
 
+    /// Freeze the broker with `SIGSTOP`: its connections stay open and it
+    /// answers nothing, so a publish sent now stays in flight until
+    /// [`resume`](Self::resume).
+    ///
+    /// # Panics
+    ///
+    /// The broker is not running, or the signal is refused.
+    pub fn pause(&self) {
+        self.signal(libc::SIGSTOP, "pause");
+    }
+
+    /// Thaw a broker [`pause`](Self::pause) froze.
+    ///
+    /// # Panics
+    ///
+    /// The broker is not running, or the signal is refused.
+    pub fn resume(&self) {
+        self.signal(libc::SIGCONT, "resume");
+    }
+
+    fn signal(&self, signal: libc::c_int, what: &str) {
+        let child = self
+            .child
+            .as_ref()
+            .unwrap_or_else(|| panic!("BrokerHarness::{what} on a stopped broker"));
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid fits pid_t");
+        // SAFETY: `kill` takes no pointers; `pid` is this harness's own child,
+        // not yet reaped, so it names no other process.
+        let sent = unsafe { libc::kill(pid, signal) };
+        assert_eq!(
+            sent,
+            0,
+            "BrokerHarness::{what}: kill failed: {}",
+            std::io::Error::last_os_error()
+        );
+        eprintln!("[BrokerHarness] mosquitto {what}d");
+    }
+
     /// Start the broker again after [`stop`](Self::stop), on the port and the
     /// configuration it had, appending to the same log: a broker that went
     /// away and came back, as a client of it sees one.

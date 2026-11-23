@@ -22,6 +22,25 @@ enum Call {
     Abandon,
 }
 
+/// How long one bus call takes.
+#[derive(Debug, Clone, Copy, Default)]
+enum Pace {
+    #[default]
+    Instant,
+    Takes(Duration),
+    Never,
+}
+
+impl Pace {
+    async fn wait(self) {
+        match self {
+            Self::Instant => {}
+            Self::Takes(duration) => tokio::time::sleep(duration).await,
+            Self::Never => std::future::pending().await,
+        }
+    }
+}
+
 #[derive(Default)]
 struct BusState {
     entries: Vec<EgressItem>,
@@ -29,6 +48,10 @@ struct BusState {
     next_owed: u64,
     calls: Vec<Call>,
     reports: Vec<EgressReport>,
+    /// Calls and reports, in the order they completed.
+    timeline: Vec<String>,
+    advance_pace: Pace,
+    report_pace: Pace,
 }
 
 struct ScriptBus {
@@ -43,6 +66,13 @@ fn item_seq(item: &EgressItem) -> u64 {
     match item {
         EgressItem::Message(message) => message.seq.0,
         EgressItem::PayloadGone { seq, .. } => seq.0,
+    }
+}
+
+fn item_meta(item: &EgressItem) -> EgressMeta {
+    match item {
+        EgressItem::Message(message) => EgressMeta::of(message),
+        EgressItem::PayloadGone { meta, .. } => meta.clone(),
     }
 }
 
@@ -111,13 +141,32 @@ impl ScriptBus {
     fn reports_by_id(&self) -> Vec<EgressReport> {
         let mut reports = self.reports();
         reports.sort_by_key(|report| match report {
-            EgressReport::Delivered(meta) | EgressReport::Expired(meta) => Some(meta.id),
-            EgressReport::Rejected { message, .. } | EgressReport::Unknown { message, .. } => {
-                Some(message.id)
-            }
+            EgressReport::Handed(meta)
+            | EgressReport::Delivered(meta)
+            | EgressReport::PayloadGone(meta) => Some(meta.id),
+            EgressReport::Expired { message, .. }
+            | EgressReport::Rejected { message, .. }
+            | EgressReport::Unknown { message, .. }
+            | EgressReport::DroppedMessage { message, .. } => Some(message.id),
             EgressReport::Dropped { .. } | EgressReport::Drained => None,
         });
         reports
+    }
+
+    fn timeline(&self) -> Vec<String> {
+        self.state.lock().unwrap().timeline.clone()
+    }
+
+    fn pace(&self, advance: Pace, report: Pace) {
+        let mut state = self.state.lock().unwrap();
+        state.advance_pace = advance;
+        state.report_pace = report;
+    }
+
+    /// Every completed bus call, `Drained` reports included.
+    fn completed_calls(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        (state.calls.len() + state.reports.len()) as u64
     }
 
     fn drained(&self) -> bool {
@@ -158,24 +207,34 @@ impl EgressBus for ScriptBus {
         if let Some(rx) = gate {
             rx.await.unwrap();
         }
+        let pace = self.state.lock().unwrap().advance_pace;
+        pace.wait().await;
         let mut state = self.state.lock().unwrap();
         state.calls.push(Call::Advance(seq.0));
+        state.timeline.push(format!("advance {}", seq.0));
         state.next_owed = seq.0 + 1;
     }
 
-    async fn abandon(&self) -> u64 {
+    async fn abandon(&self) -> Abandoned {
         let mut state = self.state.lock().unwrap();
         state.calls.push(Call::Abandon);
         let next_owed = state.next_owed;
-        let unhanded = state
+        let unhanded: Vec<EgressMeta> = state
             .entries
             .iter()
             .filter(|item| item_seq(item) >= next_owed)
-            .count();
+            .map(item_meta)
+            .collect();
         if let Some(last) = state.entries.last() {
             state.next_owed = state.next_owed.max(item_seq(last) + 1);
         }
-        unhanded as u64
+        Abandoned {
+            count: unhanded.len() as u64,
+            named: unhanded
+                .into_iter()
+                .filter(|meta| meta.status_to.is_some())
+                .collect(),
+        }
     }
 
     fn wakes(&self) -> watch::Receiver<u64> {
@@ -186,8 +245,16 @@ impl EgressBus for ScriptBus {
         self.depth
     }
 
-    fn report(&self, report: EgressReport) {
-        self.state.lock().unwrap().reports.push(report);
+    async fn report(&self, report: EgressReport) {
+        let pace = self.state.lock().unwrap().report_pace;
+        pace.wait().await;
+        let mut state = self.state.lock().unwrap();
+        if report != EgressReport::Drained {
+            state
+                .timeline
+                .push(format!("report {}", report_label(&report)));
+        }
+        state.reports.push(report);
     }
 }
 
@@ -203,8 +270,42 @@ fn message(seq: u64, qos: u8, expires: MqttExpiry) -> EgressMessage {
             retain: false,
             content_type: None,
             expires,
+            status_to: None,
         },
         payload: Bytes::from(format!("m{seq}")),
+    }
+}
+
+const STATUS_TO: &str = "brenn:light-status";
+
+/// [`message`], naming [`STATUS_TO`].
+fn named(seq: u64, qos: u8, expires: MqttExpiry) -> EgressMessage {
+    let mut message = message(seq, qos, expires);
+    message.publish.status_to = Some(STATUS_TO.to_string());
+    message
+}
+
+fn named_item(seq: u64, qos: u8) -> EgressItem {
+    EgressItem::Message(named(seq, qos, MqttExpiry::Never))
+}
+
+fn named_meta(seq: u64, qos: u8) -> EgressMeta {
+    EgressMeta::of(&named(seq, qos, MqttExpiry::Never))
+}
+
+/// A report's kind and the sequence number of the message it concerns.
+fn report_label(report: &EgressReport) -> String {
+    let seq = |meta: &EgressMeta| meta.id.as_u128();
+    match report {
+        EgressReport::Handed(meta) => format!("handed {}", seq(meta)),
+        EgressReport::Delivered(meta) => format!("delivered {}", seq(meta)),
+        EgressReport::Rejected { message, .. } => format!("rejected {}", seq(message)),
+        EgressReport::Expired { message, .. } => format!("expired {}", seq(message)),
+        EgressReport::Unknown { message, .. } => format!("unknown {}", seq(message)),
+        EgressReport::Dropped { count, .. } => format!("dropped x{count}"),
+        EgressReport::DroppedMessage { message, .. } => format!("dropped {}", seq(message)),
+        EgressReport::PayloadGone(meta) => format!("gone {}", seq(meta)),
+        EgressReport::Drained => "drained".to_string(),
     }
 }
 
@@ -214,6 +315,10 @@ fn item(seq: u64, qos: u8) -> EgressItem {
 
 fn meta(seq: u64, qos: u8) -> EgressMeta {
     EgressMeta::of(&message(seq, qos, MqttExpiry::Never))
+}
+
+fn expired(message: EgressMeta, sent: Sent) -> EgressReport {
+    EgressReport::Expired { message, sent }
 }
 
 fn make_handle() -> Arc<MqttClientHandle> {
@@ -554,7 +659,8 @@ async fn messages_go_out_in_channel_order_with_their_options() {
     until("drained", || bus.drained()).await;
 }
 
-/// A broker's failure answer is reported rejected with the broker's words.
+/// A broker's failure answer is reported rejected with the broker's words
+/// and its reason code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_broker_rejection_is_reported_with_its_reason() {
     let handle = make_handle();
@@ -570,11 +676,15 @@ async fn a_broker_rejection_is_reported_with_its_reason() {
         vec![
             EgressReport::Rejected {
                 message: meta(1, 1),
-                reason: "topic denied".to_string()
+                reason: "topic denied".to_string(),
+                code: Some(135),
+                earlier: Sent::Never,
             },
             EgressReport::Rejected {
                 message: meta(2, 2),
-                reason: "topic denied".to_string()
+                reason: "topic denied".to_string(),
+                code: Some(135),
+                earlier: Sent::Never,
             },
         ]
     );
@@ -739,7 +849,7 @@ async fn a_backlog_of_expired_messages_is_walked_from_one_wake() {
     assert_eq!(
         bus.reports(),
         (1..=4)
-            .map(|seq| EgressReport::Expired(meta(seq, 1)))
+            .map(|seq| expired(meta(seq, 1), Sent::Never))
             .collect::<Vec<_>>()
     );
     assert!(
@@ -842,7 +952,7 @@ async fn an_expired_message_is_reported_and_not_submitted() {
     bus.commit_quietly(item(2, 1));
     start_egress_reader(&handle, bus.clone());
     until("both advances", || bus.advances().len() == 2).await;
-    assert_eq!(bus.reports(), vec![EgressReport::Expired(meta(1, 1))]);
+    assert_eq!(bus.reports(), vec![expired(meta(1, 1), Sent::Never)]);
     assert_eq!(
         queued(&mut eventloop),
         1,
@@ -851,7 +961,7 @@ async fn an_expired_message_is_reported_and_not_submitted() {
 }
 
 /// A held QoS 1 message whose lifetime passes before the reconnect is
-/// reported expired and not resubmitted.
+/// reported expired, as possibly sent, and not resubmitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_message_whose_lifetime_passes_is_expired() {
     let handle = make_handle();
@@ -866,49 +976,74 @@ async fn a_held_message_whose_lifetime_passes_is_expired() {
 
     let mut eventloop = install_unpolled(&handle, 64, None, None).await;
     until("the expiry", || bus.reports().len() == 1).await;
-    assert_eq!(bus.reports(), vec![EgressReport::Expired(meta(1, 1))]);
+    assert_eq!(bus.reports(), vec![expired(meta(1, 1), Sent::Possibly)]);
     assert_eq!(queued(&mut eventloop), 0);
 }
 
-/// A packet over the broker's Maximum Packet Size is reported rejected and
-/// never given to the library.
+/// A packet over the broker's Maximum Packet Size is reported rejected, with
+/// no earlier copy, and never given to the library, at every QoS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_oversize_packet_is_rejected_unsent() {
-    let handle = make_handle();
-    let mut eventloop = install_unpolled(&handle, 64, Some(16), None).await;
-    let bus = ScriptBus::new(Some(256));
-    bus.commit_quietly(item(1, 1));
-    start_egress_reader(&handle, bus.clone());
-    until("the report", || bus.reports().len() == 1).await;
-    let reports = bus.reports();
-    let EgressReport::Rejected { message, reason } = &reports[0] else {
-        panic!("expected a rejection, got {reports:?}");
-    };
-    assert_eq!(*message, meta(1, 1));
-    assert!(
-        reason.contains("Maximum Packet Size is 16 bytes"),
-        "{reason}"
-    );
-    assert_eq!(bus.advances(), [1]);
-    assert_eq!(queued(&mut eventloop), 0);
-    until("drained", || bus.drained()).await;
+    for qos in 0..=2 {
+        let handle = make_handle();
+        let mut eventloop = install_unpolled(&handle, 64, Some(12), None).await;
+        let bus = ScriptBus::new(Some(256));
+        bus.commit_quietly(item(1, qos));
+        start_egress_reader(&handle, bus.clone());
+        until("the report", || bus.reports().len() == 1).await;
+        let reports = bus.reports();
+        let EgressReport::Rejected {
+            message,
+            reason,
+            code,
+            earlier,
+        } = &reports[0]
+        else {
+            panic!("expected a rejection, got {reports:?}");
+        };
+        assert_eq!(*message, meta(1, qos));
+        assert_eq!(
+            *code, None,
+            "the host's own rejection carries no reason code"
+        );
+        assert_eq!(*earlier, Sent::Never, "QoS {qos}");
+        assert!(
+            reason.contains("Maximum Packet Size is 12 bytes"),
+            "{reason}"
+        );
+        assert_eq!(bus.advances(), [1]);
+        assert_eq!(queued(&mut eventloop), 0);
+        until("drained", || bus.drained()).await;
+    }
 }
 
-/// A row whose blob left retention is advanced over with no report.
+/// A row whose blob left retention is advanced over; it is reported, after
+/// the advance, only when it names a `status_to`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_gone_payload_is_advanced_over_silently() {
+async fn a_gone_payload_is_reported_only_when_it_names_a_status_to() {
     let handle = make_handle();
     let mut eventloop = install_unpolled(&handle, 64, None, None).await;
     let bus = ScriptBus::new(Some(256));
     bus.commit_quietly(EgressItem::PayloadGone {
         seq: MessageSeq(1),
-        id: Uuid::from_u128(1),
+        meta: meta(1, 1),
     });
-    bus.commit_quietly(item(2, 1));
+    bus.commit_quietly(EgressItem::PayloadGone {
+        seq: MessageSeq(2),
+        meta: named_meta(2, 1),
+    });
+    bus.commit_quietly(item(3, 1));
     start_egress_reader(&handle, bus.clone());
-    until("both advances", || bus.advances().len() == 2).await;
+    until("three advances", || bus.advances().len() == 3).await;
     settle().await;
-    assert!(bus.reports().is_empty());
+    assert_eq!(
+        bus.reports(),
+        vec![EgressReport::PayloadGone(named_meta(2, 1))]
+    );
+    assert_eq!(
+        bus.timeline()[..3],
+        ["advance 1", "advance 2", "report gone 2"]
+    );
     assert_eq!(queued(&mut eventloop), 1);
 }
 
@@ -982,6 +1117,797 @@ async fn retire_abandons_the_channel_and_leaves_the_session() {
 
     // The supervisor alone is joined now.
     handle.stop_and_join().await;
+}
+
+/// A message naming a `status_to` is reported handed, and the report is
+/// complete, before the position moves past it and before the library has
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handed_is_reported_before_the_advance_and_the_hand_off() {
+    let handle = make_handle();
+    let mut eventloop = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    let (open, gate) = oneshot::channel();
+    *bus.gate.lock().await = Some((1, gate));
+    bus.commit_quietly(named_item(1, 1));
+    start_egress_reader(&handle, bus.clone());
+
+    until("the handed report", || bus.reports().len() == 1).await;
+    settle().await;
+    assert_eq!(bus.reports(), vec![EgressReport::Handed(named_meta(1, 1))]);
+    assert!(bus.advances().is_empty());
+    assert_eq!(queued(&mut eventloop), 0, "the library has nothing yet");
+
+    open.send(()).unwrap();
+    until("the submit", || queued(&mut eventloop) == 1).await;
+    assert_eq!(bus.timeline(), ["report handed 1", "advance 1"]);
+}
+
+/// A message whose lifetime passed before it was first reached is advanced
+/// over and reported expired with no handed; a message with no `status_to`
+/// is never reported handed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_message_is_never_handed() {
+    let handle = make_handle();
+    let mut eventloop = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    let past = Utc::now() - TimeDelta::seconds(1);
+    bus.commit_quietly(EgressItem::Message(named(1, 1, MqttExpiry::At(past))));
+    bus.commit_quietly(named_item(2, 1));
+    bus.commit_quietly(item(3, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("three submits and expiries", || bus.advances().len() == 3).await;
+    assert_eq!(
+        bus.timeline(),
+        [
+            "advance 1",
+            "report expired 1",
+            "report handed 2",
+            "advance 2",
+            "advance 3"
+        ]
+    );
+    assert_eq!(queued(&mut eventloop), 2);
+}
+
+/// A QoS 1 message lost in flight and resubmitted is handed once and
+/// delivered once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resubmit_is_not_handed_again() {
+    let handle = make_handle();
+    let old = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(named_item(1, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("the submit", || bus.advances().len() == 1).await;
+
+    let old_client = handle.client.lock().await.take().unwrap();
+    let broker = connect_fake(&handle, None, Answer::Success).await;
+    drop(old_client);
+    drop(old);
+    until("the delivery", || bus.reports().len() == 2).await;
+    settle().await;
+    assert_eq!(broker.topics(), ["lights/1"]);
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Handed(named_meta(1, 1)),
+            EgressReport::Delivered(named_meta(1, 1)),
+        ]
+    );
+}
+
+/// QoS 0 and 2 naming a `status_to` and lost in flight: handed, then
+/// unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_qos0_or_qos2_is_handed_then_unknown() {
+    let handle = make_handle();
+    let old = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(named_item(1, 0));
+    bus.commit_quietly(named_item(2, 2));
+    start_egress_reader(&handle, bus.clone());
+    until("two submits", || bus.advances().len() == 2).await;
+
+    lose_connection(&handle, old).await;
+    until("two unknowns", || bus.reports().len() == 4).await;
+    let unknown = |seq, qos| EgressReport::Unknown {
+        message: named_meta(seq, qos),
+        cause: UnknownCause::ConnectionLost,
+    };
+    assert_eq!(
+        bus.reports_by_id(),
+        vec![
+            EgressReport::Handed(named_meta(1, 0)),
+            unknown(1, 0),
+            EgressReport::Handed(named_meta(2, 2)),
+            unknown(2, 2),
+        ]
+    );
+}
+
+/// A handed QoS 1 message the library accepted, held across a reconnect past
+/// its lifetime: handed, then expired as possibly sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_message_past_its_lifetime_is_handed_then_expired() {
+    let handle = make_handle();
+    let old = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    let soon = Utc::now() + TimeDelta::milliseconds(300);
+    let sent = named(1, 1, MqttExpiry::At(soon));
+    bus.commit_quietly(EgressItem::Message(sent.clone()));
+    start_egress_reader(&handle, bus.clone());
+    until("the submit", || bus.advances().len() == 1).await;
+    lose_connection(&handle, old).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut eventloop = install_unpolled(&handle, 64, None, None).await;
+    until("the expiry", || bus.reports().len() == 2).await;
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Handed(EgressMeta::of(&sent)),
+            expired(EgressMeta::of(&sent), Sent::Possibly),
+        ]
+    );
+    assert_eq!(queued(&mut eventloop), 0);
+}
+
+/// An oversize packet naming a `status_to`: handed, then rejected by the
+/// host with no reason code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversize_packet_is_handed_then_rejected_without_a_code() {
+    let handle = make_handle();
+    let _eventloop = install_unpolled(&handle, 64, Some(16), None).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(named_item(1, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("both reports", || bus.reports().len() == 2).await;
+    let reports = bus.reports();
+    assert_eq!(reports[0], EgressReport::Handed(named_meta(1, 1)));
+    assert!(
+        matches!(
+            &reports[1],
+            EgressReport::Rejected { message, code: None, earlier: Sent::Never, .. }
+                if *message == named_meta(1, 1)
+        ),
+        "{reports:?}"
+    );
+}
+
+/// Leave the reader with message 1 in flight on a fresh connection whose
+/// request channel holds one, messages 2 and 3 held, and 4 and 5 unread.
+/// 1, 3 and 4 name a `status_to`.
+async fn outstanding_mix(handle: &Arc<MqttClientHandle>) -> (Arc<ScriptBus>, rumqttc::EventLoop) {
+    fake_supervisor(handle).await;
+    let old = install_unpolled(handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(named_item(1, 1));
+    bus.commit_quietly(item(2, 1));
+    bus.commit_quietly(named_item(3, 1));
+    start_egress_reader(handle, bus.clone());
+    until("three submits", || bus.advances().len() == 3).await;
+    lose_connection(handle, old).await;
+    settle().await;
+    bus.commit_quietly(named_item(4, 1));
+    bus.commit_quietly(item(5, 1));
+    let eventloop = install_unpolled(handle, 1, None, None).await;
+    settle().await;
+    assert_eq!(bus.reads(), 1, "the unread stay unread");
+    (bus, eventloop)
+}
+
+fn handed_1_and_3() -> Vec<EgressReport> {
+    vec![
+        EgressReport::Handed(named_meta(1, 1)),
+        EgressReport::Handed(named_meta(3, 1)),
+    ]
+}
+
+fn stopped_1_2_3() -> Vec<EgressReport> {
+    vec![
+        EgressReport::Unknown {
+            message: named_meta(1, 1),
+            cause: UnknownCause::SessionStopped,
+        },
+        EgressReport::Dropped {
+            cause: DropCause::SessionStopped,
+            count: 1,
+        },
+        EgressReport::DroppedMessage {
+            message: named_meta(3, 1),
+            cause: DropCause::SessionStopped,
+            sent: Sent::Possibly,
+        },
+    ]
+}
+
+/// A stop reports the held messages naming a `status_to` one by one and
+/// counts the rest, and leaves the unread on the channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_reports_each_held_message_naming_a_status_to() {
+    let handle = make_handle();
+    let (bus, _eventloop) = outstanding_mix(&handle).await;
+    handle.stop_and_join().await;
+    let mut expected = handed_1_and_3();
+    expected.extend(stopped_1_2_3());
+    assert_eq!(bus.reports(), expected);
+    assert_eq!(bus.advances(), [1, 2, 3]);
+    assert_eq!(
+        handle.egress_reader_progress.load(Ordering::Relaxed),
+        bus.completed_calls(),
+        "the counter moves once per completed bus call"
+    );
+}
+
+/// A retire reports as a stop does, then splits what it abandoned the same
+/// way under `ClientRemoved`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retire_reports_each_abandoned_message_naming_a_status_to() {
+    let handle = make_handle();
+    let (bus, _eventloop) = outstanding_mix(&handle).await;
+    handle.retire_egress_reader().await;
+    let mut expected = handed_1_and_3();
+    expected.extend(stopped_1_2_3());
+    expected.extend([
+        EgressReport::Dropped {
+            cause: DropCause::ClientRemoved,
+            count: 1,
+        },
+        EgressReport::DroppedMessage {
+            message: named_meta(4, 1),
+            cause: DropCause::ClientRemoved,
+            sent: Sent::Never,
+        },
+    ]);
+    assert_eq!(bus.reports(), expected);
+    assert_eq!(
+        handle.egress_reader_progress.load(Ordering::Relaxed),
+        bus.completed_calls(),
+        "the counter moves once per completed bus call"
+    );
+    handle.stop_and_join().await;
+}
+
+/// Start a reader over messages 1 and 2, each naming a `status_to` at `qos`
+/// and living for `lifetime`, on a client whose request channel holds one:
+/// message 1 is accepted and stays in flight, and message 2's first submit
+/// is given back, so the reader holds it never sent.
+async fn second_given_back(
+    handle: &Arc<MqttClientHandle>,
+    qos: u8,
+    lifetime: TimeDelta,
+) -> (Arc<ScriptBus>, rumqttc::EventLoop) {
+    fake_supervisor(handle).await;
+    let eventloop = install_unpolled(handle, 1, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    let expires = MqttExpiry::At(Utc::now() + lifetime);
+    bus.commit_quietly(EgressItem::Message(named(1, qos, expires)));
+    bus.commit_quietly(EgressItem::Message(named(2, qos, expires)));
+    start_egress_reader(handle, bus.clone());
+    until("both handed", || bus.advances().len() == 2).await;
+    settle().await;
+    (bus, eventloop)
+}
+
+fn named_meta_at(seq: u64, bus: &ScriptBus) -> EgressMeta {
+    let state = bus.state.lock().unwrap();
+    let item = state
+        .entries
+        .iter()
+        .find(|item| item_seq(item) == seq)
+        .expect("the message was committed");
+    item_meta(item)
+}
+
+/// A message whose first submit a full request channel gave back is held
+/// never sent: past its lifetime it is handed, then expired as never sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_given_back_by_a_full_channel_expires_never_sent() {
+    for qos in 0..=2 {
+        let handle = make_handle();
+        let (bus, _eventloop) = second_given_back(&handle, qos, TimeDelta::milliseconds(300)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        handle.egress_wake.notify_one();
+        until("the expiry", || bus.reports().len() == 3).await;
+        let second = named_meta_at(2, &bus);
+        assert_eq!(
+            bus.reports(),
+            vec![
+                EgressReport::Handed(named_meta_at(1, &bus)),
+                EgressReport::Handed(second.clone()),
+                expired(second, Sent::Never),
+            ],
+            "QoS {qos}"
+        );
+        handle.stop_and_join().await;
+    }
+}
+
+/// The same held message, stopped: dropped as never sent; the accepted one
+/// in flight is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_given_back_by_a_full_channel_is_dropped_never_sent_at_a_stop() {
+    for qos in 0..=2 {
+        let handle = make_handle();
+        let (bus, _eventloop) = second_given_back(&handle, qos, TimeDelta::seconds(600)).await;
+        handle.stop_and_join().await;
+        let first = named_meta_at(1, &bus);
+        let second = named_meta_at(2, &bus);
+        assert_eq!(
+            bus.reports(),
+            vec![
+                EgressReport::Handed(first.clone()),
+                EgressReport::Handed(second.clone()),
+                EgressReport::Unknown {
+                    message: first,
+                    cause: UnknownCause::SessionStopped,
+                },
+                EgressReport::DroppedMessage {
+                    message: second,
+                    cause: DropCause::SessionStopped,
+                    sent: Sent::Never,
+                },
+            ],
+            "QoS {qos}"
+        );
+    }
+}
+
+/// Start a reader over message 1, naming a `status_to` at `qos` and living
+/// for `lifetime`, and take the client away while the pass waits on its
+/// advance: its submit finds no client, so the reader holds it never sent.
+async fn given_back_for_no_client(
+    handle: &Arc<MqttClientHandle>,
+    qos: u8,
+    lifetime: TimeDelta,
+) -> Arc<ScriptBus> {
+    fake_supervisor(handle).await;
+    let eventloop = install_unpolled(handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    let (open, gate) = oneshot::channel();
+    *bus.gate.lock().await = Some((1, gate));
+    let expires = MqttExpiry::At(Utc::now() + lifetime);
+    bus.commit_quietly(EgressItem::Message(named(1, qos, expires)));
+    start_egress_reader(handle, bus.clone());
+    until("the handed report", || bus.reports().len() == 1).await;
+    lose_connection(handle, eventloop).await;
+    open.send(()).unwrap();
+    until("the advance", || bus.advances().len() == 1).await;
+    settle().await;
+    bus
+}
+
+/// A message whose submit found no client is held never sent: past its
+/// lifetime at the next connection it is expired as never sent, and at a
+/// stop it is dropped as never sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_given_back_for_no_client_is_never_sent() {
+    for qos in 0..=2 {
+        let handle = make_handle();
+        let bus = given_back_for_no_client(&handle, qos, TimeDelta::milliseconds(300)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut eventloop = install_unpolled(&handle, 64, None, None).await;
+        until("the expiry", || bus.reports().len() == 2).await;
+        let only = named_meta_at(1, &bus);
+        assert_eq!(
+            bus.reports(),
+            vec![
+                EgressReport::Handed(only.clone()),
+                expired(only, Sent::Never),
+            ],
+            "QoS {qos}"
+        );
+        assert_eq!(queued(&mut eventloop), 0);
+        handle.stop_and_join().await;
+
+        let handle = make_handle();
+        let bus = given_back_for_no_client(&handle, qos, TimeDelta::seconds(600)).await;
+        handle.stop_and_join().await;
+        let only = named_meta_at(1, &bus);
+        assert_eq!(
+            bus.reports(),
+            vec![
+                EgressReport::Handed(only.clone()),
+                EgressReport::DroppedMessage {
+                    message: only,
+                    cause: DropCause::SessionStopped,
+                    sent: Sent::Never,
+                },
+            ],
+            "QoS {qos}"
+        );
+    }
+}
+
+/// A QoS 1 message the library accepted stays possibly sent when a later
+/// resubmit is given back: lost, given back by a full request channel on the
+/// next connection, then past its lifetime, it is expired as possibly sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn possibly_sent_survives_a_resubmit_given_back() {
+    let handle = make_handle();
+    let old = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    let soon = MqttExpiry::At(Utc::now() + TimeDelta::milliseconds(600));
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(EgressItem::Message(named(2, 1, soon)));
+    start_egress_reader(&handle, bus.clone());
+    until("both submits", || bus.advances().len() == 2).await;
+    lose_connection(&handle, old).await;
+    settle().await;
+
+    // Room for one: message 1 is resubmitted, message 2 is given back.
+    let mut eventloop = install_unpolled(&handle, 1, None, None).await;
+    settle().await;
+    assert_eq!(queued(&mut eventloop), 1, "only message 1 went out again");
+    assert_eq!(bus.reports().len(), 1, "message 2 is still held");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    handle.egress_wake.notify_one();
+    until("the expiry", || bus.reports().len() == 2).await;
+    let second = named_meta_at(2, &bus);
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Handed(second.clone()),
+            expired(second, Sent::Possibly),
+        ]
+    );
+}
+
+/// [`named`] with a payload of `bytes` bytes.
+fn named_sized(seq: u64, qos: u8, expires: MqttExpiry, bytes: usize) -> EgressMessage {
+    let mut message = named(seq, qos, expires);
+    message.payload = Bytes::from(vec![b'x'; bytes]);
+    message
+}
+
+/// Leave the reader holding message 1, a QoS 1 message naming a `status_to`
+/// that the library accepted on a connection now lost, and nothing else.
+async fn possibly_sent_held(
+    handle: &Arc<MqttClientHandle>,
+    first: EgressMessage,
+) -> Arc<ScriptBus> {
+    fake_supervisor(handle).await;
+    let old = install_unpolled(handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(EgressItem::Message(first));
+    start_egress_reader(handle, bus.clone());
+    until("the submit", || bus.advances().len() == 1).await;
+    lose_connection(handle, old).await;
+    settle().await;
+    bus
+}
+
+/// A QoS 1 message accepted before its connection was lost, whose resend is
+/// over the next connection's Maximum Packet Size, is rejected with an
+/// earlier copy and is done; the message behind it goes out in the same pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversize_resend_is_rejected_with_an_earlier_copy() {
+    let handle = make_handle();
+    let big = named_sized(1, 1, MqttExpiry::Never, 200);
+    let bus = possibly_sent_held(&handle, big.clone()).await;
+    bus.commit(item(2, 1));
+    settle().await;
+    assert_eq!(bus.reads(), 1, "nothing is read while disconnected");
+
+    let mut eventloop = install_unpolled(&handle, 64, Some(100), None).await;
+    until("the rejection", || bus.reports().len() == 2).await;
+    let reports = bus.reports();
+    assert_eq!(reports[0], EgressReport::Handed(EgressMeta::of(&big)));
+    let EgressReport::Rejected {
+        message,
+        reason,
+        code,
+        earlier,
+    } = &reports[1]
+    else {
+        panic!("expected a rejection, got {reports:?}");
+    };
+    assert_eq!(*message, EgressMeta::of(&big));
+    assert_eq!(*code, None);
+    assert_eq!(*earlier, Sent::Possibly);
+    assert!(
+        reason.contains("Maximum Packet Size is 100 bytes"),
+        "{reason}"
+    );
+    until("the message behind it", || queued(&mut eventloop) == 1).await;
+    assert_eq!(bus.advances(), [1, 2]);
+
+    handle.stop_and_join().await;
+    assert_eq!(
+        bus.reports()[2..],
+        [EgressReport::Unknown {
+            message: meta(2, 1),
+            cause: UnknownCause::SessionStopped,
+        }],
+        "only message 2 was in flight, and nothing was held"
+    );
+}
+
+/// A QoS 1 message accepted before its connection was lost, resent and
+/// refused by the broker, is rejected with the broker's code and an earlier
+/// copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resend_the_broker_refuses_is_rejected_with_an_earlier_copy() {
+    let handle = make_handle();
+    let first = named(1, 1, MqttExpiry::Never);
+    let bus = possibly_sent_held(&handle, first.clone()).await;
+    let broker = connect_fake(&handle, None, Answer::Reject("topic denied")).await;
+    until("the rejection", || bus.reports().len() == 2).await;
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Handed(EgressMeta::of(&first)),
+            EgressReport::Rejected {
+                message: EgressMeta::of(&first),
+                reason: "topic denied".to_string(),
+                code: Some(135),
+                earlier: Sent::Possibly,
+            },
+        ]
+    );
+    assert_eq!(broker.topics(), ["lights/1"]);
+    handle.stop_and_join().await;
+}
+
+/// A possibly-sent QoS 1 message whose resend a full request channel gave
+/// back keeps its earlier copy: accepted on a later connection and refused by
+/// the broker, it is rejected with an earlier copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_earlier_copy_survives_a_resend_given_back() {
+    let handle = make_handle();
+    fake_supervisor(&handle).await;
+    let old = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(named_item(2, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("both submits", || bus.advances().len() == 2).await;
+    lose_connection(&handle, old).await;
+    settle().await;
+
+    // Room for one: message 1 is resent, message 2 is given back.
+    let mut second = install_unpolled(&handle, 1, None, None).await;
+    settle().await;
+    assert_eq!(queued(&mut second), 1, "only message 1 went out again");
+    lose_connection(&handle, second).await;
+    settle().await;
+
+    let _broker = connect_fake(&handle, None, Answer::Reject("topic denied")).await;
+    until("both rejections", || bus.reports().len() == 3).await;
+    assert_eq!(
+        bus.reports_by_id(),
+        vec![
+            EgressReport::Rejected {
+                message: meta(1, 1),
+                reason: "topic denied".to_string(),
+                code: Some(135),
+                earlier: Sent::Possibly,
+            },
+            EgressReport::Handed(named_meta(2, 1)),
+            EgressReport::Rejected {
+                message: named_meta(2, 1),
+                reason: "topic denied".to_string(),
+                code: Some(135),
+                earlier: Sent::Possibly,
+            },
+        ]
+    );
+    handle.stop_and_join().await;
+}
+
+/// A QoS 1 message accepted, lost, resent and accepted, then lost again and
+/// held past its lifetime, is expired as possibly sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resend_lost_again_and_past_its_lifetime_is_expired_possibly_sent() {
+    let handle = make_handle();
+    let soon = MqttExpiry::At(Utc::now() + TimeDelta::milliseconds(800));
+    let first = named(1, 1, soon);
+    let bus = possibly_sent_held(&handle, first.clone()).await;
+    let mut second = install_unpolled(&handle, 64, None, None).await;
+    until("the resend", || queued(&mut second) == 1).await;
+    lose_connection(&handle, second).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let mut third = install_unpolled(&handle, 64, None, None).await;
+    until("the expiry", || bus.reports().len() == 2).await;
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Handed(EgressMeta::of(&first)),
+            expired(EgressMeta::of(&first), Sent::Possibly),
+        ]
+    );
+    assert_eq!(queued(&mut third), 0);
+    handle.stop_and_join().await;
+}
+
+/// A message whose first submit found no client was never accepted: its
+/// next submit, refused by the host's size check or by the broker, is
+/// rejected with no earlier copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_given_back_then_refused_has_no_earlier_copy() {
+    let handle = make_handle();
+    let bus = given_back_for_no_client(&handle, 1, TimeDelta::seconds(600)).await;
+    let _eventloop = install_unpolled(&handle, 64, Some(16), None).await;
+    until("the rejection", || bus.reports().len() == 2).await;
+    assert!(
+        matches!(
+            &bus.reports()[1],
+            EgressReport::Rejected {
+                code: None,
+                earlier: Sent::Never,
+                ..
+            }
+        ),
+        "{:?}",
+        bus.reports()
+    );
+    handle.stop_and_join().await;
+
+    let handle = make_handle();
+    let bus = given_back_for_no_client(&handle, 1, TimeDelta::seconds(600)).await;
+    let _broker = connect_fake(&handle, None, Answer::Reject("topic denied")).await;
+    until("the rejection", || bus.reports().len() == 2).await;
+    let only = named_meta_at(1, &bus);
+    assert_eq!(
+        bus.reports()[1],
+        EgressReport::Rejected {
+            message: only,
+            reason: "topic denied".to_string(),
+            code: Some(135),
+            earlier: Sent::Never,
+        }
+    );
+    handle.stop_and_join().await;
+}
+
+/// What a slow bus call costs in the watchdog tests: four of them fill one
+/// join window.
+const SLOW: Duration = Duration::from_secs(5);
+
+/// Messages enough that their reports outlast the join window many times.
+const BACKLOG: u64 = 30;
+
+/// A retire whose exit owes far more slow reports than one join window
+/// holds joins: the reader keeps completing bus calls.
+#[tokio::test(start_paused = true)]
+async fn a_long_retire_joins_while_the_reader_progresses() {
+    let handle = make_handle();
+    let bus = ScriptBus::new(Some(256));
+    for seq in 1..=BACKLOG {
+        bus.commit_quietly(named_item(seq, 1));
+    }
+    bus.pace(Pace::Instant, Pace::Takes(SLOW));
+    start_egress_reader(&handle, bus.clone());
+    handle.retire_egress_reader().await;
+    assert_eq!(bus.reports().len() as u64, BACKLOG);
+    assert!(
+        bus.reports().iter().all(|report| matches!(
+            report,
+            EgressReport::DroppedMessage {
+                cause: DropCause::ClientRemoved,
+                sent: Sent::Never,
+                ..
+            }
+        )),
+        "every abandoned message was never read, so never sent"
+    );
+    assert_eq!(
+        handle.egress_reader_progress.load(Ordering::Relaxed),
+        bus.completed_calls()
+    );
+}
+
+/// A retire whose report never returns panics the join after one window.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "neither exited nor completed one bus call within 20s")]
+async fn a_retire_stuck_on_a_report_panics_the_join() {
+    let handle = make_handle();
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(named_item(1, 1));
+    bus.pace(Pace::Instant, Pace::Never);
+    start_egress_reader(&handle, bus.clone());
+    handle.retire_egress_reader().await;
+}
+
+/// Commit [`BACKLOG`] QoS 1 messages naming no `status_to` and wait until the
+/// reader has them all in flight.
+async fn all_in_flight(handle: &Arc<MqttClientHandle>) -> (Arc<ScriptBus>, rumqttc::EventLoop) {
+    fake_supervisor(handle).await;
+    let eventloop = install_unpolled(handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    for seq in 1..=BACKLOG {
+        bus.commit_quietly(item(seq, 1));
+    }
+    start_egress_reader(handle, bus.clone());
+    until("every submit", || bus.advances().len() as u64 == BACKLOG).await;
+    (bus, eventloop)
+}
+
+/// A stop whose exit owes far more slow reports than one join window holds
+/// joins.
+#[tokio::test(start_paused = true)]
+async fn a_long_stop_joins_while_the_reader_progresses() {
+    let handle = make_handle();
+    let (bus, _eventloop) = all_in_flight(&handle).await;
+    bus.pace(Pace::Instant, Pace::Takes(SLOW));
+    handle.stop_and_join().await;
+    assert_eq!(bus.reports().len() as u64, BACKLOG);
+}
+
+/// A stop whose report never returns panics the join after one window.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "neither exited nor completed one bus call within 20s")]
+async fn a_stop_stuck_on_a_report_panics_the_join() {
+    let handle = make_handle();
+    let (bus, _eventloop) = all_in_flight(&handle).await;
+    bus.pace(Pace::Instant, Pace::Never);
+    handle.stop_and_join().await;
+}
+
+/// Start a reader on a connected client over [`BACKLOG`] expired messages
+/// naming a `status_to`, every advance and report paced by `pace`, and wait
+/// until its pass over them has begun.
+async fn expired_backlog(
+    handle: &Arc<MqttClientHandle>,
+    advance: Pace,
+) -> (Arc<ScriptBus>, rumqttc::EventLoop) {
+    fake_supervisor(handle).await;
+    let eventloop = install_unpolled(handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    let past = Utc::now() - TimeDelta::seconds(1);
+    for seq in 1..=BACKLOG {
+        bus.commit_quietly(EgressItem::Message(named(seq, 1, MqttExpiry::At(past))));
+    }
+    bus.pace(advance, Pace::Takes(SLOW));
+    start_egress_reader(handle, bus.clone());
+    until("the pass's read", || bus.reads() == 1).await;
+    (bus, eventloop)
+}
+
+fn assert_all_expired(bus: &ScriptBus) {
+    let reports = bus.reports();
+    assert_eq!(reports.len() as u64, BACKLOG, "{reports:?}");
+    assert!(
+        reports.iter().all(|report| matches!(
+            report,
+            EgressReport::Expired {
+                sent: Sent::Never,
+                ..
+            }
+        )),
+        "the pass gives its messages their own outcome: {reports:?}"
+    );
+}
+
+/// A retire signalled during a pass that alone outlasts the join window many
+/// times joins, and every message of the pass is reported expired.
+#[tokio::test(start_paused = true)]
+async fn a_retire_during_a_long_pass_joins() {
+    let handle = make_handle();
+    let (bus, _eventloop) = expired_backlog(&handle, Pace::Takes(SLOW)).await;
+    handle.retire_egress_reader().await;
+    assert_all_expired(&bus);
+}
+
+/// The same pass under a stop.
+#[tokio::test(start_paused = true)]
+async fn a_stop_during_a_long_pass_joins() {
+    let handle = make_handle();
+    let (bus, _eventloop) = expired_backlog(&handle, Pace::Takes(SLOW)).await;
+    handle.stop_and_join().await;
+    assert_all_expired(&bus);
+}
+
+/// A pass stuck on an advance panics the join after one window.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "neither exited nor completed one bus call within 20s")]
+async fn a_pass_stuck_on_an_advance_panics_the_join() {
+    let handle = make_handle();
+    let (_bus, _eventloop) = expired_backlog(&handle, Pace::Never).await;
+    handle.retire_egress_reader().await;
 }
 
 #[tokio::test]

@@ -33,8 +33,10 @@ use brenn_messaging_store::blob::HeldAttachments;
 
 use brenn_obs::security::{DenialKind, SecurityEventType, log_component_security_event};
 
+mod delivery_status;
 mod mqtt;
-pub use mqtt::{MqttCommitted, MqttPayload, MqttRefusal};
+pub use delivery_status::{DeliveryStatusPublish, DeliveryStatusRefusal};
+pub use mqtt::{MqttCommitted, MqttPayload, MqttRefusal, StatusToRefusal};
 
 /// Per-channel memoized resolution for a batch flush: the channel entry and its
 /// live attacher-feed targets.
@@ -120,9 +122,18 @@ impl PublishResult {
     /// `Ok`, `BudgetExhausted`, `RateLimited`, and `DeferredQuotaExceeded`
     /// return `None`: the limit arms are normal operational conditions with
     /// their own counters and LLM-facing recovery paths, not policy denials.
-    /// `MqttRefused` returns `None` too: it is an argument error.
+    /// `MqttRefused` returns `None` too: it is an argument error, except a
+    /// `status_to` refused on its shape or the publisher's authority, which
+    /// carries the kind the same refusal of a `reply_to` carries.
     pub fn signal_kind(&self) -> Option<DenialKind> {
         match self {
+            Self::MqttRefused(MqttRefusal::StatusTo { why, .. }) => match why {
+                StatusToRefusal::Malformed => Some(DenialKind::MalformedAddress),
+                StatusToRefusal::GrantAbsent => Some(DenialKind::MissingSender),
+                StatusToRefusal::AclDenied => Some(DenialKind::AclDenied),
+                StatusToRefusal::Unknown => Some(DenialKind::UnknownChannel),
+                StatusToRefusal::StatusOverBodyCap { .. } => None,
+            },
             Self::MalformedAddress(_) => Some(DenialKind::MalformedAddress),
             Self::UnknownChannel(_) => Some(DenialKind::UnknownChannel),
             Self::MissingSender => Some(DenialKind::MissingSender),
@@ -288,6 +299,20 @@ enum PublishPrincipal<'a> {
     /// it is governed by the chat channels' own `send_rate`, which this arm
     /// draws like every other principal.
     Conversation { id: i64, app_slug: &'a str },
+    /// The host reporting what became of a message to the `status_to` its
+    /// sender named. `sender` is that message's stored sender. Layer-1 finds
+    /// the app in the current app table whose own identity is `sender`, by
+    /// constructing each app's identity, never by parsing `sender`; layer-1
+    /// and layer-2 both read that app's authored policy as it stands now, so
+    /// a status lands only where its sender may publish at report time.
+    ///
+    /// The stored principal is [`DELIVERY_STATUS_SENDER`], one host identity
+    /// for every status, registered nowhere: its authority is borrowed, never
+    /// its own. Always paired with a `System` origin; the per-(sender,
+    /// channel) send rate is drawn under the stored principal.
+    ///
+    /// [`DELIVERY_STATUS_SENDER`]: brenn_envelope::delivery::DELIVERY_STATUS_SENDER
+    DeliveryStatus { sender: &'a str },
 }
 
 impl Messenger {
@@ -748,6 +773,9 @@ impl Messenger {
             } => scope.principal(attribution),
             PublishPrincipal::System { component } => ParticipantId::for_system(component),
             PublishPrincipal::Conversation { id, .. } => ParticipantId::for_conversation(id),
+            PublishPrincipal::DeliveryStatus { .. } => {
+                return brenn_envelope::delivery::DELIVERY_STATUS_SENDER.to_owned();
+            }
         }
         .as_str()
         .to_owned()
@@ -1011,6 +1039,25 @@ impl Messenger {
                     // Paired with a `System` origin (see
                     // `publish_from_conversation`), which never reads the budget
                     // below — same structural `None` as Surface and System.
+                    None,
+                )
+            }
+            PublishPrincipal::DeliveryStatus { sender: concerning } => {
+                let policy = match apps
+                    .iter()
+                    .find(|(slug, _)| {
+                        ParticipantId::for_app(slug, &self.source).as_str() == concerning
+                    })
+                    .map(|(_, app)| Arc::clone(&app.policy))
+                    .filter(|p| p.has_grant(grant))
+                {
+                    Some(p) => p,
+                    None => return PublishResult::MissingSender,
+                };
+                (
+                    policy,
+                    // Paired with a `System` origin (see
+                    // `publish_delivery_status`), which never reads the budget.
                     None,
                 )
             }
@@ -1827,7 +1874,7 @@ pub struct WasmMqttPublish<'a> {
 
 /// Panic unless `publish` is a well-formed entry for the egress namespace: an
 /// MQTT entry is aimed at its own client's egress channel and carries no
-/// `reply_to`, release time or attachment, and an entry aimed anywhere in the
+/// `reply_to`, release time, attachment or `status_to`, and an entry aimed anywhere in the
 /// egress namespace is an MQTT entry.
 fn assert_wasm_egress_entry(consumer_slug: &str, publish: &WasmPublish<'_>) {
     let addr = publish.channel_address;
@@ -1846,6 +1893,11 @@ fn assert_wasm_egress_entry(consumer_slug: &str, publish: &WasmPublish<'_>) {
                     && publish.attachments.is_empty(),
                 "publish_from_wasm: MQTT entry for {addr:?} carries a reply_to, a release \
                  time or an attachment (slug={consumer_slug})"
+            );
+            assert!(
+                mqtt.options.status_to.is_none(),
+                "publish_from_wasm: MQTT entry for {addr:?} names a status_to, which a \
+                 component cannot (slug={consumer_slug})"
             );
         }
         None => {

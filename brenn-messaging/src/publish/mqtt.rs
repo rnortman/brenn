@@ -14,15 +14,17 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::gates::{publish_acl_allows, well_formed_name};
 use brenn_envelope::grants::AppCapability;
-use brenn_envelope::{AttachmentName, MessageBody, check_content_type};
+use brenn_envelope::{AttachmentName, MessageBody, check_content_type, delivery};
 use brenn_lib::access::AppPolicy;
 use brenn_lib::mqtt::{MqttClientDirectory, MqttLifetime, MqttPublishOptions, parse_topic_name};
 use brenn_messaging_store::blob::{BlobError, BlobStore, HeldAttachments};
 
 use super::{PublishOrigin, PublishPrincipal, PublishResult};
 use crate::{
-    ChannelEntry, Messenger, MqttExpiry, MqttPublishTransport, Urgency, mqtt_egress_address,
+    ChannelEntry, ChannelScheme, Messenger, MqttExpiry, MqttPublishTransport, Urgency,
+    mqtt_egress_address,
 };
 
 /// The name of the one attachment an MQTT payload rides as when it is not the
@@ -38,6 +40,12 @@ pub enum MqttRefusal {
     ReplyTo,
     /// A `delivery_deadline` was stated, which a broker cannot honour.
     DeliveryDeadline,
+    /// The stated `status_to` is not a channel the publisher may name for its
+    /// delivery statuses. `address` is the address as stated.
+    StatusTo {
+        address: String,
+        why: StatusToRefusal,
+    },
     /// QoS above 2.
     InvalidQos { qos: u8 },
     /// A stated content type that is not a well-formed media type.
@@ -52,6 +60,23 @@ pub enum MqttRefusal {
     /// An inline payload over the bus's body cap must ride as a blob, and the
     /// blob store refused it.
     BlobRefused { reason: String },
+}
+
+/// Why the MQTT admission refused a publish's `status_to`, in the order the
+/// admission asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusToRefusal {
+    /// Not a well-formed `brenn:` channel address.
+    Malformed,
+    /// The publisher holds no `MessagingPublish` grant.
+    GrantAbsent,
+    /// The publisher's `brenn:` publish ACL does not cover the channel.
+    AclDenied,
+    /// No such channel is in the directory.
+    Unknown,
+    /// The largest status about a message to this topic, `len` bytes, is
+    /// over the bus's body cap, `max`.
+    StatusOverBodyCap { len: usize, max: usize },
 }
 
 /// The payload of a conversation's MQTT publish.
@@ -121,6 +146,7 @@ pub(crate) fn mqtt_transport(
         retain: options.retain,
         content_type: options.content_type.clone(),
         expires,
+        status_to: options.status_to.clone(),
     }
 }
 
@@ -172,9 +198,14 @@ impl Messenger {
     ///    while a reload adds or removes the client, and "unknown client" is
     ///    the true answer in that moment.
     /// 5. no `deliver_after`, `reply_to` or `delivery_deadline` → `MqttRefused`.
-    /// 6. QoS ≤ 2, a stated content type well formed.
-    /// 7. the payload is the body, or one attachment beside an empty body.
-    /// 8. the payload's length is within the client's outbound cap.
+    /// 6. a stated `status_to` is a channel the publisher could publish to
+    ///    itself, and a status about this topic fits the body cap →
+    ///    `MqttRefused(StatusTo)`. Its own checks run in [`StatusToRefusal`]'s
+    ///    order; the ACL precedes the directory, so a channel the publisher may
+    ///    not publish to answers the same whether or not it exists.
+    /// 7. QoS ≤ 2, a stated content type well formed.
+    /// 8. the payload is the body, or one attachment beside an empty body.
+    /// 9. the payload's length is within the client's outbound cap.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_mqtt(
         &self,
@@ -221,6 +252,15 @@ impl Messenger {
             return refuse(MqttRefusal::DeliveryDeadline);
         }
 
+        if let Some(address) = options.status_to.as_deref()
+            && let Err(why) = self.admit_status_to(policy, address, &parsed.client, &parsed.topic)
+        {
+            return refuse(MqttRefusal::StatusTo {
+                address: address.to_owned(),
+                why,
+            });
+        }
+
         if options.qos > 2 {
             return refuse(MqttRefusal::InvalidQos { qos: options.qos });
         }
@@ -245,6 +285,36 @@ impl Messenger {
             topic: parsed.topic,
             options: options.clone(),
         })
+    }
+
+    /// Step 6 of [`Self::admit_mqtt`]: may `policy` name `address` as the
+    /// `status_to` of a publish to `client`'s `topic`. The right is the publish
+    /// right, not the wider visibility a `reply_to` is held to.
+    fn admit_status_to(
+        &self,
+        policy: &AppPolicy,
+        address: &str,
+        client: &str,
+        topic: &str,
+    ) -> Result<(), StatusToRefusal> {
+        let Some(name) = well_formed_name(address, ChannelScheme::Brenn) else {
+            return Err(StatusToRefusal::Malformed);
+        };
+        if !policy.has_grant(AppCapability::MessagingPublish) {
+            return Err(StatusToRefusal::GrantAbsent);
+        }
+        if !publish_acl_allows(policy, ChannelScheme::Brenn, name) {
+            return Err(StatusToRefusal::AclDenied);
+        }
+        if self.directory.resolve(address).is_none() {
+            return Err(StatusToRefusal::Unknown);
+        }
+        let len = delivery::max_encoded_len(client, topic);
+        let max = self.max_body_bytes();
+        if len > max {
+            return Err(StatusToRefusal::StatusOverBodyCap { len, max });
+        }
+        Ok(())
     }
 
     /// Decide whether a component under `policy` may publish `payload_len`

@@ -42,10 +42,14 @@ passage says "for that channel's window" of a durable row's blobs.
 ## `blob-restart-test-flaky-under-load`
 
 `a_request_on_the_providers_inbox_keeps_its_blob_across_a_restart` in
-`brenn-bootstrap` (`src/reload/blob_tool_call_tests.rs`) failed once under the
+`brenn-bootstrap` (`src/reload/blob_tool_call_tests.rs`) failed twice under the
 full parallel `make check`: after every durable channel was evicted and the
 store reaped, the blob store's usage was not zero. It passed when run alone and
-in three full runs of the crate's tests. The cause is not established, and what
+in three full runs of the crate's tests. The second sighting was a pre-commit
+`make check` on the make-mqtt-great-again stack, on top of `94db21d5`, of a
+change that touches no blob code (the MQTT `status_to` work): the usage
+assertion saw `sealed: 1` against an expected `0`, and the rerun passed with
+nothing changed. The cause is not established, and what
 held a blob at the reap is not known. One reading is excluded by the source,
 though it was not run: that the activation which took the redelivered request
 still held the blob, because `read_past_newest` returns once the provider's
@@ -204,6 +208,10 @@ checked at commit under the same lock the retirement takes, or a count of the
 channel's entries past the abandoned position taken once no commit can land
 and reported as `Dropped { ClientRemoved }`.
 
+A publish lost this way that named a `status_to` hears nothing on it, neither
+`handed` nor an outcome; done also requires that its `status_to` be told it
+was dropped.
+
 ## `dense-request-arguments-outgrow-guest`
 
 A provider's guest parses every new request of an activation into an owned
@@ -259,6 +267,21 @@ comment is corrected to match. This bears on `obs-log-capture-test-flaky`,
 whose record lacks exactly the messages this hook drops. Done = after any
 `panic_hook` test, success or failure, a panic in another test of the binary
 prints its message. The comment is at `restore_default_hook`.
+
+## `fast-gmail-body-fill-to-main`
+
+The make-mqtt-great-again stack carries a commit, "perf(gmail): find the body
+fill by bracketing and bisection, not a unit walk", that takes about ten minutes
+off every `make check` that re-runs `//brenn-server:brenn-server_test`. `main`
+pays the same cost: the helper the commit replaces and the 1 MiB bound that made
+it slow are both on `main`. The commit touches no MQTT file, but besides the test
+file it edits `TODO.md`, `CHANGELOG.md` and comments in
+`brenn-server/BUILD.bazel`, which earlier stack commits also edit, and its
+tracker text refers to `make timing`, which exists only on the stack; whether it
+applies to `main` by itself has not been tried. The owner either takes the
+test-file change (`brenn-server/src/wasm_dispatch_tests/google_gmail_body_e2e.rs`)
+to `main` ahead of the stack, or lets it land with the stack. Done = the fix is
+on `main`, or the owner has said it waits for the stack.
 
 ## `file-link-backslash-refused`
 
@@ -432,6 +455,33 @@ traps the activation, false from that release. Done = both repositories
 are on the release with those changes. The comment sits at
 `MqttPublisher::admit` in `brenn-wasm/src/lib.rs`.
 
+## `mqtt-egress-operator-text-unsent-of-possibly-sent`
+
+The MQTT egress hub (`brenn-server/src/mqtt_egress.rs`) tells the
+operator that a message's "lifetime passed before it could be handed to
+the broker" (the expired log line and alert) and that messages were
+"dropped unsent" (the dropped log line and alert). Both are also said of
+a QoS 1 message the client library had accepted, whose connection ended
+before the broker answered, and which was held to be sent again when its
+lifetime ended or its session stopped: the broker may have received and
+forwarded it. The reader's report says which (`Sent::Possibly` on
+`Expired` and `DroppedMessage`), and the sender's `status_to` is told
+`unknown` for it; the operator's text is not. The cycle that added
+`status_to` changed what the sender is told and left operator output as
+it was. The work: the expired log line and alert, and the dropped log
+line and alert, say what is true of a message the library had accepted.
+A `Dropped { count }` report cannot say how many of its messages may
+have been sent, and that is part of the same work; whether it is split
+by `Sent` or the text is reworded so it claims nothing about sending is
+a choice for whoever does the work. The rejected log line and alert are
+part of the same work: "the broker rejected it" is also said, under "was
+not delivered", of a QoS 1 message refused when it was sent again after a
+lost connection (`EgressReport::Rejected` with `earlier: Possibly`), whose
+first copy the broker may have received and forwarded. Done = no operator
+log line or alert says "unsent" or "before it could be handed to the
+broker" of a message the library had accepted, and none says 'was not
+delivered' of one without saying an earlier copy may have arrived.
+
 ## `mqtt-egress-removed-client-rows`
 
 A removed MQTT client's egress channel row and retained messages stay in the
@@ -469,6 +519,25 @@ to publish to and is sent as the MQTT 5 Response Topic, and
 the bus and released into the client's egress channel with its
 lifetime counted from release. Documenting either refusal as final
 does not close this entry.
+
+## `mqtt-qos2-completion-refusal-told-rejected`
+
+`notice_outcome` (`brenn-mqtt/src/state.rs`) maps a QoS 2 publish whose
+PUBCOMP carries a reason other than Success to `NoticeOutcome::Rejected`,
+the same outcome as a PUBREC refusal. The two are different events. A
+refused PUBREC means the broker did not take the message. A PUBCOMP is
+sent only after the broker answered PUBREC with success, so the broker
+had taken the message; its one failure code, Packet Identifier not found,
+says the broker no longer knows the exchange, which MQTT 5 calls normal
+during recovery after the message was released. The operator is told
+"the broker rejected it" and alerted as for an ACL mismatch, and a sender
+naming a `status_to` is told `rejected`, for a message that has probably
+been delivered. The work: decide what a completion refusal is — which
+reader report, which status kind and cause, and whether it alerts — and
+build it; whether the client library ever surfaces this outside a session
+mismatch is part of the finding out. Done = a QoS 2 message whose PUBREC
+succeeded is never reported to the operator or to a `status_to` as
+rejected.
 
 ## `mqtt-stack-history-rewrite-before-push`
 
@@ -520,6 +589,26 @@ new in a trapped activation, or the kit reads a result again on the next
 one. Done = a real-host test in which an activation traps on a result and
 its caller is answered an error without waiting for the ceiling. The comment
 sits at `fail_delivered_requests` in `brenn-wasm-dispatch/src/lib.rs`.
+
+## `quality-removed-and-possibly-sent-representable-then-panicked`
+
+`brenn_mqtt::reader::EgressReport::DroppedMessage { message, cause:
+DropCause, sent: Sent }` can hold `DropCause::ClientRemoved` with
+`Sent::Possibly`, which the reader never produces: a removed message is one
+it never read, and the retire arm fills `sent` with `Sent::Never` only
+because the field exists. The hub's `delivery_status`
+(`brenn-server/src/mqtt_egress.rs`) panics on that combination, and its
+tests keep a panic case and a skip in `every_report` to police it. Decide
+whether the report type excludes it — e.g. a `DroppedMessage` cause that
+carries `sent` only on its session-stopped arm, so `report_dropped` takes the
+cause per message and the hub's match is total — or whether the runtime
+panic stays, weighing a third cause vocabulary beside the reader's
+`DropCause` and the status body's `DeliveryDropCause`. The current shape was
+specified by the design that added `sent`. Done = either the type cannot
+hold a removed, possibly-sent message and the panic, its test and the skip
+are gone, or the decision to keep the panic is recorded and this entry and
+its comment are removed. The comment sits at the panicking arm of
+`delivery_status`.
 
 ## `tool-provide-attachment-count`
 
@@ -3141,6 +3230,10 @@ over-cap deferred publish reaches the component that issued it.
 Both park arms of the flush refuse this way — the durable one against the row
 count, the non-durable one at the ring's cap — so the fix is one report path, not
 two.
+
+The host now has a mechanism for reporting an outcome to a channel the publisher
+named (`status_to` on an MQTT publish), a candidate for that report path on a
+contract version that lets a component name one.
 
 Code site (`TODO(deferred-flush-drop-signal)`):
 `brenn-messaging/src/publish/mod.rs` (the refusal-reporting loop at the end of

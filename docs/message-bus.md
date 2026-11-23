@@ -1637,9 +1637,12 @@ is connected at that instant; when it is not, the answer also carries a `note`
 naming the session's health and saying the message is committed and waits for
 a connection within its lifetime. A client that is not connected is not an
 error. What happens to the message afterwards — delivered, refused by the
-broker, expired, lost with a connection — is not in the answer and is not
-told to the caller; it goes to the operator (§2.7.3). At QoS 1 a message may
-be delivered twice after a reconnect.
+broker, expired, lost with a connection — is never in the answer. Without a
+`status_to` it is told to the operator, not to the caller (§2.7.3). With
+`status_to` naming a `brenn:` channel the app may publish to, Brenn publishes
+the message's delivery statuses there, and the caller reads them with an
+ordinary subscription (§2.7.3, *Delivery status*). At QoS 1 a message may be
+delivered twice after a reconnect.
 
 **The bound.** Each MQTT client publishes at most
 `outbound_payload_cap_bytes` (default 4 MiB, `docs/config-dsl.md`) per
@@ -1664,7 +1667,8 @@ reason.
 budget spends none: the arguments; the attachment's admission, which takes a
 hold on the blob and reads no byte; then the bus's admission — the address,
 the app's `mqtt_publish` grant and per-topic ACL, the client and its egress
-channel, QoS and content type, the payload's shape, the bound, the body cap's
+channel, the `status_to` when one is named, QoS and content type, the
+payload's shape, the bound, the body cap's
 need for a blob store; the send rate; the send budget; the write of an
 over-cap inline payload to the blob store, whose refusal refunds the budget
 unit; then the commit. A denied call learns nothing of the client's bound. A
@@ -1675,8 +1679,9 @@ does not affect the call: the hold keeps the bytes.
 **The broker's maximum packet size.** When the broker's CONNACK advertises a
 Maximum Packet Size, a packet that would exceed it is never sent, and the
 session stays up. The message, `MqttSend`'s or a component's, is already
-committed: it is reported to the operator as refused, naming the packet's size
-and the broker's maximum. A broker that advertises no maximum arms no check.
+committed: it is reported as rejected — to the operator, naming the packet's
+size and the broker's maximum, or on its `status_to` as `rejected` with no
+reason code. A broker that advertises no maximum arms no check.
 
 **A component's publish.** A component's `mqtt-publish` and
 `mqtt-publish-expiring` go through the same egress channel. The call is
@@ -1688,7 +1693,7 @@ committed together: its MQTT publishes and its publishes to durable channels
 in one transaction, in call order. When it errs or traps the buffer is
 discarded. The call answers the admission and never a broker outcome; what
 happens after commit goes to the operator (§2.7.3), with `wasm:<slug>` as the
-sender. `mqtt-publish` is committed with no lifetime and
+sender: a component cannot name a `status_to`. `mqtt-publish` is committed with no lifetime and
 `mqtt-publish-expiring` with a lifetime of its seconds, counted from the
 commit. Nothing in the call waits on the broker or its session.
 
@@ -1702,8 +1707,9 @@ output may name it. A component's
 `in` port may read a declared client's channel. Each message carries the
 publish in the envelope's `transport` key — `{"mqtt_publish": {"client_slug",
 "topic", "qos", "retain", "content_type", "expires"}}`, where `expires` is
-`{"at": "<rfc3339>"}` or `"never"` and `content_type` is absent when the call
-stated none — and its payload as the body or as one attachment (§2.7.2).
+`{"at": "<rfc3339>"}` or `"never"`, `content_type` is absent when the call
+stated none, and `status_to` is the canonical `brenn:` address the call named
+for its delivery statuses, absent when it named none — and its payload as the body or as one attachment (§2.7.2).
 
 **Admission.** `MqttSend`'s publish is admitted by the bus as any publish is,
 against the client's channel: authority, the client and its channel, the
@@ -1728,10 +1734,11 @@ client's reader is retired.
 system participant `system:mqtt-outbound`'s position on that client's channel.
 It hands the channel's messages to the session in channel order, one cursor,
 no other subscriber's business. It reads only while the session is connected.
-For each message it moves the cursor past the message *first*, durably, and
-then hands it to the MQTT library. So a crash between the two, or while the
-message is in flight, loses it and reports nothing: delivery is at most once
-across a crash. What a crash can lose is bounded by the in-flight limit.
+For each message it first commits the `handed` status, when the message names a
+`status_to` and its lifetime has not passed; then moves the cursor past the
+message, durably; then hands it to the MQTT library, or reports it expired. So
+a crash after the cursor moves, or while the message is in flight, loses it
+and reports nothing: delivery is at most once across a crash. What a crash can lose is bounded by the in-flight limit.
 
 **The in-flight limit.** The reader keeps at most
 `min(Receive Maximum, window)` messages handed and not yet resolved: the
@@ -1749,26 +1756,44 @@ Interval, rounded up. A message waits on its channel while the client is
 disconnected and is judged when the client is next connected, so an expired
 message is reported then, not at the instant it expired.
 
-**Outcomes and who hears of them.** The caller hears of none: the call
-answered at commit. The operator hears of every outcome but a delivery. Each
-is a `warn` line naming the client, the kind, the cause or the broker's
-reason, the message id, the sender and the topic, a count per client and
-kind, and a `Warning` alert:
+**Outcomes and who hears of them.** The call answered at commit and reports
+none. A message that names a `status_to` has each outcome published there
+(*Delivery status*, below). The operator hears of every outcome but a
+delivery: each is a `warn` line naming the client, the kind, the cause or the
+broker's reason, the message id, the sender and the topic, and a count per
+client and kind; and a `Warning` alert, unless the outcome was published on
+the message's `status_to` and was not a broker's rejection:
 
 | Outcome | When |
 |---|---|
 | delivered | the broker acknowledged it (QoS 1, 2), or it was written (QoS 0); logged at `debug` and counted, no alert |
 | rejected | the broker refused it with a reason code, or its packet is over the broker's Maximum Packet Size |
-| expired | its lifetime passed before the reader handed it over |
+| expired | its lifetime passed before the reader handed it over, or before it handed over again a message it held for resubmission |
 | unknown | it was in flight when the connection was lost (QoS 0, 2) or when the session stopped |
-| dropped | the session stopped, or its client was removed, with messages the reader held or still owed; reported as a count |
+| dropped | the session stopped, or its client was removed, with messages the reader held or still owed; reported as a count, and one by one for those naming a `status_to` |
 
+A broker's rejection is always alerted, whether or not its sender was told:
+it means Brenn's per-topic ACL admits a topic the broker's configuration
+forbids, which only the operator can fix, and naming a `status_to` cannot
+silence it. Its alert says when the sender was told. Every other failure told
+on its `status_to` — an oversize packet's rejection among them — is logged and
+counted and raises no alert. One with no `status_to`, or whose status could
+not be published, is alerted.
 Alerts are coalesced per client and kind: the first failure of a kind raises
 an alert and opens an episode; later failures of that kind are logged and
 counted only; the client's next delivery, or its reader running dry, closes
 every open episode and raises one summary alert per episode that withheld
 any, with how many. A reconnect that finds 200 expired messages raises two
 alerts, not 200.
+
+A status that could not be published (*Delivery status*, below) is a `warn`
+line naming the client, the message id, the status kind, the address and the
+refusal; a count per client; and an alert under a fifth kind, *status not
+published*. That episode closes only when the reader runs dry, never on a
+delivery or a published status: a throttled status channel refuses only the
+excess, and one client serves many senders, so refused and published statuses
+interleave, and closing on either would raise an alert per alternation. A
+cause that outlasts the run alerts again in the next.
 
 **QoS across a reconnect.** A QoS 1 message in flight when the connection is
 lost is sent again as a new publish on the next connection, ahead of anything
@@ -1805,8 +1830,12 @@ durable and the cursor survives, so the restart loses nothing.
 position on it and starts the reader before any policy can name the client.
 One that removes a client retires the reader before the channel leaves: what
 the channel held for the reader when it was retired is abandoned and reported
-dropped with the count, and the position and subscriber entry are removed with
-the channel. An `MqttSend` committed after that is lost unreported
+dropped with the count, each message naming a `status_to` told `dropped`,
+`removed` there, and the position and subscriber entry are removed with
+the channel. A reload that removes or changes a client waits for that
+client's reader to finish the pass it is in and for its statuses to commit,
+however many: it gives up, and the server panics, only when the reader
+completes no bus call for 20 seconds. An `MqttSend` committed after that is lost unreported
 (Admission, above). The removed
 channel's stored row and retained messages stay in the database
 (`TODO(mqtt-egress-removed-client-rows)`). One that changes a client keeps the
@@ -1817,6 +1846,121 @@ messages — a client added again under a slug that was removed — skips them:
 they were committed for the earlier client and are not published. The skip is
 logged at `warn` with the count. A restart resumes an existing position and
 hands off exactly what was not handed.
+
+#### Delivery status
+
+A sender learns what became of its publish by naming a `status_to`: a `brenn:`
+channel it could publish to itself. The host publishes there `handed`, then
+one outcome. It is the bus's own idiom — an outcome is a fact, a fact is a
+message on a channel, the sender reads it with an ordinary subscription — and
+there is nothing to wait on or poll. `MqttSend` takes a `status_to`; a
+component cannot name one.
+
+**Admission.** A named `status_to` is checked after the publish's target and
+before its QoS and payload, and each refusal commits nothing and spends
+nothing: it must be a well-formed `brenn:` address; the app must hold the
+`publish` grant and its `brenn_publish` ACL must admit the channel — the
+publish right, not visibility: a channel it may only read is refused; the
+channel must exist; and the largest status about a message to this topic must
+fit `[messaging] max_body_bytes`. Outside the ACL and not existing answer with
+one string, as a `BrennSend` denial does, and both, like an absent grant, are
+security events; the malformed and over-cap refusals are argument errors.
+
+**The body.** A status is untyped JSON text from sender
+`system:delivery-status`:
+
+```json
+{"v":1,"message_id":"<uuid>","kind":"rejected","reason":"Not authorized",
+ "mqtt":{"client":"ha","topic":"lights/k/set","qos":1,"reason_code":135}}
+```
+
+The top level is general: `v`, `message_id` (the id the publish answered),
+`kind`, and `reason` (`rejected`) or `cause` (`unknown`, `dropped`). `mqtt` is
+the transport's member — client, topic, QoS, and the broker's MQTT 5 reason
+code when a broker refused the message, on `rejected` and on `unknown` with
+cause `resend_refused` — and a status need not carry it. Kinds are closed
+in v1: a new kind moves `v`. Causes are open: a reader treats a cause word it
+does not know as some other cause. Unknown fields are ignored.
+
+A reader believes only `sender` `system:delivery-status`: the channel is by
+rule one the publishing app may itself write, so anything else on it may be
+the app's own traffic. The sender says the host wrote a status, not whose
+message it concerns. Every app whose `brenn_publish` ACL admits a channel may
+name it, and every conversation of one app publishes as that app, so a reader
+matches `message_id` against the ids its own publishes returned and ignores
+the rest.
+
+| kind | cause | meaning |
+|---|---|---|
+| `handed` | | the message went to the MQTT library |
+| `delivered` | | the broker acknowledged it (QoS 1, 2), or it was written to the connection (QoS 0: a broker cannot refuse a QoS 0 message, and one that will not take it drops it unannounced) |
+| `rejected` | | the broker refused it, `reason` its reason string or its reason code's name; or its packet was over the broker's Maximum Packet Size, with no `reason_code`; no earlier copy of it had been accepted |
+| `expired` | | never sent: its lifetime passed before the MQTT library accepted it |
+| `unknown` | `connection_lost` | may have been sent: in flight when the connection was lost (QoS 0, 2), and not sent again |
+| `unknown` | `lifetime_ended` | may have been sent: the library accepted it, its connection ended before the broker answered (QoS 1), and its lifetime passed while it waited to be sent again |
+| `unknown` | `resend_refused` | may have been sent: the library accepted it, its connection ended before the broker answered (QoS 1), and when it was sent again the broker refused it (`reason_code` is the broker's) or its packet was over the new connection's Maximum Packet Size (no `reason_code`); the broker's reason string goes to the operator's log, not into the status |
+| `unknown` | `stopped` | may have been sent: in flight, or accepted and waiting to be sent again, when the session stopped or its client began to be removed |
+| `dropped` | `stopped` | never sent: the library never accepted it, and the session stopped or its client began to be removed while the reader held it |
+| `dropped` | `removed` | never sent: not yet read when its client was removed |
+| `dropped` | `left_retention` | its payload left the blob store before it was handed over |
+
+**What a sender may infer.**
+
+- `expired` is reported when the reader reaches the message, and nothing is
+  read while the client is disconnected, so it comes at reconnect, not at the
+  moment the lifetime ends. A message first reached past its lifetime gets
+  `expired` and no `handed`.
+- `expired` and `dropped` mean the message was not sent, whether or not a
+  `handed` came first. A `handed` followed by `expired` or `dropped` is a
+  message the MQTT library never accepted: the library had no room for it, or
+  the connection went away between the `handed` and the hand-off. A message
+  that ended without being delivered, and of which the library accepted a
+  copy the broker never answered, is `unknown`, whatever its QoS, with its
+  cause saying why. `rejected`, `expired` and `dropped` are said only of a
+  message with no such copy.
+- One `rejected` is wrong. At QoS 2, a `rejected` whose `reason_code` is 146
+  (Packet Identifier not found) is the broker failing the last step of an
+  exchange whose first step it had accepted: the broker took the message
+  (`TODO(mqtt-qos2-completion-refusal-told-rejected)`).
+- `delivered` at QoS 0 says the message was written to the connection, not
+  that the broker took it. A sender that needs the broker's answer publishes
+  at QoS 1 or 2.
+- `handed` with no outcome after a server restart means nobody knows.
+- No `handed` by the end of the lifetime means the message was not sent —
+  except when the `handed` status itself could not be published, in which
+  case the message may have been sent and the operator, not the sender,
+  knows. A sender for whom a duplicate is worse than a loss does not resend
+  on a missing `handed` alone.
+- An outcome can arrive without its `handed` when only the `handed` was
+  refused.
+- A crash between the `handed` status and the cursor sends the message after
+  restart with a second `handed`.
+- Four silences. A message the egress channel's window dropped before the
+  reader reached it gets no status: the store reports overflow as a count. A
+  message in flight when the server crashed has a `handed` and never an
+  outcome. A message committed in the moment its client is being removed gets
+  nothing (`TODO(correctness-publish-during-egress-retirement-silently-lost)`).
+  And nothing is published while the client has no connection: `expired`
+  comes when a connection next lets the reader reach the message — hours
+  later if the client is down that long, never if it stays down or the window
+  drops the message first. The same holds after a clean shutdown, which joins
+  no reader: a status that had not committed is not published.
+
+**When a status is not published.** A status is published at report time on
+the sender's authority as it stands then: the app named in the stored sender
+must still exist, hold `publish`, and admit the channel in its
+`brenn_publish` ACL; the channel must still exist; the channel's send rate
+and body cap apply. A status refused for any of these is never retried and
+never holds a message back: the operator is told (*status not published*,
+above), and the outcome of a failure whose status was refused is alerted as
+though no `status_to` had been named.
+
+**Sizing.** The status channel's window is the sender's to size; a status
+that falls out of it before it is read is gone. Its `send_rate` is drawn
+under `system:delivery-status` and is shared by every sender naming that
+channel: it must cover two statuses per publish into it. A conversation
+subscribed to its own status channel with a push depth is woken by its
+statuses.
 
 ### 2.8 The reload pair
 

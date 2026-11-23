@@ -8,15 +8,21 @@ use std::sync::Arc;
 use chrono::Utc;
 use uuid::Uuid;
 
+use brenn_envelope::delivery::{
+    self, DELIVERY_STATUS_SENDER, DeliveryDropCause, DeliveryKind, DeliveryStatus,
+};
 use brenn_envelope::{
     ChannelScheme, MessageBody, MqttExpiry, MqttPublishTransport, TransportMeta, Urgency,
 };
+use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::{ParticipantId, mqtt_egress_address};
 use brenn_messaging::Messenger;
 use brenn_messaging::config_reload::Outcome;
 use brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT;
 use brenn_messaging_store::blob::HeldAttachments;
-use brenn_messaging_store::db::{SubscriberCursorRow, load_subscriber_cursor, utc_to_ns};
+use brenn_messaging_store::db::{
+    SubscriberCursorRow, load_channel_retained_window_seq, load_subscriber_cursor, utc_to_ns,
+};
 use brenn_messaging_store::store::NewMessage;
 use brenn_obs::alerting::AlertSeverity;
 
@@ -51,12 +57,25 @@ pub(crate) async fn egress_cursor(
 
 /// Commit `n` messages to `client`'s egress channel, as the admission would.
 async fn commit(messenger: &Messenger, client: &str, n: usize) {
+    commit_as(messenger, client, n, "app:sifter", None).await;
+}
+
+/// Commit `n` messages from `sender` naming `status_to` to `client`'s egress
+/// channel, as the admission would, and return their ids in order.
+async fn commit_as(
+    messenger: &Messenger,
+    client: &str,
+    n: usize,
+    sender: &str,
+    status_to: Option<&str>,
+) -> Vec<Uuid> {
     let store = messenger.store_for_address(&mqtt_egress_address(client));
+    let mut ids = Vec::with_capacity(n);
     for i in 0..n {
-        store
+        let appended = store
             .append(NewMessage {
                 source: "test".to_string(),
-                sender: "app:sifter".to_string(),
+                sender: sender.to_string(),
                 body: MessageBody::from_parts(
                     Some("application/octet-stream"),
                     format!("m{i}").as_bytes(),
@@ -71,6 +90,7 @@ async fn commit(messenger: &Messenger, client: &str, n: usize) {
                     retain: false,
                     content_type: None,
                     expires: MqttExpiry::Never,
+                    status_to: status_to.map(str::to_string),
                 })),
                 reply_to: None,
                 delivery_deadline: None,
@@ -79,7 +99,9 @@ async fn commit(messenger: &Messenger, client: &str, n: usize) {
                 attachments: HeldAttachments::none(),
             })
             .await;
+        ids.push(appended.committed.message_uuid);
     }
+    ids
 }
 
 /// A fixture boot over `tree` and, when given, an existing database.
@@ -366,5 +388,145 @@ async fn an_outage_longer_than_the_window_is_alerted_by_the_eviction_pass() {
         "the count is not in {overflow:?}",
     );
     assert_eq!(booted.messenger.drop_counter(&address, &participant()), 3);
+    booted.stop_mqtt();
+}
+
+/// The status channel the `status_to` cases name.
+const STATUS: &str = "brenn:status";
+
+/// The agent whose publishes name [`STATUS`].
+const STATUS_SENDER: &str = "mqtt-sender";
+
+/// [`document_with_clients`] over `clients`, with [`STATUS`] deep and fast
+/// enough for a full egress window's statuses, and [`STATUS_SENDER`], which may
+/// publish to it.
+fn status_document(clients: &[(&str, u16, Option<&std::path::Path>)]) -> String {
+    let mut document = document_with_clients(clients, &[("ha", "home/state")]);
+    document.push_str(&format!(
+        r#"
+channel status at "{STATUS}" {{
+    push_depth = 1;
+    retain_depth = 512;
+    standing_retain_depth = 512;
+    send_rate = {{ burst = 1000, refill_interval_secs = 1, refill = 1000 }};
+}}
+
+agent Sender() {{
+    working_dir = ".";
+    grants = [publish];
+    acl publish [exact status];
+}}
+
+new {STATUS_SENDER}: Sender();
+"#
+    ));
+    document
+}
+
+/// The statuses on [`STATUS`], oldest first, each from
+/// `system:delivery-status`.
+async fn statuses(messenger: &Messenger) -> Vec<DeliveryStatus> {
+    let uuid = messenger
+        .directory()
+        .resolve(STATUS)
+        .expect("the status channel is declared")
+        .uuid;
+    let conn = messenger.db().lock().await;
+    load_channel_retained_window_seq(&conn, uuid, Depth::Unbounded)
+        .into_iter()
+        .map(|(_, envelope)| {
+            assert_eq!(envelope.sender, DELIVERY_STATUS_SENDER, "{envelope:?}");
+            delivery::decode(envelope.body.as_text().expect("a status is text"))
+                .expect("a v1 status")
+        })
+        .collect()
+}
+
+/// Boot with `ha` and `spare`, commit `named` messages naming [`STATUS`] and
+/// `unnamed` naming none to `spare`, and reload with `spare` removed. Returns
+/// the booted process and the named messages' ids.
+async fn remove_spare_owing(named: usize, unnamed: usize) -> (Booted, Vec<Uuid>) {
+    let one = [("ha", 8883u16, None)];
+    let two = [("ha", 8883u16, None), ("spare", 8884u16, None)];
+    let tree = Tree::holding(&status_document(&two));
+    let components = tempfile::tempdir().expect("a components root");
+    install_package(components.path(), &staged_module(&tree));
+    let mut booted = boot_over(&tree, components.path(), None).await;
+    let sender = ParticipantId::for_app(STATUS_SENDER, booted.messenger.source());
+    let ids = commit_as(
+        &booted.messenger,
+        "spare",
+        named,
+        sender.as_str(),
+        Some(STATUS),
+    )
+    .await;
+    commit_as(&booted.messenger, "spare", unnamed, sender.as_str(), None).await;
+
+    tree.write(&status_document(&one));
+    install_package(components.path(), &staged_module(&tree));
+    booted.driver.reload(TriggerSource::Signal).await;
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_removed, vec!["spare".to_string()]);
+    (booted, ids)
+}
+
+/// Assert `found` tells each of `ids`, in order, `dropped`, `removed`.
+fn assert_all_removed(found: &[DeliveryStatus], ids: &[Uuid]) {
+    let told: Vec<_> = found
+        .iter()
+        .map(|status| (status.message_id, status.kind.clone()))
+        .collect();
+    let removed: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            (
+                *id,
+                DeliveryKind::Dropped {
+                    cause: DeliveryDropCause::Removed,
+                },
+            )
+        })
+        .collect();
+    assert_eq!(told, removed);
+}
+
+/// A removed client's unread messages that name a `status_to` are each told
+/// `dropped`, `removed` there; the operator's dropped alert counts only the
+/// rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_clients_unread_messages_naming_a_status_to_are_told_removed() {
+    let (booted, ids) = remove_spare_owing(3, 2).await;
+    assert_all_removed(&statuses(&booted.messenger).await, &ids);
+    let alerts = booted.alerts().await;
+    let dropped: Vec<_> = alerts
+        .iter()
+        .filter(|(_, title, _)| title.contains("dropped") && title.contains("spare"))
+        .collect();
+    assert_eq!(dropped.len(), 1, "{alerts:?}");
+    assert!(
+        dropped[0]
+            .2
+            .contains("\"spare\": 2 message(s) dropped unsent"),
+        "only the untold messages are counted: {dropped:?}"
+    );
+    booted.stop_mqtt();
+}
+
+/// A removed client whose channel holds a full default window, every message
+/// naming a `status_to`, has every one told, and the reload completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_window_of_messages_naming_a_status_to_is_told_and_the_reload_completes() {
+    let (booted, ids) = remove_spare_owing(256, 0).await;
+    assert_eq!(ids.len(), 256);
+    assert_all_removed(&statuses(&booted.messenger).await, &ids);
+    let alerts = booted.alerts().await;
+    assert!(
+        !alerts
+            .iter()
+            .any(|(_, title, _)| title.contains("dropped") && title.contains("spare")),
+        "every dropped message was told, so none is alerted: {alerts:?}"
+    );
     booted.stop_mqtt();
 }

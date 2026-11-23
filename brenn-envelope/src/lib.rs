@@ -32,6 +32,7 @@ pub mod attachment;
 pub mod body;
 pub mod channel_model;
 pub mod chat;
+pub mod delivery;
 pub mod grants;
 pub mod shape;
 #[cfg(feature = "testutils")]
@@ -508,6 +509,10 @@ pub struct MqttPublishTransport {
     /// as the MQTT 5 Message Expiry Interval. Always serialized: a row
     /// without it does not decode.
     pub expires: MqttExpiry,
+    /// The `brenn:` channel the message's delivery statuses are published to,
+    /// as its sender named it; absent asks for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_to: Option<String>,
 }
 
 /// When an outbound MQTT message's lifetime ends: `{"at":"<rfc3339>"}` or
@@ -934,7 +939,8 @@ mod tests {
     }
 
     /// The outbound variant's wire form, pinned literally beside the ingress
-    /// ones; the content type is omitted when absent, the expiry never is.
+    /// ones; the content type and `status_to` are omitted when absent, the
+    /// expiry never is. A row written without `status_to` decodes to none.
     #[test]
     fn mqtt_publish_transport_wire_form_is_pinned_and_round_trips() {
         let at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
@@ -945,6 +951,7 @@ mod tests {
             retain: true,
             content_type: Some("application/json".to_string()),
             expires: MqttExpiry::At(at),
+            status_to: Some("brenn:light-status".to_string()),
         });
         let bare = TransportMeta::MqttPublish(MqttPublishTransport {
             client_slug: "broker".to_string(),
@@ -953,6 +960,7 @@ mod tests {
             retain: false,
             content_type: None,
             expires: MqttExpiry::Never,
+            status_to: None,
         });
         for (meta, wire) in [
             (
@@ -960,7 +968,7 @@ mod tests {
                 concat!(
                     r#"{"mqtt_publish":{"client_slug":"broker","topic":"lights/kitchen/set","#,
                     r#""qos":2,"retain":true,"content_type":"application/json","#,
-                    r#""expires":{"at":"2023-11-14T22:13:20Z"}}}"#
+                    r#""expires":{"at":"2023-11-14T22:13:20Z"},"status_to":"brenn:light-status"}}"#
                 ),
             ),
             (

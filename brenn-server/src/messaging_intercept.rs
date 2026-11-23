@@ -749,7 +749,7 @@ pub(crate) async fn publish_send(
         }
         PublishResult::MalformedAddress(addr) => outcome_err(Cow::Owned(format!(
             "malformed channel address {addr:?}: must be of the form \"brenn:<name>\" \
-             (or \"ephemeral:<name>\") with name matching ^[A-Za-z0-9._~-]+$"
+             (or \"ephemeral:<name>\") with {CHANNEL_NAME_RULE}"
         ))),
         PublishResult::MissingSender => outcome_err(Cow::Borrowed(MISSING_SENDER_ERR)),
         PublishResult::BodyTooLarge { len, max } => outcome_err(Cow::Owned(format!(
@@ -1122,7 +1122,7 @@ async fn execute_edit(
         }
         EditResult::MalformedAddress(addr) => outcome_err(Cow::Owned(format!(
             "malformed reply_to address {addr:?}: must be of the form \
-             \"brenn:<name>\" with name matching ^[A-Za-z0-9._~-]+$"
+             \"brenn:<name>\" with {CHANNEL_NAME_RULE}"
         ))),
         EditResult::MissingSender => outcome_err(Cow::Borrowed(MISSING_SENDER_ERR)),
     }
@@ -1488,6 +1488,10 @@ pub(crate) fn missing_messenger() -> ToolOutcome {
         "messaging is not configured on this brenn server",
     ))
 }
+
+/// The LLM-visible rule a channel name (the part after the scheme) must meet,
+/// as `is_unreserved_name` enforces it.
+pub(crate) const CHANNEL_NAME_RULE: &str = "name matching ^[A-Za-z0-9._~-]+$";
 
 /// The one LLM-visible reject for a durable (`brenn:`) publish/reply_to address
 /// denial. Byte-identical across the `UnknownChannel` and `AclDenied` arms (and

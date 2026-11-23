@@ -1598,6 +1598,7 @@ impl ActiveBridge {
             db.clone(),
             &[("ha", "#")],
             brenn_lib::messaging::MessagingGlobalConfig::default(),
+            &BrennStatusChannels::default(),
         )
         .await;
         let bridge = Self::inject_for_test_full(
@@ -1683,8 +1684,26 @@ impl ActiveBridge {
         session_clients: &[&str],
         global: brenn_lib::messaging::MessagingGlobalConfig,
     ) -> Arc<Self> {
+        Self::test_new_for_mqtt_publish_with_status(
+            matchers,
+            session_clients,
+            global,
+            &BrennStatusChannels::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::test_new_for_mqtt_publish_with_global`], with the `brenn:`
+    /// channels and publish authority `status` gives.
+    pub(crate) async fn test_new_for_mqtt_publish_with_status(
+        matchers: &[(&str, &str)],
+        session_clients: &[&str],
+        global: brenn_lib::messaging::MessagingGlobalConfig,
+        status: &BrennStatusChannels<'_>,
+    ) -> Arc<Self> {
         let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
-        let messenger = make_test_messenger_with_mqtt_publish(db.clone(), matchers, global).await;
+        let messenger =
+            make_test_messenger_with_mqtt_publish(db.clone(), matchers, global, status).await;
 
         let mqtt_service = brenn_mqtt::MqttService::new();
         for client in session_clients {
@@ -1840,30 +1859,49 @@ async fn make_minimal_test_db_and_channel() -> (Db, broadcast::Sender<WsServerMe
     (db, tx, user_id, conversation_id)
 }
 
+/// The `brenn:` side of an MQTT publish fixture: channels declared beside the
+/// egress channels, and the app's `brenn:` publish authority.
+#[derive(Default)]
+pub(crate) struct BrennStatusChannels<'a> {
+    /// Channel names (no scheme) declared in the directory.
+    pub(crate) declared: &'a [&'a str],
+    /// `None`: no `MessagingPublish` grant. `Some(names)`: the grant, and one
+    /// exact `brenn_publish` matcher per name.
+    pub(crate) publish: Option<&'a [&'a str]>,
+}
+
 /// Build a `Messenger` whose `"testapp"` policy grants `MqttPublish` with the
 /// `mqtt_publish` `matchers`, and whose directory (and database) holds the
-/// egress channel of every client the matchers name.
+/// egress channel of every client the matchers name and the `brenn:` channels
+/// and publish authority `status` states.
 async fn make_test_messenger_with_mqtt_publish(
     db: Db,
     matchers: &[(&str, &str)],
     global: brenn_lib::messaging::MessagingGlobalConfig,
+    status: &BrennStatusChannels<'_>,
 ) -> Arc<brenn_messaging::Messenger> {
-    let mut egress: Vec<brenn_lib::messaging::ChannelEntry> = Vec::new();
+    let mut channels: Vec<brenn_lib::messaging::ChannelEntry> = Vec::new();
     for (client, _) in matchers {
-        if !egress
+        if !channels
             .iter()
             .any(|e| e.address == brenn_lib::messaging::mqtt_egress_address(client))
         {
-            egress.push(brenn_messaging::mqtt_outbound::mqtt_egress_entry(
+            channels.push(brenn_messaging::mqtt_outbound::mqtt_egress_entry(
                 client,
                 &brenn_lib::messaging::config::SystemChannelTuning::default(),
                 &global,
             ));
         }
     }
+    for name in status.declared {
+        channels.push(brenn_lib::messaging::test_support::test_channel_entry(
+            name,
+            vec![],
+        ));
+    }
     {
         let conn = db.lock().await;
-        brenn_messaging_store::db::upsert_channels(&conn, &egress);
+        brenn_messaging_store::db::upsert_channels(&conn, &channels);
     }
     let mut testapp_cfg =
         crate::test_support::app_config::default_test_app_config("testapp", "testapp");
@@ -1881,12 +1919,26 @@ async fn make_test_messenger_with_mqtt_publish(
                 topic_filter: (*topic_filter).to_string(),
             });
     }
+    if let Some(names) = status.publish {
+        let policy = testapp_cfg.policy_mut();
+        policy
+            .grants
+            .insert(brenn_envelope::grants::AppCapability::MessagingPublish);
+        for name in names {
+            policy
+                .acls
+                .brenn_publish
+                .push(brenn_lib::access::acl::ChannelMatcher::Exact(
+                    (*name).to_string(),
+                ));
+        }
+    }
     let mut messenger_apps = indexmap::IndexMap::new();
     messenger_apps.insert("testapp".to_string(), testapp_cfg);
     brenn_messaging::Messenger::new(
         db,
         Arc::new(brenn_lib::messaging::MessagingDirectory::with_entries(
-            egress,
+            channels,
         )),
         Arc::from("test-source"),
         Arc::new(messenger_apps),

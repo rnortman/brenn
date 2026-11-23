@@ -1529,12 +1529,37 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 "when the message goes out is sent as the MQTT Message Expiry Interval (none for ",
                 "\"forever\").\n\n",
                 "The call returns once the message is committed for delivery, with its ",
-                "`message_id`; delivery happens afterwards and the result does not report it. ",
-                "`client_connected` says whether the client is connected now; when it is not, ",
-                "the message waits for a connection within its lifetime. A message whose ",
-                "lifetime passes before it is sent is dropped, and the operator, not you, is ",
-                "told; so are broker rejections and messages lost with a connection. A QoS 1 ",
-                "message may be delivered twice after a reconnect.\n\n",
+                "`message_id`, and never reports delivery. `client_connected` says whether the ",
+                "client is connected now; when it is not, the message waits for a connection ",
+                "within its lifetime. A QoS 1 message may be delivered twice after a ",
+                "reconnect.\n\n",
+                "Without `status_to`, what becomes of the message (a broker rejection, a ",
+                "lifetime that passes before it is sent, a loss with a connection) is told to ",
+                "the operator, not to you. With `status_to` naming a `brenn:` channel this app ",
+                "may publish to, Brenn publishes JSON statuses there from sender ",
+                "`system:delivery-status`, each naming the `message_id`: `handed` when the ",
+                "message goes to the MQTT library, then one of `delivered`, `rejected` (with the ",
+                "broker's `reason`), `expired`, `unknown`, `dropped`. Reading them needs a ",
+                "subscription to that channel. The sender proves only that Brenn wrote a status, ",
+                "not whose message it concerns: other publishes may name the same channel, so ",
+                "match `message_id` against the ids your own publishes returned. `delivered` at ",
+                "QoS 1 or 2 means the broker acknowledged it; at QoS 0 it means only that it was ",
+                "written to the connection, since a broker cannot refuse a QoS 0 message, so use ",
+                "QoS 1 or 2 when you need the broker's answer. A message first reached after its ",
+                "lifetime gets `expired` and no `handed`. `expired` and `dropped` mean the ",
+                "message was not sent, whether or not a `handed` came first. `unknown` means it ",
+                "may have been sent and will not be sent again; its `cause` says why ",
+                "(`connection_lost`, `lifetime_ended`, `resend_refused`, `stopped`). A message ",
+                "refused when it was sent again after a lost connection is `unknown`, not ",
+                "`rejected`, because its first copy may have arrived. Nothing is ",
+                "published while the client is disconnected, so `expired` comes at reconnect, ",
+                "not when the lifetime ends. `handed` with no outcome after a server restart ",
+                "means nobody knows. No `handed` by the end of the lifetime means the message ",
+                "was not sent, except when the status itself could not be published: then it ",
+                "may have been sent and the operator, not you, knows, so do not resend on a ",
+                "missing `handed` alone if a duplicate is worse than a loss. A message the ",
+                "client's channel window dropped, or one sent as its client was being removed, ",
+                "gets no status at all.\n\n",
                 "Wildcards (`+` or `#`) in the topic are rejected — use a concrete topic name. ",
                 "The app publishes only to topics its `acl publish` entries admit; a refusal ",
                 "names the topic. ",
@@ -1583,6 +1608,10 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                             { "type": "string", "enum": ["forever"] }
                         ],
                         "description": "Required. Seconds Brenn keeps trying to deliver the message, at least 1, or \"forever\"; what is left of it at send is the MQTT Message Expiry Interval"
+                    },
+                    "status_to": {
+                        "type": "string",
+                        "description": "Optional brenn:<channel> this app may publish to; Brenn publishes the message's delivery statuses there"
                     }
                 },
                 "required": ["to", "lifetime_s"]
@@ -2211,7 +2240,7 @@ mod tests {
     }
 
     /// `MqttSend`'s description says the call returns at commit, that delivery
-    /// is not reported to the caller, and what `lifetime_s` is, and states no
+    /// is not reported in the answer, and what `lifetime_s` is, and states no
     /// broker wait.
     #[test]
     fn mqtt_send_description_states_commit_and_lifetime() {
@@ -2224,10 +2253,10 @@ mod tests {
         let desc = &send.description;
         for phrase in [
             "returns once the message is committed",
-            "the result does not report it",
+            "never reports delivery",
             "`lifetime_s` is required",
             "MQTT Message Expiry Interval",
-            "the operator, not you, is told",
+            "told to the operator, not to you",
             "may be delivered twice after a reconnect",
         ] {
             assert!(
@@ -2860,6 +2889,56 @@ mod tests {
         ] {
             assert!(def.description.contains(phrase), "{phrase}");
         }
+    }
+
+    /// `status_to` is an optional string argument, and the description states
+    /// what is published there, by whom, and each silence a caller must read.
+    #[test]
+    fn mqtt_send_states_status_to() {
+        let def = mqtt_send_def();
+        assert_eq!(
+            def.input_schema["properties"]["status_to"]["type"],
+            "string"
+        );
+        assert_eq!(
+            def.input_schema["required"],
+            serde_json::json!(["to", "lifetime_s"])
+        );
+        let desc = &def.description;
+        let ordered = [
+            "never reports delivery",
+            "Without `status_to`",
+            "With `status_to` naming a `brenn:` channel this app may publish to",
+            "`system:delivery-status`",
+            "`handed` when the message goes to the MQTT library",
+            "`delivered`, `rejected`",
+            "`expired`, `unknown`, `dropped`",
+            "needs a subscription to that channel",
+            "not whose message it concerns",
+            "match `message_id` against the ids your own publishes returned",
+            "at QoS 0 it means only that it was written to the connection",
+            "A message first reached after its lifetime gets `expired` and no `handed`",
+            "`expired` and `dropped` mean the message was not sent, whether or not a `handed` came first",
+            "`unknown` means it may have been sent and will not be sent again",
+            "(`connection_lost`, `lifetime_ended`, `resend_refused`, `stopped`)",
+            "A message refused when it was sent again after a lost connection is `unknown`, not `rejected`, because its first copy may have arrived",
+            "`expired` comes at reconnect",
+            "after a server restart means nobody knows",
+            "No `handed` by the end of the lifetime means the message was not sent",
+            "do not resend on a missing `handed` alone",
+            "gets no status at all",
+        ];
+        let mut from = 0;
+        for phrase in ordered {
+            let at = desc[from..].find(phrase).unwrap_or_else(|| {
+                panic!("description must say {phrase:?} after byte {from}: {desc}")
+            });
+            from += at + phrase.len();
+        }
+        assert!(
+            !desc.contains("treat that as `unknown`"),
+            "a sender is not asked to reinterpret a status: {desc}"
+        );
     }
 
     fn mqtt_send_def() -> VirtualToolDef {

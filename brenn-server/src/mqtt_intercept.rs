@@ -18,7 +18,9 @@ use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_envelope::AttachmentName;
 use brenn_lib::mqtt::address::{MqttAddress, parse_topic_name};
 use brenn_lib::mqtt::{MqttLifetime, MqttPublishOptions};
-use brenn_messaging::{MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult};
+use brenn_messaging::{
+    MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, StatusToRefusal,
+};
 use brenn_messaging_store::blob::HeldAttachments;
 use brenn_mqtt::ConnectorHealthLabel;
 use brenn_mqtt::payload::{OutboundArg, decode_outbound};
@@ -28,7 +30,7 @@ use crate::active_bridge::{ActiveBridge, ToolOutcome};
 use crate::intercept_helpers::{
     PostCard, answer_post_tool_use, outcome_err, outcome_ok, outcome_rejection,
 };
-use crate::messaging_intercept;
+use crate::messaging_intercept::{self, CHANNEL_NAME_RULE, brenn_channel_denied_msg};
 use brenn_render::tools::mqtt::MCP_MQTT_SEND_TOOL;
 
 /// Outcome of `try_handle_mqtt_tool`. `None` means "not an MQTT tool".
@@ -208,6 +210,9 @@ fn answer_refused(
                 "MQTT client `{client}` is not configured on this server"
             )))
         }
+        PublishResult::MqttRefused(MqttRefusal::StatusTo { address, why }) => {
+            answer_status_to_refused(bridge, tool_name, &address, why)
+        }
         PublishResult::MqttRefused(MqttRefusal::InvalidQos { .. }) => {
             reject(tool_name, "invalid `qos`: must be 0, 1, or 2")
         }
@@ -256,8 +261,62 @@ fn answer_refused(
         | PublishResult::MqttRefused(
             MqttRefusal::DeliverAfter | MqttRefusal::ReplyTo | MqttRefusal::DeliveryDeadline,
         )) => unreachable!(
-            "MqttSend states no release time, reply_to, deadline or impetus, and an inline \
-             payload over the body cap rides as a blob, so the bus cannot answer {e:?}"
+            "MqttSend states no release time, reply_to, deadline or impetus, and an \
+             inline payload over the body cap rides as a blob, so the bus cannot answer {e:?}"
+        ),
+    }
+}
+
+/// The answer to a `status_to` the MQTT admission refused. A refusal on the
+/// app's `brenn:` publish authority raises the security signal a `BrennSend`
+/// denial raises; "not in the ACL" and "does not exist" answer with one
+/// string, so the answer is no existence oracle.
+fn answer_status_to_refused(
+    bridge: &ActiveBridge,
+    tool_name: &str,
+    address: &str,
+    why: StatusToRefusal,
+) -> ToolOutcome {
+    let signalled = match why {
+        StatusToRefusal::GrantAbsent => Some(DenialKind::GrantAbsent),
+        StatusToRefusal::AclDenied => Some(DenialKind::AclDenied),
+        StatusToRefusal::Unknown => Some(DenialKind::UnknownChannel),
+        StatusToRefusal::Malformed | StatusToRefusal::StatusOverBodyCap { .. } => None,
+    };
+    if let Some(kind) = signalled {
+        signal_publish_denial(
+            bridge.alert_dispatcher(),
+            SecurityEventType::BrennPublishDenied,
+            bridge.denial_origin(),
+            kind,
+            address,
+        );
+    }
+    match why {
+        StatusToRefusal::Malformed => {
+            let shown = sanitize_untrusted_str(address, MAX_LOGGED_UNTRUSTED_BYTES);
+            reject(
+                tool_name,
+                &format!(
+                    "malformed `status_to` {shown:?}: must be of the form \"brenn:<name>\" with \
+                     {CHANNEL_NAME_RULE}"
+                ),
+            )
+        }
+        StatusToRefusal::GrantAbsent => outcome_err(Cow::Borrowed(
+            "`status_to` is refused: this app has no `publish` grant for `brenn:` channels",
+        )),
+        StatusToRefusal::AclDenied | StatusToRefusal::Unknown => outcome_err(Cow::Owned(format!(
+            "`status_to`: {}",
+            brenn_channel_denied_msg(address)
+        ))),
+        StatusToRefusal::StatusOverBodyCap { len, max } => reject(
+            tool_name,
+            &format!(
+                "the topic is too long for a delivery status about it to be published (a status \
+                 can be {len} bytes, over the bus's {max}-byte body cap): drop `status_to` or \
+                 shorten the topic"
+            ),
         ),
     }
 }
@@ -379,6 +438,16 @@ async fn prepare(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let lifetime = lifetime(input).map_err(|e| reject(tool_name, &e))?;
+    let status_to = match input.get("status_to") {
+        None => None,
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(_) => {
+            return Err(reject(
+                tool_name,
+                "invalid `status_to` argument: give a `brenn:<channel>` address as a string",
+            ));
+        }
+    };
 
     let messenger = messenger(bridge);
     let (payload, content_type) = match form {
@@ -412,6 +481,7 @@ async fn prepare(
             retain,
             lifetime,
             content_type,
+            status_to,
         },
     })
 }

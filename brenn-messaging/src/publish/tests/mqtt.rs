@@ -43,6 +43,8 @@ const OTHER_ADDR: &str = "mqtt:away:lights/kitchen/set";
 /// A page subscribed to `home`'s egress channel, fed live.
 const PAGE: &str = "egress-watcher";
 const EGRESS_HOME: &str = "brenn:egress/mqtt/home";
+/// A plain `brenn:` channel in the directory, named as a `status_to`.
+const STATUS: &str = "brenn:light-status";
 const ORIGIN: PublishOrigin = PublishOrigin::Conversation { id: CONVERSATION };
 
 struct StubClients(HashMap<String, u32>);
@@ -62,6 +64,8 @@ struct Fixture {
     /// `away`'s egress channel.
     other: Arc<ChannelEntry>,
     ingress: ChannelEntry,
+    /// The channel at [`STATUS`].
+    status: ChannelEntry,
 }
 
 /// What the fixture's app holds: the MQTT grant, a topic ACL admitting
@@ -119,6 +123,7 @@ async fn fixture_with(install_clients: bool, install_blobs: bool) -> Fixture {
     ingress.address = ADDR.to_string();
     ingress.transport_type = crate::ChannelScheme::Mqtt;
     ingress.resolved_channel.non_text = true;
+    let status = test_channel_entry("light-status", vec![]);
     {
         let conn = db.lock().await;
         conn.execute(
@@ -133,12 +138,21 @@ async fn fixture_with(install_clients: bool, install_blobs: bool) -> Fixture {
             [],
         )
         .unwrap();
-        upsert_channels(&conn, &[outbound.clone(), other.clone(), ingress.clone()]);
+        upsert_channels(
+            &conn,
+            &[
+                outbound.clone(),
+                other.clone(),
+                ingress.clone(),
+                status.clone(),
+            ],
+        );
     }
     let directory = Arc::new(MessagingDirectory::with_entries(vec![
         outbound.clone(),
         other.clone(),
         ingress.clone(),
+        status.clone(),
     ]));
     let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
     apps.insert(APP.to_string(), publisher());
@@ -188,6 +202,7 @@ async fn fixture_with(install_clients: bool, install_blobs: bool) -> Fixture {
         outbound,
         other,
         ingress,
+        status,
     }
 }
 
@@ -205,6 +220,7 @@ fn options() -> MqttPublishOptions {
         retain: false,
         lifetime: seconds(60),
         content_type: None,
+        status_to: None,
     }
 }
 
@@ -255,6 +271,10 @@ impl Fixture {
         assert!(
             self.rows(&self.ingress).await.is_empty(),
             "nothing on ingress"
+        );
+        assert!(
+            self.rows(&self.status).await.is_empty(),
+            "nothing on the status channel"
         );
         assert!(!self.rate_drawn(), "no rate token drawn");
         assert_eq!(self.budget().await, None, "no budget row touched");
@@ -793,6 +813,7 @@ async fn a_committed_publish_is_a_brenn_row_on_its_clients_egress_channel() {
         retain: true,
         lifetime: seconds(90),
         content_type: Some("application/json".to_string()),
+        status_to: None,
     };
     let before = Utc::now();
     let committed = f
@@ -819,6 +840,7 @@ async fn a_committed_publish_is_a_brenn_row_on_its_clients_egress_channel() {
             retain: true,
             content_type: Some("application/json".to_string()),
             expires: MqttExpiry::At(row.publish_ts + Duration::seconds(90)),
+            status_to: None,
         }
     );
     let MqttExpiry::At(at) = t.expires else {
@@ -1155,6 +1177,7 @@ async fn a_components_flushed_entry_is_a_row_with_the_agents_transport() {
         retain: true,
         lifetime: seconds(90),
         content_type: Some("application/json".to_string()),
+        status_to: None,
     };
     let none = HeldAttachments::none();
     f.m.publish_from_wasm(
@@ -1191,6 +1214,7 @@ async fn a_components_flushed_entry_is_a_row_with_the_agents_transport() {
         retain: true,
         content_type: Some("application/json".to_string()),
         expires: MqttExpiry::At(row.publish_ts + Duration::seconds(90)),
+        status_to: None,
     };
     assert_eq!(*mqtt_transport(component), expect(component));
     assert_eq!(*mqtt_transport(agent), expect(agent));
@@ -1346,4 +1370,258 @@ async fn a_flush_with_a_bad_entry_commits_nothing() {
     .await;
     assert!(joined.unwrap_err().is_panic());
     assert!(f.rows(&f.outbound).await.is_empty());
+}
+
+#[tokio::test]
+#[should_panic(expected = "names a status_to, which a component cannot")]
+async fn a_flushed_mqtt_entry_naming_a_status_to_panics() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let naming = MqttPublishOptions {
+        status_to: Some(STATUS.to_string()),
+        ..options()
+    };
+    let entry = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", naming, &none);
+    f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+}
+
+// ── status_to ───────────────────────────────────────────────────────────
+
+fn naming(status_to: &str) -> MqttPublishOptions {
+    MqttPublishOptions {
+        status_to: Some(status_to.to_string()),
+        ..options()
+    }
+}
+
+/// A refusal is `StatusTo` with the address as stated and the given reason.
+fn is_status_to(refusal: &PublishResult, address: &str, why: &StatusToRefusal) -> bool {
+    matches!(
+        refusal,
+        PublishResult::MqttRefused(MqttRefusal::StatusTo { address: a, why: w })
+            if a == address && w == why
+    )
+}
+
+impl Fixture {
+    /// Replace the fixture app's policy with `edit` applied to it.
+    fn edit_policy(&self, edit: impl FnOnce(&mut brenn_lib::access::AppPolicy)) {
+        let mut apps = (*self.m.apps.load()).clone();
+        edit(apps.get_mut(APP).unwrap().policy_mut());
+        self.m.apps.store(Arc::new(apps));
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_status_to_is_refused() {
+    let f = fixture().await;
+    for address in [
+        "light-status",
+        "brenn:bad name",
+        "ephemeral:ticks",
+        "brenn:",
+    ] {
+        let refusal = expect_refused(
+            f.send(ADDR, MqttPayload::Inline(b"on".to_vec()), &naming(address))
+                .await,
+        );
+        assert!(
+            is_status_to(&refusal, address, &StatusToRefusal::Malformed),
+            "{address}: {refusal:?}"
+        );
+        assert_eq!(
+            refusal.signal_kind(),
+            Some(brenn_obs::security::DenialKind::MalformedAddress)
+        );
+    }
+    f.assert_spent_nothing().await;
+}
+
+#[tokio::test]
+async fn a_status_to_without_the_publish_grant_is_refused() {
+    let f = fixture().await;
+    f.edit_policy(|policy| {
+        policy.grants = brenn_lib::access::GrantSet::default();
+        policy.grants.insert(AppCapability::MqttPublish);
+    });
+    let refusal = expect_refused(
+        f.send(ADDR, MqttPayload::Inline(b"on".to_vec()), &naming(STATUS))
+            .await,
+    );
+    assert!(
+        is_status_to(&refusal, STATUS, &StatusToRefusal::GrantAbsent),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        refusal.signal_kind(),
+        Some(brenn_obs::security::DenialKind::MissingSender)
+    );
+    f.assert_spent_nothing().await;
+}
+
+/// The right is the publish right: a channel the publisher may only read is
+/// refused, and an address outside the ACL answers the same whether or not
+/// the channel exists.
+#[tokio::test]
+async fn a_status_to_outside_the_publish_acl_is_refused_whether_or_not_it_exists() {
+    let f = fixture().await;
+    f.edit_policy(|policy| {
+        policy.acls.brenn_publish = vec![ChannelMatcher::Exact("records".to_string())];
+        policy
+            .acls
+            .brenn_subscribe
+            .push(ChannelMatcher::Exact("light-status".to_string()));
+    });
+    assert!(
+        f.policy().allows_brenn_delivery("light-status"),
+        "the channel is readable"
+    );
+    for address in [STATUS, "brenn:nowhere"] {
+        let refusal = expect_refused(
+            f.send(ADDR, MqttPayload::Inline(b"on".to_vec()), &naming(address))
+                .await,
+        );
+        assert!(
+            is_status_to(&refusal, address, &StatusToRefusal::AclDenied),
+            "{address}: {refusal:?}"
+        );
+        assert_eq!(
+            refusal.signal_kind(),
+            Some(brenn_obs::security::DenialKind::AclDenied)
+        );
+    }
+    f.assert_spent_nothing().await;
+}
+
+#[tokio::test]
+async fn a_status_to_not_in_the_directory_is_refused() {
+    let f = fixture().await;
+    let refusal = expect_refused(
+        f.send(
+            ADDR,
+            MqttPayload::Inline(b"on".to_vec()),
+            &naming("brenn:nowhere"),
+        )
+        .await,
+    );
+    assert!(
+        is_status_to(&refusal, "brenn:nowhere", &StatusToRefusal::Unknown),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        refusal.signal_kind(),
+        Some(brenn_obs::security::DenialKind::UnknownChannel)
+    );
+    f.assert_spent_nothing().await;
+}
+
+/// A topic so long that a status about it could never fit the body cap is
+/// refused at the publish, and an argument error carries no denial kind.
+#[tokio::test]
+async fn a_status_to_whose_statuses_cannot_fit_the_body_cap_is_refused() {
+    let f = fixture().await;
+    let max = f.m.max_body_bytes();
+    let topic = format!("lights/{}/set", "k".repeat(max - 200));
+    let addr = format!("mqtt:{CLIENT}:{topic}");
+    let len = brenn_envelope::delivery::max_encoded_len(CLIENT, &topic);
+    assert!(len > max, "the fixture topic's statuses are over the cap");
+    let refusal = expect_refused(
+        f.send(&addr, MqttPayload::Inline(b"on".to_vec()), &naming(STATUS))
+            .await,
+    );
+    assert!(
+        is_status_to(
+            &refusal,
+            STATUS,
+            &StatusToRefusal::StatusOverBodyCap { len, max }
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.signal_kind(), None);
+    f.assert_spent_nothing().await;
+
+    // Without a `status_to` the same topic is admitted.
+    f.send(&addr, MqttPayload::Inline(b"on".to_vec()), &options())
+        .await
+        .expect("committed");
+}
+
+/// The target's grant, ACL and client are answered before the `status_to`,
+/// and the `status_to` before the QoS, content type and payload.
+#[tokio::test]
+async fn the_status_to_is_asked_after_the_target_and_before_the_arguments() {
+    let f = fixture().await;
+    let bad = naming("brenn:nowhere");
+    let fixture = &f;
+    let send = |addr: &'static str, opts: MqttPublishOptions| async move {
+        expect_refused(
+            fixture
+                .send(addr, MqttPayload::Inline(b"on".to_vec()), &opts)
+                .await,
+        )
+    };
+
+    let refusal = send("mqtt:home:lights/kitchen/get", bad.clone()).await;
+    assert!(
+        matches!(refusal, PublishResult::AclDenied(_)),
+        "{refusal:?}"
+    );
+    let refusal = send("mqtt:loft:lights/kitchen/set", bad.clone()).await;
+    assert!(
+        matches!(refusal, PublishResult::UnknownChannel(ref a) if a == "mqtt:loft:lights/kitchen/set"),
+        "{refusal:?}"
+    );
+
+    for opts in [
+        MqttPublishOptions {
+            qos: 3,
+            ..bad.clone()
+        },
+        MqttPublishOptions {
+            content_type: Some("not a type".to_string()),
+            ..bad.clone()
+        },
+    ] {
+        let refusal = send(ADDR, opts).await;
+        assert!(
+            is_status_to(&refusal, "brenn:nowhere", &StatusToRefusal::Unknown),
+            "{refusal:?}"
+        );
+    }
+    let two = held(&f, &[("a", b"one"), ("b", b"two")]);
+    let refusal = expect_refused(f.send(ADDR, MqttPayload::Attached(two), &bad).await);
+    assert!(
+        is_status_to(&refusal, "brenn:nowhere", &StatusToRefusal::Unknown),
+        "{refusal:?}"
+    );
+
+    f.edit_policy(|policy| {
+        policy.grants = brenn_lib::access::GrantSet::default();
+        policy.grants.insert(AppCapability::MessagingPublish);
+    });
+    let refusal = send(ADDR, bad).await;
+    assert!(
+        matches!(refusal, PublishResult::MissingSender),
+        "{refusal:?}"
+    );
+    f.assert_spent_nothing().await;
+}
+
+#[tokio::test]
+async fn the_committed_row_carries_the_status_to() {
+    let f = fixture().await;
+    let committed = f
+        .send(ADDR, MqttPayload::Inline(b"on".to_vec()), &naming(STATUS))
+        .await
+        .expect("committed");
+    let rows = f.rows(&f.outbound).await;
+    let [row] = rows.as_slice() else {
+        panic!("one row, got {}", rows.len());
+    };
+    assert_eq!(row.message_id, committed.message_id);
+    assert_eq!(mqtt_transport(row).status_to.as_deref(), Some(STATUS));
+    assert!(
+        f.rows(&f.status).await.is_empty(),
+        "admission publishes no status"
+    );
 }

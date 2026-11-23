@@ -12,6 +12,7 @@ use rumqttc::{AsyncClient, MqttOptions, Transport};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use brenn_envelope::delivery::{self, DELIVERY_STATUS_SENDER, DeliveryKind, DeliveryStatus};
 use brenn_lib::messaging::config::Depth;
 use brenn_lib::mqtt::{MqttLifetime, MqttPublishOptions};
 use brenn_messaging::config_reload::Outcome;
@@ -192,6 +193,7 @@ fn options(retain: bool, content_type: Option<&str>, lifetime: MqttLifetime) -> 
         retain,
         lifetime,
         content_type: content_type.map(str::to_string),
+        status_to: None,
     }
 }
 
@@ -844,5 +846,457 @@ async fn a_broker_refusal_of_a_components_publish_names_the_component() {
     );
     assert!(activation_failures(&booted).is_empty());
 
+    booted.stop_mqtt();
+}
+
+/// The status channel every `status_to` case names.
+const STATUS: &str = "brenn:status";
+
+/// The one client `ha` at `port`, retrying every second and backing off at
+/// most `backoff_max` seconds; the status channel [`STATUS`] when `status` is
+/// given, with `status` as extra lines of its block (a `send_rate`, or empty);
+/// and the sender agent, which may publish to `ha`'s topics under
+/// [`TOPIC_PREFIX`], to [`BROKER_REFUSED_TOPIC`], and to the status channel
+/// when it is declared.
+fn status_document(
+    port: u16,
+    ca_file: &std::path::Path,
+    status: Option<&str>,
+    backoff_max: u32,
+) -> String {
+    let status_acl = if status.is_some() {
+        ", exact status"
+    } else {
+        ""
+    };
+    let channel = status.map_or_else(String::new, |extra| {
+        format!(
+            "channel status at \"{STATUS}\" {{\n    push_depth = 1;\n    retain_depth = 64;\n    \
+             standing_retain_depth = 64;\n{extra}}}\n"
+        )
+    });
+    document(&format!(
+        r#"mqtt_client ha {{
+    url = "mqtts://127.0.0.1:{port}";
+    ca_file = "{ca}";
+    qos = 1;
+    reconnect_backoff_initial_secs = 1;
+    reconnect_backoff_max_secs = {backoff_max};
+}}
+
+{channel}
+agent Sender() {{
+    working_dir = ".";
+    grants = [publish];
+    send_budget = 1000000;
+    acl publish [topic_filter "mqtt:ha:{TOPIC_PREFIX}/#", topic_filter "mqtt:ha:{BROKER_REFUSED_TOPIC}"{status_acl}];
+}}
+
+new {SENDER}: Sender();
+"#,
+        ca = ca_file.display(),
+    ))
+}
+
+/// [`options`] at QoS 1 with a minute's lifetime, naming `status_to`.
+fn telling(status_to: Option<&str>, lifetime: MqttLifetime) -> MqttPublishOptions {
+    MqttPublishOptions {
+        status_to: status_to.map(str::to_string),
+        ..options(false, None, lifetime)
+    }
+}
+
+/// The statuses on [`STATUS`], oldest first, each checked to be from
+/// `system:delivery-status`.
+async fn statuses(booted: &Booted) -> Vec<DeliveryStatus> {
+    let uuid = booted
+        .messenger
+        .directory()
+        .resolve(STATUS)
+        .expect("the status channel is declared")
+        .uuid;
+    let conn = booted.db.lock().await;
+    load_channel_retained_window_seq(&conn, uuid, Depth::Unbounded)
+        .into_iter()
+        .map(|(_, envelope)| {
+            assert_eq!(envelope.sender, DELIVERY_STATUS_SENDER, "{envelope:?}");
+            delivery::decode(envelope.body.as_text().expect("a status is text"))
+                .expect("a v1 status")
+        })
+        .collect()
+}
+
+/// The statuses on [`STATUS`] once there are at least `count`.
+async fn await_statuses(booted: &Booted, count: usize) -> Vec<DeliveryStatus> {
+    brenn_mqtt::test_support::poll_until(
+        BROKER_WAIT_SECS,
+        || async {
+            let found = statuses(booted).await;
+            (found.len() >= count).then_some(found)
+        },
+        || async { format!("{STATUS} never held {count} statuses") },
+    )
+    .await
+}
+
+/// Each status's `(message id, kind)`, in order.
+fn kinds(found: &[DeliveryStatus]) -> Vec<(Uuid, DeliveryKind)> {
+    found
+        .iter()
+        .map(|status| (status.message_id, status.kind.clone()))
+        .collect()
+}
+
+/// Wait until exactly `count` rejected alerts have been raised for client
+/// `ha`, and answer them.
+async fn await_rejected_alerts(
+    booted: &Booted,
+    count: usize,
+) -> Vec<(AlertSeverity, String, String)> {
+    brenn_mqtt::test_support::poll_until(
+        BROKER_WAIT_SECS,
+        || async {
+            let found = egress_alerts(booted, "rejected", "ha");
+            (found.len() >= count).then_some(found)
+        },
+        || async { format!("fewer than {count} rejected alerts") },
+    )
+    .await
+}
+
+/// A publish naming a `status_to` is told `handed` then `delivered`, and one
+/// the broker refuses `handed` then `rejected` with the broker's reason. A
+/// broker's refusal alerts the operator whether or not its sender was told:
+/// the untold one first, then, after a delivery closed its episode, the told
+/// one, each opening its own episode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_status_to_hears_handed_then_its_outcome_and_a_broker_rejection_alerts_told_or_not() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let tree = Tree::holding(&status_document(harness.port, &ca_file, Some(""), 1));
+    let booted = boot_dispatching(&tree, None).await;
+    wait_for_health(
+        &booted.mqtt.0,
+        "ha",
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the client never connected",
+    )
+    .await;
+    let conversation = sender_conversation(&booted).await;
+    let topic = format!("{TOPIC_PREFIX}/told");
+
+    let untold = send(
+        &booted,
+        conversation,
+        "ha",
+        BROKER_REFUSED_TOPIC,
+        b"no",
+        &telling(None, seconds(60)),
+    )
+    .await;
+    let alerted = await_rejected_alerts(&booted, 1).await;
+    assert_eq!(alerted.len(), 1, "{alerted:?}");
+    assert!(alerted[0].2.contains(&untold.to_string()), "{alerted:?}");
+    assert!(
+        statuses(&booted).await.is_empty(),
+        "an untold publish publishes no status"
+    );
+
+    let delivered = send(
+        &booted,
+        conversation,
+        "ha",
+        &topic,
+        b"on",
+        &telling(Some(STATUS), seconds(60)),
+    )
+    .await;
+    let found = await_statuses(&booted, 2).await;
+    assert_eq!(
+        kinds(&found),
+        vec![
+            (delivered, DeliveryKind::Handed),
+            (delivered, DeliveryKind::Delivered)
+        ],
+    );
+    let mqtt = found[1]
+        .mqtt
+        .as_ref()
+        .expect("an MQTT status names its publish");
+    assert_eq!(
+        (
+            mqtt.client.as_str(),
+            mqtt.topic.as_str(),
+            mqtt.qos,
+            mqtt.reason_code
+        ),
+        ("ha", topic.as_str(), 1, None),
+    );
+
+    let told = send(
+        &booted,
+        conversation,
+        "ha",
+        BROKER_REFUSED_TOPIC,
+        b"no",
+        &telling(Some(STATUS), seconds(60)),
+    )
+    .await;
+    let found = await_statuses(&booted, 4).await;
+    assert_eq!(
+        (found[2].message_id, &found[2].kind),
+        (told, &DeliveryKind::Handed)
+    );
+    assert_eq!(found[3].message_id, told);
+    let DeliveryKind::Rejected { reason } = &found[3].kind else {
+        panic!("the broker's refusal is told as rejected: {:?}", found[3]);
+    };
+    assert!(
+        !reason.is_empty(),
+        "the rejection carries the broker's reason"
+    );
+    let code = found[3]
+        .mqtt
+        .as_ref()
+        .and_then(|mqtt| mqtt.reason_code)
+        .expect("a broker rejection carries its reason code");
+    assert!(code >= 0x80, "a refusal's reason code is a failure: {code}");
+    let alerted = await_rejected_alerts(&booted, 2).await;
+    assert_eq!(
+        alerted.len(),
+        2,
+        "the delivery closed the first episode with nothing withheld: {alerted:?}"
+    );
+    assert!(alerted[1].2.contains(&told.to_string()), "{alerted:?}");
+    assert!(
+        alerted[1]
+            .2
+            .contains("Its sender was told on its status channel."),
+        "{alerted:?}"
+    );
+    assert_eq!(statuses(&booted).await.len(), 4);
+
+    booted.stop_mqtt();
+}
+
+/// A message whose lifetime ends while the broker is down is told nothing
+/// until its client connects, then `expired`, with no `handed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lifetime_that_ends_while_the_broker_is_down_is_told_expired_at_reconnect() {
+    broker_gate!();
+
+    let mut harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let tree = Tree::holding(&status_document(harness.port, &ca_file, Some(""), 1));
+    let booted = boot_dispatching(&tree, None).await;
+    let service = booted.mqtt.0.clone();
+    wait_for_health(
+        &service,
+        "ha",
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the client never connected",
+    )
+    .await;
+    let conversation = sender_conversation(&booted).await;
+
+    harness.stop();
+    wait_for_health(
+        &service,
+        "ha",
+        &[ConnectorHealthLabel::Disconnected],
+        BROKER_WAIT_SECS,
+        "the client never noticed the broker go",
+    )
+    .await;
+
+    let lapsed = send(
+        &booted,
+        conversation,
+        "ha",
+        &format!("{TOPIC_PREFIX}/lapsed-told"),
+        b"too late",
+        &telling(Some(STATUS), seconds(1)),
+    )
+    .await;
+    let kept = format!("{TOPIC_PREFIX}/kept-after-lapse");
+    send(
+        &booted,
+        conversation,
+        "ha",
+        &kept,
+        b"in time",
+        &telling(None, seconds(600)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        statuses(&booted).await.is_empty(),
+        "nothing is told while the client has no connection",
+    );
+
+    let since = harness.log_len();
+    harness.restart();
+    await_received(&harness, since, "ha", &[&kept]).await;
+    let found = await_statuses(&booted, 1).await;
+    assert_eq!(kinds(&found), vec![(lapsed, DeliveryKind::Expired)]);
+    assert!(egress_alerts(&booted, "expired", "ha").is_empty());
+
+    booted.stop_mqtt();
+}
+
+/// A status channel whose send rate admits one status: the first publish's
+/// `handed` is published and every later status refused. The refused
+/// statuses' messages still go out, the refusal is alerted, and nothing
+/// panics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_status_holds_nothing_back_and_is_alerted() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let tree = Tree::holding(&status_document(
+        harness.port,
+        &ca_file,
+        Some("    send_rate = { burst = 1, refill_interval_secs = 3600, refill = 1 };\n"),
+        1,
+    ));
+    let booted = boot_dispatching(&tree, None).await;
+    wait_for_health(
+        &booted.mqtt.0,
+        "ha",
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the client never connected",
+    )
+    .await;
+    let conversation = sender_conversation(&booted).await;
+    let (first_topic, second_topic, third_topic) = (
+        format!("{TOPIC_PREFIX}/rate-first"),
+        format!("{TOPIC_PREFIX}/rate-second"),
+        format!("{TOPIC_PREFIX}/rate-third"),
+    );
+
+    let since = harness.log_len();
+    let first = send(
+        &booted,
+        conversation,
+        "ha",
+        &first_topic,
+        b"1",
+        &telling(Some(STATUS), seconds(60)),
+    )
+    .await;
+    send(
+        &booted,
+        conversation,
+        "ha",
+        &second_topic,
+        b"2",
+        &telling(Some(STATUS), seconds(60)),
+    )
+    .await;
+    await_received(&harness, since, "ha", &[&first_topic, &second_topic]).await;
+
+    let refused = brenn_mqtt::test_support::poll_until(
+        BROKER_WAIT_SECS,
+        || async {
+            let found: Vec<_> = egress_alerts(&booted, "status not published", "ha")
+                .into_iter()
+                .filter(|(_, title, _)| !title.ends_with("summary"))
+                .collect();
+            (!found.is_empty()).then_some(found)
+        },
+        || async { "no status-not-published alert for ha".to_string() },
+    )
+    .await;
+    assert_eq!(refused.len(), 1, "one alert opens the episode: {refused:?}");
+    assert!(refused[0].2.contains(STATUS), "{refused:?}");
+    assert_eq!(
+        kinds(&statuses(&booted).await),
+        vec![(first, DeliveryKind::Handed)],
+        "only the first status fits the send rate",
+    );
+
+    // The reader carries on: a later publish is delivered.
+    let since = harness.log_len();
+    send(
+        &booted,
+        conversation,
+        "ha",
+        &third_topic,
+        b"3",
+        &telling(None, seconds(60)),
+    )
+    .await;
+    await_received(&harness, since, "ha", &[&third_topic]).await;
+
+    booted.stop_mqtt();
+}
+
+/// A changed client is stopped after the reload's directory swap, so the
+/// statuses of its stop see the new directory and policies: a message in
+/// flight when a reload changes its client and removes its status channel
+/// (and the sender's right to it) has its `unknown` status refused, and both
+/// the refusal and the untold failure are alerted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_changed_clients_stop_statuses_to_a_channel_the_reload_removes_are_refused() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let tree = Tree::holding(&status_document(harness.port, &ca_file, Some(""), 1));
+    let mut booted = boot_dispatching(&tree, None).await;
+    wait_for_health(
+        &booted.mqtt.0,
+        "ha",
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the client never connected",
+    )
+    .await;
+    let conversation = sender_conversation(&booted).await;
+
+    // A frozen broker acknowledges nothing, so the publish stays in flight.
+    harness.pause();
+    let in_flight = send(
+        &booted,
+        conversation,
+        "ha",
+        &format!("{TOPIC_PREFIX}/in-flight"),
+        b"pending",
+        &telling(Some(STATUS), seconds(600)),
+    )
+    .await;
+    assert_eq!(
+        kinds(&await_statuses(&booted, 1).await),
+        vec![(in_flight, DeliveryKind::Handed)],
+    );
+
+    tree.write(&status_document(harness.port, &ca_file, None, 2));
+    booted.driver.reload(TriggerSource::Signal).await;
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_changed, vec!["ha".to_string()]);
+    assert!(booted.messenger.directory().resolve(STATUS).is_none());
+
+    let refused = egress_alerts(&booted, "status not published", "ha");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0].2.contains(&in_flight.to_string()) && refused[0].2.contains("\"unknown\""),
+        "{refused:?}"
+    );
+    let unknown = egress_alerts(&booted, "outcome unknown", "ha");
+    assert_eq!(
+        unknown.len(),
+        1,
+        "an untold failure is alerted: {unknown:?}"
+    );
+    assert!(unknown[0].2.contains(&in_flight.to_string()), "{unknown:?}");
+
+    harness.resume();
     booted.stop_mqtt();
 }

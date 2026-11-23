@@ -134,6 +134,7 @@ fn filled(id: &str, len: usize, payload_of: fn(usize) -> Value) -> (String, usiz
 
 /// The largest `n` whose `size(n)` is at most `len`, for a `size` that
 /// grows with every unit.
+// TODO(fast-gmail-body-fill-to-main): this search is also owed to `main`.
 fn largest_fitting(len: usize, size: impl Fn(usize) -> usize) -> usize {
     const SPAN: usize = 1024;
     let (one, span) = (size(1), size(1 + SPAN));

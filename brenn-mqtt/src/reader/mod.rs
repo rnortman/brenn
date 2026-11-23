@@ -9,7 +9,11 @@
 //! outcome from the library's publish notice.
 //!
 //! It reaches the bus only through [`EgressBus`], so this crate does not
-//! depend on the messaging crate; the implementation lives above both.
+//! depend on the messaging crate; the implementation lives above both. A
+//! message may name a `status_to`; the reader then reports it handed before
+//! it advances over it, and reports each of its drops one by one, so that the
+//! bus side can tell its sender. Every awaited bus call moves the handle's
+//! progress counter, which the reader's join watches.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -51,7 +55,7 @@ pub enum EgressItem {
     /// retention between the two reads.
     PayloadGone {
         seq: MessageSeq,
-        id: Uuid,
+        meta: EgressMeta,
     },
 }
 
@@ -62,16 +66,25 @@ pub struct EgressMeta {
     pub sender: String,
     pub topic: String,
     pub qos: u8,
+    /// The `brenn:` channel the sender named for the message's statuses.
+    pub status_to: Option<String>,
 }
 
 impl EgressMeta {
-    fn of(message: &EgressMessage) -> Self {
+    /// The metadata of a message with id `id` from `sender`, published as
+    /// `publish`.
+    pub fn new(id: Uuid, sender: &str, publish: &MqttPublishTransport) -> Self {
         Self {
-            id: message.id,
-            sender: message.sender.clone(),
-            topic: message.publish.topic.clone(),
-            qos: message.publish.qos,
+            id,
+            sender: sender.to_string(),
+            topic: publish.topic.clone(),
+            qos: publish.qos,
+            status_to: publish.status_to.clone(),
         }
+    }
+
+    fn of(message: &EgressMessage) -> Self {
+        Self::new(message.id, &message.sender, &message.publish)
     }
 }
 
@@ -84,7 +97,19 @@ pub enum UnknownCause {
     SessionStopped,
 }
 
-/// Why handed or unhanded messages were dropped unsent.
+/// Whether the client library ever accepted a message for sending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sent {
+    /// Every submit of it was given back before the library held it: no
+    /// client, a newer connection, or a full request channel.
+    Never,
+    /// The library accepted it; nothing the reader sees says whether a byte
+    /// of it reached the broker.
+    Possibly,
+}
+
+/// Why handed or unhanded messages were given up; whether the library ever
+/// had them is the report's `sent`, where it carries one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropCause {
     /// The session stopped while the reader held them for a resubmit.
@@ -96,23 +121,61 @@ pub enum DropCause {
 /// What became of the messages the reader handled. The bus side's report sink
 /// is the one place each is logged, counted and raised.
 #[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A report concerns at most one message that names a `status_to`.
 pub enum EgressReport {
+    /// A message naming a `status_to` is about to be advanced over and given
+    /// to the library. Reported once per message, never for a resubmit.
+    Handed(EgressMeta),
     Delivered(EgressMeta),
+    /// The broker refused it, and `code` is its reason code; or the host
+    /// refused a packet over the broker's Maximum Packet Size, and `code` is
+    /// `None`. `code` is `Some` exactly when the broker answered. `earlier`
+    /// says whether the library had accepted it on a submission before the
+    /// one this report answers, on a connection that ended before the broker
+    /// answered.
     Rejected {
         message: EgressMeta,
         reason: String,
+        code: Option<u8>,
+        earlier: Sent,
     },
-    Expired(EgressMeta),
+    /// Its lifetime passed before it was (again) given to the library;
+    /// `sent` says whether the library had accepted it before.
+    Expired {
+        message: EgressMeta,
+        sent: Sent,
+    },
     Unknown {
         message: EgressMeta,
         cause: UnknownCause,
     },
+    /// `count` messages naming no `status_to` were given up, whether or not
+    /// the library ever had them.
     Dropped {
         cause: DropCause,
         count: u64,
     },
+    /// One message naming a `status_to` was given up; `sent` says whether the
+    /// library ever had it.
+    DroppedMessage {
+        message: EgressMeta,
+        cause: DropCause,
+        sent: Sent,
+    },
+    /// A message naming a `status_to` left retention before it was read.
+    PayloadGone(EgressMeta),
     /// Nothing is outstanding and the channel holds nothing unhanded.
     Drained,
+}
+
+/// What [`EgressBus::abandon`] skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Abandoned {
+    /// How many unhanded messages the position moved past.
+    pub count: u64,
+    /// The metadata of those among them that name a `status_to`.
+    pub named: Vec<EgressMeta>,
 }
 
 /// The reader's view of its client's egress channel: one subscriber position.
@@ -122,13 +185,56 @@ pub trait EgressBus: Send + Sync + 'static {
     async fn unhanded(&self, limit: usize) -> Vec<EgressItem>;
     /// Move the position past `seq`.
     async fn advance(&self, seq: MessageSeq);
-    /// Move the position past everything retained; how many were unhanded.
-    async fn abandon(&self) -> u64;
+    /// Move the position past everything retained; what was unhanded.
+    async fn abandon(&self) -> Abandoned;
     /// Changes whenever the channel may hold a message this reader has not read.
     fn wakes(&self) -> watch::Receiver<u64>;
     /// The channel's retain depth, `None` when unbounded.
     fn window_depth(&self) -> Option<usize>;
-    fn report(&self, report: EgressReport);
+    /// Log, count, alert and, for a message naming a `status_to`, publish
+    /// its status. Returns once the status, if any, is committed or refused.
+    async fn report(&self, report: EgressReport);
+}
+
+/// The reader's one way to its bus: each awaited call moves the handle's
+/// progress counter when it returns.
+struct CountedBus {
+    handle: Arc<MqttClientHandle>,
+    bus: Arc<dyn EgressBus>,
+}
+
+impl CountedBus {
+    fn progressed(&self) {
+        self.handle
+            .egress_reader_progress
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn unhanded(&self, limit: usize) -> Vec<EgressItem> {
+        let items = self.bus.unhanded(limit).await;
+        self.progressed();
+        items
+    }
+
+    async fn advance(&self, seq: MessageSeq) {
+        self.bus.advance(seq).await;
+        self.progressed();
+    }
+
+    async fn abandon(&self) -> Abandoned {
+        let abandoned = self.bus.abandon().await;
+        self.progressed();
+        abandoned
+    }
+
+    async fn report(&self, report: EgressReport) {
+        self.bus.report(report).await;
+        self.progressed();
+    }
+
+    fn wakes(&self) -> watch::Receiver<u64> {
+        self.bus.wakes()
+    }
 }
 
 /// The reader recorded on a handle.
@@ -165,7 +271,10 @@ pub fn start_egress_reader(handle: &Arc<MqttClientHandle>, bus: Arc<dyn EgressBu
     let (retire_tx, retire_rx) = oneshot::channel();
     let reader = Reader {
         handle: Arc::clone(handle),
-        bus,
+        bus: CountedBus {
+            handle: Arc::clone(handle),
+            bus,
+        },
         window,
         held: BTreeMap::new(),
         in_flight: BTreeMap::new(),
@@ -186,12 +295,20 @@ pub fn start_egress_reader(handle: &Arc<MqttClientHandle>, bus: Arc<dyn EgressBu
 
 type NoticeResult = Result<rumqttc::PublishResult, rumqttc::PublishNoticeError>;
 
-/// A handed message the library holds, the connection it went out on, and
-/// the wait for its notice.
+/// A handed message the library holds, the connection it went out on, the
+/// wait for its notice, and whether the library had accepted it on an earlier
+/// submission.
 struct InFlight {
     message: EgressMessage,
     epoch: u64,
+    earlier: Sent,
     notice: Pin<Box<dyn Future<Output = NoticeResult> + Send>>,
+}
+
+/// A handed message the library does not have, and whether it ever had it.
+struct Held {
+    message: EgressMessage,
+    sent: Sent,
 }
 
 /// The facts of the current connection a pass decides on.
@@ -212,10 +329,10 @@ enum Wake {
 
 struct Reader {
     handle: Arc<MqttClientHandle>,
-    bus: Arc<dyn EgressBus>,
+    bus: CountedBus,
     window: Option<usize>,
     /// Handed messages the library does not have, by channel order.
-    held: BTreeMap<MessageSeq, EgressMessage>,
+    held: BTreeMap<MessageSeq, Held>,
     /// Handed messages whose notice is unresolved, by channel order.
     in_flight: BTreeMap<MessageSeq, InFlight>,
     /// A channel wake arrived since the last read.
@@ -257,23 +374,23 @@ impl Reader {
             };
             match wake {
                 Wake::Stop => {
-                    self.report_stopped();
+                    self.report_stopped().await;
                     return;
                 }
                 Wake::Retire => {
-                    self.report_stopped();
-                    let abandoned = self.bus.abandon().await;
-                    if abandoned > 0 {
-                        self.bus.report(EgressReport::Dropped {
-                            cause: DropCause::ClientRemoved,
-                            count: abandoned,
-                        });
-                    }
+                    self.report_stopped().await;
+                    let Abandoned { count, named } = self.bus.abandon().await;
+                    let named = named
+                        .into_iter()
+                        .map(|message| (message, Sent::Never))
+                        .collect();
+                    self.report_dropped(DropCause::ClientRemoved, count, named)
+                        .await;
                     return;
                 }
                 Wake::Channel => self.unread = true,
                 Wake::Room | Wake::Again => {}
-                Wake::Notice(seq, result) => self.resolve(seq, result),
+                Wake::Notice(seq, result) => self.resolve(seq, result).await,
             }
             self.pass().await;
         }
@@ -333,14 +450,18 @@ impl Reader {
             return;
         }
 
-        while let Some((seq, message)) = self.held.pop_first() {
+        while let Some((seq, Held { message, sent })) = self.held.pop_first() {
             let Some(expiry) = expiry_interval(&message.publish.expires, Utc::now()) else {
                 self.bus
-                    .report(EgressReport::Expired(EgressMeta::of(&message)));
+                    .report(EgressReport::Expired {
+                        message: EgressMeta::of(&message),
+                        sent,
+                    })
+                    .await;
                 continue;
             };
-            if let Err(message) = self.submit(message, expiry, connection.epoch).await {
-                self.held.insert(seq, message);
+            if let Err(message) = self.submit(message, expiry, connection.epoch, sent).await {
+                self.held.insert(seq, Held { message, sent });
                 return;
             }
         }
@@ -359,22 +480,43 @@ impl Reader {
             let mut items = items.into_iter();
             while let Some(item) = items.next() {
                 let message = match item {
-                    EgressItem::PayloadGone { seq, .. } => {
+                    EgressItem::PayloadGone { seq, meta } => {
                         self.bus.advance(seq).await;
+                        if meta.status_to.is_some() {
+                            self.bus.report(EgressReport::PayloadGone(meta)).await;
+                        }
                         continue;
                     }
                     EgressItem::Message(message) => message,
                 };
                 let seq = message.seq;
                 let expiry = expiry_interval(&message.publish.expires, Utc::now());
+                if expiry.is_some() && message.publish.status_to.is_some() {
+                    self.bus
+                        .report(EgressReport::Handed(EgressMeta::of(&message)))
+                        .await;
+                }
                 self.bus.advance(seq).await;
                 let Some(expiry) = expiry else {
                     self.bus
-                        .report(EgressReport::Expired(EgressMeta::of(&message)));
+                        .report(EgressReport::Expired {
+                            message: EgressMeta::of(&message),
+                            sent: Sent::Never,
+                        })
+                        .await;
                     continue;
                 };
-                if let Err(message) = self.submit(message, expiry, connection.epoch).await {
-                    self.held.insert(seq, message);
+                if let Err(message) = self
+                    .submit(message, expiry, connection.epoch, Sent::Never)
+                    .await
+                {
+                    self.held.insert(
+                        seq,
+                        Held {
+                            message,
+                            sent: Sent::Never,
+                        },
+                    );
                     if items.len() > 0 {
                         self.more = true;
                     }
@@ -385,7 +527,7 @@ impl Reader {
 
         self.again = self.more && self.outstanding() < limit;
         if self.held.is_empty() && self.in_flight.is_empty() && !self.unread && !self.more {
-            self.bus.report(EgressReport::Drained);
+            self.bus.report(EgressReport::Drained).await;
         }
     }
 
@@ -393,12 +535,14 @@ impl Reader {
     /// Expiry Interval `expiry`. `Err` gives the message back when there is
     /// no client, the client belongs to a newer connection, or its request
     /// channel refused the publish. A packet over the broker's Maximum Packet
-    /// Size is reported rejected and is done.
+    /// Size is reported rejected and is done. `earlier` is whether the library
+    /// had accepted the message on a submission before this one.
     async fn submit(
         &mut self,
         message: EgressMessage,
         expiry: Option<u32>,
         epoch: u64,
+        earlier: Sent,
     ) -> Result<(), EgressMessage> {
         let publish = &message.publish;
         assert!(
@@ -433,13 +577,17 @@ impl Reader {
             );
             if packet_bytes > broker_max as usize {
                 drop(guard);
-                self.bus.report(EgressReport::Rejected {
-                    message: EgressMeta::of(&message),
-                    reason: format!(
-                        "the PUBLISH packet is {packet_bytes} bytes and the broker's Maximum \
-                         Packet Size is {broker_max} bytes"
-                    ),
-                });
+                self.bus
+                    .report(EgressReport::Rejected {
+                        message: EgressMeta::of(&message),
+                        reason: format!(
+                            "the PUBLISH packet is {packet_bytes} bytes and the broker's Maximum \
+                             Packet Size is {broker_max} bytes"
+                        ),
+                        code: None,
+                        earlier,
+                    })
+                    .await;
                 return Ok(());
             }
         }
@@ -464,6 +612,7 @@ impl Reader {
                     InFlight {
                         message,
                         epoch,
+                        earlier,
                         notice: Box::pin(notice.wait_async()),
                     },
                 );
@@ -478,44 +627,97 @@ impl Reader {
     }
 
     /// Settle the in-flight message at `seq` by its notice's result.
-    fn resolve(&mut self, seq: MessageSeq, result: NoticeResult) {
-        let InFlight { message, .. } = self
+    async fn resolve(&mut self, seq: MessageSeq, result: NoticeResult) {
+        let InFlight {
+            message, earlier, ..
+        } = self
             .in_flight
             .remove(&seq)
             .unwrap_or_else(|| panic!("a notice resolved for {seq:?}, which is not in flight"));
-        match notice_outcome(result) {
-            NoticeOutcome::Delivered => self
-                .bus
-                .report(EgressReport::Delivered(EgressMeta::of(&message))),
-            NoticeOutcome::Rejected { reason } => self.bus.report(EgressReport::Rejected {
+        let report = match notice_outcome(result) {
+            NoticeOutcome::Delivered => EgressReport::Delivered(EgressMeta::of(&message)),
+            NoticeOutcome::Rejected { reason, code } => EgressReport::Rejected {
                 message: EgressMeta::of(&message),
                 reason,
-            }),
+                code: Some(code),
+                earlier,
+            },
             NoticeOutcome::ConnectionEnded if message.publish.qos == 1 => {
-                self.held.insert(seq, message);
+                self.held.insert(
+                    seq,
+                    Held {
+                        message,
+                        sent: Sent::Possibly,
+                    },
+                );
+                return;
             }
-            NoticeOutcome::ConnectionEnded => self.bus.report(EgressReport::Unknown {
+            NoticeOutcome::ConnectionEnded => EgressReport::Unknown {
                 message: EgressMeta::of(&message),
                 cause: UnknownCause::ConnectionLost,
-            }),
-        }
+            },
+        };
+        self.bus.report(report).await;
     }
 
     /// Report what the reader still has as it exits: in flight is unknown,
     /// held is dropped.
-    fn report_stopped(&mut self) {
+    async fn report_stopped(&mut self) {
         for (_, InFlight { message, .. }) in std::mem::take(&mut self.in_flight) {
-            self.bus.report(EgressReport::Unknown {
-                message: EgressMeta::of(&message),
-                cause: UnknownCause::SessionStopped,
-            });
+            self.bus
+                .report(EgressReport::Unknown {
+                    message: EgressMeta::of(&message),
+                    cause: UnknownCause::SessionStopped,
+                })
+                .await;
         }
-        let held = std::mem::take(&mut self.held).len();
-        if held > 0 {
-            self.bus.report(EgressReport::Dropped {
-                cause: DropCause::SessionStopped,
-                count: held as u64,
-            });
+        let held = std::mem::take(&mut self.held);
+        let count = held.len() as u64;
+        let named = held
+            .values()
+            .filter(|held| held.message.publish.status_to.is_some())
+            .map(|held| (EgressMeta::of(&held.message), held.sent))
+            .collect();
+        self.report_dropped(DropCause::SessionStopped, count, named)
+            .await;
+    }
+
+    /// Report `count` messages dropped for `cause`, of which `named` are the
+    /// ones naming a `status_to`, each with whether the library ever had it:
+    /// one count for the rest, if any, then one report per named message.
+    async fn report_dropped(
+        &mut self,
+        cause: DropCause,
+        count: u64,
+        named: Vec<(EgressMeta, Sent)>,
+    ) {
+        let unnamed = count.checked_sub(named.len() as u64).unwrap_or_else(|| {
+            panic!(
+                "{} dropped messages name a status_to out of {count} dropped",
+                named.len()
+            )
+        });
+        if unnamed > 0 {
+            self.bus
+                .report(EgressReport::Dropped {
+                    cause,
+                    count: unnamed,
+                })
+                .await;
+        }
+        for (message, sent) in named {
+            assert!(
+                message.status_to.is_some(),
+                "message {} is reported dropped by itself and names no status_to",
+                message.id
+            );
+            self.bus
+                .report(EgressReport::DroppedMessage {
+                    message,
+                    cause,
+                    sent,
+                })
+                .await;
         }
     }
 }

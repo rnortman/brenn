@@ -463,6 +463,7 @@ mod tests {
                         retain,
                         content_type: None,
                         expires: brenn_lib::messaging::MqttExpiry::Never,
+                        status_to: None,
                     },
                 )),
                 ..fake_envelope("on")

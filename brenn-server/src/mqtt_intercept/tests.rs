@@ -10,6 +10,7 @@ use brenn_lib::messaging::{egress_channel_uuid, mqtt_egress_address};
 use serde_json::json;
 
 use super::*;
+use crate::active_bridge::test_fixtures::BrennStatusChannels;
 use crate::active_bridge::test_support::{post_tool_use_req, pre_tool_use_req, send_budget_row};
 use crate::test_support::mqtt::register_test_client;
 
@@ -755,4 +756,210 @@ async fn execution_alone_emits_no_card() {
             "execution alone must emit no chat card: {msg:?}"
         );
     }
+}
+
+// ── status_to ───────────────────────────────────────────────────────────
+
+/// A bridge whose app may publish anywhere on `home` (with a session for it),
+/// beside the declared `brenn:light-status` and `brenn:other-status`.
+/// `publish` is the app's `brenn:` publish authority (see
+/// [`BrennStatusChannels::publish`]); `global` the bus's configuration.
+async fn bridge_with_status(
+    publish: Option<&[&str]>,
+    global: brenn_lib::messaging::MessagingGlobalConfig,
+) -> Arc<ActiveBridge> {
+    ActiveBridge::test_new_for_mqtt_publish_with_status(
+        &[("home", "#")],
+        &["home"],
+        global,
+        &BrennStatusChannels {
+            declared: &["light-status", "other-status"],
+            publish,
+        },
+    )
+    .await
+}
+
+/// [`bridge_with_status`] where the app may publish to `light-status` and to
+/// the undeclared `gone-status`.
+async fn status_bridge() -> Arc<ActiveBridge> {
+    bridge_with_status(
+        Some(&["light-status", "gone-status"]),
+        brenn_lib::messaging::MessagingGlobalConfig::default(),
+    )
+    .await
+}
+
+fn naming(status_to: serde_json::Value) -> serde_json::Value {
+    json!({
+        "to": "mqtt:home:cmd/light",
+        "body": "on",
+        "lifetime_s": 60,
+        "status_to": status_to,
+    })
+}
+
+/// Assert `input` is refused with exactly `error`, committing nothing and
+/// spending no budget.
+async fn assert_refused_with(bridge: &ActiveBridge, input: serde_json::Value, error: &str) {
+    assert_eq!(
+        call(bridge, input.clone()).await,
+        Some(ToolOutcome::Err(json!({ "ok": false, "error": error }))),
+        "{input}"
+    );
+    assert!(committed(bridge, "home").await.is_empty());
+    assert_eq!(
+        send_budget_row(bridge).await,
+        None,
+        "a refusal spends no budget"
+    );
+}
+
+#[tokio::test]
+async fn a_status_to_rides_on_the_committed_row() {
+    let bridge = status_bridge().await;
+    let row = commit(
+        &bridge,
+        json!({ "body": "on", "status_to": "brenn:light-status" }),
+    )
+    .await;
+    assert_eq!(
+        transport(&row).status_to.as_deref(),
+        Some("brenn:light-status")
+    );
+    let row = commit(&bridge, json!({ "body": "off" })).await;
+    assert_eq!(transport(&row).status_to, None);
+}
+
+#[tokio::test]
+async fn a_status_to_that_is_not_a_nonempty_string_is_an_argument_error() {
+    let bridge = status_bridge().await;
+    for value in [
+        json!(""),
+        json!(7),
+        json!(null),
+        json!(["brenn:light-status"]),
+    ] {
+        assert_rejected(
+            &bridge,
+            naming(value),
+            "invalid `status_to` argument: give a `brenn:<channel>` address as a string",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_malformed_status_to_names_the_brenn_form_and_is_no_security_event() {
+    let bridge = status_bridge().await;
+    for address in ["light-status", "brenn:bad name", "ephemeral:light-status"] {
+        assert_refused_with(
+            &bridge,
+            naming(json!(address)),
+            &format!(
+                "malformed `status_to` {address:?}: must be of the form \"brenn:<name>\" with \
+                 name matching ^[A-Za-z0-9._~-]+$"
+            ),
+        )
+        .await;
+    }
+    assert!(!logs_contain("brenn_publish_denied"));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_status_to_without_the_publish_grant_is_refused_as_a_security_event() {
+    let bridge =
+        bridge_with_status(None, brenn_lib::messaging::MessagingGlobalConfig::default()).await;
+    let v = through_hook(&bridge, naming(json!("brenn:light-status"))).await;
+    assert_eq!(
+        v,
+        json!({
+            "ok": false,
+            "error": "`status_to` is refused: this app has no `publish` grant for `brenn:` channels",
+        })
+    );
+    assert!(committed(&bridge, "home").await.is_empty());
+    assert_eq!(send_budget_row(&bridge).await, None);
+    assert!(logs_contain("brenn_publish_denied"));
+    assert!(logs_contain("kind=grant_absent address=brenn:light-status"));
+}
+
+/// Outside the ACL and absent from the directory answer with one string, the
+/// one a `BrennSend` denial gives; only the security log tells them apart.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn an_out_of_acl_or_missing_status_to_answers_alike_and_signals_its_kind() {
+    let bridge = status_bridge().await;
+    for (address, kind) in [
+        ("brenn:other-status", "acl_denied"),
+        ("brenn:nowhere", "acl_denied"),
+        ("brenn:gone-status", "unknown_channel"),
+    ] {
+        let v = through_hook(&bridge, naming(json!(address))).await;
+        assert_eq!(
+            v,
+            json!({
+                "ok": false,
+                "error": format!("`status_to`: {}", brenn_channel_denied_msg(address)),
+            }),
+            "{address}"
+        );
+        assert!(
+            logs_contain(&format!("kind={kind} address={address}")),
+            "{address}"
+        );
+    }
+    assert!(logs_contain("brenn_publish_denied"));
+    assert!(committed(&bridge, "home").await.is_empty());
+    assert_eq!(send_budget_row(&bridge).await, None);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_topic_whose_status_could_not_fit_the_body_cap_is_refused() {
+    let global = brenn_lib::messaging::MessagingGlobalConfig {
+        max_body_bytes: 256,
+        ..Default::default()
+    };
+    let bridge = bridge_with_status(Some(&["light-status"]), global).await;
+    let len = brenn_envelope::delivery::max_encoded_len("home", "cmd/light");
+    assert!(len > 256, "the fixture's cap is below the bound: {len}");
+    assert_refused_with(
+        &bridge,
+        naming(json!("brenn:light-status")),
+        &format!(
+            "the topic is too long for a delivery status about it to be published (a status can \
+             be {len} bytes, over the bus's 256-byte body cap): drop `status_to` or shorten the \
+             topic"
+        ),
+    )
+    .await;
+    assert!(!logs_contain("brenn_publish_denied"));
+}
+
+/// A refusal of the target itself answers before any `status_to` refusal.
+#[tokio::test]
+async fn a_target_refusal_answers_before_the_status_to() {
+    let bridge =
+        bridge_with_status(None, brenn_lib::messaging::MessagingGlobalConfig::default()).await;
+    let v = call(
+        &bridge,
+        json!({
+            "to": "mqtt:office:cmd/light",
+            "body": "on",
+            "lifetime_s": 60,
+            "status_to": "brenn:nowhere",
+        }),
+    )
+    .await;
+    let Some(ToolOutcome::Err(v)) = v else {
+        panic!("expected a refusal, got {v:?}");
+    };
+    let error = v["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("MQTT publish to `mqtt:office:cmd/light`"),
+        "{error}"
+    );
 }

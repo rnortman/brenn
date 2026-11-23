@@ -118,6 +118,27 @@ In rough order of severity if compromised:
   user and device ids and counts only. A position appears in a conversation's
   transcript only where the assistant called the tool, as any tool result
   does.
+- **Delivery statuses.** An app that names a `status_to` on an MQTT publish
+  has Brenn publish what became of the message to that `brenn:` channel as
+  `system:delivery-status`. That sender is not a registered participant and
+  holds no policy of its own: each status is published on the authority of
+  the app that made the publish, as that app's policy stands when the status
+  is published — the app must still hold `publish` and its `brenn_publish`
+  ACL must still admit the channel — so a status lands only where the app
+  could itself write, and its body can only be a status. A reader believes a
+  status only from `system:delivery-status`; anything else on the channel may
+  be the app's own traffic. That sender says the host wrote a status, not
+  whose message it concerns: any app that may write the channel may name it,
+  and conversations of one app publish as that app, so a reader matches the
+  status's `message_id` against the ids its own publishes returned.
+  `system:mqtt-outbound` still publishes nothing. A broker's rejection
+  always alerts the operator, whether or not the message's `status_to` told
+  its sender: it means Brenn's per-topic ACL admits a topic the broker's
+  configuration forbids, which only the operator can fix, so naming a
+  `status_to` cannot silence it. The other failures told on a `status_to` do
+  not alert; each is still a `warn` line and a per-client count, as every
+  egress failure is. A broker refusal can only concern a topic the app's own
+  `acl publish` entries admit, and is not a security event, told or not.
 - **Cross-user and cross-app isolation.** Conversation history, per-app data,
   per-app filesystem scope, per-component WASM storage. One user or one app must
   not reach another's data.

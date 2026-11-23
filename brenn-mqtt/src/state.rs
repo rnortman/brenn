@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -130,8 +130,8 @@ pub enum NoticeOutcome {
     /// (QoS 1/2).
     Delivered,
     /// The broker answered with a failure reason: the packet's reason string
-    /// when it carried one, else the reason code.
-    Rejected { reason: String },
+    /// when it carried one, else the reason code's name; and the code.
+    Rejected { reason: String, code: u8 },
     /// The connection the publish was submitted on ended before an answer.
     ConnectionEnded,
 }
@@ -157,9 +157,11 @@ pub fn notice_outcome(
             } else {
                 NoticeOutcome::Rejected {
                     reason: reason_text(ack.properties.and_then(|p| p.reason_string), &ack.reason),
+                    code: ack.reason as u8,
                 }
             }
         }
+        // TODO(mqtt-qos2-completion-refusal-told-rejected)
         Ok(R::Qos2Completed(comp)) => {
             if comp.reason == PubCompReason::Success {
                 NoticeOutcome::Delivered
@@ -169,11 +171,13 @@ pub fn notice_outcome(
                         comp.properties.and_then(|p| p.reason_string),
                         &comp.reason,
                     ),
+                    code: comp.reason as u8,
                 }
             }
         }
         Ok(R::Qos2PubRecRejected(rec)) => NoticeOutcome::Rejected {
             reason: reason_text(rec.properties.and_then(|p| p.reason_string), &rec.reason),
+            code: rec.reason as u8,
         },
         Err(E::Recv | E::SessionReset | E::Qos0NotFlushed) => NoticeOutcome::ConnectionEnded,
         Err(
@@ -333,6 +337,11 @@ pub struct MqttClientHandle {
     /// The egress reader, recorded by [`crate::reader::start_egress_reader`].
     /// A `std::sync::Mutex`: every section is a synchronous take or store.
     pub(crate) egress_reader: std::sync::Mutex<ReaderSlot>,
+
+    /// The reader completed a bus call: moves by one after every awaited
+    /// call the egress reader makes on its bus. The reader's join reads it
+    /// to tell a reader that is working from one that is stuck.
+    pub(crate) egress_reader_progress: AtomicU64,
 }
 
 /// Poisoning message for [`MqttClientHandle::egress_reader`].
@@ -364,6 +373,7 @@ impl MqttClientHandle {
             stop_tx,
             supervisor: Mutex::new(None),
             egress_reader: std::sync::Mutex::new(ReaderSlot::Never),
+            egress_reader_progress: AtomicU64::new(0),
         })
     }
 
@@ -513,19 +523,22 @@ impl MqttClientHandle {
     /// Signal the supervisor and the egress reader to stop, then wait for the
     /// reader, if one is running, and then the supervisor to exit.
     ///
-    /// Bounded twice over. The supervisor's stop arm drains the DISCONNECT
-    /// under its own timeout and its connect and backoff sleeps race the stop
-    /// signal, so every path out of it is short; and the wait itself is under
-    /// [`STOP_JOIN_TIMEOUT`], because a commit step that stalls here stalls the
-    /// whole reload with no `mqtt:` route installed and no status published,
-    /// which is a worse failure than a loud death. Returning means the broker
-    /// connection is gone and the client id is free for a successor to take.
+    /// The supervisor's stop arm drains the DISCONNECT under its own timeout
+    /// and its connect and backoff sleeps race the stop signal, so every path
+    /// out of it is short; and the wait for it is under [`STOP_JOIN_TIMEOUT`],
+    /// because a commit step that stalls here stalls the whole reload with no
+    /// `mqtt:` route installed and no status published, which is a worse
+    /// failure than a loud death. The reader's exit commits one report per
+    /// outstanding message, so its wait is bounded by progress instead: it
+    /// panics only when [`STOP_JOIN_TIMEOUT`] passes with no bus call
+    /// completed. Returning means the broker connection is gone and the
+    /// client id is free for a successor to take.
     ///
     /// # Panics
     ///
-    /// Panics if no handle was recorded; if the wait outlives
-    /// [`STOP_JOIN_TIMEOUT`], which means the supervisor has a path out that
-    /// does not race the stop signal; or if the supervisor task ended in a way
+    /// Panics if no handle was recorded; if the reader stalls as above; if
+    /// the supervisor's wait outlives [`STOP_JOIN_TIMEOUT`], which means the
+    /// supervisor has a path out that does not race the stop signal; or if the supervisor task ended in a way
     /// `tokio` reports as an error — the outer task catches its body's panics
     /// itself, so a join error here means the runtime tore the task down.
     pub async fn stop_and_join(&self) {
@@ -566,8 +579,8 @@ impl MqttClientHandle {
     /// # Panics
     ///
     /// If no reader is running on this handle, or as
-    /// [`Self::stop_and_join`] does for its supervisor when the reader does
-    /// not exit within [`STOP_JOIN_TIMEOUT`].
+    /// [`Self::stop_and_join`] does when the reader completes no bus call for
+    /// [`STOP_JOIN_TIMEOUT`] without exiting.
     pub async fn retire_egress_reader(&self) {
         let (join, retire) = self.take_egress_reader().unwrap_or_else(|| {
             panic!(
@@ -610,22 +623,32 @@ impl MqttClientHandle {
         }
     }
 
-    async fn join_egress_reader(&self, join: tokio::task::JoinHandle<()>) {
-        let joined = tokio::time::timeout(STOP_JOIN_TIMEOUT, join)
-            .await
-            .unwrap_or_else(|_| {
+    /// Wait for the reader to exit, in windows of [`STOP_JOIN_TIMEOUT`]. A
+    /// window in which the reader completed a bus call starts another: a
+    /// reader with many statuses to commit is working, however long that
+    /// takes. A window in which it completed none ends the wait in a panic.
+    async fn join_egress_reader(&self, mut join: tokio::task::JoinHandle<()>) {
+        loop {
+            let before = self.egress_reader_progress.load(Ordering::Relaxed);
+            let Ok(joined) = tokio::time::timeout(STOP_JOIN_TIMEOUT, &mut join).await else {
+                if self.egress_reader_progress.load(Ordering::Relaxed) == before {
+                    panic!(
+                        "MQTT egress reader for client {:?} neither exited nor completed one bus \
+                         call within {}s of being asked to exit — it waits on no broker, so the \
+                         store has stopped or this is a host bug",
+                        self.config.identity.slug,
+                        STOP_JOIN_TIMEOUT.as_secs(),
+                    );
+                }
+                continue;
+            };
+            if let Err(e) = joined {
                 panic!(
-                    "MQTT egress reader for client {:?} did not exit within {}s of being asked \
-                     to — it waits on no broker, so this is a host bug",
+                    "MQTT egress reader for client {:?} could not be joined: {e}",
                     self.config.identity.slug,
-                    STOP_JOIN_TIMEOUT.as_secs(),
-                )
-            });
-        if let Err(e) = joined {
-            panic!(
-                "MQTT egress reader for client {:?} could not be joined: {e}",
-                self.config.identity.slug,
-            );
+                );
+            }
+            return;
         }
     }
 }
@@ -778,8 +801,9 @@ mod tests {
             PubAckReason, PubComp, PubCompProperties, PubCompReason, PubRec, PubRecProperties,
             PubRecReason, PublishNoticeError as E, PublishResult as R,
         };
-        let rejected = |reason: &str| NoticeOutcome::Rejected {
+        let rejected = |reason: &str, code: u8| NoticeOutcome::Rejected {
             reason: reason.to_string(),
+            code,
         };
 
         assert_eq!(notice_outcome(Ok(R::Qos0Flushed)), NoticeOutcome::Delivered);
@@ -791,7 +815,7 @@ mod tests {
         }
         assert_eq!(
             notice_outcome(Ok(R::Qos1(puback(PubAckReason::NotAuthorized, None)))),
-            rejected("NotAuthorized"),
+            rejected("NotAuthorized", 135),
             "with no reason string the reason code's name is the reason",
         );
         assert_eq!(
@@ -799,7 +823,7 @@ mod tests {
                 PubAckReason::QuotaExceeded,
                 Some("over quota")
             )))),
-            rejected("over quota"),
+            rejected("over quota", 151),
         );
 
         let comp = |reason, reason_string: Option<&str>| PubComp {
@@ -819,14 +843,14 @@ mod tests {
                 PubCompReason::PacketIdentifierNotFound,
                 None
             )))),
-            rejected("PacketIdentifierNotFound"),
+            rejected("PacketIdentifierNotFound", 146),
         );
         assert_eq!(
             notice_outcome(Ok(R::Qos2Completed(comp(
                 PubCompReason::PacketIdentifierNotFound,
                 Some("lost it")
             )))),
-            rejected("lost it"),
+            rejected("lost it", 146),
         );
 
         let rec = PubRec {
@@ -839,7 +863,7 @@ mod tests {
         };
         assert_eq!(
             notice_outcome(Ok(R::Qos2PubRecRejected(rec))),
-            rejected("denied")
+            rejected("denied", 135)
         );
 
         for e in [E::Recv, E::SessionReset, E::Qos0NotFlushed] {

@@ -83,8 +83,8 @@ pub use ingress::{
 pub use live::{GapReason, PrepaidDestination, PrepaidEntry, Replay};
 pub use publish::{
     AttachBatchPublish, AttachSendDraw, AttachSendVerdict, IngressMessage, MissingChannelPosture,
-    MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, WasmMqttPublish,
-    WasmPublish, is_well_formed_address,
+    MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, StatusToRefusal,
+    WasmMqttPublish, WasmPublish, is_well_formed_address,
 };
 pub use query::{MessageQuery, QueryError};
 pub use retained_part::{AdmittedPart, NamedPart, PartRefusal, ToolChannelAttachments};

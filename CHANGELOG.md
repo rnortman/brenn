@@ -11,13 +11,25 @@ All notable changes to Brenn are documented here.
   is left of it is sent as the MQTT message expiry. The answer is `ok` with
   the message's id, the remaining budget and whether the client is connected
   now; it never reports delivery. A client that is not connected is no longer
-  an error: the message waits for the connection within its lifetime. Broker
-  refusals, a packet over the broker's maximum size, expiry and messages lost
-  with a connection go to the operator as `warn` lines and phone alerts, not to
-  the caller. At QoS 1 a message may be delivered twice after a reconnect. An
+  an error: the message waits for the connection within its lifetime. Without
+  a `status_to` (below), failures go to the operator as `warn` lines and phone
+  alerts, not to the caller. At QoS 1 a message may be delivered twice after a
+  reconnect. An
   inline payload over `[messaging] max_body_bytes` needs a blob store and is
   refused as `payload_unstorable` without one. The `MqttSend` card's badge
   reads "committed".
+- **New: a sender can learn what became of its MQTT message.** `MqttSend`
+  takes an optional `status_to`, a `brenn:` channel the app may publish to.
+  Brenn publishes JSON statuses there (sender `system:delivery-status`):
+  `handed` when the message goes to the broker, then one outcome — delivered,
+  refused by the broker, too large for the broker, `expired`, `dropped` or
+  `unknown`. `expired` and `dropped` mean the message was never sent;
+  `unknown` means it may have been sent and will not be sent again, including
+  a QoS 1 message refused when re-sent after a lost connection (cause
+  `resend_refused`), whose first copy may have arrived. A broker's rejection
+  still alerts the operator whether or not the caller was told, since it means
+  the app's topic ACL admits what the broker forbids. Components cannot name a
+  `status_to` yet.
 - **Development:** `make check` no longer spends about eleven minutes on the
   `brenn-server` test suite. Three Gmail message-body tests searched for the
   largest body that fits one byte step at a time; they now bracket and bisect,
@@ -45,6 +57,10 @@ All notable changes to Brenn are documented here.
   the caller's spelling); a string `body` is still published verbatim, and a
   number, boolean or null `body` is refused. `content_type` also types a
   `body`, and is refused beside an `attachment`, which publishes its own.
+- **For component authors:** `MqttPublishTransport` gained a `status_to`
+  field (absent on the wire when unset). A guest that builds or destructures
+  it exhaustively needs a source change; a component cannot name a
+  `status_to`, and its publish always carries none.
 - **BREAKING for component authors:** a component's `mqtt-publish` and
   `mqtt-publish-expiring` now go through the bus, like `MqttSend`, and never
   wait on the broker. The WIT shapes are unchanged and every existing component
