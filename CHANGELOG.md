@@ -109,6 +109,13 @@ All notable changes to Brenn are documented here.
   path is now percent-encoded: file links carry `%5E`, `api-request` sends
   `%5E` for it, and a push `data.url`, redirector target or login return path
   holding a raw `^` is refused.
+- **For developers:** `make check` and `make build` now keep a timing record
+  of each Bazel run: how long it took and which steps were rebuilt rather than
+  taken from the cache. `make timing` shows the last run. Set
+  `BAZEL_TIMING=off` to turn it off; it is off by default when `BAZEL_CONFIG`
+  is set, as it is in CI and deploy builds. See `docs/build-timing.md`.
+- The policy check no longer scans a local database's blob store directory
+  (`*.db.blobs`) left in the source tree by a dev server.
 
 ## [0.38.0] — 2026-11-21
 

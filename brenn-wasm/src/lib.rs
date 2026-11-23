@@ -870,6 +870,8 @@ pub trait MqttPublisher: Send + Sync {
     /// `invalid-payload`.
     fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String>;
 
+    // TODO(mqtt-component-publish-dependents-follow-up): out-of-tree
+    // dependents still test and document the broker outcome this replaced.
     /// Whether this consumer may publish `payload_len` bytes to a target
     /// [`resolve`](Self::resolve) returned, with `props`. No I/O, no wait,
     /// nothing spent.

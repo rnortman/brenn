@@ -14,6 +14,10 @@ POLICY_SRC_EXCLUDE = [
     "**/*.db",
     "**/*.db-shm",
     "**/*.db-wal",
+    # A database's blob store: a directory named for the database path with
+    # `.blobs` appended, written by any server run from the tree and ignored by
+    # git under the same pattern.
+    "**/*.db.blobs/**",
     "**/node_modules/**",
     "**/target/**",
     "**/dist/**",

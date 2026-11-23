@@ -1,4 +1,5 @@
-// xtask: policy runner for brenn. Subcommands: guard, policy-parity, check-wit, deny.
+// xtask: policy runner for brenn. Subcommands: guard, policy-parity, check-wit, deny,
+// timing (the reader of the Bazel timing record).
 // Invoked via `bazel run //xtask -- <subcommand>`; the guards and the WIT gates also
 // run as Bazel test targets.
 
@@ -15,6 +16,7 @@ mod removal_guard;
 mod sync_guard;
 mod test_target_guard;
 mod testutils_deps_guard;
+mod timing;
 mod workspace_guard;
 mod world_sig;
 
@@ -24,7 +26,7 @@ const GUARD_USAGE: &str = "guard [--root <dir>] [--manifest <file>]";
 const PARITY_USAGE: &str = "policy-parity [--root <dir>] --manifest <file>";
 const CHECK_WIT_USAGE: &str = "check-wit [--root <dir>]";
 const DENY_USAGE: &str = "deny [--root <dir>]";
-const SUBCOMMANDS: &str = "guard | policy-parity | check-wit | deny";
+const SUBCOMMANDS: &str = "guard | policy-parity | check-wit | deny | timing";
 
 /// Each guard runs to completion so one failure does not hide the rest.
 fn run_guards(root: &Path, files: &[PathBuf]) -> bool {
@@ -143,6 +145,9 @@ fn main() {
             let parsed = parse_guard_args(&mut args, &repo_root, DENY_USAGE, Manifest::Rejected);
             deny::run_deny(&parsed.root)
         }
+        // Reads only the per-user record store, never the tree, so it takes
+        // its own options rather than the guards'.
+        "timing" => timing::run_timing(&mut args),
         other => {
             eprintln!("xtask: unknown subcommand {other:?}");
             eprintln!("Subcommands: {SUBCOMMANDS}");

@@ -151,6 +151,7 @@ In particular, whenever considering WASM-related design questions, remember: out
 `make check` runs checks.
 `make launchdev` builds and starts the dev server in the background (uses `brenn.dev.brenn`, binds to `127.0.0.1:3000`).
 `make stopdev` stops it.
+`make check` and `make build` record what each Bazel invocation rebuilt and how long it took; `make timing` prints the last run. See `docs/build-timing.md`.
 See Makefile for other targets that you don't need because those two do everything.
 
 **IMPORTANT:** Run `make launchdev` exactly as-is. No `2>&1`, no `| tail`, no `| head`, no output redirection of any kind. The Makefile backgrounds the server process, and piping or redirecting its output will cause the pipe to hang forever because the backgrounded server holds the file descriptors open. Just run `make launchdev` bare.

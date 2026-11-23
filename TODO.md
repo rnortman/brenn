@@ -395,6 +395,43 @@ in-flight and backlog rows than the floor and the guest's memory cover read
 whole completes, each with a test. The comment sits at `sweep` in
 `brenn-provider-kit/src/activation.rs`.
 
+## `mqtt-component-publish-behaviour-cut-unconfirmed`
+
+`brenn:processor/mqtt@0.1.0`'s `mqtt-publish`/`mqtt-publish-expiring` now
+commit the publish to the client's egress channel and return, with no new
+contract version: a behaviour-only change to a published WIT contract, decided
+by a planning agent and not confirmed by the owner. `docs/component-packages.md`
+records the cut and the survey of component repositories it rests on. The
+owner has not said (a) whether the rule that a WIT contract changes only
+additively or under a new version covers a change of behaviour with no change
+of signature; (b) whether a component repository exists that the survey could
+not reach — one that `docs/component-packages.md` does not name and that is
+not on the maintainer's machine; (c) whether `brenn-component-demo` is the
+repository the project's planning calls `brenn-demo-components`. Options: A keep the switch (old artifacts lose
+the inline broker outcome; a hidden component relying on it breaks
+silently); B restore the synchronous functions and offer async only in a
+new contract version (keeps `PUBLISH_WAIT` and the wait budget until the
+old contract retires). Free to reverse only until the stack is released;
+the `CHANGELOG.md` **BREAKING for component authors** entry records the
+limit. Done = the user has answered before release. The comment sits above
+`mqtt-publish` in `brenn-wasm/wit/processor.wit`.
+
+## `mqtt-component-publish-dependents-follow-up`
+
+When the stack is published, two private repositories owe follow-up work.
+The owner's private components repository repins its brenn dependency to
+the release, rewrites its usage-proxy tests against
+`MqttPublisher::admit` / `ProcessorOutcome::Ok.publishes` (dropping the
+cases that script `MqttPublishOutcome::Broker` or
+`MqttPublishOutcome::BrokerRejected`, adding a discarded-on-failure case)
+and corrects the two doc comments in its usage-proxy component that still
+describe a broker refusal or rejection as an outcome of the publish. The
+private ops annex moves its deploy pin to the release and corrects the
+comment in the prod switcher configuration that claims a refused publish
+traps the activation, false from that release. Done = both repositories
+are on the release with those changes. The comment sits at
+`MqttPublisher::admit` in `brenn-wasm/src/lib.rs`.
+
 ## `mqtt-egress-removed-client-rows`
 
 A removed MQTT client's egress channel row and retained messages stay in the
@@ -407,16 +444,18 @@ is reaped at removal.
 
 ## `mqtt-publish-acl-ops-config`
 
-Per-topic MQTT publish ACLs exist (`acl publish [topic_filter …]`), but the
-deployment config in the `brenn-ops` repository still grants publish per
-client: `deploy/brenn/config/prod/site.brenn` says "publish ACLs are per
-client, not per topic", and `deploy/brenn/config/prod/switcher.brenn` uses the
-client-only form, which deployment text now refuses. The wishlist in this
-project's brief asks for the owner's personal-assistant app to be scoped to
-`ha/cmd`, `zigbee2mqtt/+/set` and `zigbee2mqtt/+/get`. That repository is
-outside what the make-mqtt-great-again workflow may change. The owner decides:
-bring `brenn-ops` into the workflow's scope, or make the config change by hand
-at the deploy that carries the ACLs. Until one happens, every PA can publish
+Per-topic MQTT publish ACLs exist (`acl publish [topic_filter …]`), but
+the production deployment configuration in the private ops annex still
+grants publish per client: the prod site configuration carries a comment
+saying that publish ACLs are per client and not per topic, and the prod
+switcher configuration uses the client-only form, which deployment text
+now refuses. The wishlist in this project's brief asks for the owner's
+personal-assistant app to be scoped to three topic filters: the
+home-automation command topic and the Zigbee bridge's per-device set and
+get topics. The ops annex is outside what the make-mqtt-great-again
+workflow may change. The owner decides: bring the ops annex into the
+workflow's scope, or make the config change by hand at the deploy that
+carries the ACLs. Until one happens, every PA can publish
 to every topic on its broker. Done = the production config grants each MQTT
 publisher only the topic filters it needs.
 
@@ -430,6 +469,22 @@ to publish to and is sent as the MQTT 5 Response Topic, and
 the bus and released into the client's egress channel with its
 lifetime counted from release. Documenting either refusal as final
 does not close this entry.
+
+## `mqtt-stack-history-rewrite-before-push`
+
+Before any branch of the make-mqtt-great-again stack is pushed, the
+owner rewrites the stack's history so that the earlier wording of the
+`mqtt-publish-acl-ops-config` entry in this file is in none of its
+commits. Commit `0f9cca14` introduced that wording, and the commits
+above it carry it up to the one that reworded the entry. Either reword
+the entry in `0f9cca14` to its present text and rebase everything above
+it, every local branch of the stack included, or squash the whole stack
+into one commit. This is done by hand, by the owner, at publication; no
+cycle of the workflow does it. This entry and its code comment are
+deleted in that same rewrite, so neither is ever published. Done = the
+stack has been pushed with the earlier wording in none of its commits.
+The comment sits beside `TODO(mqtt-publish-acl-ops-config)` in
+`family_admits` in `brenn-dsl/src/derive.rs`.
 
 ## `obs-log-capture-test-flaky`
 

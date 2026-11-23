@@ -1,4 +1,4 @@
-.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e e2e-measure e2e-mounts dev-mounts dev-bin
+.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity example-check xtask-deny build run-artifacts timing clean launchdev stopdev npm-audit e2e e2e-measure e2e-mounts dev-mounts dev-bin
 # Delete partially-written targets on recipe failure. Without this, a failing
 # recipe leaves the target file with a fresh mtime, causing subsequent
 # incremental builds to skip it entirely.
@@ -39,6 +39,47 @@ else
 $(error EXAMPLE_LANE must be ci, cd or unset, not "$(EXAMPLE_LANE)")
 endif
 
+# The timing record: what each Bazel invocation a recipe
+# makes executed rather than took from a cache, and how long it took.
+#
+# `$(REC)` goes in front of a recipe's command. It is the recorder script and the
+# target whose recipe is running, so the script can ask Bazel for its build event
+# file and compact execution log, time the command from outside — which is what
+# covers a `bazel run` binary's own run time — and file the record in the
+# per-user store. It is a prefix, not a replacement for the word `bazel`: the
+# `bazel-check` guard in xtask's sync_guard reads that recipe as text and looks
+# for `bazel test ` on one line, which a prefix keeps true.
+#
+# BAZEL_TIMING=off makes `$(REC)` empty and exports nothing, so every recipe line
+# is then textually what it would be without the recorder — the only meaning of
+# "off" that holds when the recorder itself is the suspect. The default follows
+# BAZEL_CONFIG: every CI and deploy lane passes one, and a store growing on a
+# runner nobody reads is not something a developer default should start.
+#
+# The run id is simply expanded so its `$(shell)` runs once, at parse time: an
+# exported recursively expanded variable is re-expanded for every recipe line's
+# environment, which would file each step of one `make check` as a run of its
+# own. The goals stay recursive because `.DEFAULT_GOAL` is not set until the
+# first rule below has been read. One parse is one run; no recipe here runs a
+# sub-make. `REC` is recursive so `$@` is the target running it.
+#
+# docs/build-timing.md describes the record, the store and the reader.
+ifeq ($(BAZEL_CONFIG),)
+BAZEL_TIMING ?= on
+else
+BAZEL_TIMING ?= off
+endif
+ifeq ($(BAZEL_TIMING),on)
+BRENN_TIMING_RUN := $(shell date -u +%Y%m%dT%H%M%S.%NZ-$$PPID)
+BRENN_TIMING_GOALS = $(or $(MAKECMDGOALS),$(.DEFAULT_GOAL))
+export BRENN_TIMING_RUN BRENN_TIMING_GOALS
+REC = bazel/timing/record.sh $@
+else ifeq ($(BAZEL_TIMING),off)
+REC :=
+else
+$(error BAZEL_TIMING must be on or off, not "$(BAZEL_TIMING)")
+endif
+
 # Where bazel plants its convenience symlinks (--symlink_prefix in .bazelrc).
 # Every path below that names a build output goes through this, because the
 # configuration segment of a real output path is Bazel's to choose.
@@ -59,9 +100,9 @@ BAZEL_BIN := .bazel-bin
 # clippy needs its own request under the wasm32 platform for each. The rustfmt
 # aspect rides those same two requests, for the same reason.
 bazel-check: bazel-dsl-coherence
-	bazel test $(BAZEL_CONFIG) --config=clippy --config=rustfmt //...
-	bazel build $(BAZEL_CONFIG) --config=clippy --config=rustfmt --platforms=//bazel/platforms:wasm32 //brenn-wasm/components/...
-	bazel build $(BAZEL_CONFIG) --config=clippy --config=rustfmt --platforms=//bazel/platforms:wasm32 //surface/...
+	$(REC) bazel test $(BAZEL_CONFIG) --config=clippy --config=rustfmt //...
+	$(REC) bazel build $(BAZEL_CONFIG) --config=clippy --config=rustfmt --platforms=//bazel/platforms:wasm32 //brenn-wasm/components/...
+	$(REC) bazel build $(BAZEL_CONFIG) --config=clippy --config=rustfmt --platforms=//bazel/platforms:wasm32 //surface/...
 
 # What //brenn-dsl links out of the fltk module, asserted over the resolved
 # dependency graph.
@@ -106,7 +147,7 @@ bazel-check: bazel-dsl-coherence
 bazel-dsl-coherence:
 	@set -e; \
 	out="$$(mktemp)"; err="$$(mktemp)"; trap 'rm -f "$$out" "$$err"' EXIT; \
-	cq() { bazel cquery $(BAZEL_CONFIG) --config=clippy --config=rustfmt "$$1" >"$$out" 2>"$$err" \
+	cq() { $(REC) bazel cquery $(BAZEL_CONFIG) --config=clippy --config=rustfmt "$$1" >"$$out" 2>"$$err" \
 	    || { echo "FAIL: bazel-dsl-coherence broken: the cquery failed: $$1"; cat "$$err"; exit 1; }; }; \
 	cq 'somepath(//brenn-dsl:brenn-dsl, @fltk//crates/fltk-cst-core:no_python)'; \
 	test -s "$$out" \
@@ -127,8 +168,8 @@ bazel-dsl-coherence:
 # Needs BRENN_BUILD_ID: the release config stamps, and the workspace status
 # command refuses to emit an unidentifiable build.
 bazel-release:
-	bazel build $(BAZEL_CONFIG) --config=release-package //deploy:release_package
-	bazel test $(BAZEL_CONFIG) --config=release-package //deploy:all
+	$(REC) bazel build $(BAZEL_CONFIG) --config=release-package //deploy:release_package
+	$(REC) bazel test $(BAZEL_CONFIG) --config=release-package //deploy:all
 
 # Prints the absolute path of the tree `bazel-release` staged, and nothing else,
 # so the deploying repo can tar it. Derived rather than spelled out: the
@@ -158,8 +199,8 @@ bazel-release-dir:
 # this runs. Two invocations because the comparison needs the manifest built
 # first and then a binary run against it with the workspace still in view.
 bazel-policy-parity:
-	bazel build $(BAZEL_CONFIG) //:policy_manifest
-	bazel run $(BAZEL_CONFIG) //xtask -- policy-parity --root $(CURDIR) --manifest $(CURDIR)/$(BAZEL_BIN)/policy_manifest.txt
+	$(REC) bazel build $(BAZEL_CONFIG) //:policy_manifest
+	$(REC) bazel run $(BAZEL_CONFIG) //xtask -- policy-parity --root $(CURDIR) --manifest $(CURDIR)/$(BAZEL_BIN)/policy_manifest.txt
 
 # The out-of-tree authoring example: the same gate set an in-tree component
 # gets, plus the fit check over the root document that imports the packaged
@@ -190,7 +231,7 @@ example-check:
 # runfiles tree, not the workspace.
 # Install with: cargo install --locked cargo-deny
 xtask-deny:
-	bazel run $(BAZEL_CONFIG) //xtask -- deny --root $(CURDIR)
+	$(REC) bazel run $(BAZEL_CONFIG) //xtask -- deny --root $(CURDIR)
 
 # Full pre-commit check suite: the Bazel graph, the policy scan's file-set
 # parity against git, the Rust advisory gate, and the scrub gate's own
@@ -216,7 +257,16 @@ check: bazel-check bazel-policy-parity xtask-deny scrub-selfcheck
 	@echo "check: all steps passed (bazel-check bazel-policy-parity xtask-deny scrub-selfcheck)"
 
 build:
-	bazel build $(BAZEL_CONFIG) //...
+	$(REC) bazel build $(BAZEL_CONFIG) //...
+
+# The timing record's reader, over runs recorded from this checkout. It is not
+# itself recorded, so reading a run adds none, and it runs with the options of
+# `make build` and of the last steps of `make check`, so it discards no
+# analysis cache after either. TIMING_ARGS is the view and its options:
+# `runs`, `show [<run>]` (the default: the newest run) or `rebuilt`.
+TIMING_ARGS ?= show
+timing:
+	bazel run $(BAZEL_CONFIG) //xtask -- timing --root $(CURDIR) $(TIMING_ARGS)
 
 # What a running server reads: the binary, the two asset trees the configs name,
 # and the components root it resolves packages against — which stages the
@@ -234,7 +284,7 @@ DEV_BIN_DIR := .dev-bin
 TOOL_PATH := PATH=$(abspath $(DEV_BIN_DIR)):$$PATH
 
 run-artifacts:
-	bazel build $(BAZEL_CONFIG) $(RUN_TARGETS)
+	$(REC) bazel build $(BAZEL_CONFIG) $(RUN_TARGETS)
 
 dev-bin: run-artifacts
 	@rm -rf $(DEV_BIN_DIR)
@@ -244,8 +294,9 @@ dev-bin: run-artifacts
 # How the scrub gate's pinned binary is reached: the crates.io release
 # tools/scrub/Cargo.toml pins, built and run by Bazel with the vended gitleaks
 # first on its PATH; nothing is installed. The mode and its arguments follow
-# the `--`.
-BRENN_SCRUB := bazel run $(BAZEL_CONFIG) //tools/scrub:brenn-scrub --
+# the `--`. Recursively expanded so the `$@` in `$(REC)` names the target that
+# uses it.
+BRENN_SCRUB = $(REC) bazel run $(BAZEL_CONFIG) //tools/scrub:brenn-scrub --
 
 # Asserts the scrub gate is live on this clone. The hook binary — the
 # brenn-scrub the git and Claude hooks exec from PATH — exists and is at or
@@ -254,7 +305,7 @@ BRENN_SCRUB := bazel run $(BAZEL_CONFIG) //tools/scrub:brenn-scrub --
 # core.hooksPath) passes `init --check` as run by the pinned binary Bazel
 # builds from crates.io, the same bytes on every machine.
 scrub-selfcheck:
-	@./dev/scrub-hook-floor.sh
+	@$(REC) ./dev/scrub-hook-floor.sh
 	$(BRENN_SCRUB) init --check
 
 # Canonical release-gate sweep: the tree must be free of disallowed strings,
@@ -299,8 +350,9 @@ e2e/node_modules: e2e/package-lock.json
 # by MODULE.bazel and MODULE.bazel.lock like every other tool the build
 # executes, and nothing has to be installed on the machine. `--dir` is absolute
 # in the recipe below because `bazel run` starts the binary in its runfiles
-# tree, not the workspace.
-PNPM := bazel run $(BAZEL_CONFIG) -- @pnpm//:pnpm
+# tree, not the workspace. Recursively expanded so the `$@` in `$(REC)` names
+# the target that uses it.
+PNPM = $(REC) bazel run $(BAZEL_CONFIG) -- @pnpm//:pnpm
 
 # Fail the build on known advisories in all three npm trees (full audit, dev
 # deps included). `frontend` and `surface` are audited through pnpm because
@@ -350,7 +402,7 @@ E2E_MOUNTS_DIR := .e2e-mounts
 E2E_MOUNTS := $(E2E_MOUNTS_DIR)/mounts.brenn
 
 e2e-mounts: run-artifacts
-	bazel build $(BAZEL_CONFIG) $(E2E_TARGETS)
+	$(REC) bazel build $(BAZEL_CONFIG) $(E2E_TARGETS)
 	@./bazel/wasm/dev_mounts.sh $(E2E_MOUNTS_DIR) \
 	    "$(BRENN_MOUNT_SPEC)" \
 	    "e2e-fixtures=surface:$(BAZEL_BIN)/surface/processor-page-bytes-test_assets,modules:brenn-wasm/components/processor-page-bytes-test/spec" \

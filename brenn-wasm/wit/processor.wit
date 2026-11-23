@@ -510,6 +510,8 @@ interface mqtt {
         broker-rejected(string),
     }
 
+    // TODO(mqtt-component-publish-behaviour-cut-unconfirmed): this function
+    // and `mqtt-publish-expiring` changed behaviour without a new version.
     /// Publish to an MQTT broker through the client's egress channel.
     ///
     /// Buffered like `ports.publish`: when the activation returns ok the

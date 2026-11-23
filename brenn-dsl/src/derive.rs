@@ -2022,6 +2022,9 @@ fn family_admits(
     if family == Family::MqttPublish && kind == MatcherKind::Client {
         // TODO(mqtt-publish-acl-ops-config): the production deployment text
         // still uses this refused form.
+        // TODO(mqtt-stack-history-rewrite-before-push): an earlier wording of
+        // the tracker entry for the slug above leaves this stack's history
+        // before any branch of it is pushed, and this comment leaves with it.
         errors.push(Diagnostic::at(
             client_only_publish(bare),
             matcher.val.span().clone(),
