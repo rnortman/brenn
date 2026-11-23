@@ -30,9 +30,10 @@ The case list is the binary's own: read it with `--list` rather than from a
 copy here. Test order varies run to run (each is an independent test); the set
 is what matters.
 
-The three `wasm_egress_*` tests are the WASM-egress acceptance layer: they drive
-`enforce_and_publish` (the shared enforcement pipeline the WASM `mqtt:publish`
-callback uses) against the live broker.
+Every outbound case publishes the way production does: through the client's
+egress reader (`start_egress_reader`) over an in-memory egress channel
+(`MemBus`), asserting the reader's report and what a witness subscriber
+received.
 
 ### Human-review gate
 
@@ -60,7 +61,7 @@ parallel and contend for ephemeral ports. A serialised run
 **ACL denied**
 : The test ACL permits `brenn/itest/#` only. Tests must use topic prefixes within that tree. If you see ACL-denied errors in mosquitto logs, check the test topic prefixes.
 
-**`wasm_egress_broker_rejected_maps_reason` fails or hangs**
+**`the_reader_reports_a_broker_denied_topic_rejected` fails or hangs**
 : This test publishes QoS 1 to a topic **outside** `brenn/itest/#` and expects the broker to reject it with a PUBACK non-success reason code (mosquitto 2.x answers a v5 client's ACL-denied publish with reason 0x87). Two distinct failures:
-  - **`Ok(())` returned** — the broker accepted a publish outside its ACL tree, so the ACL is not being enforced (bad broker config / wrong ACL file). The `BrokerRejected` assertion is meaningless until this is fixed.
-  - **Timed out with no PUBACK** — the broker is silently *dropping* the denied publish rather than rejecting it (e.g. a v3.1.1 client, which has no PUBACK reason codes, or a broker configured to drop). `PubackOutcome::BrokerRejected` is then unreachable with this broker and the harness assumption needs revisiting.
+  - **Reported delivered** — the broker accepted a publish outside its ACL tree, so the ACL is not being enforced (bad broker config / wrong ACL file).
+  - **No report within the wait** — the broker is silently *dropping* the denied publish rather than rejecting it (e.g. a v3.1.1 client, which has no PUBACK reason codes, or a broker configured to drop). A rejection report is then unreachable with this broker and the harness assumption needs revisiting.

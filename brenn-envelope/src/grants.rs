@@ -61,7 +61,7 @@ pub enum ComponentGrant {
     Alert,
     /// `brenn:processor/config` — read-only operator config.
     Config,
-    /// `brenn:processor/mqtt` — synchronous direct-to-broker MQTT publish.
+    /// `brenn:processor/mqtt` — MQTT publish through the client's egress channel.
     Mqtt,
     /// `brenn:processor/tools` — invoke registry tools, fast and async.
     Tools,

@@ -16,7 +16,7 @@ use crate::testutils::{
     surface_registrations, test_channel_entry,
 };
 use crate::{
-    AttachmentName, ChannelEntry, MessageEnvelope, MessagingDirectory, MqttExpiry,
+    AttachmentName, ChannelEntry, MessageBody, MessageEnvelope, MessagingDirectory, MqttExpiry,
     MqttPublishTransport, SubscriberEntry, SubscriberEntryKind, TransportMeta, WakeRouter,
 };
 use brenn_envelope::grants::AppCapability;
@@ -1001,4 +1001,349 @@ async fn an_egress_channel_is_not_a_publish_target() {
 async fn the_client_table_is_installed_once() {
     let f = fixture().await;
     f.m.install_mqtt_clients(Arc::new(StubClients(HashMap::new())));
+}
+
+// ── A component's MQTT publish: admitted at the call, committed at the flush ──
+
+const COMPONENT: &str = "usage-proxy";
+
+fn component_sender() -> String {
+    ParticipantId::for_wasm(COMPONENT).as_str().to_owned()
+}
+
+fn wasm_mqtt<'a>(
+    egress: &'a str,
+    client: &'a str,
+    topic: &'a str,
+    body: &[u8],
+    options: MqttPublishOptions,
+    none: &'a HeldAttachments,
+) -> WasmPublish<'a> {
+    WasmPublish {
+        channel_address: egress,
+        body: MessageBody::carrying(options.content_type.as_deref(), body),
+        urgency: Urgency::Normal,
+        reply_to: None,
+        deliver_after: None,
+        attachments: none,
+        mqtt: Some(WasmMqttPublish {
+            client,
+            topic,
+            options,
+        }),
+    }
+}
+
+impl Fixture {
+    fn policy(&self) -> Arc<brenn_lib::access::AppPolicy> {
+        let apps = self.m.apps.load();
+        Arc::clone(&apps.get(APP).unwrap().policy)
+    }
+}
+
+/// The component's entry point answers each case it can reach with the
+/// admission's variant for it, and spends nothing deciding.
+#[tokio::test]
+async fn the_components_admission_answers_each_case() {
+    type Expect = fn(&Result<(), PublishResult>) -> bool;
+    let f = fixture().await;
+    let policy = f.policy();
+    let typed = |ct: &str| MqttPublishOptions {
+        content_type: Some(ct.to_string()),
+        ..options()
+    };
+    let kitchen = "lights/kitchen/set";
+    let cases: Vec<(&str, &str, MqttPublishOptions, u64, Expect)> = vec![
+        (CLIENT, kitchen, options(), 2, |r| r.is_ok()),
+        (CLIENT, kitchen, typed("text/plain"), 2, |r| r.is_ok()),
+        (
+            CLIENT,
+            "lights/+/set",
+            options(),
+            2,
+            |r| matches!(r, Err(PublishResult::MalformedAddress(a)) if a == "mqtt:home:lights/+/set"),
+        ),
+        (
+            CLIENT,
+            "locks/front/set",
+            options(),
+            2,
+            |r| matches!(r, Err(PublishResult::AclDenied(a)) if a == "mqtt:home:locks/front/set"),
+        ),
+        // The topic ACL is asked before the client table.
+        (
+            "nowhere",
+            kitchen,
+            options(),
+            2,
+            |r| matches!(r, Err(PublishResult::AclDenied(a)) if a == "mqtt:nowhere:lights/kitchen/set"),
+        ),
+        (
+            UNCHANNELLED,
+            kitchen,
+            options(),
+            2,
+            |r| matches!(r, Err(PublishResult::UnknownChannel(a)) if a == "mqtt:loft:lights/kitchen/set"),
+        ),
+        (CLIENT, kitchen, typed("text/"), 2, |r| {
+            matches!(
+                r,
+                Err(PublishResult::MqttRefused(
+                    MqttRefusal::InvalidContentType { .. }
+                ))
+            )
+        }),
+        (
+            CLIENT,
+            kitchen,
+            MqttPublishOptions {
+                qos: 3,
+                ..options()
+            },
+            2,
+            |r| {
+                matches!(
+                    r,
+                    Err(PublishResult::MqttRefused(MqttRefusal::InvalidQos {
+                        qos: 3
+                    }))
+                )
+            },
+        ),
+        (CLIENT, kitchen, options(), u64::from(CLIENT_CAP), |r| {
+            r.is_ok()
+        }),
+        (CLIENT, kitchen, options(), u64::from(CLIENT_CAP) + 1, |r| {
+            matches!(
+                r,
+                Err(PublishResult::MqttRefused(MqttRefusal::PayloadOverClientCap { len, cap }))
+                    if *len == u64::from(CLIENT_CAP) + 1 && *cap == CLIENT_CAP
+            )
+        }),
+    ];
+    for (client, topic, opts, len, expect) in cases {
+        let answer = f.m.admit_mqtt_from_wasm(&policy, client, topic, &opts, len);
+        assert!(
+            expect(&answer),
+            "{client}:{topic} {opts:?} {len}: {answer:?}"
+        );
+    }
+    f.assert_spent_nothing().await;
+}
+
+#[tokio::test]
+async fn the_components_admission_needs_the_grant() {
+    let f = fixture().await;
+    let mut policy = (*f.policy()).clone();
+    policy.grants = brenn_lib::access::GrantSet::default();
+    policy.grants.insert(AppCapability::MessagingPublish);
+    assert!(matches!(
+        f.m.admit_mqtt_from_wasm(&policy, CLIENT, "lights/kitchen/set", &options(), 2),
+        Err(PublishResult::MissingSender)
+    ));
+}
+
+/// A component's MQTT entry commits to its client's egress channel as the
+/// component's row, with the transport an agent's publish of the same options
+/// gets: an expiry counted from the row's own commit time. It draws no send
+/// rate and no budget.
+#[tokio::test]
+async fn a_components_flushed_entry_is_a_row_with_the_agents_transport() {
+    let f = fixture().await;
+    let opts = MqttPublishOptions {
+        qos: 2,
+        retain: true,
+        lifetime: seconds(90),
+        content_type: Some("application/json".to_string()),
+    };
+    let none = HeldAttachments::none();
+    f.m.publish_from_wasm(
+        COMPONENT,
+        &[wasm_mqtt(
+            EGRESS_HOME,
+            CLIENT,
+            "lights/kitchen/set",
+            br#"{"on":true}"#,
+            opts.clone(),
+            &none,
+        )],
+    )
+    .await;
+    assert!(!f.rate_drawn_on(&f.outbound), "no send rate drawn");
+    assert_eq!(f.budget().await, None, "no budget drawn");
+    f.send(ADDR, MqttPayload::Inline(br#"{"on":true}"#.to_vec()), &opts)
+        .await
+        .expect("the agent's publish commits");
+
+    let rows = f.rows(&f.outbound).await;
+    let [component, agent] = rows.as_slice() else {
+        panic!("two rows, got {}", rows.len());
+    };
+    assert_eq!(component.sender, component_sender());
+    assert_eq!(component.envelope_type, crate::ChannelScheme::Brenn);
+    assert_eq!(component.channel, EGRESS_HOME);
+    assert_eq!(component.body, agent.body);
+    assert_eq!(component.body.content_type(), Some("application/json"));
+    let expect = |row: &MessageEnvelope| MqttPublishTransport {
+        client_slug: CLIENT.to_string(),
+        topic: "lights/kitchen/set".to_string(),
+        qos: 2,
+        retain: true,
+        content_type: Some("application/json".to_string()),
+        expires: MqttExpiry::At(row.publish_ts + Duration::seconds(90)),
+    };
+    assert_eq!(*mqtt_transport(component), expect(component));
+    assert_eq!(*mqtt_transport(agent), expect(agent));
+}
+
+#[tokio::test]
+async fn a_components_forever_publish_never_expires_and_is_fed_its_transport() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let forever = MqttPublishOptions {
+        lifetime: MqttLifetime::Forever,
+        ..options()
+    };
+    f.m.publish_from_wasm(
+        COMPONENT,
+        &[wasm_mqtt(
+            EGRESS_HOME,
+            CLIENT,
+            "lights/kitchen/set",
+            b"",
+            forever,
+            &none,
+        )],
+    )
+    .await;
+    let row = &f.rows(&f.outbound).await[0];
+    assert_eq!(mqtt_transport(row).expires, MqttExpiry::Never);
+    assert_eq!(
+        row.body,
+        MessageBody::text(""),
+        "an empty payload is an empty body"
+    );
+    let fed = f.router.fed.lock().await;
+    let [envelope] = fed.as_slice() else {
+        panic!("one live delivery, got {}", fed.len());
+    };
+    assert_eq!(envelope.message_id, row.message_id);
+    assert!(envelope.transport.is_some());
+    assert_eq!(envelope.transport, row.transport);
+}
+
+/// One flush commits its MQTT entries to their clients' channels in call
+/// order, with strictly increasing timestamps across channels.
+#[tokio::test]
+async fn a_flush_commits_mqtt_entries_in_call_order() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let egress_away = crate::mqtt_egress_address(OTHER);
+    f.m.publish_from_wasm(
+        COMPONENT,
+        &[
+            wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", options(), &none),
+            wasm_mqtt(&egress_away, OTHER, "lights/b/set", b"2", options(), &none),
+            wasm_mqtt(EGRESS_HOME, CLIENT, "lights/c/set", b"3", options(), &none),
+        ],
+    )
+    .await;
+    let home = f.rows(&f.outbound).await;
+    let away = f.rows(&f.other).await;
+    assert_eq!(home.len(), 2);
+    assert_eq!(away.len(), 1);
+    assert_eq!(mqtt_transport(&home[0]).topic, "lights/a/set");
+    assert_eq!(mqtt_transport(&away[0]).topic, "lights/b/set");
+    assert_eq!(mqtt_transport(&home[1]).topic, "lights/c/set");
+    assert!(home[0].publish_ts < away[0].publish_ts);
+    assert!(away[0].publish_ts < home[1].publish_ts);
+}
+
+#[tokio::test]
+#[should_panic(expected = "MQTT entry for client \"away\" aimed at")]
+async fn a_flushed_mqtt_entry_aimed_at_another_clients_channel_panics() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    f.m.publish_from_wasm(
+        COMPONENT,
+        &[wasm_mqtt(
+            EGRESS_HOME,
+            OTHER,
+            "lights/a/set",
+            b"1",
+            options(),
+            &none,
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "carries a reply_to, a release time or an attachment")]
+async fn a_flushed_mqtt_entry_with_a_reply_to_panics() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let mut entry = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", options(), &none);
+    entry.reply_to = Some(EGRESS_HOME);
+    f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "carries a reply_to, a release time or an attachment")]
+async fn a_flushed_mqtt_entry_with_a_release_time_panics() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let mut entry = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", options(), &none);
+    entry.deliver_after = Some(Utc::now() + Duration::seconds(60));
+    f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "carries a reply_to, a release time or an attachment")]
+async fn a_flushed_mqtt_entry_with_an_attachment_panics() {
+    let f = fixture().await;
+    let attached = held(&f, &[("payload", b"1")]);
+    let entry = wasm_mqtt(
+        EGRESS_HOME,
+        CLIENT,
+        "lights/a/set",
+        b"",
+        options(),
+        &attached,
+    );
+    f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "a non-MQTT entry aimed at the egress channel")]
+async fn a_flushed_plain_entry_aimed_at_an_egress_channel_panics() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let mut entry = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", options(), &none);
+    entry.mqtt = None;
+    f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+}
+
+/// The invariants are checked before anything is written: a bad entry late in
+/// a flush leaves the good ones before it uncommitted.
+#[tokio::test]
+async fn a_flush_with_a_bad_entry_commits_nothing() {
+    let f = fixture().await;
+    let m = Arc::clone(&f.m);
+    let joined = tokio::spawn(async move {
+        let none = HeldAttachments::none();
+        let mut bad = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/b/set", b"2", options(), &none);
+        bad.mqtt = None;
+        m.publish_from_wasm(
+            COMPONENT,
+            &[
+                wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", options(), &none),
+                bad,
+            ],
+        )
+        .await;
+    })
+    .await;
+    assert!(joined.unwrap_err().is_panic());
+    assert!(f.rows(&f.outbound).await.is_empty());
 }

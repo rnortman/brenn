@@ -1811,6 +1811,55 @@ pub struct WasmPublish<'a> {
     /// The channel's store takes its own holder: a durable row adopts them, a
     /// ring entry keeps a clone of the holds.
     pub attachments: &'a HeldAttachments,
+    /// `Some` for an MQTT publish; `channel_address` is then the client's
+    /// egress channel, and the committed row carries this as its
+    /// `MqttPublish` transport.
+    pub mqtt: Option<WasmMqttPublish<'a>>,
+}
+
+/// Where a component's MQTT publish goes and how, as admitted at the call by
+/// [`Messenger::admit_mqtt_from_wasm`].
+pub struct WasmMqttPublish<'a> {
+    pub client: &'a str,
+    pub topic: &'a str,
+    pub options: MqttPublishOptions,
+}
+
+/// Panic unless `publish` is a well-formed entry for the egress namespace: an
+/// MQTT entry is aimed at its own client's egress channel and carries no
+/// `reply_to`, release time or attachment, and an entry aimed anywhere in the
+/// egress namespace is an MQTT entry.
+fn assert_wasm_egress_entry(consumer_slug: &str, publish: &WasmPublish<'_>) {
+    let addr = publish.channel_address;
+    match &publish.mqtt {
+        Some(mqtt) => {
+            let expected = super::mqtt_egress_address(mqtt.client);
+            assert!(
+                addr == expected,
+                "publish_from_wasm: MQTT entry for client {:?} aimed at {addr:?}, not \
+                 {expected:?} (slug={consumer_slug})",
+                mqtt.client
+            );
+            assert!(
+                publish.reply_to.is_none()
+                    && publish.deliver_after.is_none()
+                    && publish.attachments.is_empty(),
+                "publish_from_wasm: MQTT entry for {addr:?} carries a reply_to, a release \
+                 time or an attachment (slug={consumer_slug})"
+            );
+        }
+        None => {
+            let in_egress = matches!(
+                ChannelScheme::split(addr),
+                Some((ChannelScheme::Brenn, name)) if super::in_the_egress_namespace(name)
+            );
+            assert!(
+                !in_egress,
+                "publish_from_wasm: a non-MQTT entry aimed at the egress channel {addr:?} \
+                 (slug={consumer_slug})"
+            );
+        }
+    }
 }
 
 impl Messenger {
@@ -1827,6 +1876,14 @@ impl Messenger {
     ///
     /// Each publish carries its own urgency: port-configured default (for `publish`)
     /// or guest-supplied (for `publish-with-urgency`).
+    ///
+    /// An MQTT entry (`mqtt` set) was admitted at the call and draws no send
+    /// rate here: it commits to its client's egress channel with `MqttPublish`
+    /// transport metadata whose expiry counts from the row's own timestamp, in
+    /// the same transaction and timestamp sequence as the batch's other durable
+    /// entries. Panics on an MQTT entry not aimed at its client's egress
+    /// channel or carrying a `reply_to`, release time or attachment, and on a
+    /// non-MQTT entry aimed into the egress namespace.
     ///
     /// Attachments of a durable entry are synced before the database lock is
     /// taken, adopted with the entry's row, and confirmed after the commit; an
@@ -1878,6 +1935,10 @@ impl Messenger {
         // transaction has committed. An entry the deferred cap refused is not
         // here: nothing adopted its blobs.
         let mut adopted: Vec<&HeldAttachments> = Vec::new();
+
+        for publish in publishes {
+            assert_wasm_egress_entry(consumer_slug, publish);
+        }
 
         // Sync the blobs a durable row will name before the lock. A ring entry's blobs stay unsynced.
         for publish in publishes {
@@ -1948,6 +2009,14 @@ impl Messenger {
                 // Non-durable: skip the durable transaction machinery; ring
                 // append is deferred to after the lock.
                 if !entry.capabilities().durable {
+                    // Unreachable while `assert_wasm_egress_entry` holds: an
+                    // MQTT entry targets its client's `brenn:` egress address,
+                    // whose entry is `mqtt_egress_entry`'s durable channel.
+                    assert!(
+                        publish.mqtt.is_none(),
+                        "publish_from_wasm: MQTT entry for {channel_addr:?} on a non-durable \
+                         channel (slug={consumer_slug})"
+                    );
                     entry.assert_may_hold(&publish.body);
                     let scheme = ChannelScheme::of(channel_addr).unwrap_or_else(|| {
                         panic!(
@@ -2002,6 +2071,14 @@ impl Messenger {
                     refused.push((channel.address.clone(), cap));
                     continue;
                 }
+                let transport = publish.mqtt.as_ref().map(|m| {
+                    super::TransportMeta::MqttPublish(mqtt::mqtt_transport(
+                        m.client,
+                        m.topic,
+                        &m.options,
+                        db::ns_to_utc(publish_ts_ns),
+                    ))
+                });
                 let inserted = self.insert_message(
                     &tx,
                     channel,
@@ -2014,7 +2091,7 @@ impl Messenger {
                     reply_to_target.as_ref().map(|target| target.uuid),
                     release,
                     None, // no delivery_deadline
-                    None, // no transport metadata
+                    transport.as_ref(),
                     publish.attachments,
                 );
                 adopted.push(publish.attachments);
@@ -2040,7 +2117,7 @@ impl Messenger {
                             None,
                             publish.urgency,
                             ChannelScheme::Brenn,
-                            None,
+                            transport,
                             publish.attachments.refs().clone(),
                         )),
                         inserted.retained_seq.expect(

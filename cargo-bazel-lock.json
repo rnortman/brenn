@@ -1,5 +1,5 @@
 {
-  "checksum": "182d0152cb29b697947139ae1f14ad202510fc5c915174a2e4863ab9d9aef651",
+  "checksum": "490ff59c77d87768420fcce7de59857dd40e1defea2250b2c986b9cf3d8447f9",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -4760,15 +4760,6 @@
             {
               "id": "uuid 1.24.0",
               "target": "uuid"
-            }
-          ],
-          "selects": {}
-        },
-        "deps_dev": {
-          "common": [
-            {
-              "id": "rusqlite 0.41.1",
-              "target": "rusqlite"
             }
           ],
           "selects": {}

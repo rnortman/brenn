@@ -196,12 +196,12 @@ rust_test(
 # `//bazel/tools:mosquitto`, and dropping it or the `data` entry fails every
 # case at spawn with a message naming this target.
 #
-# Every case spawns a broker of its own. The binary's 16 cases finish in 2.3s
-# locally, measured over three runs, the brokers running concurrently; the
+# Every case spawns a broker of its own. The binary's 19 cases finish in 3.1s
+# locally, measured over five runs, the brokers running concurrently; the
 # longest case is the egress one that stops its broker and starts it again.
 # `medium` (300s): at the repo's one measured local-to-CD-runner factor for a
-# suite of this shape, ~21x (see the wiring suite above), that is ~48s on a
-# loaded capacity-1 runner, too near the small budget (60s) and well inside the
+# suite of this shape, ~21x (see the wiring suite above), that is ~65s on a
+# loaded capacity-1 runner, past the small budget (60s) and well inside the
 # medium one. The budget is sized for the readiness and connect waits on that
 # runner, not the assertions. Re-measure both numbers when the suite grows
 # again rather than carrying this arithmetic forward: a stale justification is
@@ -216,6 +216,7 @@ rust_test(
         "//brenn-wasm:fixture_processor_config",
         "//brenn-wasm:fixture_processor_demo",
         "//brenn-wasm:fixture_processor_dual",
+        "//brenn-wasm:fixture_processor_mqtt_test",
         "//brenn-wasm:fixture_replay",
         "//bazel/tools:mosquitto",
     ],

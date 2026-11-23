@@ -17,6 +17,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod mqtt;
+pub use mqtt::mqtt_publisher_over;
+
 use chrono::{DateTime, Utc};
 
 use brenn_activation::sync::{SyncAnswer, SyncRefusal, sync_request};
@@ -25,7 +28,7 @@ use brenn_envelope::addressing::TOOL_REQUEST_INPUT_PORT;
 use brenn_lib::messaging::config::{ActivationPacing, WasmInputPort, WasmOutputPort};
 use brenn_lib::messaging::{ParticipantId, Urgency};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
-use brenn_messaging::{Messenger, MountDebt, Wake, WasmBatchFailure, WasmPublish};
+use brenn_messaging::{Messenger, MountDebt, Wake, WasmBatchFailure, WasmMqttPublish, WasmPublish};
 use brenn_messaging_store::store::{DeferralOutcome, MessageSeq, instant_of, release_time_of};
 use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use brenn_obs::security::{SecurityEventType, log_component_security_event};
@@ -1059,6 +1062,11 @@ async fn drain(
                             .expect("deliver_after was range-validated at buffer time")
                         }),
                         attachments: &p.attachments,
+                        mqtt: p.mqtt.as_ref().map(|m| WasmMqttPublish {
+                            client: &m.target.client,
+                            topic: &m.target.topic,
+                            options: mqtt::mqtt_options(&m.props),
+                        }),
                     })
                     .collect();
                 cfg.messenger

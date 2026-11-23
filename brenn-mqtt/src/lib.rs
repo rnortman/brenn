@@ -16,7 +16,6 @@
 //!
 //! - `payload`    — `InboundPayload` / `OutboundPayload`; `classify_inbound` / `decode_outbound`.
 //! - `state`      — `MqttClientHandle`, `SupervisorState`, `IngressSubscription`.
-//! - `egress`     — shared capability/ACL/budget enforcement + broker publish (`enforce_and_publish`).
 //! - `service`    — `MqttService`, `MqttEventRouter` trait.
 //! - `reader`     — the per-client egress reader (`start_egress_reader`) and the
 //!   `EgressBus` view of a client's egress channel it reads through.
@@ -27,7 +26,6 @@
 //!   through a real broker. Behind the `testutils` feature.
 
 pub mod connection;
-pub mod egress;
 pub mod payload;
 pub mod reader;
 pub mod service;
@@ -38,7 +36,6 @@ pub mod test_support;
 pub use connection::{
     ArrivingFilters, register_and_spawn, spawn_client_supervisor, union_subscriptions,
 };
-pub use egress::{MqttEgressError, SendBudget, enforce_and_publish};
 pub use payload::{
     InboundClass, InboundPayload, OutboundArg, OutboundPayload, classify_inbound, decode_outbound,
 };
@@ -47,7 +44,6 @@ pub use reader::{
     start_egress_reader,
 };
 pub use service::{
-    IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService, PUBLISH_WAIT,
-    PublishProps,
+    IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService,
 };
 pub use state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle, SubAckOutcome};

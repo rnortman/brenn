@@ -250,7 +250,7 @@ fn build_mqtt_options(broker: &MqttClientConfig, transport: Transport) -> MqttOp
     // `u32` at config resolution, so no cast is needed here.
     opts.set_max_packet_size(Some(broker.identity.inbound_payload_cap_bytes));
 
-    // A publish is sent exactly as submitted: `publish_on_handle` checks the
+    // A publish is sent exactly as submitted: the egress reader checks the
     // packet's size against the broker's maximum before submitting it, and an
     // alias the event loop added afterwards would make the packet larger than
     // the size checked.
@@ -1204,7 +1204,7 @@ async fn handle_event(
 /// A client that never connects, with room for `capacity` requests on each
 /// channel. Requests stay queued until the returned event loop is polled; with
 /// the event loop dropped, every send fails as on a closed channel.
-#[cfg(any(test, feature = "testutils"))]
+#[cfg(test)]
 pub(crate) fn unpolled_client(capacity: usize) -> (AsyncClient, rumqttc::EventLoop) {
     let opts = MqttOptions::new("test-unpolled", ("127.0.0.1", 1));
     AsyncClient::builder(opts).capacity(capacity).build()

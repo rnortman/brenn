@@ -80,17 +80,11 @@ impl TcpRelay {
     /// byte read *after* the mode change is forwarded (the `biased;` select in
     /// `relay_connection` makes the mode change win over a pending read). A chunk
     /// already read when the stall lands may still complete its in-flight
-    /// `write_all`; the current test never relies on the stricter boundary
-    /// because it issues the stalled publish only after `stall()` returns.
+    /// `write_all`; a test needing the stricter boundary issues its stalled
+    /// publish only after `stall()` returns.
     /// Sockets stay open, no new bytes move. New connections are unaffected.
     pub async fn stall(&self) {
         self.broadcast(Mode::Stall);
-    }
-
-    /// Resume forwarding on all current connections after [`Self::stall`]. Bytes
-    /// held in the socket buffers while stalled are forwarded first, in order.
-    pub async fn resume(&self) {
-        self.broadcast(Mode::Forward);
     }
 
     /// Close all current connections (drop both stream halves). The listener keeps

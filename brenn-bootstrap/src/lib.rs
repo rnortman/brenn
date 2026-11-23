@@ -33,7 +33,6 @@ mod surface_boot_harness;
 mod surface_ws_tests;
 #[cfg(test)]
 mod wasm_dispatch_e2e_tests;
-mod wasm_mqtt;
 mod webhook;
 
 use std::path::PathBuf;
@@ -957,7 +956,7 @@ pub async fn run_server(
         let load_ctx = consumers::ConsumerLoadContext {
             components_roots: &components_roots,
             alert_dispatcher: &guard.alert_dispatcher,
-            mqtt_service: mqtt_result.service.clone(),
+            messenger: messaging_result.messenger.clone(),
             tool_registry: &tool_registry_cell,
             provider_runtime: &provider_runtime,
             max_payload_bytes: config.messaging.max_body_bytes,

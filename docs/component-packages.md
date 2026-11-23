@@ -78,6 +78,43 @@ entry per filter the arrangement publishes to; such an entry is conferred reach,
 and the deployer's ceiling names the same filter character for character. The
 legacy reading is to be removed once out-of-tree bundles have moved.
 
+A second such change is in force, in the behaviour of
+**`brenn:processor/mqtt@0.1.0`**. No shape, package or version changed, and
+every existing artifact loads and links as before; what changed is what a call
+to `mqtt-publish` or `mqtt-publish-expiring` means. An artifact built earlier
+observes:
+
+- the call returns once the host has decided the publish may be made, with
+  nothing sent, where it returned after the broker answered (QoS ≥ 1) or the
+  packet was written (QoS 0);
+- a message published before a later `err` or trap is discarded with the
+  activation's other publishes, where it had already reached the broker;
+- a disconnected, slow or silent broker is not an error and the message waits
+  on the client's egress channel, where it was `broker(..)`;
+- a broker refusal and a packet over the broker's maximum go to the operator
+  and are not told to the component, where they were `broker-rejected(..)` and
+  `invalid-payload`;
+- the message is kept until sent, bounded by the egress channel's window,
+  where it was attempted once;
+- `mqtt-publish-expiring`'s interval starts at commit, and what is left at
+  hand-off is the interval sent, where it started when the broker received
+  the message;
+- each accepted call is a buffered publish — shared with `ports.publish`, at
+  most 256 per activation and 4 MiB of payload in total, past either
+  `quota-exceeded` — where each call was bounded only by the client's token
+  bucket;
+- the payload is held to the client's `outbound_payload_cap_bytes` as well as
+  to `[messaging] max_body_bytes`, and a malformed `content-type` is
+  `invalid-payload`.
+
+This breaks this section's rule: it is not an additive change, and it was made
+deliberately. It rests on a survey of the out-of-tree component repositories
+this document names, which found one component that publishes MQTT and none
+that relies on the broker's inline answer; a component repository this
+document does not name was not and could not be surveyed. It is one cut and
+licenses no other: a further behaviour change to a `brenn:processor` interface
+is a new version of that interface.
+
 So a runtime-record bump is **withheld, not fatal, under a bundle mount**. A
 surface kind whose record names a version this host does not read is not served:
 it is left out of the served kind set, alerted once, named as `withheld` in the
@@ -135,7 +172,8 @@ has `pending` imports it.
 A third additive change in force: **`mqtt-publish-expiring`**, a new function
 in the existing `brenn:processor/mqtt` interface. It is `mqtt-publish` plus the
 MQTT 5 message-expiry interval, under the same `mqtt` grant, budgets and
-errors; a zero interval is `invalid-payload`. Unlike `calls` and `provides` it
+errors; a zero interval is `invalid-payload`. What both functions now do is
+the behaviour cut under *Contract evolution*. Unlike `calls` and `provides` it
 is not a new interface, and it took the route `ports.publish-with-urgency`
 took: a new function beside an unchanged one, with no package version bump and
 no new grant word. A component imports only the functions it calls, so a

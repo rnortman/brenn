@@ -1951,9 +1951,9 @@ pub mod calls {
     //!
     //! **Not transactional with the activation outcome.** The peer's activation
     //! runs to completion and its ok flushes its own buffer before the call
-    //! returns; a later err or trap here does not retract it, the same rule
-    //! [`crate::mqtt`] carries. A guest needing all-or-nothing semantics across
-    //! a call and its own publishes must not mix the two.
+    //! returns; a later err or trap here does not retract it. A guest needing
+    //! all-or-nothing semantics across a call and its own publishes must not
+    //! mix the two.
     //!
     //! A call is weighed against this activation's own call budget, beside
     //! `publish`: one counter over both. It bounds how many calls an activation
@@ -2090,7 +2090,7 @@ pub mod calls {
 // ── mqtt ──────────────────────────────────────────────────────────────────────
 
 pub mod mqtt {
-    //! Direct MQTT publishing.
+    //! MQTT publishing through the client's egress channel.
     //!
     //! **Requires grant:** `"mqtt"` in `[[wasm_consumer]]` grants, and an
     //! `mqtt_publish` ACL whose entries — a client and a topic filter each —
@@ -2098,37 +2098,37 @@ pub mod mqtt {
     //! grant is absent the host does not link the `brenn:processor/mqtt`
     //! interface and any import of it causes a load-time panic.
     //!
-    //! **Not transactional with the activation outcome.** A send here goes
-    //! straight to the broker and returns the broker's outcome inline; it is
-    //! NOT discarded by a later err or trap the way a buffered
-    //! [`crate::publish`] is. A guest that needs all-or-nothing semantics
-    //! across MQTT and the bus must not mix the two.
+    //! A publish is buffered like [`crate::publish`]: when the activation
+    //! returns ok it is committed with the activation's other publishes, in
+    //! call order, and when it errs or traps it is discarded with them. The
+    //! call returns the host's decision that the publish may be made; nothing
+    //! has been sent, and no broker outcome is ever returned. A client that is
+    //! not connected is not an error: the committed message waits on the
+    //! client's egress channel and is sent when the client connects, within
+    //! the window the operator sizes for that client. QoS 1 may be delivered
+    //! twice after a reconnect. A failure after commit — a broker refusal, a
+    //! packet over the broker's maximum, a message lost or dropped — is
+    //! reported to the operator, not to the component.
     //!
     //! `client` is the `[[mqtt_client]]` slug; `topic` is a concrete topic
-    //! under that client and must contain no wildcard. For QoS >= 1 the call
-    //! awaits the PUBACK for a bounded time set by the host; past it the call
-    //! fails with `broker("timed out")`, and the message may still be
-    //! delivered.
-    //!
-    //! Time stopped in a publish is not counted against the activation's
-    //! running-time limit. The host limits the total time one activation waits
-    //! on one client instead: past it, further publishes to that client in the
-    //! activation fail at once with `broker("wait budget spent")`.
+    //! under that client and must contain no wildcard.
 
     use super::Error;
     use crate::contract::mqtt::{self as raw};
 
-    /// The broker outcome of a failed publish, for a guest that classifies
-    /// before it gives up. [`publish`] flattens this into an [`Error`]; reach
+    /// Why the host refused a publish, for a guest that classifies before it
+    /// gives up. [`publish`] flattens this into an [`Error`]; reach
     /// for [`try_publish`] to keep it.
     pub use crate::contract::mqtt::MqttPublishError as PublishError;
 
-    /// Whether a later activation may retry this failure. Only a broker
-    /// disconnect / submit failure / dropped ack / timeout / spent wait budget
-    /// is transient; a denial, an absent service, a malformed address, an
+    /// Whether a later activation may retry this failure: true only for
+    /// `broker`, which no host at or after the release that buffers MQTT
+    /// publishes returns. A host before it returned `broker` for a broker
+    /// that was not connected, failed the submit or did not answer in time,
+    /// and such a publish may still have been delivered, so a retry could
+    /// deliver twice. A denial, an absent service, a malformed address, an
     /// exhausted quota and a broker-side rejection are all permanent for this
-    /// config. A transient failure may still have been delivered — a timed-out
-    /// publish can reach the broker late — so a retry can deliver twice.
+    /// config.
     pub fn is_transient(e: &PublishError) -> bool {
         matches!(e, PublishError::Broker(_))
     }
@@ -2146,7 +2146,7 @@ pub mod mqtt {
         Error::failed(format!("mqtt publish {client}/{topic}: {variant}"))
     }
 
-    /// Publish `payload` to `topic` on `client`, keeping the broker outcome.
+    /// Publish `payload` to `topic` on `client`, keeping the refusal.
     ///
     /// The whole WIT surface, for the guest that needs `content_type` or wants
     /// to classify the failure with [`is_transient`].
@@ -2176,10 +2176,11 @@ pub mod mqtt {
             .map_err(|e| mqtt_err(client, topic, e))
     }
 
-    /// [`try_publish`] with an MQTT 5 message-expiry interval: the broker
-    /// discards the message `message_expiry_s` seconds after receiving it, and
-    /// a retained message stops being retained then. Zero is refused as
-    /// `invalid-payload`.
+    /// [`try_publish`] with a lifetime: the message is kept for
+    /// `message_expiry_s` seconds from commit, and what is left of that when
+    /// it is handed to the broker is sent as the MQTT 5 message-expiry
+    /// interval. A message whose lifetime passes before it is sent is not
+    /// sent. Zero is refused as `invalid-payload`.
     ///
     /// Imports `mqtt-publish-expiring`, which a host that predates it does not
     /// provide: a component calling this does not link there.
@@ -2247,8 +2248,8 @@ pub mod mqtt {
 
     /// Serialize `value` to JSON and publish it as `application/json`.
     ///
-    /// A serialization failure is a guest bug, not a broker outcome, and maps
-    /// to `Err(ProcessingFailed("serialize: {e}"))` before anything is sent.
+    /// A serialization failure is a guest bug and maps to
+    /// `Err(ProcessingFailed("serialize: {e}"))` before anything is buffered.
     pub fn publish_json<T: serde::Serialize>(
         client: &str,
         topic: &str,

@@ -2668,6 +2668,7 @@ mod tests {
                     reply_to: Some("brenn:tool-results/sync"),
                     deliver_after: None,
                     attachments: &attachments,
+                    mqtt: None,
                 }],
             )
             .await;

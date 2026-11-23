@@ -17,16 +17,15 @@ rust_library(
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
-        "//brenn-db",
         "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging-store",
     ],
 )
 
-# 158 tests, all in-process: payload classification, session bookkeeping under
-# tokio's test runtime, egress enforcement over an in-memory sqlite, and the
-# egress reader against a broker scripted over an in-memory stream. No broker
+# 142 tests, all in-process: payload classification, session bookkeeping under
+# tokio's test runtime, and the egress reader against a broker scripted over an
+# in-memory stream. No broker
 # process is spawned here — that is `:mqtt_integration`. 0.65s locally against
 # a 60s budget, so `small` holds with room on a cold 4-vCPU runner. The count is
 # `.bazel-bin/brenn-mqtt/brenn-mqtt_test --list`'s own total, which is what to
@@ -42,7 +41,6 @@ rust_test(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True) + [
-        "//brenn-db",
         "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging-store",
@@ -84,7 +82,6 @@ rust_test(
         normal_dev = True,
     ) + [
         ":brenn-mqtt",
-        "//brenn-db",
         "//brenn-envelope",
         "//brenn-lib",
         "//brenn-messaging-store",

@@ -76,7 +76,7 @@ pub fn broker_auth() -> BrokerHarness {
 // ---------------------------------------------------------------------------
 
 /// Handle set returned by the unified spawn helpers: the service, the client
-/// slug, the session handle (for `publish_on_handle` / stop / subscription-set
+/// slug, the session handle (for the egress reader / stop / subscription-set
 /// asserts), and the receiver every inbound delivery lands on.
 pub struct SpawnedClient {
     pub svc: Arc<MqttService>,

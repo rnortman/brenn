@@ -575,9 +575,9 @@ pub(crate) fn resolve_wasm_consumers(
             }
             // The buffered `ports.publish` path serves pub/sub schemes only
             // (brenn:/ephemeral:/local:). Do NOT let mqtt:/webhook:/pwa_push:
-            // ride this path — MQTT egress uses the separate synchronous
-            // `mqtt-publish` host fn, which can surface immediate broker errors;
-            // the buffered path cannot.
+            // ride this path — MQTT egress uses the `mqtt-publish` host fn,
+            // which admits each publish against the consumer's MQTT ACL and
+            // commits it to the client's egress channel.
             let out_scheme = brenn_lib::messaging::ChannelScheme::of(&entry.address)
                 .unwrap_or_else(|| {
                     panic!(

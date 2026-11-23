@@ -380,10 +380,10 @@ pub(crate) fn warn_string_contract_surface_kinds(
 pub(crate) struct ConsumerLoadContext<'a> {
     pub components_roots: &'a [PathBuf],
     pub alert_dispatcher: &'a AlertDispatcher,
-    /// The MQTT service. A consumer holding the `mqtt` grant gets an egress
-    /// callback over it; one that does not gets no callback and no linked
-    /// interface.
-    pub mqtt_service: Arc<brenn_mqtt::MqttService>,
+    /// The bus. A consumer holding the `mqtt` grant gets an admission callback
+    /// over it; `None` is a host with no messaging, where such a consumer cannot
+    /// be loaded at all.
+    pub messenger: Option<Arc<brenn_messaging::Messenger>>,
     pub tool_registry: &'a brenn_tool_registry::ToolRegistryCell,
     /// The process's pending-call table. A consumer holding the `provides`
     /// grant answers its requests and acts for their users through a host
@@ -470,17 +470,23 @@ pub(crate) fn load_consumer(
             .with_field("wasm_slug", &consumer.slug),
         consumer.slug.clone(),
     ));
-    // Synchronous MQTT egress callback. Built iff the consumer holds the `Mqtt`
+    // MQTT admission seam over the bus. Built iff the consumer holds the `Mqtt`
     // grant — the `mqtt` interface is linked iff this is `Some`, and
     // `ProcessorComponent::load` re-asserts that invariant.
     let mqtt_publish: Option<brenn_wasm::MqttPublishFn> = if consumer
         .grants
         .contains(&brenn_lib::messaging::ComponentGrant::Mqtt)
     {
-        Some(crate::wasm_mqtt::make_wasm_mqtt_publish_fn(
+        let messenger = ctx.messenger.as_ref().unwrap_or_else(|| {
+            panic!(
+                "consumer {}: holds the `mqtt` grant on a host with no messenger",
+                consumer.slug,
+            )
+        });
+        Some(brenn_wasm_dispatch::mqtt_publisher_over(
+            messenger,
             consumer.policy.clone(),
             consumer.slug.clone(),
-            ctx.mqtt_service.clone(),
             ctx.alert_dispatcher.clone(),
         ))
     } else {
@@ -1337,7 +1343,7 @@ mod tests {
         let ctx = ConsumerLoadContext {
             components_roots: &[],
             alert_dispatcher: &alert_dispatcher,
-            mqtt_service: brenn_mqtt::MqttService::new(),
+            messenger: None,
             tool_registry: &tool_registry,
             provider_runtime: &brenn_tool_registry::ProviderRuntime::new(alert_dispatcher.clone()),
             max_payload_bytes: 1024,

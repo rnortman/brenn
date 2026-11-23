@@ -152,6 +152,7 @@ fn entry<'a>(
         reply_to: None,
         deliver_after,
         attachments,
+        mqtt: None,
     }
 }
 

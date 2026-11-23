@@ -476,66 +476,61 @@ interface alert {
 }
 
 interface mqtt {
-    /// Failure modes the guest can observe from a synchronous MQTT publish.
-    /// Distinct variants so a guest can tell a transient broker outage
-    /// (`broker`) from a permanent denial (`not-permitted`): the former MAY be
-    /// retried on a later activation, the latter never.
+    /// Failure modes the guest can observe from an MQTT publish. Every one is
+    /// the host's decision at the call; none is a broker outcome.
     variant mqtt-publish-error {
         /// Grant/ACL denied for the target — no entry of the consumer's
         /// `mqtt_publish` ACL names this client with a topic filter matching
         /// this topic (or the `mqtt` grant is absent). Permanent for this
         /// config; do not retry.
         not-permitted,
-        /// The MQTT service is not configured on this server (no `[[mqtt_client]]`
-        /// is declared, so no session exists to publish through). Permanent for
-        /// this config; do not retry. (Kept as a stable WIT variant; its reachable
-        /// meaning narrowed to the service-absent case — a validly-booted server
-        /// with a declared client always has a session, since every ACL-authorized
-        /// client is validated and registered at boot.)
+        /// Kept for the shape of the variant; never returned by a host at or
+        /// after the release that buffers MQTT publishes. A host before it
+        /// returned it when no MQTT service was configured.
         no-connector,
-        /// Address parse / wildcard / oversize failure. Diagnostic string.
+        /// The publish is malformed or too large, with a diagnostic string:
+        /// an address the host cannot parse, a wildcard in the topic, a QoS
+        /// above 2, a zero `message-expiry-s`, a malformed `content-type`, a
+        /// payload over the bus's message body cap, or a payload over the
+        /// client's outbound payload cap.
         invalid-payload(string),
-        /// Per-activation publish quota hit (shared with `ports.publish`).
+        /// A per-activation ceiling is reached: the call ceiling shared with
+        /// `ports.publish` and `calls.call`, the client's publish token
+        /// bucket, the count of publishes buffered in the activation (shared
+        /// with `ports.publish`), or their total payload bytes.
         quota-exceeded,
-        /// Broker disconnect / submit failure / ack drop / no answer in time.
-        /// Transient — MAY be retried on a later activation. The payload is a
-        /// stable coarse kind (e.g. `"not connected"` / `"publish failed"` /
-        /// `"timed out"` / `"wait budget spent"`) suitable for logging and retry
-        /// classification; it is NOT the full host-side error detail and MUST
-        /// NOT be parsed beyond that classification. After `"timed out"` the
-        /// message may still reach the broker, so a retry can deliver it twice.
+        /// Kept for the shape of the variant; never returned by a host at or
+        /// after the release that buffers MQTT publishes. A host before it
+        /// returned it for a broker that was not connected, failed the
+        /// submit or did not answer in time, as a coarse kind string.
         broker(string),
-        /// Broker accepted the connection but rejected the publish (PUBACK
-        /// reason code != success). Diagnostic string.
+        /// Kept for the shape of the variant; never returned by a host at or
+        /// after the release that buffers MQTT publishes. A host before it
+        /// returned it when the broker refused the publish.
         broker-rejected(string),
     }
 
-    /// Publish synchronously to an MQTT broker. Unlike `ports.publish`
-    /// (buffered, flushed atomically at activation end), this goes STRAIGHT to
-    /// the broker and returns the broker outcome inline — there is no
-    /// store-and-forward, no queuing, no retry.
+    /// Publish to an MQTT broker through the client's egress channel.
     ///
-    /// **Not transactional with the activation outcome.** Because the send is
-    /// immediate, a message published here has ALREADY reached the broker by the
-    /// time a later trap or err aborts the activation; it is NOT rolled back.
-    /// This is a genuine semantic difference from `ports.publish`, which
-    /// discards its whole buffer on failure. A guest needing all-or-nothing
-    /// semantics across MQTT + bus must NOT mix the two — the MQTT side effect
-    /// is not retractable. (Same immediacy as `log` / `alert`.)
+    /// Buffered like `ports.publish`: when the activation returns ok the
+    /// message is committed with the activation's other publishes, in call
+    /// order, and when it errs or traps the message is discarded with them.
+    /// The call returns the host's decision that the publish may be made;
+    /// nothing has been sent, and no broker outcome is ever returned. A
+    /// client that is not connected is not an error: the committed message
+    /// waits on the client's egress channel and is sent when the client
+    /// connects, kept until sent within the window the operator sizes for
+    /// that client, where the oldest messages are dropped first. QoS 1 may
+    /// be delivered twice after a reconnect. A failure after commit — a
+    /// broker refusal, a packet over the broker's maximum, a message lost or
+    /// dropped — is reported to the operator, not to the component.
     ///
     /// `client` is the `[[mqtt_client]]` slug (mirrors the LLM `MqttSend`
     /// tool's `<client>` address segment); `topic` is the topic under that
     /// client and MUST NOT contain wildcards. The consumer's `mqtt_publish` ACL
     /// gates which topics on which clients are reachable: an entry names a
     /// client and a topic filter, matched by the MQTT rules (`#` and a leading
-    /// `+` match no topic whose first level starts with `$`). For QoS >= 1 the call awaits the
-    /// PUBACK for a bounded time set by the host, and fails with
-    /// `broker("timed out")` past it.
-    ///
-    /// Time stopped in this call is not counted against the activation's
-    /// running-time limit. The host instead limits the total time one
-    /// activation waits on one client; past it, further publishes to that
-    /// client in the activation fail at once with `broker("wait budget spent")`.
+    /// `+` match no topic whose first level starts with `$`).
     mqtt-publish: func(
         client: string,
         topic: string,
@@ -545,13 +540,16 @@ interface mqtt {
         retain: bool,
     ) -> result<_, mqtt-publish-error>;
 
-    /// `mqtt-publish` plus the MQTT 5 message-expiry interval: the broker
-    /// discards the message `message-expiry-s` seconds after it receives it,
-    /// and a retained message stops being retained then. Same grant, budgets,
-    /// errors and synchrony as `mqtt-publish`. `message-expiry-s = 0` is
-    /// refused as `invalid-payload`. Existing components compiled without this
-    /// import keep working (additive WIT ABI — no package version bump); a
-    /// component that imports it does not link on a host that predates it.
+    /// `mqtt-publish` plus a lifetime: the message is kept for
+    /// `message-expiry-s` seconds from commit, and what is left of that when
+    /// it is handed to the broker is sent as the MQTT 5 message-expiry
+    /// interval, after which the broker discards it and a retained message
+    /// stops being retained. A message whose lifetime passes before it is
+    /// sent is not sent, and the operator is told. Same grant, budgets and
+    /// errors as `mqtt-publish`. `message-expiry-s = 0` is refused as
+    /// `invalid-payload`. Existing components compiled without this import
+    /// keep working (additive WIT ABI — no package version bump); a component
+    /// that imports it does not link on a host that predates it.
     mqtt-publish-expiring: func(
         client: string,
         topic: string,
@@ -590,8 +588,8 @@ interface calls {
     /// Call the peer wired to `port` and return its reply inline. IMMEDIATE and
     /// NOT transactional with the caller's outcome: the peer's activation
     /// runs to completion, and its ok flushes its buffer, before this returns —
-    /// a caller that later errs or traps does not retract it (the same rule as
-    /// `mqtt.mqtt-publish`). A `port` the specification does not declare traps
+    /// a caller that later errs or traps does not retract it. A `port` the
+    /// specification does not declare traps
     /// the activation, as in `ports.publish`. A reply that is not text, which
     /// only a peer built against a byte-carrying contract can give, traps the
     /// activation too; the peer has run and its buffer is flushed.

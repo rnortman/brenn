@@ -790,41 +790,30 @@ pub trait ProcessorAlerter: Send + Sync {
     fn alert(&self, severity: GuestAlertSeverity, title: &str, body: &str);
 }
 
-/// Outcome of a synchronous MQTT publish, as seen at the `brenn-wasm` API
-/// boundary.
+/// The host's decision on one guest MQTT publish, as seen at the
+/// `brenn-wasm` API boundary.
 ///
-/// Mirror of the WIT `mqtt.mqtt-publish-error` variant (plus an `Ok` arm) so the
-/// host seam ([`MqttPublisher`]) never exposes a bindgen-generated WIT
-/// type — and, more importantly, never a `brenn-lib` type. `brenn-wasm` cannot
-/// depend on `brenn-lib` (where `enforce_and_publish` / `MqttEgressError` live);
-/// the binary crate implements the seam over `enforce_and_publish` and maps
-/// its `MqttEgressError` into this enum. This is the same crate-boundary seam as
-/// `OutputAclFn` and `ProcessorAlerter`.
+/// A `brenn-wasm`-local shape so the host seam ([`MqttPublisher`]) never
+/// exposes a bindgen-generated WIT type, nor a type of the crate that owns the
+/// admission rules. Same crate-boundary seam as `OutputAclFn` and
+/// `ProcessorAlerter`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MqttPublishOutcome {
-    /// Publish reached the broker and (for QoS >= 1) was acknowledged.
-    Ok,
-    /// Grant/ACL denied for the target client. Permanent for this config.
+pub enum MqttAdmission {
+    /// The publish may be made; the host buffers it with the activation.
+    Admitted,
+    /// The consumer's publish ACL does not admit the target.
     NotPermitted,
-    /// MQTT service not configured on this server (no client referenced by any
-    /// ingress channel or ACL matcher). Mirrors the WIT `no-connector` variant.
-    /// Permanent.
-    NoConnector,
-    /// Address parse / wildcard / oversize failure. Diagnostic string.
+    /// The payload or its properties break a rule of the target client.
+    /// Diagnostic string.
     InvalidPayload(String),
-    /// Broker disconnect / submit failure / ack drop / no answer in time.
-    /// Transient. Diagnostic.
-    Broker(String),
-    /// Broker rejected the publish (PUBACK reason code != success). Diagnostic.
-    BrokerRejected(String),
 }
 
 /// The per-publish MQTT properties a guest supplies, as received over the WIT
 /// boundary.
 ///
-/// Like [`MqttPublishOutcome`], this is the `brenn-wasm`-local shape at the
-/// [`MqttPublisher`] seam; the binary crate maps it onto the egress pipeline's
-/// own properties type. `Default` is QoS 0, not retained, with no content type
+/// Like [`MqttAdmission`], this is the `brenn-wasm`-local shape at the
+/// [`MqttPublisher`] seam; the host maps it onto the bus's own publish
+/// options. `Default` is QoS 0, not retained, with no content type
 /// and no expiry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MqttPublishProps {
@@ -855,41 +844,41 @@ pub struct MqttTarget {
     pub topic: String,
 }
 
-/// Host seam performing a synchronous MQTT publish for the `mqtt` interface.
+/// Host seam deciding a guest's MQTT publish for the `mqtt` interface.
 ///
-/// `brenn-wasm` cannot depend on `brenn-lib` (where the address parser and the
-/// shared enforcement pipeline `enforce_and_publish` live); the binary crate
-/// implements this over the `MqttService`, the consumer's `AppPolicy`, and the
-/// consumer slug, mapping the pipeline's result into `MqttPublishOutcome`. Same
-/// seam as `OutputAclFn` / `ProcessorAlerter`.
+/// `brenn-wasm` cannot depend on the crates that own the address parser and the
+/// publish rules; the host implements this over the bus, the consumer's policy
+/// and the consumer slug. Same seam as `OutputAclFn` / `ProcessorAlerter`.
 ///
-/// The publish is two steps so that the host's one parser hands
-/// `do_mqtt_publish` the key it charges per client before anything is charged:
-/// [`resolve`](Self::resolve) parses, [`publish`](Self::publish) sends.
+/// Neither method performs I/O or waits. The decision is two steps so that the
+/// host's one parser hands `do_mqtt_publish` the key it charges per client
+/// before anything is charged: [`resolve`](Self::resolve) parses,
+/// [`admit`](Self::admit) decides. An admitted publish is buffered with the
+/// activation and committed to the client's egress channel with the
+/// activation's other publishes.
 ///
 /// Contract: neither method may panic on any *guest-supplied input* — bad
-/// client/topic/payload/qos must map to an `Err` from `resolve` or a
-/// `MqttPublishOutcome` variant, never a panic, because `do_mqtt_publish`
-/// invokes both without a `catch_unwind` boundary. A *host-side invariant
-/// violation* (a wiring bug in the implementation's own plumbing, not a guest
-/// input) is a different matter and SHOULD panic per the project posture — the
-/// in-tree `publish` panics via `unreachable!` if `enforce_and_publish` ever
-/// returns `BudgetExhausted` under the `SendBudget::None` it always passes.
-/// Out-of-tree hosts must likewise handle every guest input total.
+/// client/topic/payload/props must map to an `Err` from `resolve` or a refusal
+/// from `admit`, never a panic, because `do_mqtt_publish` invokes both without
+/// a `catch_unwind` boundary. A *host-side invariant violation* (a wiring bug
+/// in the implementation's own plumbing, not a guest input) SHOULD panic per
+/// the project posture. Out-of-tree hosts must likewise handle every guest
+/// input total.
 pub trait MqttPublisher: Send + Sync {
     /// Parse and validate the guest's `(client, topic)` exactly as received over
     /// the WIT boundary. No I/O and no wait. `Err` is the text of an
     /// `invalid-payload`.
     fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String>;
 
-    /// Publish `payload` to a target [`resolve`](Self::resolve) returned, and
-    /// wait for the outcome.
-    fn publish(
+    /// Whether this consumer may publish `payload_len` bytes to a target
+    /// [`resolve`](Self::resolve) returned, with `props`. No I/O, no wait,
+    /// nothing spent.
+    fn admit(
         &self,
-        target: MqttTarget,
-        payload: Vec<u8>,
-        props: MqttPublishProps,
-    ) -> MqttPublishOutcome;
+        target: &MqttTarget,
+        payload_len: usize,
+        props: &MqttPublishProps,
+    ) -> MqttAdmission;
 }
 
 /// The shared form of [`MqttPublisher`] a processor holds. Callers with no MQTT
@@ -904,7 +893,7 @@ pub type MqttPublishFn = Arc<dyn MqttPublisher>;
 /// and, more importantly, never a `brenn-lib`/`brenn-server` type (`brenn-wasm`
 /// cannot depend on either). The binary crate builds a `ToolHost` over the native
 /// `ToolRegistry` + the consumer's `AppPolicy` and maps its own `ToolError` into
-/// this enum. Same crate-boundary seam as `MqttPublishOutcome`.
+/// this enum. Same crate-boundary seam as `MqttAdmission`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCallError {
     /// Unknown tool OR ungranted tool — deliberately indistinguishable.
@@ -1138,19 +1127,6 @@ const PROCESSOR_EPOCH_TICK_MS: u64 = 100;
 
 /// Epoch deadline ticks per activation (300 × 100 ms ≈ 30 s wall).
 const PROCESSOR_EPOCH_DEADLINE_TICKS: u64 = 300;
-
-/// The total time one activation may spend stopped in `mqtt-publish` calls to
-/// one client before further publishes to that client are refused at once with
-/// `broker("wait budget spent")`.
-///
-/// Time in `mqtt-publish` is not charged to the epoch deadline, so this is what
-/// bounds how long a component holds its thread on a slow broker: a call starts
-/// only while the client's accumulated wait is under this figure, so the hold
-/// per client is under this plus one call's own bound.
-pub const PROCESSOR_MQTT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// The coarse `broker` kind of a publish refused for a spent wait budget.
-const MQTT_WAIT_BUDGET_SPENT: &str = "wait budget spent";
 
 // The floor, the rates, the caps and guest memory are constants of the host,
 // not settings. A guest cannot learn a limit at run time, so a component's
@@ -1673,6 +1649,18 @@ pub struct ProcessorPublish {
     /// flush hands them to the store. Empty for a `ports` publish and an async
     /// tool request, which carry no attachments.
     pub attachments: HeldAttachments,
+    /// `Some` for an `mqtt` publish: where it goes and how. `channel_address`
+    /// is then the client's egress channel and `port` a log label.
+    pub mqtt: Option<ProcessorMqttPublish>,
+}
+
+/// Where a buffered `mqtt` publish goes and with what MQTT properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessorMqttPublish {
+    /// The client and topic the host's parser resolved.
+    pub target: MqttTarget,
+    /// The guest's QoS, retain flag, content type and message expiry.
+    pub props: MqttPublishProps,
 }
 
 /// One buffered deferred-message control op from a guest activation.
@@ -1703,6 +1691,11 @@ pub enum ProcessorDeferredOp {
 /// activation's transactional flush). Logging only; the channel address is the
 /// resolved `brenn:tools/<tool>` request channel.
 const TOOL_REQUEST_LOG_PORT: &str = "<async-tool-request>";
+
+/// Logical port label carried on the `ProcessorPublish` of an `mqtt` publish,
+/// which names no output port. Logging only; the channel address is the
+/// client's egress channel.
+const MQTT_PUBLISH_LOG_PORT: &str = "<mqtt-publish>";
 
 /// Urgency as carried through the host buffer — mirrors the WIT `ports.urgency` enum.
 ///
@@ -1924,46 +1917,6 @@ pub enum ProcessorOutcome {
 /// out-of-tree hosts must handle every input total.
 pub type OutputAclFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
-/// One activation's wait budget for `mqtt-publish`, per resolved client.
-///
-/// Both maps are keyed by [`MqttTarget::client`], so every spelling of the
-/// guest's address that reaches one session spends that session's one budget.
-/// Each holds at most one entry per call, so at most
-/// `MAX_PUBLISH_CALLS_PER_ACTIVATION`.
-struct MqttWaitBudget {
-    /// The accumulated wait at or past which a client's publishes are refused.
-    budget: std::time::Duration,
-    /// Time spent stopped in publishes to each client.
-    waited: HashMap<String, std::time::Duration>,
-    /// Publishes to each client refused because its budget was spent. Drains
-    /// into one post-activation warn; a refused call logs nothing itself.
-    refusals: HashMap<String, u32>,
-}
-
-impl MqttWaitBudget {
-    fn new(budget: std::time::Duration) -> Self {
-        Self {
-            budget,
-            waited: HashMap::new(),
-            refusals: HashMap::new(),
-        }
-    }
-
-    /// Whether `client` has spent its budget; counts a refusal if so.
-    fn refuse(&mut self, client: &str) -> bool {
-        let spent = self.waited.get(client).copied().unwrap_or_default() >= self.budget;
-        if spent {
-            *self.refusals.entry(client.to_string()).or_insert(0) += 1;
-        }
-        spent
-    }
-
-    /// Add `elapsed` to `client`'s accumulated wait.
-    fn spend(&mut self, client: String, elapsed: std::time::Duration) {
-        *self.waited.entry(client).or_default() += elapsed;
-    }
-}
-
 /// Per-invocation store data for the `processor` world.
 struct ProcessorData {
     resource_table: ResourceTable,
@@ -2003,7 +1956,7 @@ struct ProcessorData {
     /// Output-channel ACL. Called in `do_publish` with the resolved channel
     /// address after the port→channel lookup; `false` ⇒ `NotPermitted`.
     output_acl: OutputAclFn,
-    /// Host callback for synchronous MQTT egress (via the `mqtt` WIT interface).
+    /// Host seam deciding MQTT publishes (via the `mqtt` WIT interface).
     /// `None` when the component lacks the `Mqtt` grant; the host fn is then
     /// unreachable (the interface is unlinked), so `None` is a structural
     /// backstop rather than a live path.
@@ -2060,13 +2013,9 @@ struct ProcessorData {
     /// own running time rather than to a peer's.
     activation_start: Instant,
     /// How long this activation has been stopped inside `calls.call` waiting on
-    /// a peer or inside `mqtt-publish` waiting on a broker. The epoch-deadline
-    /// callback subtracts it from elapsed wall time, so an activation is never
-    /// charged for somebody else's slowness.
+    /// a peer. The epoch-deadline callback subtracts it from elapsed wall time,
+    /// so an activation is never charged for somebody else's slowness.
     blocked: std::time::Duration,
-    /// Per-client accounting of the time this activation spent in
-    /// `mqtt-publish`, which bounds the hold that `blocked` no longer does.
-    mqtt_wait: MqttWaitBudget,
     /// How much running time of its own this activation is allowed, as the
     /// deadline it was armed with. Read by the epoch-deadline callback, which
     /// re-arms the remainder rather than the whole; a test hatch that arms a
@@ -2437,6 +2386,7 @@ impl ProcessorData {
             reply_to: None,
             deliver_after,
             attachments: held,
+            mqtt: None,
         });
         Ok(Ok(()))
     }
@@ -2689,19 +2639,19 @@ impl ProcessorData {
         )
     }
 
-    /// Synchronous MQTT publish (the `mqtt.mqtt-publish` import, and
+    /// One MQTT publish (the `mqtt.mqtt-publish` import, and
     /// `mqtt.mqtt-publish-expiring` with `message_expiry_s` set).
     ///
-    /// Unlike `do_publish` (buffered, flushed at activation end), this reaches
-    /// the broker inline and returns its outcome — no store-and-forward.
+    /// Buffered like `do_publish`: an admitted publish joins the activation's
+    /// publish buffer as an entry for the client's egress channel, committed
+    /// with the activation's other publishes on a guest ok and discarded on an
+    /// err or trap. The call returns the host's decision and never waits on a
+    /// broker.
     ///
-    /// Shares the gate's per-activation call budget with `do_publish`, so a
-    /// hostile guest cannot flood across the combined `ports.publish` +
-    /// `mqtt-publish` surface. The buffered-publish count does not apply here —
-    /// nothing is buffered.
-    ///
-    /// The time stopped in the publish is not charged to the epoch deadline; it
-    /// is spent from the resolved client's [`MqttWaitBudget`] instead.
+    /// Order: the shared call ceiling; the argument checks and the body cap;
+    /// resolving the client; the client's bucket, charged on attempt; the
+    /// host's admission; the buffered-entry ceiling and the byte aggregate.
+    /// Each refusal buffers nothing.
     fn do_mqtt_publish(
         &mut self,
         client: String,
@@ -2716,36 +2666,22 @@ impl ProcessorData {
             return Err(MqttPublishWitError::QuotaExceeded);
         }
 
-        // `client` is guest-controlled; cap + debug-escape before logging
-        // (identical treatment to the guest-controlled `port` in `do_publish`).
-        let display_client = cap_guest_for_log(&client);
-
-        // Caller-owned input validation: malformed guest input is a permanent
-        // `invalid-payload`, not a transient `broker` error — falling through
-        // would invite a guest retry loop on an unfixable bug.
-        //
-        // qos range: the WIT type is `u8` (0..=255) but only 0/1/2 are valid.
-        // Without this check an out-of-range qos reaches `publish_on_handle`,
-        // which returns `MqttError::NotConnected` → mapped to `broker(...)` (the
-        // documented MAY-retry variant) — a guest following the retry contract
-        // would loop forever on an unfixable bug. Reject it here as permanent.
+        // Malformed guest input is a permanent `invalid-payload`. The WIT qos
+        // type is `u8` but only 0/1/2 are valid.
         if props.qos > 2 {
             return Err(MqttPublishWitError::InvalidPayload(format!(
                 "invalid qos {}: must be 0, 1, or 2",
                 props.qos
             )));
         }
-        // A zero expiry interval would have the broker drop the message on
-        // receipt; it is a guest bug, refused as permanent.
+        // A zero expiry interval would have the message expire on commit; it is
+        // a guest bug, refused as permanent.
         if props.message_expiry_s == Some(0) {
             return Err(MqttPublishWitError::InvalidPayload(
                 "message-expiry-s must be at least 1".to_string(),
             ));
         }
-        // Per-message payload size cap: a hostile guest holding the `mqtt` grant
-        // must not emit arbitrary-size broker publishes. The per-activation byte
-        // budget is deliberately not applied here (nothing is buffered), but the
-        // per-message cap is load-bearing.
+        // The payload becomes a bus message body, so it takes the bus body cap.
         let max_payload_bytes = self.gate.max_body_bytes();
         if payload.len() > max_payload_bytes {
             return Err(MqttPublishWitError::InvalidPayload(format!(
@@ -2770,107 +2706,58 @@ impl ProcessorData {
             Err(reason) => return Err(MqttPublishWitError::InvalidPayload(reason)),
         };
 
-        // Per-sink token-bucket budget, keyed by the resolved client. Charged on
-        // attempt (not refunded on a broker/not-permitted outcome or a wait-budget
-        // refusal): this path synchronously reaches the broker pipeline, so a guest
-        // retry-looping on transient broker errors must burn budget or the loop is
-        // unbounded within the 512-call cap. A topic the ACL refuses on a client the
-        // component holds is such an attempt, so it spends a token too, which also
-        // bounds the denial signals one activation raises on that client. A client
-        // with no bucket entry is by construction outside the ACL — the
-        // ACL/NoConnector handling in `publish` governs; no per-sink counting for it
-        // (exactly like an unbound bus port).
+        // Per-sink token-bucket budget, keyed by the resolved client and charged
+        // on attempt: a topic the ACL refuses on a client the component holds
+        // spends a token too, which bounds the denial signals one activation
+        // raises on that client. A client with no bucket entry is by
+        // construction outside the ACL, and the admission refuses it.
         let sink_key = SinkKey::MqttClient(target.client.clone());
         if self.gate.charge_sink_on_attempt(&sink_key).is_err() {
             *self.publish_suppressed_by_sink.entry(sink_key).or_insert(0) += 1;
             return Err(MqttPublishWitError::QuotaExceeded);
         }
 
-        // The wait budget: once this activation has spent it on the client, the
-        // call is refused without reaching the broker. Counted for the
-        // post-activation warn, not logged here.
-        if self.mqtt_wait.refuse(&target.client) {
-            return Err(MqttPublishWitError::Broker(
-                MQTT_WAIT_BUDGET_SPENT.to_string(),
-            ));
-        }
-
-        // The guest is stopped on this stack for the whole publish. Credit it to
-        // `blocked` so the epoch deadline measures the activation's own running
-        // time, and spend it from the client's wait budget, which bounds the hold.
-        let resolved_client = target.client.clone();
-        let waited_from = Instant::now();
-        let outcome = publisher.publish(target, payload, props);
-        let waited = waited_from.elapsed();
-        self.blocked += waited;
-        self.mqtt_wait.spend(resolved_client, waited);
-
-        match outcome {
-            MqttPublishOutcome::Ok => Ok(()),
-            MqttPublishOutcome::NotPermitted => {
+        match publisher.admit(&target, payload.len(), &props) {
+            MqttAdmission::Admitted => {}
+            MqttAdmission::NotPermitted => {
                 // Security-relevant: an operator policy actively blocking a WASM
                 // publish. ACL denials must be logged on both the WASM and LLM
                 // publish paths; without this a deny would be invisible.
                 warn!(
                     slug = %self.slug,
-                    client = %display_client,
+                    client = %cap_guest_for_log(&client),
                     topic = %cap_guest_for_log(&topic),
-                    "wasm mqtt-publish: not-permitted — target outside the publish ACL (or mqtt grant absent)"
+                    "wasm mqtt-publish: not-permitted — target outside the publish ACL"
                 );
-                Err(MqttPublishWitError::NotPermitted)
+                return Err(MqttPublishWitError::NotPermitted);
             }
-            MqttPublishOutcome::NoConnector => {
-                // The MQTT service is absent (no `[[mqtt_client]]` declared on this
-                // server), so the bootstrap closure's service-`None` short-circuit
-                // returned this outcome (it logs its own distinct `warn!`). A
-                // per-client resolution miss can no longer occur: every ACL-allowed
-                // client is validated and a session registered at boot, so on a
-                // validly-booted server with a declared client the publish always
-                // resolves a session. Log a server-side trace so an on-call engineer
-                // can diagnose the service-absent config. `info!` rather than
-                // `warn!`: it is a config gap, not a security-relevant policy denial
-                // like `not-permitted`.
-                info!(
-                    slug = %self.slug,
-                    client = %display_client,
-                    "wasm mqtt-publish: no-connector — MQTT service not configured on this server"
-                );
-                Err(MqttPublishWitError::NoConnector)
-            }
-            MqttPublishOutcome::InvalidPayload(reason) => {
-                Err(MqttPublishWitError::InvalidPayload(reason))
-            }
-            MqttPublishOutcome::Broker(reason) => {
-                // A broker connectivity failure (disconnect / submit / ack drop) on
-                // the primary WASM egress path. The guest sees the typed `broker`
-                // error, but a guest may silently retry or swallow it — without a
-                // server-side signal a persistent broker outage affecting WASM
-                // components would be invisible in Brenn logs (posture: real
-                // observability; errhandling review). `warn!` with the consumer slug
-                // + the capped/escaped reason. (The LLM path's broker-error logging
-                // is a separate pre-existing gap, not addressed here.)
-                warn!(
-                    slug = %self.slug,
-                    client = %display_client,
-                    reason = %sanitize_untrusted_str(&reason, PROCESSOR_MAX_PORT_NAME_LOG_BYTES),
-                    "wasm mqtt-publish: broker error"
-                );
-                Err(MqttPublishWitError::Broker(reason))
-            }
-            MqttPublishOutcome::BrokerRejected(reason) => {
-                // The broker accepted the connection but rejected the publish
-                // (PUBACK/PUBCOMP reason code != success). Same observability
-                // rationale as the `Broker` arm — surface a server-side signal so a
-                // persistent rejection (e.g. broker-side ACL) is diagnosable.
-                warn!(
-                    slug = %self.slug,
-                    client = %display_client,
-                    reason = %sanitize_untrusted_str(&reason, PROCESSOR_MAX_PORT_NAME_LOG_BYTES),
-                    "wasm mqtt-publish: broker rejected publish"
-                );
-                Err(MqttPublishWitError::BrokerRejected(reason))
+            MqttAdmission::InvalidPayload(reason) => {
+                return Err(MqttPublishWitError::InvalidPayload(reason));
             }
         }
+
+        // MQTT entries ride the entry ceiling and the byte aggregate with the
+        // port publishes; buffered async tool requests travel as the addend.
+        if self
+            .gate
+            .admit_buffered(payload.len(), self.tool_request_buffer.len())
+            .is_err()
+        {
+            return Err(MqttPublishWitError::QuotaExceeded);
+        }
+
+        let body = MessageBody::carrying(props.content_type.as_deref(), &payload);
+        self.publish_buffer.push(ProcessorPublish {
+            port: MQTT_PUBLISH_LOG_PORT.to_string(),
+            channel_address: brenn_envelope::addressing::mqtt_egress_address(&target.client),
+            body,
+            urgency: ProcessorUrgency::Normal,
+            reply_to: None,
+            deliver_after: None,
+            attachments: HeldAttachments::none(),
+            mqtt: Some(ProcessorMqttPublish { target, props }),
+        });
+        Ok(())
     }
 }
 
@@ -3532,6 +3419,7 @@ impl ProcessorData {
                 reply_to: Some(request.reply_to),
                 deliver_after: None,
                 attachments,
+                mqtt: None,
             });
         }
         publishes
@@ -4504,8 +4392,8 @@ pub struct ProcessorLoadSpec<'a> {
     /// address after the port→channel lookup. Required — no `Option`; pass an
     /// allow-all closure (`Arc::new(|_| true)`) for callers with no policy.
     pub output_acl: OutputAclFn,
-    /// Host callback for synchronous MQTT egress (the `mqtt` interface). `Some`
-    /// iff the component has the `Mqtt` grant; `None` = no MQTT egress linked.
+    /// Host seam deciding MQTT publishes (the `mqtt` interface). `Some` iff
+    /// the component has the `Mqtt` grant; `None` = no MQTT egress linked.
     /// The caller (bootstrap) enforces the invariant; the host fn is unreachable
     /// when the `Mqtt` capability is not linked, so `None` is a structural
     /// backstop.
@@ -5088,7 +4976,6 @@ impl ProcessorComponent {
                 call_chain: Arc::new(call_chain),
                 activation_start: Instant::now(),
                 blocked: std::time::Duration::ZERO,
-                mqtt_wait: MqttWaitBudget::new(PROCESSOR_MQTT_WAIT_BUDGET),
                 // Overwritten by `arm_epoch` below, which is the only thing that
                 // sets this field and the deadline it must agree with.
                 epoch_budget: std::time::Duration::ZERO,
@@ -5117,12 +5004,10 @@ impl ProcessorComponent {
     /// wall-clock ticks against a free-running engine epoch, so a caller stopped
     /// inside `calls.call` would otherwise spend its budget on a peer's pacing
     /// delay, queue position and run — recursively down a chain, with the
-    /// outermost caller trapping for somebody else's work — and a component
-    /// stopped inside `mqtt-publish` would trap for a slow broker. When the
-    /// deadline fires, give back whatever the activation spent blocked in either
-    /// call and let it run on; a chain's total wall time is still bounded by
-    /// depth × the deadline, and the document's acyclicity bounds depth. The
-    /// MQTT wait has its own bound, the per-client wait budget.
+    /// outermost caller trapping for somebody else's work. When the deadline
+    /// fires, give back whatever the activation spent blocked in a call and let
+    /// it run on; a chain's total wall time is still bounded by depth × the
+    /// deadline, and the document's acyclicity bounds depth.
     fn arm_epoch(store: &mut Store<ProcessorData>, ticks: u64) {
         store.set_epoch_deadline(ticks);
         store.data_mut().epoch_budget =
@@ -5220,37 +5105,6 @@ impl ProcessorComponent {
         epoch_deadline: u64,
         fuel: u64,
     ) -> ProcessorOutcome {
-        self.handle_with_overrides(activation, epoch_deadline, fuel, |_| {})
-    }
-
-    /// [`handle_with_limits`](Self::handle_with_limits) with an overridden
-    /// per-client `mqtt-publish` wait budget — test use only.
-    ///
-    /// Lets a test drive the accumulated wait bound in milliseconds rather than
-    /// the production [`PROCESSOR_MQTT_WAIT_BUDGET`].
-    #[doc(hidden)]
-    pub fn handle_with_mqtt_wait_budget(
-        &self,
-        activation: HostActivation,
-        epoch_deadline: u64,
-        fuel: u64,
-        budget: std::time::Duration,
-    ) -> ProcessorOutcome {
-        self.handle_with_overrides(activation, epoch_deadline, fuel, |data| {
-            data.mqtt_wait.budget = budget;
-        })
-    }
-
-    /// The store prologue of the `handle_with_*` test hatches: builds the store
-    /// with `fuel`, lets `configure` overwrite fields of its data, arms the epoch
-    /// at `epoch_deadline` and invokes.
-    fn handle_with_overrides(
-        &self,
-        activation: HostActivation,
-        epoch_deadline: u64,
-        fuel: u64,
-        configure: impl FnOnce(&mut ProcessorData),
-    ) -> ProcessorOutcome {
         // The fuel is the override; still computes the activation-derived input
         // grant so multi-envelope budget tests driven through this path see a
         // real per-sink budget.
@@ -5258,7 +5112,6 @@ impl ProcessorComponent {
         let mut carry = self.lock_carry_for_activation();
         let budgets = self.seed_publish_budgets(&carry, grant_input_mt);
         let mut store = self.make_store(fuel, budgets, vec![self.slug.to_string()]);
-        configure(store.data_mut());
         // The override is the whole budget for this activation, so the deadline
         // and the budget the callback re-arms against move together.
         Self::arm_epoch(&mut store, epoch_deadline);
@@ -5416,17 +5269,6 @@ impl ProcessorComponent {
                     slug = %data.slug,
                     suppressed = ?data.publish_suppressed_by_sink,
                     "wasm publish budget exceeded — publishes dropped"
-                );
-            }
-
-            // `mqtt-publish` calls refused for a spent wait budget, per client:
-            // one line per activation. The keys are client slugs the host's parser
-            // returned, not guest text.
-            if !data.mqtt_wait.refusals.is_empty() {
-                warn!(
-                    slug = %data.slug,
-                    refused = ?data.mqtt_wait.refusals,
-                    "wasm mqtt-publish: wait budget spent — publishes refused"
                 );
             }
 
@@ -5815,7 +5657,6 @@ mod processor_store_host_tests {
             call_chain: Arc::new(Vec::new()),
             activation_start: Instant::now(),
             blocked: std::time::Duration::ZERO,
-            mqtt_wait: MqttWaitBudget::new(PROCESSOR_MQTT_WAIT_BUDGET),
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
@@ -5879,7 +5720,6 @@ mod processor_store_host_tests {
             call_chain: Arc::new(Vec::new()),
             activation_start: Instant::now(),
             blocked: std::time::Duration::ZERO,
-            mqtt_wait: MqttWaitBudget::new(PROCESSOR_MQTT_WAIT_BUDGET),
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
@@ -6492,44 +6332,15 @@ mod processor_store_host_tests {
 
     // --- do_mqtt_publish host-fn tests ---
 
-    /// An [`MqttPublisher`] whose `resolve` returns the guest's `(client, topic)`
-    /// unchanged and whose `publish` hands both back to a closure.
-    struct PassThroughMqtt<F>(F);
+    /// What a [`ScriptedMqtt`] saw in one `admit` call.
+    type SeenAdmit = (MqttTarget, usize, MqttPublishProps);
 
-    impl<F> MqttPublisher for PassThroughMqtt<F>
-    where
-        F: Fn(String, String, Vec<u8>, MqttPublishProps) -> MqttPublishOutcome + Send + Sync,
-    {
-        fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String> {
-            resolve_unchanged(client, topic)
-        }
-
-        fn publish(
-            &self,
-            target: MqttTarget,
-            payload: Vec<u8>,
-            props: MqttPublishProps,
-        ) -> MqttPublishOutcome {
-            (self.0)(target.client, target.topic, payload, props)
-        }
-    }
-
-    fn passthrough_mqtt(
-        publish: impl Fn(String, String, Vec<u8>, MqttPublishProps) -> MqttPublishOutcome
-        + Send
-        + Sync
-        + 'static,
-    ) -> MqttPublishFn {
-        Arc::new(PassThroughMqtt(publish))
-    }
-
-    /// An [`MqttPublisher`] with a caller-supplied `resolve` and a `publish`
-    /// that sleeps `sleep`, counts the call and returns `outcome`.
+    /// An [`MqttPublisher`] with a caller-supplied `resolve` and an `admit` that
+    /// records its arguments and returns `admission`.
     struct ScriptedMqtt {
         resolve: fn(&str, &str) -> Result<MqttTarget, String>,
-        sleep: std::time::Duration,
-        outcome: MqttPublishOutcome,
-        published: Arc<std::sync::atomic::AtomicUsize>,
+        admission: MqttAdmission,
+        seen: Arc<Mutex<Vec<SeenAdmit>>>,
     }
 
     impl MqttPublisher for ScriptedMqtt {
@@ -6537,34 +6348,33 @@ mod processor_store_host_tests {
             (self.resolve)(client, topic)
         }
 
-        fn publish(
+        fn admit(
             &self,
-            _target: MqttTarget,
-            _payload: Vec<u8>,
-            _props: MqttPublishProps,
-        ) -> MqttPublishOutcome {
-            std::thread::sleep(self.sleep);
-            self.published
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.outcome.clone()
+            target: &MqttTarget,
+            payload_len: usize,
+            props: &MqttPublishProps,
+        ) -> MqttAdmission {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((target.clone(), payload_len, props.clone()));
+            self.admission.clone()
         }
     }
 
-    /// Install a [`ScriptedMqtt`] on `data`; returns its publish counter.
+    /// Install a [`ScriptedMqtt`] on `data`; returns what its `admit` sees.
     fn script_mqtt(
         data: &mut ProcessorData,
         resolve: fn(&str, &str) -> Result<MqttTarget, String>,
-        sleep: std::time::Duration,
-        outcome: MqttPublishOutcome,
-    ) -> Arc<std::sync::atomic::AtomicUsize> {
-        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        admission: MqttAdmission,
+    ) -> Arc<Mutex<Vec<SeenAdmit>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
         data.mqtt_publish = Some(Arc::new(ScriptedMqtt {
             resolve,
-            sleep,
-            outcome,
-            published: Arc::clone(&published),
+            admission,
+            seen: Arc::clone(&seen),
         }));
-        published
+        seen
     }
 
     /// The guest's `(client, topic)` as the target, unchanged.
@@ -6591,116 +6401,261 @@ mod processor_store_host_tests {
         }
     }
 
-    /// The wait is credited to `blocked`, so a slow broker never costs the
-    /// component its epoch budget, and spent from the resolved client's wait
-    /// budget, which bounds the hold instead.
-    #[test]
-    fn the_wait_for_a_slow_broker_is_credited_to_blocked_and_spent_from_the_budget() {
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        let published = script_mqtt(
-            &mut data,
-            resolve_unchanged,
-            std::time::Duration::from_millis(60),
-            MqttPublishOutcome::Ok,
-        );
-        data.do_mqtt_publish("home".into(), "t".into(), vec![1], mqtt_qos1())
-            .expect("ok");
-        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let floor = std::time::Duration::from_millis(60);
-        assert!(data.blocked >= floor, "blocked {:?}", data.blocked);
-        assert!(
-            data.mqtt_wait.waited["home"] >= floor,
-            "waited {:?}",
-            data.mqtt_wait.waited
-        );
+    /// The entries `data` has buffered for an `mqtt` publish.
+    fn mqtt_entries(data: &ProcessorData) -> Vec<&ProcessorPublish> {
+        data.publish_buffer
+            .iter()
+            .filter(|p| p.mqtt.is_some())
+            .collect()
     }
 
-    /// With the client's budget spent the call is refused at once with
-    /// `broker("wait budget spent")`, never reaches `publish`, and has been
-    /// charged a call and a token; another client's budget is untouched.
+    /// Build a `ProcessorData` whose MQTT seam resolves addresses unchanged and
+    /// answers every admission with `admission`. Body cap 1024, no buckets.
+    fn make_mqtt_data(admission: MqttAdmission) -> ProcessorData {
+        let mut data = ProcessorData {
+            resource_table: ResourceTable::new(),
+            limits: StoreLimitsBuilder::new().build(),
+            kv_store: None,
+            output_ports: Arc::new(HashMap::new()),
+            declared_out_ports: Arc::new(std::collections::BTreeSet::new()),
+            config: Arc::new(HashMap::new()),
+            slug: Arc::from("test-slug"),
+            gate: ActivationGate::new(1024, HashMap::new()),
+            publish_suppressed_by_sink: HashMap::new(),
+            text_only_refusals: HashMap::new(),
+            publish_buffer: Vec::new(),
+            alerter: Arc::new(NoopAlerter),
+            output_acl: Arc::new(|_| true),
+            mqtt_publish: None,
+            log_call_count: 0,
+            alert_call_count: 0,
+            tool_host: None,
+            provides_host: None,
+            tool_request_buffer: Vec::new(),
+            tool_call_count: 0,
+            complete_call_count: 0,
+            deferred_op_buffer: Vec::new(),
+            deferred_index_bounds: HashMap::new(),
+            sync_caller: None,
+            declared_call_ports: Arc::new(std::collections::BTreeSet::new()),
+            calls: Arc::new(HashMap::new()),
+            call_chain: Arc::new(Vec::new()),
+            activation_start: Instant::now(),
+            blocked: std::time::Duration::ZERO,
+            epoch_budget: std::time::Duration::from_millis(
+                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
+            ),
+            blob: blobs::ActivationBlobs::new(None, false),
+        };
+        script_mqtt(&mut data, resolve_unchanged, admission);
+        data
+    }
+
+    /// An admitted `mqtt-publish` buffers one entry for the client's egress
+    /// channel carrying the target, the guest's properties and the payload as
+    /// the body; nothing waits, so nothing is credited to `blocked`.
     #[test]
-    fn a_spent_wait_budget_refuses_without_publishing_and_still_charges() {
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        let published = script_mqtt(
+    fn an_admitted_publish_buffers_one_entry_for_the_egress_channel() {
+        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        let seen = script_mqtt(&mut data, resolve_unchanged, MqttAdmission::Admitted);
+        let props = MqttPublishProps {
+            content_type: Some("application/json".into()),
+            qos: 2,
+            retain: true,
+            message_expiry_s: None,
+        };
+        data.do_mqtt_publish(
+            "home".into(),
+            "sensors/temp".into(),
+            br#"{"c":21}"#.to_vec(),
+            props.clone(),
+        )
+        .expect("admitted");
+
+        let target = MqttTarget {
+            client: "home".into(),
+            topic: "sensors/temp".into(),
+        };
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(target.clone(), 8, props.clone())],
+            "the admission sees the resolved target, the length and the props"
+        );
+        assert_eq!(data.publish_buffer.len(), 1);
+        let entry = &data.publish_buffer[0];
+        assert_eq!(entry.port, MQTT_PUBLISH_LOG_PORT);
+        assert_eq!(
+            entry.channel_address,
+            brenn_envelope::addressing::mqtt_egress_address("home")
+        );
+        assert_eq!(entry.body.as_bytes(), br#"{"c":21}"#);
+        assert_eq!(entry.body.content_type(), Some("application/json"));
+        assert_eq!(entry.urgency, ProcessorUrgency::Normal);
+        assert_eq!(entry.reply_to, None);
+        assert_eq!(entry.deliver_after, None);
+        assert_eq!(
+            entry.mqtt,
+            Some(ProcessorMqttPublish {
+                target,
+                props: props.clone()
+            })
+        );
+        assert_eq!(data.gate.entries(), 1);
+        assert_eq!(data.gate.bytes(), 8);
+        assert_eq!(data.blocked, std::time::Duration::ZERO);
+    }
+
+    /// `mqtt-publish-expiring` buffers its interval in the entry's props, and a
+    /// payload its content type cannot hold is carried as octet-stream.
+    #[test]
+    fn an_expiring_publish_carries_its_interval() {
+        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        data.do_mqtt_publish(
+            "home".into(),
+            "t".into(),
+            vec![0xff, 0xfe],
+            MqttPublishProps {
+                content_type: Some("text/plain".into()),
+                qos: 1,
+                retain: false,
+                message_expiry_s: Some(90),
+            },
+        )
+        .expect("admitted");
+        let entry = &data.publish_buffer[0];
+        let mqtt = entry.mqtt.as_ref().expect("an mqtt entry");
+        assert_eq!(mqtt.props.message_expiry_s, Some(90));
+        assert_eq!(
+            mqtt.props.content_type.as_deref(),
+            Some("text/plain"),
+            "the MQTT content type is the guest's, whatever the body's"
+        );
+        assert_eq!(entry.body.as_bytes(), &[0xff, 0xfe]);
+        assert!(!entry.body.is_text());
+    }
+
+    /// MQTT entries and port publishes share one buffer in call order.
+    #[test]
+    fn mqtt_entries_and_port_publishes_keep_call_order() {
+        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        bind_ports(
             &mut data,
-            resolve_unchanged,
-            std::time::Duration::ZERO,
-            MqttPublishOutcome::Ok,
+            HashMap::from([("out".to_string(), test_out_spec("brenn:out"))]),
         );
         data.gate = ActivationGate::new(
             1024,
-            HashMap::from([
-                (SinkKey::MqttClient("home".to_string()), 5000u64),
-                (SinkKey::MqttClient("office".to_string()), 5000u64),
-            ]),
+            HashMap::from([(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT)]),
         );
-        data.mqtt_wait
-            .waited
-            .insert("home".to_string(), data.mqtt_wait.budget);
+        data.do_mqtt_publish("home".into(), "a".into(), b"1".to_vec(), mqtt_qos1())
+            .expect("mqtt 1");
+        data.do_publish_declared("out".to_string(), "2".to_string(), None, None)
+            .expect("port");
+        data.do_mqtt_publish("office".into(), "b".into(), b"3".to_vec(), mqtt_qos1())
+            .expect("mqtt 2");
+        let order: Vec<(&str, &[u8])> = data
+            .publish_buffer
+            .iter()
+            .map(|p| (p.channel_address.as_str(), p.body.as_bytes()))
+            .collect();
+        let home = brenn_envelope::addressing::mqtt_egress_address("home");
+        let office = brenn_envelope::addressing::mqtt_egress_address("office");
+        assert_eq!(
+            order,
+            vec![
+                (home.as_str(), &b"1"[..]),
+                ("brenn:out", &b"2"[..]),
+                (office.as_str(), &b"3"[..]),
+            ]
+        );
+        assert_eq!(data.take_ok_publishes().len(), 3);
+    }
 
-        match data.do_mqtt_publish("home".into(), "t".into(), vec![1], mqtt_qos1()) {
-            Err(MqttPublishWitError::Broker(kind)) => assert_eq!(kind, MQTT_WAIT_BUDGET_SPENT),
-            other => panic!("expected broker(wait budget spent), got {other:?}"),
+    /// The admission's refusals reach the guest as their variants, buffer
+    /// nothing, and have spent the client's token.
+    #[traced_test]
+    #[test]
+    fn admission_refusals_buffer_nothing_and_still_spend_a_token() {
+        let mut np = make_mqtt_data(MqttAdmission::NotPermitted);
+        np.gate = ActivationGate::new(
+            1024,
+            HashMap::from([(SinkKey::MqttClient("blocked-client".to_string()), 5000u64)]),
+        );
+        assert!(matches!(
+            np.do_mqtt_publish("blocked-client".into(), "t".into(), vec![], mqtt_qos1()),
+            Err(MqttPublishWitError::NotPermitted)
+        ));
+        assert!(np.publish_buffer.is_empty());
+        assert_eq!(np.gate.entries(), 0);
+        assert_eq!(
+            np.gate.sinks()[&SinkKey::MqttClient("blocked-client".to_string())],
+            4000,
+            "the denied call spent its token"
+        );
+        assert!(logs_contain("not-permitted"));
+        assert!(logs_contain("test-slug"));
+        assert!(logs_contain("blocked-client"));
+
+        let mut ip = make_mqtt_data(MqttAdmission::InvalidPayload("bad content type".into()));
+        match ip.do_mqtt_publish("home".into(), "t".into(), vec![1], mqtt_qos1()) {
+            Err(MqttPublishWitError::InvalidPayload(s)) => assert_eq!(s, "bad content type"),
+            other => panic!("expected invalid-payload, got {other:?}"),
         }
-        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(data.gate.calls(), 1, "the refused call was charged a call");
-        assert_eq!(data.mqtt_wait.refusals["home"], 1);
+        assert!(ip.publish_buffer.is_empty());
+        assert_eq!(ip.gate.entries(), 0);
+        assert_eq!(ip.gate.bytes(), 0);
+    }
 
-        // Four tokens left on `home`: four more refusals spend them, and the
-        // next call meets the empty bucket.
-        for _ in 0..4 {
+    /// The client's bucket is charged on attempt: a refused admission spends a
+    /// token, and the empty bucket answers `quota-exceeded` before the
+    /// admission runs.
+    #[test]
+    fn the_client_bucket_is_charged_on_attempt() {
+        let mut data = make_mqtt_data(MqttAdmission::NotPermitted);
+        data.gate = ActivationGate::new(
+            1024,
+            HashMap::from([(SinkKey::MqttClient("home".to_string()), 2000u64)]),
+        );
+        let seen = script_mqtt(&mut data, resolve_unchanged, MqttAdmission::NotPermitted);
+        for _ in 0..2 {
             assert!(matches!(
-                data.do_mqtt_publish("home".into(), "t".into(), vec![1], mqtt_qos1()),
-                Err(MqttPublishWitError::Broker(_))
+                data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+                Err(MqttPublishWitError::NotPermitted)
             ));
         }
         assert!(matches!(
-            data.do_mqtt_publish("home".into(), "t".into(), vec![1], mqtt_qos1()),
+            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
-
-        // `office` has its own budget.
-        data.do_mqtt_publish("office".into(), "t".into(), vec![1], mqtt_qos1())
-            .expect("another client's budget is independent");
-        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the empty bucket answers first"
+        );
+        assert_eq!(
+            data.publish_suppressed_by_sink
+                .get(&SinkKey::MqttClient("home".to_string())),
+            Some(&1)
+        );
     }
 
-    /// Spellings that resolve to one client share its one wait budget and its
-    /// one token bucket.
+    /// A client with no bucket entry is not per-sink metered; the admission
+    /// governs it.
     #[test]
-    fn spellings_of_one_client_share_its_wait_budget_and_token_bucket() {
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        let published = script_mqtt(
-            &mut data,
-            resolve_all_to_home,
-            std::time::Duration::from_millis(20),
-            MqttPublishOutcome::Ok,
-        );
-        data.mqtt_wait.budget = std::time::Duration::from_millis(10);
-        data.do_mqtt_publish("home:a".into(), "b".into(), vec![1], mqtt_qos1())
-            .expect("the first call runs");
-        assert!(
-            matches!(
-                data.do_mqtt_publish("home:c".into(), "d".into(), vec![1], mqtt_qos1()),
-                Err(MqttPublishWitError::Broker(ref kind)) if kind == MQTT_WAIT_BUDGET_SPENT
-            ),
-            "a second spelling of `home` finds its budget spent"
-        );
-        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            data.mqtt_wait.waited.keys().collect::<Vec<_>>(),
-            vec!["home"]
-        );
+    fn a_client_with_no_bucket_is_unmetered() {
+        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        for _ in 0..50 {
+            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1())
+                .expect("no per-sink limit when the client has no bucket");
+        }
+        assert!(data.publish_suppressed_by_sink.is_empty());
+        assert_eq!(mqtt_entries(&data).len(), 50);
+    }
 
-        // One token on `home`'s bucket: spent under one spelling, the next
-        // spelling meets the empty bucket.
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        script_mqtt(
-            &mut data,
-            resolve_all_to_home,
-            std::time::Duration::ZERO,
-            MqttPublishOutcome::Ok,
-        );
+    /// Spellings that resolve to one client share its one token bucket.
+    #[test]
+    fn spellings_of_one_client_share_its_token_bucket() {
+        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        script_mqtt(&mut data, resolve_all_to_home, MqttAdmission::Admitted);
         data.gate = ActivationGate::new(
             1024,
             HashMap::from([(SinkKey::MqttClient("home".to_string()), 1000u64)]),
@@ -6719,19 +6674,14 @@ mod processor_store_host_tests {
     }
 
     /// An address `resolve` refuses is `invalid-payload` with its text, never
-    /// reaches `publish`, and costs no token.
+    /// reaches the admission, and costs no token.
     #[test]
     fn an_unresolvable_address_is_invalid_payload_and_costs_no_token() {
         fn refuse(_client: &str, _topic: &str) -> Result<MqttTarget, String> {
             Err("bad address".to_string())
         }
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        let published = script_mqtt(
-            &mut data,
-            refuse,
-            std::time::Duration::ZERO,
-            MqttPublishOutcome::Ok,
-        );
+        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        let seen = script_mqtt(&mut data, refuse, MqttAdmission::Admitted);
         data.gate = ActivationGate::new(
             1024,
             HashMap::from([(SinkKey::MqttClient("home".to_string()), 1000u64)]),
@@ -6740,404 +6690,56 @@ mod processor_store_host_tests {
             Err(MqttPublishWitError::InvalidPayload(text)) => assert_eq!(text, "bad address"),
             other => panic!("expected invalid-payload, got {other:?}"),
         }
-        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(data.publish_buffer.is_empty());
         assert_eq!(data.gate.calls(), 1, "it still costs a call");
-
-        // The bucket's one token is still there.
-        data.mqtt_publish = Some(passthrough_mqtt(|_c, _t, _p, _props| {
-            MqttPublishOutcome::Ok
-        }));
-        data.do_mqtt_publish("home".into(), "t".into(), vec![1], mqtt_qos1())
-            .expect("the token was not spent by the refused address");
-        assert!(matches!(
-            data.do_mqtt_publish("home".into(), "t".into(), vec![1], mqtt_qos1()),
-            Err(MqttPublishWitError::QuotaExceeded)
-        ));
-    }
-
-    /// Build a `ProcessorData` whose MQTT-publish callback returns `outcome`.
-    fn make_mqtt_data(outcome: MqttPublishOutcome) -> ProcessorData {
-        let cb: MqttPublishFn =
-            passthrough_mqtt(move |_client, _topic, _payload, _props| outcome.clone());
-        ProcessorData {
-            resource_table: ResourceTable::new(),
-            limits: StoreLimitsBuilder::new().build(),
-            kv_store: None,
-            output_ports: Arc::new(HashMap::new()),
-            declared_out_ports: Arc::new(std::collections::BTreeSet::new()),
-            config: Arc::new(HashMap::new()),
-            slug: Arc::from("test-slug"),
-            gate: ActivationGate::new(1024, HashMap::new()),
-            publish_suppressed_by_sink: HashMap::new(),
-            text_only_refusals: HashMap::new(),
-            publish_buffer: Vec::new(),
-            alerter: Arc::new(NoopAlerter),
-            output_acl: Arc::new(|_| true),
-            mqtt_publish: Some(cb),
-            log_call_count: 0,
-            alert_call_count: 0,
-            tool_host: None,
-            provides_host: None,
-            tool_request_buffer: Vec::new(),
-            tool_call_count: 0,
-            complete_call_count: 0,
-            deferred_op_buffer: Vec::new(),
-            deferred_index_bounds: HashMap::new(),
-            sync_caller: None,
-            declared_call_ports: Arc::new(std::collections::BTreeSet::new()),
-            calls: Arc::new(HashMap::new()),
-            call_chain: Arc::new(Vec::new()),
-            activation_start: Instant::now(),
-            blocked: std::time::Duration::ZERO,
-            mqtt_wait: MqttWaitBudget::new(PROCESSOR_MQTT_WAIT_BUDGET),
-            epoch_budget: std::time::Duration::from_millis(
-                PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
-            ),
-            blob: blobs::ActivationBlobs::new(None, false),
-        }
-    }
-
-    /// The callback's outcome is mapped 1:1 onto the WIT `mqtt-publish-error`
-    /// variants (and `Ok`). Each arm of the seam enum reaches the right WIT arm.
-    #[test]
-    fn do_mqtt_publish_maps_each_outcome() {
-        // Ok → Ok(()).
-        let mut ok = make_mqtt_data(MqttPublishOutcome::Ok);
-        ok.do_mqtt_publish(
-            "home".into(),
-            "t".into(),
-            vec![1],
-            MqttPublishProps::default(),
-        )
-        .expect("Ok outcome must map to Ok(())");
-        assert_eq!(ok.gate.calls(), 1, "a call consumes the shared budget");
-
-        // NotPermitted → not-permitted.
-        let mut np = make_mqtt_data(MqttPublishOutcome::NotPermitted);
-        assert!(
-            matches!(
-                np.do_mqtt_publish(
-                    "home".into(),
-                    "t".into(),
-                    vec![],
-                    MqttPublishProps::default()
-                ),
-                Err(MqttPublishWitError::NotPermitted)
-            ),
-            "NotPermitted must map to not-permitted"
-        );
-
-        // NoConnector → no-connector.
-        let mut nc = make_mqtt_data(MqttPublishOutcome::NoConnector);
-        assert!(matches!(
-            nc.do_mqtt_publish(
-                "home".into(),
-                "t".into(),
-                vec![],
-                MqttPublishProps::default()
-            ),
-            Err(MqttPublishWitError::NoConnector)
-        ));
-
-        // InvalidPayload(reason) → invalid-payload(reason), preserving the string.
-        let mut ip = make_mqtt_data(MqttPublishOutcome::InvalidPayload("bad topic".into()));
-        match ip.do_mqtt_publish(
-            "home".into(),
-            "t#".into(),
-            vec![],
-            MqttPublishProps::default(),
-        ) {
-            Err(MqttPublishWitError::InvalidPayload(s)) => assert_eq!(s, "bad topic"),
-            other => panic!("expected invalid-payload, got {other:?}"),
-        }
-
-        // Broker(reason) → broker(reason).
-        let mut br = make_mqtt_data(MqttPublishOutcome::Broker("disconnected".into()));
-        match br.do_mqtt_publish(
-            "home".into(),
-            "t".into(),
-            vec![],
-            MqttPublishProps {
-                qos: 1,
-                ..Default::default()
-            },
-        ) {
-            Err(MqttPublishWitError::Broker(s)) => assert_eq!(s, "disconnected"),
-            other => panic!("expected broker, got {other:?}"),
-        }
-
-        // BrokerRejected(reason) → broker-rejected(reason).
-        let mut rj = make_mqtt_data(MqttPublishOutcome::BrokerRejected("not authorized".into()));
-        match rj.do_mqtt_publish(
-            "home".into(),
-            "t".into(),
-            vec![],
-            MqttPublishProps {
-                qos: 1,
-                ..Default::default()
-            },
-        ) {
-            Err(MqttPublishWitError::BrokerRejected(s)) => assert_eq!(s, "not authorized"),
-            other => panic!("expected broker-rejected, got {other:?}"),
-        }
-    }
-
-    /// The callback receives the guest-supplied arguments verbatim (client,
-    /// topic, payload and every publish property) — the host fn forwards, it does
-    /// not reinterpret.
-    #[test]
-    fn do_mqtt_publish_forwards_guest_args() {
-        type SeenArgs = (String, String, Vec<u8>, MqttPublishProps);
-        let seen: Arc<Mutex<Option<SeenArgs>>> = Arc::new(Mutex::new(None));
-        let seen_cb = Arc::clone(&seen);
-        let cb: MqttPublishFn = passthrough_mqtt(move |client, topic, payload, props| {
-            *seen_cb.lock().unwrap() = Some((client, topic, payload, props));
-            MqttPublishOutcome::Ok
-        });
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        data.mqtt_publish = Some(cb);
-
-        let props = MqttPublishProps {
-            content_type: Some("application/json".into()),
-            qos: 2,
-            retain: true,
-            message_expiry_s: Some(90),
-        };
-        data.do_mqtt_publish(
-            "home".into(),
-            "sensors/temp".into(),
-            vec![9, 8, 7],
-            props.clone(),
-        )
-        .expect("Ok");
-
-        let got = seen.lock().unwrap().clone().expect("callback was invoked");
-        assert_eq!(got.0, "home");
-        assert_eq!(got.1, "sensors/temp");
-        assert_eq!(got.2, vec![9, 8, 7]);
-        assert_eq!(got.3, props);
-    }
-
-    /// A zero message-expiry interval is a permanent `invalid-payload`, and the
-    /// callback is never reached.
-    #[test]
-    fn do_mqtt_publish_rejects_zero_expiry_as_invalid_payload() {
-        let called = Arc::new(Mutex::new(false));
-        let called_cb = Arc::clone(&called);
-        let cb: MqttPublishFn = passthrough_mqtt(move |_c, _t, _p, _props| {
-            *called_cb.lock().unwrap() = true;
-            MqttPublishOutcome::Ok
-        });
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        data.mqtt_publish = Some(cb);
-        match data.do_mqtt_publish(
-            "home".into(),
-            "t".into(),
-            vec![1],
-            MqttPublishProps {
-                qos: 1,
-                retain: true,
-                message_expiry_s: Some(0),
-                ..Default::default()
-            },
-        ) {
-            Err(MqttPublishWitError::InvalidPayload(msg)) => {
-                assert!(msg.contains("message-expiry-s"), "msg: {msg}");
-            }
-            other => panic!("expected InvalidPayload, got {other:?}"),
-        }
-        assert!(!*called.lock().unwrap(), "callback must not be reached");
-    }
-
-    /// The per-activation call-count budget is *shared* with `do_publish`:
-    /// interleaved `ports.publish` + `mqtt-publish` calls draw
-    /// from the same `MAX_PUBLISH_CALLS_PER_ACTIVATION` cap, and once
-    /// it is exhausted `mqtt-publish` returns `quota-exceeded`.
-    #[test]
-    fn do_mqtt_publish_shares_call_budget_with_do_publish() {
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        // Also bind an output port so do_publish reaches its own success path and
-        // bumps the shared counter.
-        let mut ports = HashMap::new();
-        ports.insert("out".to_string(), test_out_spec("brenn:out"));
-        bind_ports(&mut data, ports);
-        // Generous per-sink budget so the shared 512-call cap trips first.
-        data.gate = ActivationGate::new(
-            1024,
-            HashMap::from([(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT)]),
-        );
-
-        // Spend half the budget via ports.publish, the rest via mqtt-publish.
-        let half = MAX_PUBLISH_CALLS_PER_ACTIVATION / 2;
-        for _ in 0..half {
-            data.do_publish_declared("out".to_string(), "p".to_string(), None, None)
-                .expect("under budget");
-        }
-        for _ in half..MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            data.do_mqtt_publish(
-                "home".into(),
-                "t".into(),
-                vec![],
-                MqttPublishProps::default(),
-            )
-            .expect("under budget");
-        }
-        assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
-        // One more — over the shared cap — must be quota-exceeded, even though the
-        // callback would otherwise return Ok.
-        assert!(
-            matches!(
-                data.do_mqtt_publish(
-                    "home".into(),
-                    "t".into(),
-                    vec![],
-                    MqttPublishProps::default()
-                ),
-                Err(MqttPublishWitError::QuotaExceeded)
-            ),
-            "mqtt-publish past the shared call cap must be quota-exceeded"
-        );
-    }
-
-    /// A `quota-exceeded` rejection still consumes a call-count slot (the bump is
-    /// before the cap check), exactly like `do_publish` — so a guest cannot get
-    /// free retries by spamming past the cap.
-    #[test]
-    fn do_mqtt_publish_quota_reject_consumes_budget() {
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        for _ in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            data.gate.charge_call().expect("under the cap");
-        }
-        assert!(matches!(
-            data.do_mqtt_publish(
-                "home".into(),
-                "t".into(),
-                vec![],
-                MqttPublishProps::default()
-            ),
-            Err(MqttPublishWitError::QuotaExceeded)
-        ));
         assert_eq!(
-            data.gate.calls(),
-            MAX_PUBLISH_CALLS_PER_ACTIVATION + 1,
-            "an over-cap call still bumps the counter (no free retries)"
+            data.gate.sinks()[&SinkKey::MqttClient("home".to_string())],
+            1000,
+            "the token was not spent by the refused address"
         );
     }
 
-    /// Pure-MQTT call-budget boundary, independent of `do_publish` sharing the
-    /// counter: exactly `MAX_PUBLISH_CALLS_PER_ACTIVATION` successful
-    /// `mqtt-publish` calls all return `Ok`, and the next one (the first over the
-    /// cap) returns `quota-exceeded`. A regression that skipped the MQTT counter
-    /// bump (e.g. bumping only for successful publishes) would let this run past
-    /// the cap and fail here, where the mixed `do_publish`+`do_mqtt_publish` test
-    /// could mask it.
+    /// The argument checks answer `invalid-payload` before the seam is
+    /// reached, buffer nothing, and still cost a call: QoS above 2, a zero
+    /// expiry, a payload over the body cap. A payload exactly at the cap is
+    /// accepted.
     #[test]
-    fn do_mqtt_publish_call_budget_boundary_mqtt_only() {
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        for i in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            data.do_mqtt_publish(
-                "home".into(),
-                "t".into(),
-                vec![],
-                MqttPublishProps::default(),
-            )
-            .unwrap_or_else(|e| panic!("call {i} within budget must be Ok, got {e:?}"));
-        }
-        assert_eq!(
-            data.gate.calls(),
-            MAX_PUBLISH_CALLS_PER_ACTIVATION,
-            "exactly the cap many successful calls consumed exactly the cap many slots"
-        );
-        assert!(
-            matches!(
-                data.do_mqtt_publish(
-                    "home".into(),
-                    "t".into(),
-                    vec![],
-                    MqttPublishProps::default()
-                ),
-                Err(MqttPublishWitError::QuotaExceeded)
+    fn argument_checks_refuse_before_the_seam() {
+        let cases: [(MqttPublishProps, usize, &str); 3] = [
+            (
+                MqttPublishProps {
+                    qos: 3,
+                    ..Default::default()
+                },
+                1,
+                "qos",
             ),
-            "the first call past the cap must be quota-exceeded"
-        );
-    }
-
-    /// An out-of-range `qos` (the WIT type is `u8`, but only 0/1/2 are valid) is
-    /// rejected up front as a *permanent* `invalid-payload`, never forwarded to the
-    /// callback where it would surface as a transient (MAY-retry) `broker` error.
-    /// Mirrors the LLM intercept's up-front qos check; keeps both call sites'
-    /// input-validation aligned (correctness review).
-    #[test]
-    fn do_mqtt_publish_rejects_out_of_range_qos_as_invalid_payload() {
-        // The callback would return Ok — proving the rejection happens before it.
-        let cb_invoked = Arc::new(Mutex::new(false));
-        let flag = Arc::clone(&cb_invoked);
-        let cb: MqttPublishFn = passthrough_mqtt(move |_c, _t, _p, _props| {
-            *flag.lock().unwrap() = true;
-            MqttPublishOutcome::Ok
-        });
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        data.mqtt_publish = Some(cb);
-
-        match data.do_mqtt_publish(
-            "home".into(),
-            "t".into(),
-            vec![1],
-            MqttPublishProps {
-                qos: 3,
-                ..Default::default()
-            },
-        ) {
-            Err(MqttPublishWitError::InvalidPayload(s)) => {
-                assert!(s.contains("qos"), "reason should mention qos, got {s:?}")
+            (
+                MqttPublishProps {
+                    qos: 1,
+                    message_expiry_s: Some(0),
+                    ..Default::default()
+                },
+                1,
+                "message-expiry-s",
+            ),
+            (MqttPublishProps::default(), 1025, "exceeds max"),
+        ];
+        for (props, len, needle) in cases {
+            let mut data = make_mqtt_data(MqttAdmission::Admitted);
+            let seen = script_mqtt(&mut data, resolve_unchanged, MqttAdmission::Admitted);
+            match data.do_mqtt_publish("home".into(), "t".into(), vec![0u8; len], props) {
+                Err(MqttPublishWitError::InvalidPayload(s)) => {
+                    assert!(s.contains(needle), "{needle}: got {s:?}")
+                }
+                other => panic!("{needle}: expected invalid-payload, got {other:?}"),
             }
-            other => panic!("qos=3 must be invalid-payload, got {other:?}"),
+            assert!(seen.lock().unwrap().is_empty(), "{needle}: seam reached");
+            assert!(data.publish_buffer.is_empty());
+            assert_eq!(data.gate.calls(), 1);
         }
-        assert!(
-            !*cb_invoked.lock().unwrap(),
-            "the callback (and thus the broker) must never be reached for an invalid qos"
-        );
-        // The call still consumed a budget slot (validation is after the bump).
-        assert_eq!(data.gate.calls(), 1);
-    }
-
-    /// A payload larger than `max_payload_bytes` is rejected as `invalid-payload`
-    /// before reaching the broker — the synchronous MQTT path enforces the same
-    /// per-message size bound the buffered `do_publish` path does, so a guest
-    /// holding the `mqtt` grant cannot emit arbitrary-size broker publishes
-    /// (security review).
-    #[test]
-    fn do_mqtt_publish_rejects_oversize_payload_as_invalid_payload() {
-        let cb_invoked = Arc::new(Mutex::new(false));
-        let flag = Arc::clone(&cb_invoked);
-        let cb: MqttPublishFn = passthrough_mqtt(move |_c, _t, _p, _props| {
-            *flag.lock().unwrap() = true;
-            MqttPublishOutcome::Ok
-        });
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok); // max_payload_bytes = 1024
-        data.mqtt_publish = Some(cb);
-
-        let oversize = vec![0u8; 1025];
-        match data.do_mqtt_publish(
-            "home".into(),
-            "t".into(),
-            oversize,
-            MqttPublishProps::default(),
-        ) {
-            Err(MqttPublishWitError::InvalidPayload(s)) => {
-                assert!(
-                    s.contains("exceeds max"),
-                    "reason should mention the cap, got {s:?}"
-                )
-            }
-            other => panic!("oversize payload must be invalid-payload, got {other:?}"),
-        }
-        assert!(
-            !*cb_invoked.lock().unwrap(),
-            "the callback (and thus the broker) must never be reached for an oversize payload"
-        );
-        // A payload exactly at the cap is accepted (boundary: `>` not `>=`).
-        let mut at_cap = make_mqtt_data(MqttPublishOutcome::Ok);
+        let mut at_cap = make_mqtt_data(MqttAdmission::Admitted);
         at_cap
             .do_mqtt_publish(
                 "home".into(),
@@ -7145,36 +6747,82 @@ mod processor_store_host_tests {
                 vec![0u8; 1024],
                 MqttPublishProps::default(),
             )
-            .expect("a payload exactly at max_payload_bytes must be accepted");
+            .expect("a payload exactly at the body cap is accepted");
     }
 
-    /// `not-permitted` (an operator ACL actively blocking a WASM publish) emits a
-    /// server-side `warn!` carrying the consumer slug and the (capped) client slug.
-    /// Without this assertion a
-    /// refactor that dropped the `warn!` would silently regress WASM ACL-deny
-    /// observability (test review).
-    #[traced_test]
+    /// The call ceiling is shared with `ports.publish` and counts refused calls:
+    /// past it `mqtt-publish` is `quota-exceeded` and buffers nothing.
     #[test]
-    fn do_mqtt_publish_not_permitted_emits_warn() {
-        let mut np = make_mqtt_data(MqttPublishOutcome::NotPermitted);
-        let _ = np.do_mqtt_publish(
-            "blocked-client".into(),
-            "t".into(),
-            vec![],
-            MqttPublishProps::default(),
+    fn the_call_ceiling_is_shared_and_counts_refusals() {
+        let mut data = make_mqtt_data(MqttAdmission::NotPermitted);
+        bind_ports(
+            &mut data,
+            HashMap::from([("out".to_string(), test_out_spec("brenn:out"))]),
         );
-        assert!(
-            logs_contain("not-permitted"),
-            "a not-permitted MQTT publish must emit a warn! naming the denial"
+        data.gate = ActivationGate::new(
+            1024,
+            HashMap::from([(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT)]),
         );
-        assert!(
-            logs_contain("test-slug"),
-            "the warn! must carry the consumer slug"
+        let half = MAX_PUBLISH_CALLS_PER_ACTIVATION / 2;
+        for _ in 0..half {
+            data.do_publish_declared("out".to_string(), "p".to_string(), None, None)
+                .expect("under budget");
+        }
+        for _ in half..MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            assert!(matches!(
+                data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+                Err(MqttPublishWitError::NotPermitted)
+            ));
+        }
+        assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
+        script_mqtt(&mut data, resolve_unchanged, MqttAdmission::Admitted);
+        assert!(matches!(
+            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+            Err(MqttPublishWitError::QuotaExceeded)
+        ));
+        assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION + 1);
+        assert!(mqtt_entries(&data).is_empty());
+    }
+
+    /// MQTT entries count against the buffered-entry ceiling with port
+    /// publishes and buffered tool requests: the 257th buffered publish is
+    /// `quota-exceeded`, and the gate's count and the buffer agree.
+    #[test]
+    fn the_buffered_entry_ceiling_bounds_mqtt_entries() {
+        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        for i in 0..MAX_PUBLISHES_PER_ACTIVATION {
+            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1())
+                .unwrap_or_else(|e| panic!("entry {i} under the ceiling, got {e:?}"));
+        }
+        assert!(matches!(
+            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+            Err(MqttPublishWitError::QuotaExceeded)
+        ));
+        assert_eq!(data.publish_buffer.len(), MAX_PUBLISHES_PER_ACTIVATION);
+        assert_eq!(
+            data.take_ok_publishes().len(),
+            MAX_PUBLISHES_PER_ACTIVATION,
+            "the gate's entry count and the buffer agree"
         );
-        assert!(
-            logs_contain("blocked-client"),
-            "the warn! must carry the denied client slug"
-        );
+    }
+
+    /// MQTT payloads are charged to the activation's byte aggregate: past it the
+    /// call is `quota-exceeded` and buffers nothing.
+    #[test]
+    fn the_byte_aggregate_bounds_mqtt_payloads() {
+        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        let chunk = MAX_PUBLISH_BYTES_PER_ACTIVATION / 4;
+        data.gate = ActivationGate::new(chunk, HashMap::new());
+        for _ in 0..4 {
+            data.do_mqtt_publish("home".into(), "t".into(), vec![0u8; chunk], mqtt_qos1())
+                .expect("within the aggregate");
+        }
+        assert!(matches!(
+            data.do_mqtt_publish("home".into(), "t".into(), vec![0u8; 1], mqtt_qos1()),
+            Err(MqttPublishWitError::QuotaExceeded)
+        ));
+        assert_eq!(data.publish_buffer.len(), 4);
+        assert_eq!(data.gate.bytes(), MAX_PUBLISH_BYTES_PER_ACTIVATION);
     }
 
     // --- do_fast_call / do_queue_async host-fn tests ---
@@ -7267,7 +6915,6 @@ mod processor_store_host_tests {
             call_chain: Arc::new(Vec::new()),
             activation_start: Instant::now(),
             blocked: std::time::Duration::ZERO,
-            mqtt_wait: MqttWaitBudget::new(PROCESSOR_MQTT_WAIT_BUDGET),
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
@@ -8027,7 +7674,6 @@ mod processor_store_host_tests {
             call_chain: Arc::new(Vec::new()),
             activation_start: Instant::now(),
             blocked: std::time::Duration::ZERO,
-            mqtt_wait: MqttWaitBudget::new(PROCESSOR_MQTT_WAIT_BUDGET),
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
@@ -8049,64 +7695,6 @@ mod processor_store_host_tests {
             None,
             "B has no suppression"
         );
-    }
-
-    /// MQTT per-sink budget is charged on attempt — even a broker-error outcome
-    /// consumes a token (anti-retry-amplification), and exhaustion returns
-    /// `quota-exceeded`.
-    #[test]
-    fn mqtt_per_sink_charged_on_attempt_even_on_broker_error() {
-        let mut data = make_mqtt_data(MqttPublishOutcome::Broker("down".into()));
-        // Budget for exactly two attempts.
-        data.gate = ActivationGate::new(
-            1024,
-            HashMap::from([(SinkKey::MqttClient("home".to_string()), 2000u64)]),
-        );
-        for _ in 0..2 {
-            let r = data.do_mqtt_publish(
-                "home".into(),
-                "t".into(),
-                vec![],
-                MqttPublishProps::default(),
-            );
-            assert!(
-                matches!(r, Err(MqttPublishWitError::Broker(_))),
-                "broker error still charges"
-            );
-        }
-        // Third attempt: budget exhausted ⇒ quota-exceeded (before the callback).
-        assert!(matches!(
-            data.do_mqtt_publish(
-                "home".into(),
-                "t".into(),
-                vec![],
-                MqttPublishProps::default()
-            ),
-            Err(MqttPublishWitError::QuotaExceeded)
-        ));
-        assert_eq!(
-            data.publish_suppressed_by_sink
-                .get(&SinkKey::MqttClient("home".to_string())),
-            Some(&1)
-        );
-    }
-
-    /// An MQTT client with no bucket entry (outside the ACL sink set) is not
-    /// per-sink counted — the call-count cap alone bounds it.
-    #[test]
-    fn mqtt_no_sink_entry_skips_per_sink_budget() {
-        let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        // No budget entry for "home".
-        for _ in 0..50 {
-            data.do_mqtt_publish(
-                "home".into(),
-                "t".into(),
-                vec![],
-                MqttPublishProps::default(),
-            )
-            .expect("no per-sink limit when the client has no bucket");
-        }
-        assert!(data.publish_suppressed_by_sink.is_empty());
     }
 
     /// begin → put → commit → begin → get round-trip.
@@ -9006,7 +8594,6 @@ mod processor_calls_host_tests {
             call_chain: Arc::new(vec!["menu".to_string()]),
             activation_start: Instant::now(),
             blocked: std::time::Duration::ZERO,
-            mqtt_wait: MqttWaitBudget::new(PROCESSOR_MQTT_WAIT_BUDGET),
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),
@@ -9405,7 +8992,6 @@ mod processor_config_host_tests {
             call_chain: Arc::new(Vec::new()),
             activation_start: Instant::now(),
             blocked: std::time::Duration::ZERO,
-            mqtt_wait: MqttWaitBudget::new(PROCESSOR_MQTT_WAIT_BUDGET),
             epoch_budget: std::time::Duration::from_millis(
                 PROCESSOR_EPOCH_TICK_MS * PROCESSOR_EPOCH_DEADLINE_TICKS,
             ),

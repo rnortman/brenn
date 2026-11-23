@@ -121,17 +121,8 @@ impl SupervisorState {
 // Publish outcomes
 // ---------------------------------------------------------------------------
 
-/// Outcome of a QoS ≥ 1 publish on the synchronous path.
-#[derive(Debug, Clone)]
-pub enum PubackOutcome {
-    /// Broker acknowledged with a success reason code.
-    Success,
-    /// Broker returned a failure PUBACK reason code.
-    BrokerRejected { reason: String },
-}
-
 /// What the client library reported for one tracked publish when its notice
-/// resolved. Every submitter on a session reads its outcome through
+/// resolved. The egress reader reads every outcome through
 /// [`notice_outcome`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoticeOutcome {

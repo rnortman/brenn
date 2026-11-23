@@ -821,6 +821,7 @@ async fn a_deferred_op_naming_another_senders_parked_message_panics() {
                 reply_to: None,
                 deliver_after: Some(Utc::now() + chrono::Duration::seconds(60)),
                 attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
+                mqtt: None,
             }],
         )
         .await;

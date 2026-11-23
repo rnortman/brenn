@@ -27,7 +27,7 @@ use uuid::Uuid;
 use brenn_envelope::{MqttExpiry, MqttPublishTransport};
 use brenn_messaging_store::store::MessageSeq;
 
-use crate::service::{publish_packet_size, publish_properties, qos_of};
+use crate::service::qos_of;
 use crate::state::{EGRESS_READER_POISONED, MqttClientHandle, NoticeOutcome, notice_outcome};
 
 #[cfg(test)]
@@ -564,4 +564,36 @@ pub(crate) fn expiry_interval(expires: &MqttExpiry, now: DateTime<Utc>) -> Optio
         whole
     };
     Some(Some(u32::try_from(seconds).unwrap_or(u32::MAX)))
+}
+
+/// The PUBLISH properties carrying `content_type` and the Message Expiry
+/// Interval `expiry`; `None` when there is neither.
+fn publish_properties(
+    content_type: Option<String>,
+    expiry: Option<u32>,
+) -> Option<rumqttc::PublishProperties> {
+    (content_type.is_some() || expiry.is_some()).then(|| rumqttc::PublishProperties {
+        content_type,
+        message_expiry_interval: expiry,
+        ..Default::default()
+    })
+}
+
+/// The size of a PUBLISH as the client library will encode it: same topic,
+/// QoS, retain, payload and properties, and a non-zero packet identifier at
+/// QoS 1/2, which the encoder counts only when set. The measured packet shares
+/// `payload`'s buffer.
+fn publish_packet_size(
+    topic: &str,
+    qos: rumqttc::mqttbytes::QoS,
+    retain: bool,
+    payload: &bytes::Bytes,
+    properties: &Option<rumqttc::PublishProperties>,
+) -> usize {
+    let mut packet = rumqttc::Publish::new(topic, qos, payload.clone(), properties.clone());
+    packet.retain = retain;
+    if qos != rumqttc::mqttbytes::QoS::AtMostOnce {
+        packet.pkid = 1;
+    }
+    packet.size()
 }

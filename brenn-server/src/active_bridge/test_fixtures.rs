@@ -1618,8 +1618,8 @@ impl ActiveBridge {
 
     /// Test bridge whose `"testapp"` policy does **not** grant `MqttPublish`, with
     /// an MQTT service present so the server-global readiness check passes and the
-    /// shared `enforce_and_publish` reaches the grant/ACL gate and
-    /// returns `AclDenied`. The intercept then selects the "MQTT publish is not
+    /// bus's MQTT admission reaches the grant gate and refuses with
+    /// `MissingSender`. The intercept then selects the "MQTT publish is not
     /// enabled" remedy string (grant absent). Used by the grant-absent intercept
     /// test.
     pub(crate) async fn test_new_for_mqtt_no_grant() -> Arc<Self> {
@@ -1897,10 +1897,9 @@ async fn make_test_messenger_with_mqtt_publish(
 
 /// Build a `Messenger` (empty directory) whose `"testapp"` policy does **not**
 /// grant `MqttPublish`. Used by the MQTT-publish "grant absent" intercept test:
-/// after the shared-enforcement refactor the intercept reaches the
-/// policy via `messenger.app_policy("testapp")` and `enforce_and_publish` returns
-/// `AclDenied`; the intercept's secondary `has_grant(MqttPublish)` check (false
-/// here) selects the "MQTT publish is not enabled" remedy string.
+/// the bus's MQTT admission refuses with `MissingSender`, and the intercept's
+/// `has_grant(MqttPublish)` check (false here) selects the "MQTT publish is not
+/// enabled" remedy string.
 fn make_test_messenger_no_mqtt_grant(db: Db) -> Arc<brenn_messaging::Messenger> {
     let testapp_cfg =
         crate::test_support::app_config::default_test_app_config("testapp", "testapp");

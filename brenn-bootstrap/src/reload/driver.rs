@@ -1096,7 +1096,7 @@ impl ReloadDriver {
         let ctx = ConsumerLoadContext {
             components_roots: &roots.components_roots,
             alert_dispatcher: &self.env.alert_dispatcher,
-            mqtt_service: self.env.mqtt_service.clone(),
+            messenger: Some(self.env.messenger.clone()),
             tool_registry: &self.env.tool_registry,
             provider_runtime: &self.env.provider_runtime,
             max_payload_bytes: self.env.max_payload_bytes,
@@ -2778,7 +2778,7 @@ channel scratch at "ephemeral:scratch" {{
                 &ConsumerLoadContext {
                     components_roots: &components_roots,
                     alert_dispatcher: &alert_dispatcher,
-                    mqtt_service: mqtt.0.clone(),
+                    messenger: Some(messenger.clone()),
                     tool_registry: &tool_registry_cell,
                     provider_runtime: &provider_runtime,
                     max_payload_bytes: document.config.messaging.max_body_bytes,
@@ -4312,8 +4312,8 @@ new sifter: Demo {{
 
     /// Commit registers an arriving client before the swap that makes an
     /// agent's new authority live: an agent that may publish through a client
-    /// the registry does not hold reaches `enforce_and_publish`'s per-client
-    /// panic, and the window would be every step between.
+    /// the registry does not hold is told the client is not configured, and
+    /// the window would be every step between.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_added_client_is_registered_before_agents_swap() {
         let one = [("ha", 8883u16, None)];
@@ -5433,6 +5433,7 @@ channel sink at "brenn:sink" {{
                     reply_to: None,
                     deliver_after: None,
                     attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
+                    mqtt: None,
                 }],
             )
             .await;

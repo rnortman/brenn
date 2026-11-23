@@ -885,6 +885,8 @@ mod limits;
 #[cfg(test)]
 mod mount;
 #[cfg(test)]
+mod mqtt;
+#[cfg(test)]
 mod multiport;
 #[cfg(test)]
 mod non_text;

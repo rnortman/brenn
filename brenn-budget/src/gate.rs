@@ -33,6 +33,23 @@
 //! no sink, and takes [`ActivationGate::admit_publish_without_sink`] at step 3
 //! instead: the same checks in the same order, minus the bucket.
 //!
+//! # MQTT publish order
+//!
+//! A component's MQTT publish is buffered and flushed with the activation's
+//! bus publishes. Its checks differ from a port publish's in two ways: the
+//! sink bucket is charged on attempt, before the host decides whether the
+//! publish is permitted, so the denials one activation can raise on a client
+//! are bounded; and the host's admission comes between the bucket and the
+//! arithmetic ceilings.
+//!
+//! 1. [`ActivationGate::charge_call`] — the shared call ceiling.
+//! 2. **Host:** argument checks, the body cap from
+//!    [`ActivationGate::max_body_bytes`], and resolving the client.
+//! 3. [`ActivationGate::charge_sink_on_attempt`] — the client's bucket.
+//! 4. **Host:** the admission — publish authority and the client's own limits.
+//! 5. [`ActivationGate::admit_buffered`] — the buffered-entry ceiling, then the
+//!    byte aggregate.
+//!
 //! # Control-op order
 //!
 //! 1. [`check_deliver_after`] — a fact about the argument, not about any
@@ -213,29 +230,18 @@ impl<K: Eq + Hash + Clone + Debug> ActivationGate<K> {
             });
         }
         check_deliver_after(check.deliver_after)?;
-        // The bucket is resolved once and held across the ceilings, so the check
-        // and the debit are the same entry by construction. The ceilings below are
-        // therefore written as field reads rather than calls through `&self`,
-        // which the live bucket borrow rules out.
-        let Some(remaining) = self.sinks.get_mut(check.sink) else {
+        let Some(&remaining) = self.sinks.get(check.sink) else {
             panic!("activation gate: no sink budget for {:?}", check.sink)
         };
-        if *remaining < MILLITOKENS_PER_PUBLISH {
+        if remaining < MILLITOKENS_PER_PUBLISH {
             return Err(GateRefusal::SinkExhausted);
         }
-        if self.entries + check.entry_addend >= MAX_PUBLISHES_PER_ACTIVATION {
-            return Err(GateRefusal::EntryCap {
-                cap: MAX_PUBLISHES_PER_ACTIVATION,
-            });
-        }
-        if self.bytes + check.body_len > MAX_PUBLISH_BYTES_PER_ACTIVATION {
-            return Err(GateRefusal::ByteCap {
-                cap: MAX_PUBLISH_BYTES_PER_ACTIVATION,
-            });
-        }
-        *remaining -= MILLITOKENS_PER_PUBLISH;
-        self.bytes += check.body_len;
-        self.entries += 1;
+        self.admit_buffered(check.body_len, check.entry_addend)?;
+        let bucket = self
+            .sinks
+            .get_mut(check.sink)
+            .expect("the bucket read above is still seeded");
+        *bucket -= MILLITOKENS_PER_PUBLISH;
         Ok(())
     }
 
@@ -267,7 +273,23 @@ impl<K: Eq + Hash + Clone + Debug> ActivationGate<K> {
             });
         }
         check_deliver_after(deliver_after)?;
-        if self.entries + entry_addend >= MAX_PUBLISHES_PER_ACTIVATION {
+        self.admit_buffered(body_len, entry_addend)?;
+        self.dropped += 1;
+        Ok(())
+    }
+
+    /// Judge one entry whose body cap and sink bucket are already answered, and
+    /// on acceptance charge the entry and its bytes.
+    ///
+    /// Order: the buffered-entry ceiling (counting `entry_addend` host-held
+    /// entries beside the gate's own), then the byte aggregate. A refusal
+    /// charges nothing. Nothing is counted as dropped.
+    pub fn admit_buffered(
+        &mut self,
+        body_len: usize,
+        entry_addend: usize,
+    ) -> Result<(), GateRefusal> {
+        if self.entries_at_ceiling(entry_addend) {
             return Err(GateRefusal::EntryCap {
                 cap: MAX_PUBLISHES_PER_ACTIVATION,
             });
@@ -279,7 +301,6 @@ impl<K: Eq + Hash + Clone + Debug> ActivationGate<K> {
         }
         self.bytes += body_len;
         self.entries += 1;
-        self.dropped += 1;
         Ok(())
     }
 
@@ -322,9 +343,8 @@ impl<K: Eq + Hash + Clone + Debug> ActivationGate<K> {
         Ok(())
     }
 
-    /// Charge one sink for a synchronous, unbuffered send that reaches its
-    /// destination inside the call — charges on attempt rather than on
-    /// acceptance.
+    /// Charge one sink on attempt rather than on acceptance: the token is spent
+    /// whether or not a later check refuses the call.
     ///
     /// A sink with no bucket is unmetered here, unlike [`Self::admit_publish`]:
     /// the caller's own ACL handling governs unbudgeted sinks.
@@ -532,6 +552,77 @@ mod tests {
         );
         assert_eq!(g.sinks()[PORT], before);
         assert_eq!(g.entries(), 1);
+    }
+
+    #[test]
+    fn an_accepted_buffered_entry_charges_entry_and_bytes_and_no_bucket() {
+        let mut g = gate(8, MILLITOKENS_PER_PUBLISH);
+        // The body cap is the host's to answer before this step.
+        g.admit_buffered(100, 0)
+            .expect("under both ceilings, whatever the body cap");
+        assert_eq!(g.entries(), 1);
+        assert_eq!(g.bytes(), 100);
+        assert_eq!(g.dropped(), 0);
+        assert_eq!(g.sinks()[PORT], MILLITOKENS_PER_PUBLISH);
+        assert_eq!(g.calls(), 0);
+    }
+
+    #[test]
+    fn the_buffered_entry_ceiling_answers_before_the_byte_aggregate() {
+        let mut g = gate(8, u64::MAX);
+        assert_eq!(
+            g.admit_buffered(
+                MAX_PUBLISH_BYTES_PER_ACTIVATION + 1,
+                MAX_PUBLISHES_PER_ACTIVATION
+            ),
+            Err(GateRefusal::EntryCap {
+                cap: MAX_PUBLISHES_PER_ACTIVATION
+            })
+        );
+        assert_eq!(g.entries(), 0);
+        assert_eq!(g.bytes(), 0);
+    }
+
+    #[test]
+    fn the_buffered_entry_ceiling_counts_gate_and_addend_together() {
+        let mut g = gate(8, u64::MAX);
+        for _ in 0..MAX_PUBLISHES_PER_ACTIVATION - 1 {
+            g.admit_buffered(1, 0).expect("under the entry ceiling");
+        }
+        assert_eq!(
+            g.admit_buffered(1, 1),
+            Err(GateRefusal::EntryCap {
+                cap: MAX_PUBLISHES_PER_ACTIVATION
+            })
+        );
+        g.admit_buffered(1, 0)
+            .expect("the last slot, with no host-held entry");
+        assert_eq!(g.entries(), MAX_PUBLISHES_PER_ACTIVATION);
+        assert_eq!(
+            g.admit_buffered(0, 0),
+            Err(GateRefusal::EntryCap {
+                cap: MAX_PUBLISHES_PER_ACTIVATION
+            })
+        );
+        assert_eq!(g.bytes(), MAX_PUBLISHES_PER_ACTIVATION);
+    }
+
+    #[test]
+    fn the_buffered_byte_aggregate_is_shared_and_refuses_charging_nothing() {
+        let mut g = gate(MAX_PUBLISH_BYTES_PER_ACTIVATION, u64::MAX);
+        g.admit_publish(publish(MAX_PUBLISH_BYTES_PER_ACTIVATION - 1))
+            .expect("a bus publish fills all but one byte");
+        assert_eq!(
+            g.admit_buffered(2, 0),
+            Err(GateRefusal::ByteCap {
+                cap: MAX_PUBLISH_BYTES_PER_ACTIVATION
+            })
+        );
+        assert_eq!(g.entries(), 1);
+        assert_eq!(g.bytes(), MAX_PUBLISH_BYTES_PER_ACTIVATION - 1);
+        g.admit_buffered(1, 0).expect("exactly the aggregate fits");
+        assert_eq!(g.bytes(), MAX_PUBLISH_BYTES_PER_ACTIVATION);
+        assert_eq!(g.entries(), 2);
     }
 
     #[test]

@@ -893,10 +893,8 @@ impl ActiveBridge {
         &self.mqtt_event_router
     }
 
-    /// The shared DB handle. Used by callers that need to pass the `Db` to a
-    /// helper which locks it internally for a short synchronous step (e.g.
-    /// `mqtt::egress::enforce_and_publish`, which decrements the send budget under
-    /// the lock and drops it before the broker await).
+    /// The shared DB handle, for callers that pass the `Db` to a helper which
+    /// locks it internally for a short synchronous step.
     pub fn db(&self) -> &Db {
         &self.db
     }

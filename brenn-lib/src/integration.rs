@@ -1976,16 +1976,10 @@ mod tests {
         }
     }
 
-    /// LLM tool visibility regression guard. The egress
-    /// unification refactor removed the `ActiveBridge.mqtt_publish_denied` cache
-    /// and rewired the LLM intercept onto the shared
-    /// `enforce_and_publish`; none of that touches this visibility gate, which
-    /// keys purely on the `MqttPublish` grant. This single assertion pins that
-    /// invariant: flip *only* the grant, hold every other input identical, and
-    /// `MqttSend` presence must track the grant 1:1 — proving the egress refactor
-    /// did not entangle tool visibility with the intercept/cache changes (the gate
-    /// is `policy.has_grant(MqttPublish)`, never the removed cache or any connector
-    /// state).
+    /// LLM tool visibility regression guard: `MqttSend`'s visibility keys
+    /// purely on the `MqttPublish` grant. Flip *only* the grant, hold every
+    /// other input identical, and `MqttSend` presence must track the grant 1:1
+    /// (the gate is `policy.has_grant(MqttPublish)`, never connector state).
     #[test]
     fn core_virtual_tools_mqtt_send_visibility_tracks_grant_after_egress_unify() {
         // Identical config except the MqttPublish grant.
@@ -2242,10 +2236,6 @@ mod tests {
             );
         }
         assert!(!desc.contains("PUBACK"), "{desc}");
-        assert!(
-            !desc.contains(&format!("{} s", crate::mqtt::PUBLISH_WAIT.as_secs())),
-            "{desc}"
-        );
     }
 
     /// `MessageChannelGet`'s description documents the transport-agnostic read

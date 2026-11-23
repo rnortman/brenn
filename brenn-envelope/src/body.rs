@@ -12,6 +12,9 @@ use std::sync::Arc;
 /// Longest content type [`MessageBody::from_parts`] accepts, in bytes.
 pub const MAX_CONTENT_TYPE_LEN: usize = 255;
 
+/// The type of a body [`MessageBody::carrying`] could not type as stated.
+const OCTET_STREAM: &str = "application/octet-stream";
+
 /// A message body: UTF-8 text, or bytes with a content type.
 ///
 /// Invariants: a text body is valid UTF-8 and its content type, if any, is a
@@ -103,6 +106,24 @@ impl MessageBody {
                 content_type: ct.into(),
             }))
         }
+    }
+
+    /// A body carrying `bytes` exactly, whatever they are: typed by
+    /// `content_type` when the bytes are valid for it, and an
+    /// `application/octet-stream` body of the same bytes otherwise (a
+    /// malformed type, untyped bytes that are not UTF-8, or a text type over
+    /// bytes that are not UTF-8). Infallible.
+    ///
+    /// For a payload whose content type travels beside it rather than with the
+    /// body, as an MQTT publish's does: text reads as text to an observer of
+    /// the channel and other bytes are still carried exactly.
+    pub fn carrying(content_type: Option<&str>, bytes: &[u8]) -> Self {
+        Self::from_parts(content_type, bytes).unwrap_or_else(|_| {
+            MessageBody(Repr::Binary {
+                bytes: bytes.into(),
+                content_type: OCTET_STREAM.into(),
+            })
+        })
     }
 
     /// The body's text; `Some` iff the body is text.
@@ -726,6 +747,66 @@ mod tests {
             err.to_string(),
             "body typed \"text/csv\" is not valid UTF-8"
         );
+    }
+
+    #[test]
+    fn carrying_types_text_by_the_stated_type() {
+        assert_eq!(
+            MessageBody::carrying(Some("text/plain"), b"on"),
+            MessageBody::from_parts(Some("text/plain"), b"on").unwrap()
+        );
+        assert_eq!(
+            MessageBody::carrying(Some("application/json"), b"{\"a\":1}").content_type(),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn carrying_untyped_utf8_is_untyped_text() {
+        assert_eq!(MessageBody::carrying(None, b"on"), MessageBody::text("on"));
+    }
+
+    #[test]
+    fn carrying_keeps_a_binary_type() {
+        let body = MessageBody::carrying(Some("image/png"), &[0x89, 0x50]);
+        assert!(!body.is_text());
+        assert_eq!(body.content_type(), Some("image/png"));
+        assert_eq!(body.as_bytes(), &[0x89, 0x50]);
+    }
+
+    #[test]
+    fn carrying_bytes_its_type_cannot_hold_is_octet_stream() {
+        for (ct, bytes) in [
+            (Some("text/plain"), &[0xff, 0xfe][..]),
+            (None, &[0xc3][..]),
+            (Some("application/json"), &[0x80][..]),
+        ] {
+            let body = MessageBody::carrying(ct, bytes);
+            assert!(!body.is_text(), "{ct:?}");
+            assert_eq!(
+                body.content_type(),
+                Some("application/octet-stream"),
+                "{ct:?}"
+            );
+            assert_eq!(body.as_bytes(), bytes, "{ct:?}");
+        }
+    }
+
+    #[test]
+    fn carrying_a_malformed_type_is_octet_stream() {
+        let body = MessageBody::carrying(Some("text/"), b"hello");
+        assert!(!body.is_text());
+        assert_eq!(body.content_type(), Some("application/octet-stream"));
+        assert_eq!(body.as_bytes(), b"hello");
+    }
+
+    #[test]
+    fn carrying_empty_bytes() {
+        assert_eq!(MessageBody::carrying(None, b""), MessageBody::text(""));
+        let typed = MessageBody::carrying(Some("text/plain"), b"");
+        assert!(typed.is_text() && typed.is_empty());
+        let binary = MessageBody::carrying(Some("application/octet-stream"), b"");
+        assert!(!binary.is_text() && binary.is_empty());
     }
 
     #[test]

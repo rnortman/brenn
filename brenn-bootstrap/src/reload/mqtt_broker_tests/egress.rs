@@ -1,6 +1,6 @@
-//! An app's MQTT publish from commit to broker: the admission commits it to
-//! the client's egress channel, the client's reader hands it to the session,
-//! and `mosquitto` receives it. What the broker received is read off its own
+//! An app's or a component's MQTT publish from commit to broker: the admission
+//! commits it to the client's egress channel, the client's reader hands it to
+//! the session, and `mosquitto` receives it. What the broker received is read off its own
 //! log (`Received PUBLISH from <session>`), which is the one account of what
 //! brenn sent that does not depend on a subscriber being connected at the
 //! instant it was sent.
@@ -26,7 +26,9 @@ use brenn_mqtt::test_support::{
 use brenn_obs::alerting::AlertSeverity;
 
 use super::super::driver::TriggerSource;
-use super::super::driver::tests::{BootFixture, Booted, Tree, boot_with, document, seat_user};
+use super::super::driver::tests::{
+    BootFixture, Booted, Tree, boot_with, document, install_package_from, seat_user, staged_module,
+};
 use super::super::mqtt_egress_tests::{egress_cursor, egress_uuid, shut_down};
 use super::{BROKER_WAIT_SECS, trusted_ca};
 
@@ -54,6 +56,54 @@ fn closed_port() -> u16 {
 /// The one-second backoff is what lets a case wait on a reconnect inside the
 /// file's broker wait rather than the default backoff's minute.
 fn egress_document(clients: &[(&str, u16)], ca_file: &std::path::Path) -> String {
+    egress_document_with(clients, ca_file, "")
+}
+
+/// The consumer every component case declares: the `processor-mqtt-test`
+/// fixture, holding the `mqtt` grant, woken by each message on `work`.
+const COMPONENT: &str = "mqtt-component";
+
+/// A topic Brenn's ACL admits for [`COMPONENT`] and the harness broker's ACL
+/// does not, which admits `brenn/itest/#` only.
+const BROKER_REFUSED_TOPIC: &str = "brenn/outside/refused";
+
+/// [`egress_document`] over the one client `ha` at `port`, with [`COMPONENT`]
+/// beside the sender: its Brenn ACL admits `ha`'s topics under
+/// [`TOPIC_PREFIX`] and [`BROKER_REFUSED_TOPIC`], and its `out` port, which the
+/// fixture's interleave path writes, is bound to a sink so its `ports` grant
+/// reaches something. The sender may also publish on `work`, which is how a
+/// case wakes the component.
+fn component_document(port: u16, ca_file: &std::path::Path) -> String {
+    egress_document_with(
+        &[("ha", port)],
+        ca_file,
+        &format!(
+            r#"channel sink at "brenn:sink" {{
+    push_depth = 1;
+    retain_depth = 4;
+    standing_retain_depth = 4;
+}}
+{packaged}component MqttTest {{
+    abi = processor;
+    requires = [ports, mqtt];
+    in inbound;
+    out out;
+}}
+{packaged}
+new {COMPONENT}: MqttTest {{
+    grants = [ports, mqtt];
+    acl publish [topic_filter "mqtt:ha:{TOPIC_PREFIX}/#", topic_filter "mqtt:ha:{BROKER_REFUSED_TOPIC}", exact sink];
+    in inbound <- work {{ push_depth = 4; }}
+    out out -> sink;
+}}
+"#,
+            packaged = brenn_lib::config::PACKAGED,
+        ),
+    )
+}
+
+/// [`egress_document`] with `extra` after the sender.
+fn egress_document_with(clients: &[(&str, u16)], ca_file: &std::path::Path, extra: &str) -> String {
     let blocks: String = clients
         .iter()
         .map(|(slug, port)| {
@@ -76,11 +126,11 @@ agent Sender() {{
     working_dir = ".";
     grants = [publish];
     send_budget = 1000000;
-    acl publish [{acl}];
+    acl publish [{acl}, exact work];
 }}
 
 new {SENDER}: Sender();
-"#
+{extra}"#
     ))
 }
 
@@ -98,6 +148,26 @@ async fn boot_dispatching(tree: &Tree, db: Option<brenn_db::Db>) -> Booted {
         tree,
         BootFixture {
             db,
+            mqtt_live: true,
+            dispatcher: true,
+            ..BootFixture::default()
+        },
+    )
+    .await
+}
+
+/// [`boot_dispatching`] over a fresh database with the fixture's package
+/// installed under `components`, for a document from [`component_document`].
+async fn boot_component(tree: &Tree, components: &std::path::Path) -> Booted {
+    install_package_from(
+        components,
+        &staged_module(tree),
+        "brenn_processor_mqtt_test.wasm",
+    );
+    boot_with(
+        tree,
+        BootFixture {
+            components_roots: vec![components.to_path_buf()],
             mqtt_live: true,
             dispatcher: true,
             ..BootFixture::default()
@@ -151,6 +221,76 @@ async fn send(
         .await
         .unwrap_or_else(|refused| panic!("the publish to {client} was refused: {refused:?}"))
         .message_id
+}
+
+/// Wake [`COMPONENT`] with the fixture's parameterised publish: one call
+/// through `ha` with these arguments and no message expiry.
+async fn wake_component(
+    booted: &Booted,
+    conversation: i64,
+    topic: &str,
+    retain: bool,
+    content_type: &str,
+    payload: &str,
+) {
+    let body = format!(
+        "PUBLISH_TO\nha\n{topic}\n1\n{}\n-\n{content_type}\n{payload}",
+        u8::from(retain)
+    );
+    let published = booted
+        .messenger
+        .publish(
+            PublishOrigin::Conversation { id: conversation },
+            SENDER,
+            "brenn:work",
+            body.into(),
+            brenn_messaging::Urgency::Normal,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(published, brenn_messaging::PublishResult::Ok { .. }),
+        "{published:?}"
+    );
+}
+
+/// The rows on `client`'s egress channel, oldest first, once there are
+/// `count`.
+async fn await_egress_rows(
+    booted: &Booted,
+    client: &str,
+    count: usize,
+) -> Vec<brenn_lib::messaging::MessageEnvelope> {
+    let uuid = egress_uuid(&booted.messenger, client);
+    brenn_mqtt::test_support::poll_until(
+        BROKER_WAIT_SECS,
+        || async {
+            let rows: Vec<_> = {
+                let conn = booted.db.lock().await;
+                load_channel_retained_window_seq(&conn, uuid, Depth::Unbounded)
+                    .into_iter()
+                    .map(|(_, envelope)| envelope)
+                    .collect()
+            };
+            (rows.len() >= count).then_some(rows)
+        },
+        || async { format!("{client}'s egress channel never held {count} rows") },
+    )
+    .await
+}
+
+/// Every alert raised so far whose title says a consumer's activation failed.
+fn activation_failures(booted: &Booted) -> Vec<(AlertSeverity, String, String)> {
+    booted
+        .captured
+        .lock()
+        .expect("alert capture")
+        .iter()
+        .filter(|(_, t, _)| t.contains("activation failed") || t.contains("activation trapped"))
+        .cloned()
+        .collect()
 }
 
 /// Wait until the broker has received a PUBLISH on each of `topics` from
@@ -561,6 +701,148 @@ async fn an_added_client_publishes_and_a_changed_clients_successor_delivers_what
     )
     .await;
     await_received(&harness, 0, "spare", &[&added]).await;
+
+    booted.stop_mqtt();
+}
+
+/// A component's publish reaches the broker through the client's reader, with
+/// the topic, payload, QoS, retain flag and content type it was made with, and
+/// its row on the egress channel is the component's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_components_publish_arrives_at_the_broker() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&component_document(harness.port, &ca_file));
+    let booted = boot_component(&tree, components.path()).await;
+    wait_for_health(
+        &booted.mqtt.0,
+        "ha",
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the client never connected",
+    )
+    .await;
+    let conversation = sender_conversation(&booted).await;
+    let topic = format!("{TOPIC_PREFIX}/component");
+    let mut live = subscriber(harness.port, &topic).await;
+
+    wake_component(&booted, conversation, &topic, true, "text/plain", "lit").await;
+
+    let publish = next_publish(&mut live, "the component's publish").await;
+    assert_eq!(&publish.topic[..], topic.as_bytes());
+    assert_eq!(&publish.payload[..], b"lit");
+    assert_eq!(publish.qos, QoS::AtLeastOnce);
+    let props = publish.properties.expect("the publish carried properties");
+    assert_eq!(props.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(
+        props.message_expiry_interval, None,
+        "mqtt-publish sends no Message Expiry Interval"
+    );
+    let mut late = subscriber(harness.port, &topic).await;
+    let retained = next_publish(&mut late, "the retained copy").await;
+    assert!(retained.retain, "the broker kept no retained copy");
+    assert_eq!(&retained.payload[..], b"lit");
+
+    let rows = await_egress_rows(&booted, "ha", 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].sender,
+        brenn_lib::messaging::ParticipantId::for_wasm(COMPONENT).as_str()
+    );
+    assert!(activation_failures(&booted).is_empty());
+
+    booted.stop_mqtt();
+}
+
+/// With the client at a port nothing listens on, the component's call is
+/// admitted and the activation commits without waiting on a broker: its row
+/// is on the channel and nothing failed. A reload that moves the client to
+/// the live broker delivers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_components_publish_to_an_unreachable_client_waits_on_the_channel_until_a_reload() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&component_document(closed_port(), &ca_file));
+    let mut booted = boot_component(&tree, components.path()).await;
+    let conversation = sender_conversation(&booted).await;
+    let topic = format!("{TOPIC_PREFIX}/component-owed");
+
+    wake_component(&booted, conversation, &topic, false, "-", "owed").await;
+    let rows = await_egress_rows(&booted, "ha", 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        activation_failures(&booted).is_empty(),
+        "the call was admitted and the activation committed: {:?}",
+        activation_failures(&booted)
+    );
+
+    tree.write(&component_document(harness.port, &ca_file));
+    booted.driver.reload(TriggerSource::Signal).await;
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_changed, vec!["ha".to_string()]);
+
+    await_received(&harness, 0, "ha", &[&topic]).await;
+
+    booted.stop_mqtt();
+}
+
+/// A topic Brenn admits and the broker refuses, published by a component at
+/// QoS 1, is reported to the operator as rejected with the component named
+/// as its sender. (A QoS 0 message counts as delivered once written, so its
+/// refusal is never reported.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broker_refusal_of_a_components_publish_names_the_component() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let (_ca_dir, ca_file) = trusted_ca();
+    let components = tempfile::tempdir().expect("a components root");
+    let tree = Tree::holding(&component_document(harness.port, &ca_file));
+    let booted = boot_component(&tree, components.path()).await;
+    wait_for_health(
+        &booted.mqtt.0,
+        "ha",
+        &[ConnectorHealthLabel::Connected],
+        BROKER_WAIT_SECS,
+        "the client never connected",
+    )
+    .await;
+    let conversation = sender_conversation(&booted).await;
+
+    wake_component(
+        &booted,
+        conversation,
+        BROKER_REFUSED_TOPIC,
+        false,
+        "-",
+        "refused",
+    )
+    .await;
+
+    let rejected = brenn_mqtt::test_support::poll_until(
+        BROKER_WAIT_SECS,
+        || async {
+            let found = egress_alerts(&booted, "rejected", "ha");
+            (!found.is_empty()).then_some(found)
+        },
+        || async { "no rejected alert for ha".to_string() },
+    )
+    .await;
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    let sender = brenn_lib::messaging::ParticipantId::for_wasm(COMPONENT);
+    assert!(
+        rejected[0].2.contains(&format!("from {}", sender.as_str()))
+            && rejected[0].2.contains(BROKER_REFUSED_TOPIC),
+        "the alert names the component and the topic: {rejected:?}",
+    );
+    assert!(activation_failures(&booted).is_empty());
 
     booted.stop_mqtt();
 }

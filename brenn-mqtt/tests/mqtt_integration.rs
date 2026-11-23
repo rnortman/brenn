@@ -10,15 +10,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use brenn_envelope::grants::AppCapability;
 use brenn_envelope::{MqttExpiry, MqttPublishTransport};
-use brenn_lib::access::acl::{AclSet, MqttPubMatcher};
-use brenn_lib::access::{AppPolicy, GrantSet};
-use brenn_lib::mqtt::address::MqttAddress;
 use brenn_lib::mqtt::config::TlsVersionMin;
 use brenn_messaging_store::store::MessageSeq;
 use brenn_mqtt::broker_gate;
-use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
 use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::reader::{
     EgressBus, EgressItem, EgressMessage, EgressReport, UnknownCause, start_egress_reader,
@@ -28,8 +23,7 @@ use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
 use brenn_mqtt::state::IngressSubscription;
 use brenn_mqtt::test_support::client::wait_for_filter_acked;
-use brenn_mqtt::{ArrivingFilters, MqttService, register_and_spawn};
-use brenn_mqtt::{PUBLISH_WAIT, PublishProps};
+use brenn_mqtt::{ArrivingFilters, MqttClientHandle, MqttService, register_and_spawn};
 use common::{
     AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, SpawnedClient, TcpRelay,
     await_puback, broker_auth, broker_tls13, certs, direct_publisher_acked, direct_subscriber,
@@ -39,25 +33,6 @@ use common::{
     spawn_client_with_config, subscribe_live_confirmed, test_client_config, wait_for_health,
 };
 use rumqttc::mqttbytes::QoS;
-
-/// A WASM-egress `AppPolicy`: the `MqttPublish` grant plus a `mqtt_publish`
-/// matcher for `client`. Hand-rolled literal-field construction because
-/// `AppPolicy::with_grants` is `#[cfg(test)]`-gated inside `brenn-lib` and so
-/// invisible to integration tests in `tests/`.
-fn wasm_egress_policy(client: &str) -> AppPolicy {
-    let mut grants = GrantSet::default();
-    grants.insert(AppCapability::MqttPublish);
-    let mut acls = AclSet::default();
-    acls.mqtt_publish.push(MqttPubMatcher {
-        client: client.to_string(),
-        topic_filter: "#".to_string(),
-    });
-    AppPolicy {
-        grants,
-        acls,
-        tool_grants: Default::default(),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // QoS 1 publish reaches an external subscriber (text)
@@ -69,29 +44,15 @@ async fn publish_qos1_text_delivers() {
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
-    let SpawnedClient { svc, handle, .. } =
-        spawn_client("test2", &harness, ca.clone(), vec![]).await;
+    let SpawnedClient { handle, .. } = spawn_client("test2", &harness, ca.clone(), vec![]).await;
 
     // Witness delivery on a separate client id.
     let mut deliver_rx = direct_subscriber(harness.port, ca, "brenn/itest/test2/state").await;
 
-    let outcome = svc
-        .publish_on_handle(
-            &handle,
-            "brenn/itest/test2/state".to_string(),
-            b"online".to_vec(),
-            PublishProps {
-                qos: 1,
-                retain: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("publish retained failed");
-    assert!(
-        matches!(outcome, brenn_mqtt::state::PubackOutcome::Success),
-        "qos1 publish outcome: {outcome:?}"
-    );
+    let mut egress = Egress::start(&handle);
+    let mut message = egress.message("brenn/itest/test2/state", 1, b"online");
+    message.publish.retain = true;
+    egress.deliver(message).await;
 
     let payload = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
         .await
@@ -110,66 +71,54 @@ async fn publish_binary_content_type_delivers() {
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
-    let SpawnedClient { svc, handle, .. } =
-        spawn_client("test3", &harness, ca.clone(), vec![]).await;
+    let SpawnedClient { handle, .. } = spawn_client("test3", &harness, ca.clone(), vec![]).await;
 
-    let mut deliver_rx = direct_subscriber(harness.port, ca, "brenn/itest/test3/bin").await;
+    let topic = "brenn/itest/test3/bin";
+    let mut deliver_rx = direct_subscriber_publish(harness.port, ca, topic).await;
 
     let payload_bytes: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
-    svc.publish_on_handle(
-        &handle,
-        "brenn/itest/test3/bin".to_string(),
-        payload_bytes.clone(),
-        PublishProps {
-            content_type: Some("application/octet-stream".to_string()),
-            qos: 1,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("publish binary failed");
+    let mut egress = Egress::start(&handle);
+    let mut message = egress.message(topic, 1, &payload_bytes);
+    message.publish.content_type = Some("application/octet-stream".to_string());
+    egress.deliver(message).await;
 
-    let payload = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
+    let received = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
         .await
         .expect("no binary message within 2s")
         .expect("channel closed");
-    assert_eq!(payload, payload_bytes, "unexpected payload: {payload:?}");
+    assert_eq!(received.payload.to_vec(), payload_bytes);
+    assert_eq!(
+        received
+            .properties
+            .as_ref()
+            .and_then(|p| p.content_type.as_deref()),
+        Some("application/octet-stream")
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Message expiry reaches the subscriber, with and without a content type
 // ---------------------------------------------------------------------------
 
-/// Publish on `slug` with `message_expiry_s = 60` and the given content type,
-/// and return the properties of the PUBLISH a separate subscriber receives.
+/// Publish on `slug` a retained message with 60 s of lifetime left and the
+/// given content type, and return the properties of the PUBLISH a separate
+/// subscriber receives.
 async fn publish_expiring_and_receive(
     slug: &str,
     content_type: Option<String>,
 ) -> rumqttc::mqttbytes::v5::PublishProperties {
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
-    let SpawnedClient { svc, handle, .. } = spawn_client(slug, &harness, ca.clone(), vec![]).await;
+    let SpawnedClient { handle, .. } = spawn_client(slug, &harness, ca.clone(), vec![]).await;
     let topic = format!("brenn/itest/{slug}/expiring");
     let mut deliver_rx = direct_subscriber_publish(harness.port, ca, &topic).await;
 
-    let outcome = svc
-        .publish_on_handle(
-            &handle,
-            topic,
-            b"alive".to_vec(),
-            PublishProps {
-                content_type,
-                qos: 1,
-                retain: true,
-                message_expiry_s: Some(60),
-            },
-        )
-        .await
-        .expect("expiring publish failed");
-    assert!(
-        matches!(outcome, brenn_mqtt::state::PubackOutcome::Success),
-        "expiring publish outcome: {outcome:?}"
-    );
+    let mut egress = Egress::start(&handle);
+    let mut message = egress.message(&topic, 1, b"alive");
+    message.publish.retain = true;
+    message.publish.content_type = content_type;
+    message.publish.expires = MqttExpiry::At(chrono::Utc::now() + chrono::TimeDelta::seconds(60));
+    egress.deliver(message).await;
 
     let publish = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
         .await
@@ -212,91 +161,22 @@ async fn publish_message_expiry_with_content_type() {
 }
 
 // ---------------------------------------------------------------------------
-// Disconnect returns NotConnected promptly
+// QoS 0 publish: reported delivered + external delivery confirmation
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disconnect_returns_not_connected_promptly() {
-    broker_gate!();
-
-    let mut harness = BrokerHarness::start();
-    let ca = certs::ca_pem_bytes();
-
-    let SpawnedClient {
-        svc,
-        client_slug,
-        handle,
-        ..
-    } = spawn_client("test6", &harness, ca, vec![]).await;
-
-    // Kill the broker, then signal the supervisor to stop so it does not
-    // accumulate unnecessary reconnect attempts during teardown.
-    harness.stop();
-    handle.stop();
-
-    wait_for_health(
-        &svc,
-        &client_slug,
-        &[
-            ConnectorHealthLabel::Disconnected,
-            ConnectorHealthLabel::Failed,
-        ],
-        3,
-        "session did not become Disconnected within 3s after broker kill",
-    )
-    .await;
-
-    let start = std::time::Instant::now();
-    let result = svc
-        .publish_on_handle(
-            &handle,
-            "brenn/itest/test6/probe".to_string(),
-            b"x".to_vec(),
-            PublishProps {
-                qos: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-    let elapsed = start.elapsed();
-
-    assert!(
-        matches!(result, Err(brenn_lib::mqtt::MqttError::NotConnected { .. })),
-        "expected NotConnected, got {result:?}"
-    );
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "publish took too long: {elapsed:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// QoS 0 publish: PubackOutcome::Success + external delivery confirmation
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn qos0_publish_returns_success_and_delivers() {
+async fn qos0_publish_is_delivered() {
     broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
-    let SpawnedClient { svc, handle, .. } =
-        spawn_client("test8", &harness, ca.clone(), vec![]).await;
+    let SpawnedClient { handle, .. } = spawn_client("test8", &harness, ca.clone(), vec![]).await;
 
     let mut deliver_rx = direct_subscriber(harness.port, ca, "brenn/itest/test8/topic").await;
 
-    let result = svc
-        .publish_on_handle(
-            &handle,
-            "brenn/itest/test8/topic".to_string(),
-            b"qos0-payload".to_vec(),
-            PublishProps::default(),
-        )
-        .await;
-    assert!(
-        matches!(result, Ok(brenn_mqtt::state::PubackOutcome::Success)),
-        "qos0 publish result: {result:?}"
-    );
+    let mut egress = Egress::start(&handle);
+    let message = egress.message("brenn/itest/test8/topic", 0, b"qos0-payload");
+    egress.deliver(message).await;
 
     let payload = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
         .await
@@ -312,26 +192,6 @@ async fn qos0_publish_returns_success_and_delivers() {
 /// The maximum the broker of `broker_max_packet_*` advertises in its CONNACK.
 const BROKER_MAX_PACKET: u32 = 1024;
 
-/// Publish `len` zero bytes on `topic` at `qos`, with no properties.
-async fn publish_zeros(
-    svc: &brenn_mqtt::MqttService,
-    handle: &Arc<brenn_mqtt::MqttClientHandle>,
-    topic: &str,
-    len: usize,
-    qos: u8,
-) -> Result<brenn_mqtt::state::PubackOutcome, brenn_lib::mqtt::MqttError> {
-    svc.publish_on_handle(
-        handle,
-        topic.to_string(),
-        vec![0u8; len],
-        PublishProps {
-            qos,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
 /// The payload length that makes a property-less PUBLISH on `topic` exactly
 /// [`BROKER_MAX_PACKET`] bytes: fixed header 1, remaining length 2 (it is over
 /// 127), topic 2 + its length, packet identifier 2 at QoS 1 and 2, empty
@@ -342,10 +202,10 @@ fn payload_filling_the_maximum(topic: &str, qos: u8) -> usize {
 }
 
 /// Against a broker that advertises a Maximum Packet Size, at QoS 0 and at
-/// QoS 1: a publish whose packet is exactly the maximum is delivered — the
-/// size checked is the size encoded — and one a byte over is `PacketTooLarge`
-/// without touching the session, which stays connected, is not dropped at
-/// the broker, and delivers the next in-limit publish.
+/// QoS 1: a message whose packet is exactly the maximum is delivered — the
+/// size checked is the size encoded — and one a byte over is reported
+/// rejected without touching the session, which stays connected, is not
+/// dropped at the broker, and delivers the next in-limit message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_max_packet_size_refuses_over_and_delivers_exact() {
     broker_gate!();
@@ -360,16 +220,14 @@ async fn broker_max_packet_size_refuses_over_and_delivers_exact() {
         ..
     } = spawn_client("maxpkt", &harness, ca.clone(), vec![]).await;
     let since = harness.log_len();
+    let mut egress = Egress::start(&handle);
 
     for qos in [0u8, 1] {
         let exact_topic = format!("brenn/itest/maxpkt/exact{qos}");
         let exact_len = payload_filling_the_maximum(&exact_topic, qos);
         let mut deliver_rx = direct_subscriber(harness.port, ca.clone(), &exact_topic).await;
-        let result = publish_zeros(&svc, &handle, &exact_topic, exact_len, qos).await;
-        assert!(
-            matches!(result, Ok(brenn_mqtt::state::PubackOutcome::Success)),
-            "QoS {qos}: a packet exactly at the maximum: {result:?}"
-        );
+        let message = egress.message(&exact_topic, qos, &vec![0u8; exact_len]);
+        egress.deliver(message).await;
         let payload = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
             .await
             .unwrap_or_else(|_| panic!("QoS {qos}: the exact-maximum publish was not delivered"))
@@ -378,25 +236,29 @@ async fn broker_max_packet_size_refuses_over_and_delivers_exact() {
 
         let over_topic = format!("brenn/itest/maxpkt/over{qos}");
         let over_len = payload_filling_the_maximum(&over_topic, qos) + 1;
-        let result = publish_zeros(&svc, &handle, &over_topic, over_len, qos).await;
-        assert_eq!(
-            result.err(),
-            Some(brenn_lib::mqtt::MqttError::PacketTooLarge {
-                client_slug: client_slug.clone(),
-                packet_bytes: BROKER_MAX_PACKET as usize + 1,
-                broker_max: BROKER_MAX_PACKET,
-            }),
-            "QoS {qos}: a packet one byte over the maximum",
-        );
+        let message = egress.message(&over_topic, qos, &vec![0u8; over_len]);
+        let id = message.id;
+        match egress.send(message).await {
+            EgressReport::Rejected { message, reason } => {
+                assert_eq!(message.id, id);
+                assert_eq!(
+                    reason,
+                    format!(
+                        "the PUBLISH packet is {} bytes and the broker's Maximum Packet Size \
+                         is {BROKER_MAX_PACKET} bytes",
+                        BROKER_MAX_PACKET + 1
+                    ),
+                    "QoS {qos}: a packet one byte over the maximum",
+                );
+            }
+            other => panic!("QoS {qos}: expected the oversize message rejected, got {other:?}"),
+        }
     }
 
     let after_topic = "brenn/itest/maxpkt/after";
     let mut deliver_rx = direct_subscriber(harness.port, ca, after_topic).await;
-    let result = publish_zeros(&svc, &handle, after_topic, 16, 1).await;
-    assert!(
-        matches!(result, Ok(brenn_mqtt::state::PubackOutcome::Success)),
-        "the in-limit publish after the refusals: {result:?}"
-    );
+    let message = egress.message(after_topic, 1, &[0u8; 16]);
+    egress.deliver(message).await;
     tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
         .await
         .expect("the in-limit publish after the refusals was not delivered")
@@ -425,56 +287,6 @@ async fn broker_max_packet_size_refuses_over_and_delivers_exact() {
     );
 }
 
-/// The two egress halves put a binary payload and its Content Type on the wire
-/// unchanged.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authorize_then_publish_delivers_bytes_and_content_type() {
-    broker_gate!();
-
-    let harness = BrokerHarness::start();
-    let ca = certs::ca_pem_bytes();
-    let SpawnedClient {
-        svc, client_slug, ..
-    } = spawn_client("halves", &harness, ca.clone(), vec![]).await;
-    let topic = "brenn/itest/halves/bin";
-    let mut deliver_rx = direct_subscriber_publish(harness.port, ca, topic).await;
-
-    let policy = wasm_egress_policy(&client_slug);
-    let addr = MqttAddress {
-        client: client_slug.clone(),
-        topic: topic.to_string(),
-    };
-    let payload: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x00, 0xFF];
-    let authorized = brenn_mqtt::egress::authorize(&svc, &policy, &addr)
-        .unwrap_or_else(|e| panic!("authorize: {e:?}"));
-    authorized
-        .publish(
-            &svc,
-            payload.clone(),
-            PublishProps {
-                content_type: Some("image/png".to_string()),
-                qos: 1,
-                ..Default::default()
-            },
-            SendBudget::None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("publish: {e:?}"));
-
-    let received = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
-        .await
-        .expect("no message within 2s")
-        .expect("channel closed");
-    assert_eq!(received.payload.to_vec(), payload);
-    assert_eq!(
-        received
-            .properties
-            .as_ref()
-            .and_then(|p| p.content_type.as_deref()),
-        Some("image/png")
-    );
-}
-
 // ---------------------------------------------------------------------------
 // TLS 1.3 connect + publish/delivery roundtrip
 //
@@ -489,22 +301,14 @@ async fn tls13_connect_publish_delivers() {
 
     let harness = broker_tls13();
     let ca = certs::ca_pem_bytes();
-    let SpawnedClient { svc, handle, .. } =
+    let SpawnedClient { handle, .. } =
         spawn_client_tls13("tls13", &harness, ca.clone(), vec![]).await;
 
     let mut deliver_rx = direct_subscriber(harness.port, ca, "brenn/itest/tls13/state").await;
 
-    svc.publish_on_handle(
-        &handle,
-        "brenn/itest/tls13/state".to_string(),
-        b"tls13-hello".to_vec(),
-        PublishProps {
-            qos: 1,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("tls13 publish failed");
+    let mut egress = Egress::start(&handle);
+    let message = egress.message("brenn/itest/tls13/state", 1, b"tls13-hello");
+    egress.deliver(message).await;
 
     let payload = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
         .await
@@ -581,17 +385,9 @@ async fn self_publish_echoes_back_on_same_session() {
 
     // Publish via the SAME session. With nolocal removed the broker delivers it
     // back to this session, and the router surfaces it as an ingress message.
-    svc.publish_on_handle(
-        &handle,
-        echo_topic.to_string(),
-        b"echoed".to_vec(),
-        PublishProps {
-            qos: 1,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("self-publish failed");
+    let mut egress = Egress::start(&handle);
+    let message = egress.message(echo_topic, 1, b"echoed");
+    egress.deliver(message).await;
 
     let msg = recv_delivery(&mut rx, "echo").await;
     assert_eq!(msg.topic, echo_topic);
@@ -608,190 +404,6 @@ async fn self_publish_echoes_back_on_same_session() {
         Ok(Some(m)) => panic!("unexpected second delivery on {:?}", m.topic),
         Ok(None) => panic!("router receiver closed"),
     }
-}
-
-// ===========================================================================
-// WASM egress — the acceptance layer for the guest→host→broker publish path.
-//
-// These drive `enforce_and_publish` with `SendBudget::None` (the exact call
-// shape the WASM `mqtt:publish` closure uses) against the live broker. The
-// app/client slugs follow `spawn_client`'s registration convention
-// (`itest-<name>` / `testbroker-<name>`).
-// ===========================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wasm_egress_publish_reaches_broker() {
-    broker_gate!();
-
-    let harness = BrokerHarness::start();
-    let ca = certs::ca_pem_bytes();
-    let SpawnedClient { svc, .. } = spawn_client("wasmpub", &harness, ca.clone(), vec![]).await;
-
-    let mut deliver_rx = direct_subscriber(harness.port, ca, "brenn/itest/wasmpub/topic").await;
-
-    let policy = wasm_egress_policy("testbroker-wasmpub");
-    let addr = MqttAddress {
-        client: "testbroker-wasmpub".to_string(),
-        topic: "brenn/itest/wasmpub/topic".to_string(),
-    };
-    let result = enforce_and_publish(
-        &svc,
-        &policy,
-        &addr,
-        b"wasm-egress".to_vec(),
-        PublishProps {
-            qos: 1,
-            ..Default::default()
-        },
-        SendBudget::None,
-    )
-    .await;
-    assert!(matches!(result, Ok(())), "expected Ok, got {result:?}");
-
-    let payload = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
-        .await
-        .expect("no message within 2s after permitted WASM egress publish")
-        .expect("delivery channel closed");
-    assert_eq!(payload, b"wasm-egress", "unexpected payload: {payload:?}");
-}
-
-// `outbound_payload_cap_bytes` bounds `MqttSend` alone: the component's
-// entry, `enforce_and_publish` with no budget, delivers a payload larger than it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wasm_egress_is_not_held_to_the_outbound_bound() {
-    broker_gate!();
-
-    let harness = BrokerHarness::start();
-    let ca = certs::ca_pem_bytes();
-    let mut config = test_client_config(
-        "testbroker-wasmbig",
-        harness.port,
-        ca.clone(),
-        TlsVersionMin::Tls12,
-    );
-    config.identity.outbound_payload_cap_bytes = 8;
-    let SpawnedClient {
-        svc, client_slug, ..
-    } = spawn_client_with_config(Arc::new(config), vec![]).await;
-    wait_for_health(
-        &svc,
-        &client_slug,
-        &[ConnectorHealthLabel::Connected],
-        5,
-        "session never reached Connected",
-    )
-    .await;
-
-    let mut deliver_rx = direct_subscriber(harness.port, ca, "brenn/itest/wasmbig/topic").await;
-
-    let payload = vec![0x5a_u8; 64];
-    let result = enforce_and_publish(
-        &svc,
-        &wasm_egress_policy("testbroker-wasmbig"),
-        &MqttAddress {
-            client: "testbroker-wasmbig".to_string(),
-            topic: "brenn/itest/wasmbig/topic".to_string(),
-        },
-        payload.clone(),
-        PublishProps {
-            qos: 1,
-            ..Default::default()
-        },
-        SendBudget::None,
-    )
-    .await;
-    assert!(matches!(result, Ok(())), "expected Ok, got {result:?}");
-
-    let delivered = tokio::time::timeout(Duration::from_secs(2), deliver_rx.recv())
-        .await
-        .expect("no message within 2s after a component publish over the outbound bound")
-        .expect("delivery channel closed");
-    assert_eq!(delivered, payload);
-}
-
-// broker-rejected publish maps to BrokerRejected with a non-empty reason.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wasm_egress_broker_rejected_maps_reason() {
-    broker_gate!();
-
-    let harness = BrokerHarness::start();
-    let ca = certs::ca_pem_bytes();
-    let SpawnedClient { svc, .. } = spawn_client("wasmrej", &harness, ca, vec![]).await;
-
-    let policy = wasm_egress_policy("testbroker-wasmrej");
-    // Topic OUTSIDE `brenn/itest/#`: brenn-side ACL permits it (client-scoped),
-    // the broker rejects it.
-    let addr = MqttAddress {
-        client: "testbroker-wasmrej".to_string(),
-        topic: "forbidden/wasmrej/topic".to_string(),
-    };
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        enforce_and_publish(
-            &svc,
-            &policy,
-            &addr,
-            b"denied".to_vec(),
-            PublishProps {
-                qos: 1,
-                ..Default::default()
-            },
-            SendBudget::None,
-        ),
-    )
-    .await
-    .expect(
-        "publish to a broker-denied topic hung with no PUBACK within 5s — the broker may be \
-         silently dropping the denied publish rather than rejecting it",
-    );
-
-    match result {
-        Err(MqttEgressError::BrokerRejected { reason }) => {
-            assert!(
-                !reason.is_empty(),
-                "BrokerRejected reason must be non-empty"
-            );
-        }
-        Ok(()) => panic!(
-            "broker ACL not enforced: a QoS-1 publish to a topic outside `brenn/itest/#` succeeded"
-        ),
-        other => panic!("expected BrokerRejected, got {other:?}"),
-    }
-}
-
-// brenn-side ACL deny (client not in the policy's mqtt_publish matcher).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wasm_egress_acl_denied() {
-    broker_gate!();
-
-    let harness = BrokerHarness::start();
-    let ca = certs::ca_pem_bytes();
-    let SpawnedClient { svc, .. } = spawn_client("wasmacl", &harness, ca, vec![]).await;
-
-    // Grant MqttPublish, but only for a different client — the target client is
-    // denied at layer 2 before any session lookup or broker contact.
-    let policy = wasm_egress_policy("some-other-client");
-    let addr = MqttAddress {
-        client: "testbroker-wasmacl".to_string(),
-        topic: "brenn/itest/wasmacl/topic".to_string(),
-    };
-    let result = enforce_and_publish(
-        &svc,
-        &policy,
-        &addr,
-        b"x".to_vec(),
-        PublishProps {
-            qos: 1,
-            ..Default::default()
-        },
-        SendBudget::None,
-    )
-    .await;
-    assert!(
-        matches!(result, Err(MqttEgressError::AclDenied { ref client, .. }) if client == "testbroker-wasmacl"),
-        "expected AclDenied for testbroker-wasmacl, got {result:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,20 +765,17 @@ async fn the_disconnect_matcher_reads_a_live_brokers_wording() {
 }
 
 // ===========================================================================
-// Reconnect / auth (mqtt-unify-reconnect-test) — the two design-mandated pins
-// for the unify-sessions refactor's core behaviors, exercised through a real
-// broker: (1) a mid-session drop re-asserts subscription filters AND fails a
-// pending publish cleanly; (2) bad credentials drive the session to Failed with
+// Reconnect / auth, through a real broker: (1) a mid-session drop re-asserts
+// subscription filters; (2) bad credentials drive the session to Failed with
 // the reason surfaced.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Mid-session drop (broker stays up): reconnect re-asserts the filter AND a
-// pre-disconnect pending publish fails NotConnected on the one shared session.
+// Mid-session drop (broker stays up): reconnect re-asserts the filter.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reconnect_reasserts_filters_and_fails_pending_publish() {
+async fn reconnect_reasserts_filters() {
     broker_gate!();
 
     let broker = BrokerHarness::start();
@@ -1175,11 +784,9 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
 
     // Retained sentinel stored at the broker (via a DIRECT connection, not the
     // relay) before the session ever subscribes. The subscribed filter is a
-    // wildcard covering it; the stalled publish goes OUTSIDE that filter so no
-    // self-echo can confuse the delivery assertions.
+    // wildcard covering it.
     let sub_filter = "brenn/itest/reconn/sub/#";
     let sentinel_topic = "brenn/itest/reconn/sub/probe";
-    let pub_topic = "brenn/itest/reconn/pub/probe";
     let (pubc, mut ack_rx) = direct_publisher_acked(broker.port, ca.clone()).await;
     pubc.publish(
         sentinel_topic.to_string(),
@@ -1224,46 +831,8 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
         msg.payload
     );
 
-    // Stall the relay, then start a QoS-1 publish OUTSIDE the subscribed filter.
-    // Its PUBLISH bytes leave the client but are never forwarded, so no PubAck can
-    // arrive: the call parks awaiting its notice.
-    relay.stall().await;
-    // Take the wake the connection's install left, so the wait below sees the
-    // publish's own.
-    tokio::time::timeout(Duration::from_secs(1), handle.egress_wake.notified())
-        .await
-        .expect("the install left a wake");
-    let svc_task = svc.clone();
-    let handle_task = handle.clone();
-    let pub_task = tokio::spawn(async move {
-        svc_task
-            .publish_on_handle(
-                &handle_task,
-                pub_topic.to_string(),
-                b"stalled".to_vec(),
-                PublishProps {
-                    qos: 1,
-                    ..Default::default()
-                },
-            )
-            .await
-    });
-
-    // Event witness: the event loop wrote the PUBLISH BEFORE the sever, so the
-    // disconnect provably ends a real in-flight publish rather than one that
-    // took the client-is-None fast path.
-    tokio::time::timeout(Duration::from_secs(3), handle.egress_wake.notified())
-        .await
-        .expect("stalled publish was never written within 3s");
-
-    // Sever: the eventloop errors, and the supervisor's disconnect path drops
-    // it, ending the parked publish's notice with NotConnected.
+    // Sever: the event loop errors and the supervisor reconnects.
     relay.sever().await;
-    let result = pub_task.await.expect("publish task panicked");
-    assert!(
-        matches!(result, Err(brenn_lib::mqtt::MqttError::NotConnected { .. })),
-        "pre-disconnect pending publish must fail NotConnected, got {result:?}"
-    );
 
     // Reconnect through the relay (listener still up, new conns Forward).
     wait_for_health(
@@ -1290,9 +859,7 @@ async fn reconnect_reasserts_filters_and_fails_pending_publish() {
 }
 
 // ---------------------------------------------------------------------------
-// The publish wait: a broker that does not answer releases the caller after
-// `PUBLISH_WAIT`. The sessions keep `keepalive_secs: Some(30)`, so keepalive
-// cannot end a wait before 30 s and the bound is what is observed.
+// A session behind a relay the test can stall and sever.
 // ---------------------------------------------------------------------------
 
 /// A session for `slug` dialling a relay in front of a fresh broker, Connected,
@@ -1332,32 +899,6 @@ async fn relayed_session(slug: &str, topic: &str) -> RelayedSession {
     }
 }
 
-/// A component's publish: `enforce_and_publish` with no send budget.
-async fn component_publish(
-    session: &RelayedSession,
-    topic: &str,
-    payload: &[u8],
-) -> Result<(), MqttEgressError> {
-    let SpawnedClient {
-        svc, client_slug, ..
-    } = &session.spawned;
-    enforce_and_publish(
-        svc,
-        &wasm_egress_policy(client_slug),
-        &MqttAddress {
-            client: client_slug.clone(),
-            topic: topic.to_string(),
-        },
-        payload.to_vec(),
-        PublishProps {
-            qos: 1,
-            ..Default::default()
-        },
-        SendBudget::None,
-    )
-    .await
-}
-
 /// The next payload the direct subscriber receives, within 5 s.
 async fn next_delivery(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
@@ -1376,180 +917,6 @@ async fn no_more_deliveries(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8
         Ok(Some(p)) => panic!("{what}: unexpected delivery {p:?}"),
         Ok(None) => panic!("{what}: delivery channel closed"),
     }
-}
-
-fn assert_timed_out(result: &Result<(), MqttEgressError>, what: &str) {
-    assert!(
-        matches!(
-            result,
-            Err(MqttEgressError::Broker(
-                brenn_lib::mqtt::MqttError::TimedOut { .. }
-            ))
-        ),
-        "{what}: expected Broker(TimedOut), got {result:?}"
-    );
-}
-
-/// A silent connection: the component's call and the conversation's call both
-/// return `TimedOut` after the bound, well before keepalive would notice, and
-/// the session stays Connected. Once the connection forwards again both
-/// messages are delivered, though their callers were told of a timeout, and a
-/// third publish is resolved by its own acknowledgement.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_silent_connection_times_out_both_callers_within_the_bound() {
-    broker_gate!();
-
-    let topic = "brenn/itest/silent/t";
-    let mut session = relayed_session("testbroker-silent", topic).await;
-    let db = brenn_messaging_store::db::init_db_memory();
-    {
-        let conn = db.lock().await;
-        brenn_messaging_store::testutils::ensure_user_and_conv(&conn, 1);
-    }
-
-    session.relay.stall().await;
-    let start = std::time::Instant::now();
-    let SpawnedClient {
-        svc, client_slug, ..
-    } = &session.spawned;
-    let policy = wasm_egress_policy(client_slug);
-    let addr = MqttAddress {
-        client: client_slug.clone(),
-        topic: topic.to_string(),
-    };
-    let conversation = async {
-        brenn_mqtt::egress::authorize(svc, &policy, &addr)
-            .expect("authorized")
-            .publish(
-                svc,
-                b"conversation".to_vec(),
-                PublishProps {
-                    qos: 1,
-                    ..Default::default()
-                },
-                SendBudget::Conversation {
-                    db: &db,
-                    conversation_id: 1,
-                    default_budget: 5,
-                },
-            )
-            .await
-    };
-    let (component, conversation) = tokio::join!(
-        component_publish(&session, topic, b"component"),
-        conversation
-    );
-    let elapsed = start.elapsed();
-    assert_timed_out(&component, "component publish");
-    assert_timed_out(&conversation, "conversation publish");
-    assert!(elapsed >= PUBLISH_WAIT, "returned after {elapsed:?}");
-    assert!(
-        elapsed < Duration::from_secs(25),
-        "returned after {elapsed:?}"
-    );
-    assert_eq!(
-        svc.ingress_health(client_slug).await.0,
-        ConnectorHealthLabel::Connected
-    );
-    assert_eq!(
-        brenn_messaging_store::db::read_send_budget(&db.lock().await as &rusqlite::Connection, 1),
-        Some(4),
-        "the conversation's send budget is spent and not refunded"
-    );
-
-    session.relay.resume().await;
-    let mut stalled = vec![
-        next_delivery(&mut session.deliver_rx, "first stalled message").await,
-        next_delivery(&mut session.deliver_rx, "second stalled message").await,
-    ];
-    stalled.sort();
-    assert_eq!(
-        stalled,
-        vec![b"component".to_vec(), b"conversation".to_vec()]
-    );
-
-    let third = component_publish(&session, topic, b"third").await;
-    assert!(matches!(third, Ok(())), "third publish: {third:?}");
-    assert_eq!(
-        next_delivery(&mut session.deliver_rx, "third message").await,
-        b"third"
-    );
-    no_more_deliveries(&mut session.deliver_rx, "after the third message").await;
-
-    session.spawned.handle.stop();
-}
-
-/// An acknowledgement that arrives late but within the bound completes the
-/// publish normally.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_late_acknowledgement_within_the_bound_completes_the_publish() {
-    broker_gate!();
-
-    let topic = "brenn/itest/late/t";
-    let mut session = relayed_session("testbroker-late", topic).await;
-
-    session.relay.stall().await;
-    let publish = component_publish(&session, topic, b"late");
-    let resume = async {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        session.relay.resume().await;
-    };
-    let (result, ()) = tokio::join!(publish, resume);
-    assert!(matches!(result, Ok(())), "late publish: {result:?}");
-    assert_eq!(
-        next_delivery(&mut session.deliver_rx, "late message").await,
-        b"late"
-    );
-    no_more_deliveries(&mut session.deliver_rx, "after the late message").await;
-
-    session.spawned.handle.stop();
-}
-
-/// A timed-out publish is not resent when the session reconnects: the client
-/// side keeps nothing across connections.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_timed_out_publish_is_not_resent_after_a_reconnect() {
-    broker_gate!();
-
-    let topic = "brenn/itest/noresend/t";
-    let mut session = relayed_session("testbroker-noresend", topic).await;
-
-    session.relay.stall().await;
-    let first = component_publish(&session, topic, b"first").await;
-    assert_timed_out(&first, "stalled publish");
-    session.relay.sever().await;
-
-    let SpawnedClient {
-        svc, client_slug, ..
-    } = &session.spawned;
-    // The supervisor backs off at least a second before it redials, so the
-    // Disconnected state is there to be seen.
-    wait_for_health(
-        svc,
-        client_slug,
-        &[ConnectorHealthLabel::Disconnected],
-        10,
-        "session never noticed the sever",
-    )
-    .await;
-    wait_for_health(
-        svc,
-        client_slug,
-        &[ConnectorHealthLabel::Connected],
-        10,
-        "session never reconnected through the relay after sever",
-    )
-    .await;
-
-    let second = component_publish(&session, topic, b"second").await;
-    assert!(matches!(second, Ok(())), "second publish: {second:?}");
-    assert_eq!(
-        next_delivery(&mut session.deliver_rx, "second message").await,
-        b"second"
-    );
-    no_more_deliveries(&mut session.deliver_rx, "after the second message").await;
-
-    session.spawned.handle.stop();
 }
 
 /// Forwards each inbound payload, except that the first payload `panic`
@@ -1581,19 +948,17 @@ impl MqttEventRouter for PanicOnceRouter {
     }
 }
 
-/// A publish submitted on the connection of a supervisor body that panics is
-/// resolved, not left hanging: the unwinding body drops its event loop, and
-/// the respawned body replaces the dead client. The first publish on the new
-/// connection is resolved by its own acknowledgement.
+/// A message handed on the connection of a supervisor body that panics is
+/// delivered: acknowledged before the panic, or resent on the respawned
+/// body's connection. The next message is resolved by its own acknowledgement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_publish_on_a_panicked_bodys_connection_is_resolved() {
+async fn a_message_on_a_panicked_bodys_connection_is_delivered() {
     broker_gate!();
 
     let harness = BrokerHarness::start();
     let ca = certs::ca_pem_bytes();
     let trigger_topic = "brenn/itest/respawn/trigger";
     let publish_topic = "brenn/itest/respawn/out";
-    let racing_topic = "brenn/itest/respawn/racing";
 
     // A retained message on the trigger topic, delivered when the session's
     // subscription goes live.
@@ -1638,6 +1003,7 @@ async fn a_publish_on_a_panicked_bodys_connection_is_resolved() {
         .expect("retained ready not delivered within 5s")
         .expect("router channel closed");
     assert_eq!(ready, b"ready");
+    let mut egress = Egress::start(&handle);
 
     pubc.publish(
         trigger_topic.to_string(),
@@ -1649,63 +1015,27 @@ async fn a_publish_on_a_panicked_bodys_connection_is_resolved() {
     .expect("panic trigger publish failed");
     await_puback(&mut ack_rx, "panic trigger").await;
 
-    // Submitted on the dying body's client: acknowledged before the panic, or
-    // ended by it. Either way its notice resolves.
-    let notice = {
-        let guard = handle.client.lock().await;
-        guard.as_ref().and_then(|client| {
-            client
-                .try_publish_tracked(racing_topic, QoS::AtLeastOnce, false, b"racing".to_vec())
-                .ok()
-        })
-    };
-    if let Some(notice) = notice {
-        // The watchdog delays its respawn, so this wait must allow for that delay.
-        let result = tokio::time::timeout(Duration::from_secs(10), notice.wait_async())
-            .await
-            .expect("a publish on the panicked body's connection was never resolved");
-        let outcome = brenn_mqtt::state::notice_outcome(result);
-        assert!(
-            matches!(
-                outcome,
-                brenn_mqtt::state::NoticeOutcome::Delivered
-                    | brenn_mqtt::state::NoticeOutcome::ConnectionEnded
-            ),
-            "racing publish: {outcome:?}"
-        );
+    // Handed while the body delivering the trigger panics: on the dying
+    // connection, or on its successor once the watchdog respawns the body.
+    // The respawn is delayed, so the report wait allows for that delay.
+    let racing = egress.message(publish_topic, 1, b"racing");
+    egress.deliver(racing).await;
+    let after = egress.message(publish_topic, 1, b"after");
+    egress.deliver(after).await;
+
+    // QoS 1 may deliver the racing message twice when its acknowledgement was
+    // lost with the connection; the message after it arrives exactly once.
+    let mut received = Vec::new();
+    while received.last().map(Vec::as_slice) != Some(b"after".as_slice()) {
+        received.push(next_delivery(&mut deliver_rx, "racing, then after").await);
     }
-    // Until the respawned body installs its connection, the dead body's client
-    // is still in the cell and the state still reads Connected; a publish on it
-    // fails at submit. The first publish the new connection accepts is the
-    // barrier.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let outcome = loop {
-        let result = svc
-            .publish_on_handle(
-                &handle,
-                publish_topic.to_string(),
-                b"after".to_vec(),
-                PublishProps {
-                    qos: 1,
-                    ..Default::default()
-                },
-            )
-            .await;
-        match result {
-            Ok(outcome) => break outcome,
-            Err(brenn_lib::mqtt::MqttError::NotConnected { .. })
-                if std::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => panic!("publish on the new connection failed: {e:?}"),
-        }
-    };
+    let (after, racing) = received.split_last().expect("at least the message after");
+    assert_eq!(after, b"after");
     assert!(
-        matches!(outcome, brenn_mqtt::state::PubackOutcome::Success),
-        "publish outcome: {outcome:?}"
+        !racing.is_empty() && racing.iter().all(|p| p == b"racing"),
+        "the racing message arrives at least once before the next: {received:?}"
     );
-    assert_eq!(next_delivery(&mut deliver_rx, "after").await, b"after");
+    no_more_deliveries(&mut deliver_rx, "after the message after").await;
 
     handle.stop();
 }
@@ -2148,6 +1478,65 @@ impl MemBus {
             reports,
         });
         (bus, rx)
+    }
+}
+
+impl MemBus {
+    /// Append `message` to the channel and raise the wake, as a commit does.
+    fn append(&self, message: EgressMessage) {
+        self.entries
+            .lock()
+            .unwrap()
+            .0
+            .push(EgressItem::Message(message));
+        self.wake.send_modify(|n| *n += 1);
+    }
+}
+
+/// A client's egress reader over an initially empty [`MemBus`], for a test that
+/// publishes through the session one message at a time. One handle takes one
+/// reader, so a test that publishes more than once appends to the same bus.
+struct Egress {
+    client_slug: String,
+    bus: Arc<MemBus>,
+    reports: tokio::sync::mpsc::UnboundedReceiver<EgressReport>,
+    next_seq: u64,
+}
+
+impl Egress {
+    fn start(handle: &Arc<MqttClientHandle>) -> Self {
+        let (bus, reports) = MemBus::holding(vec![]);
+        start_egress_reader(handle, bus.clone());
+        Self {
+            client_slug: handle.config.identity.slug.clone(),
+            bus,
+            reports,
+            next_seq: 1,
+        }
+    }
+
+    /// The next message for `topic` at `qos`: not retained, no content type,
+    /// no expiry.
+    fn message(&mut self, topic: &str, qos: u8, payload: &[u8]) -> EgressMessage {
+        let message = egress_message(self.next_seq, &self.client_slug, topic, qos, payload);
+        self.next_seq += 1;
+        message
+    }
+
+    /// Commit `message` to the channel and return the reader's next report.
+    async fn send(&mut self, message: EgressMessage) -> EgressReport {
+        self.bus.append(message);
+        next_report(&mut self.reports, 15, "the egress report").await
+    }
+
+    /// Commit `message` and assert the reader reports it delivered.
+    async fn deliver(&mut self, message: EgressMessage) {
+        let id = message.id;
+        let report = self.send(message).await;
+        assert!(
+            matches!(&report, EgressReport::Delivered(meta) if meta.id == id),
+            "expected {id} delivered, got {report:?}"
+        );
     }
 }
 

@@ -395,26 +395,6 @@ in-flight and backlog rows than the floor and the guest's memory cover read
 whole completes, each with a test. The comment sits at `sweep` in
 `brenn-provider-kit/src/activation.rs`.
 
-## `mqtt-async-publish-component-survey`
-
-The component functions `mqtt-publish` and `mqtt-publish-expiring` are to
-become commit-and-return: they stop returning `broker(..)` and
-`broker-rejected(..)`, and a publish from an activation that later traps is
-not sent. That rests on a survey of out-of-tree components for any that relies
-on the inline broker outcome. The survey read the owner's private component
-repository (one caller, `usage-proxy`, which retries no message),
-`brenn-fastmail` and `brenn-component-demo` (no MQTT publish calls). A
-repository named `brenn-demo-components` was named as out-of-tree and was not
-found; `brenn-component-demo` was read in its place. The owner says: whether
-`brenn-component-demo` is the one meant, and whether any component repository
-exists that the survey did not read. If one does and it relies on the inline
-outcome, the old functions keep their synchronous behaviour and the
-asynchronous one arrives only in a new contract version; if none does, the
-switch goes ahead as planned. The cycle that makes the switch repeats the
-survey over every repository it can reach and records what it could not check.
-Done = the owner has answered, or the switch has shipped with its survey
-recorded.
-
 ## `mqtt-egress-removed-client-rows`
 
 A removed MQTT client's egress channel row and retained messages stay in the
@@ -424,23 +404,6 @@ client added again under the same slug gets the same channel; its reader's new
 position skips whatever the channel still retains and logs the count. Done =
 removed channels are reaped under the general policy, or this channel family
 is reaped at removal.
-
-## `mqtt-egress-unwired`
-
-A component's `mqtt-publish` and `mqtt-publish-expiring` still publish to the
-broker directly and synchronously, through `brenn-mqtt/src/egress.rs` and
-`brenn-bootstrap/src/wasm_mqtt.rs`, under the 10 s `PUBLISH_WAIT`; only
-`MqttSend` goes through the bus admission (`Messenger::admit_mqtt`) and the
-per-client egress channels. The admission still refuses `deliver_after` and
-`reply_to` on an MQTT publish. Done = both component functions buffer with the
-activation and flush through `admit_mqtt`, `egress.rs`'s direct path and the
-wait machinery (`PUBLISH_WAIT`, `MqttError::TimedOut`, the wait budget, the
-MQTT `blocked` credit) are deleted, `reply_to` on an MQTT publish names an
-MQTT topic on the same broker that the sender's ACLs allow it to publish to
-and is sent as the MQTT 5 Response Topic, and `deliver_after` on an MQTT
-publish is accepted, the message parked on the bus and released into the
-client's egress channel with its lifetime counted from release. Documenting
-either refusal as final does not close this entry.
 
 ## `mqtt-publish-acl-ops-config`
 
@@ -456,6 +419,17 @@ bring `brenn-ops` into the workflow's scope, or make the config change by hand
 at the deploy that carries the ACLs. Until one happens, every PA can publish
 to every topic on its broker. Done = the production config grants each MQTT
 publisher only the topic filters it needs.
+
+## `mqtt-publish-reply-to-and-deliver-after-refused`
+
+The bus admission of an MQTT publish (`Messenger::admit_mqtt`) refuses
+`reply_to` and `deliver_after`. Done = `reply_to` on an MQTT publish
+names an MQTT topic on the same broker that the sender's ACLs allow it
+to publish to and is sent as the MQTT 5 Response Topic, and
+`deliver_after` on an MQTT publish is accepted, the message parked on
+the bus and released into the client's egress channel with its
+lifetime counted from release. Documenting either refusal as final
+does not close this entry.
 
 ## `obs-log-capture-test-flaky`
 

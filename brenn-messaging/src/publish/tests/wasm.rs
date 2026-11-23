@@ -753,6 +753,7 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
             reply_to: None,
             deliver_after: None,
             attachments: &none,
+            mqtt: None,
         },
         WasmPublish {
             channel_address: &channel_addr,
@@ -761,6 +762,7 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
             reply_to: None,
             deliver_after: None,
             attachments: &none,
+            mqtt: None,
         },
     ];
     m.publish_from_wasm(consumer_slug, &publishes).await;
@@ -999,6 +1001,7 @@ async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
                 reply_to: None,
                 deliver_after: None,
                 attachments: &HeldAttachments::none(),
+                mqtt: None,
             },
             WasmPublish {
                 channel_address: &addr,
@@ -1007,6 +1010,7 @@ async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
                 reply_to: None,
                 deliver_after: Some(chrono::Utc::now() + chrono::Duration::seconds(600)),
                 attachments: &HeldAttachments::none(),
+                mqtt: None,
             },
         ],
     )
@@ -1038,6 +1042,7 @@ async fn a_fed_body_shares_the_retained_bodys_allocation() {
             reply_to: None,
             deliver_after: None,
             attachments: &HeldAttachments::none(),
+            mqtt: None,
         }],
     )
     .await;
@@ -1080,6 +1085,7 @@ async fn publish_from_wasm_ephemeral_output_lands_in_the_ring() {
             reply_to: None,
             deliver_after: None,
             attachments: &HeldAttachments::none(),
+            mqtt: None,
         }],
     )
     .await;
@@ -1129,6 +1135,7 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
                 reply_to: None,
                 deliver_after: None,
                 attachments: &HeldAttachments::none(),
+                mqtt: None,
             },
             WasmPublish {
                 channel_address: &ephemeral_addr,
@@ -1137,6 +1144,7 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
                 reply_to: None,
                 deliver_after: None,
                 attachments: &HeldAttachments::none(),
+                mqtt: None,
             },
         ],
     )
@@ -1190,6 +1198,7 @@ async fn publish_from_wasm_ephemeral_deferred_parks_then_releases() {
             reply_to: None,
             deliver_after: Some(release_at),
             attachments: &HeldAttachments::none(),
+            mqtt: None,
         }],
     )
     .await;
@@ -1237,6 +1246,7 @@ async fn publish_from_wasm_ephemeral_past_deliver_after_is_immediate() {
             reply_to: None,
             deliver_after: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
             attachments: &HeldAttachments::none(),
+            mqtt: None,
         }],
     )
     .await;
@@ -1273,6 +1283,7 @@ async fn publish_from_wasm_durable_deferred_parks_the_row() {
             reply_to: None,
             deliver_after: Some(release_at),
             attachments: &HeldAttachments::none(),
+            mqtt: None,
         }],
     )
     .await;
@@ -1311,6 +1322,7 @@ async fn the_durable_deferred_cap_refuses_a_wasm_park_and_the_flush_carries_on()
                 reply_to: None,
                 deliver_after: Some(release_at),
                 attachments: &HeldAttachments::none(),
+                mqtt: None,
             },
             WasmPublish {
                 channel_address: &durable_addr,
@@ -1319,6 +1331,7 @@ async fn the_durable_deferred_cap_refuses_a_wasm_park_and_the_flush_carries_on()
                 reply_to: None,
                 deliver_after: Some(release_at),
                 attachments: &HeldAttachments::none(),
+                mqtt: None,
             },
             WasmPublish {
                 channel_address: &durable_addr,
@@ -1327,6 +1340,7 @@ async fn the_durable_deferred_cap_refuses_a_wasm_park_and_the_flush_carries_on()
                 reply_to: None,
                 deliver_after: None,
                 attachments: &HeldAttachments::none(),
+                mqtt: None,
             },
         ],
     )
@@ -1392,6 +1406,7 @@ async fn publish_from_wasm_unknown_channel_panics() {
         reply_to: None,
         deliver_after: None,
         attachments: &HeldAttachments::none(),
+        mqtt: None,
     };
     m.publish_from_wasm(consumer_slug, &[bad_publish]).await;
 }
@@ -1419,6 +1434,7 @@ async fn publish_from_wasm_reply_to_resolves_to_channel_uuid() {
         reply_to: Some(&channel_addr),
         deliver_after: None,
         attachments: &none,
+        mqtt: None,
     }];
     m.publish_from_wasm(consumer_slug, &publishes).await;
 
@@ -1452,6 +1468,7 @@ async fn publish_from_wasm_unknown_reply_to_panics() {
         reply_to: Some("brenn:tool-results/nonexistent"),
         deliver_after: None,
         attachments: &none,
+        mqtt: None,
     }];
     m.publish_from_wasm(consumer_slug, &publishes).await;
 }
@@ -1473,6 +1490,7 @@ async fn publish_from_wasm_reply_to_reaches_a_ring_channel_as_an_address() {
             reply_to: Some(&durable_addr),
             deliver_after: None,
             attachments: &HeldAttachments::none(),
+            mqtt: None,
         }],
     )
     .await;
@@ -1508,6 +1526,7 @@ async fn a_fed_ring_envelope_carries_the_resolved_reply_address() {
             reply_to: Some(&reply_addr),
             deliver_after: None,
             attachments: &HeldAttachments::none(),
+            mqtt: None,
         }],
     )
     .await;
@@ -1538,6 +1557,7 @@ async fn publish_from_wasm_unknown_reply_to_on_a_ring_channel_panics() {
             reply_to: Some("brenn:tool-results/nonexistent"),
             deliver_after: None,
             attachments: &HeldAttachments::none(),
+            mqtt: None,
         }],
     )
     .await;

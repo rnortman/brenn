@@ -1,23 +1,20 @@
-// Integration tests for the WASM MQTT-egress path (first test: guest calls
-// `mqtt-publish` naming an authorized client,
-// the host callback reports a broker error, and the guest propagates it back).
+// Integration tests for the WASM MQTT-egress path: the `processor-mqtt-test`
+// SDK fixture, a real activation, and a scripted `MqttPublisher`.
 //
-// Uses the `processor-mqtt-test` SDK fixture component: on any activation
-// with ≥1 new envelope, the component publishes the first new message's body
-// bytes with `mqtt::try_publish("test-client", "test/topic", payload, None, 0,
-// false)` and maps the returned `PublishError` to a processing failure
-// `"ErrorVariant:detail"`.
+// An admitted MQTT publish is buffered with the activation and comes back in
+// `ProcessorOutcome::Ok`'s `publishes` as an entry with `mqtt` set, aimed at
+// the client's egress channel; an activation that errs or traps returns none.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
-use brenn_budget::MAX_PUBLISH_CALLS_PER_ACTIVATION;
+use brenn_budget::{MAX_PUBLISH_CALLS_PER_ACTIVATION, MAX_PUBLISHES_PER_ACTIVATION};
+use brenn_envelope::addressing::mqtt_egress_address;
 use brenn_wasm::{
-    ComponentGrant, MqttPublishFn, MqttPublishOutcome, MqttPublishProps, MqttPublisher, MqttTarget,
-    ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
+    ComponentGrant, MqttAdmission, MqttPublishFn, MqttPublishProps, MqttPublisher, MqttTarget,
+    ProcessorComponent, ProcessorLoadSpec, ProcessorMqttPublish, ProcessorOutcome,
+    ProcessorPublish, SinkBudget,
 };
 
 mod common;
@@ -27,15 +24,22 @@ fn component_path() -> std::path::PathBuf {
         .join("target/components/brenn_processor_mqtt_test.wasm")
 }
 
-fn make_envelope() -> String {
-    r#"{"message_id":"00000000-0000-0000-0000-000000000001","source":"test","channel":"brenn:test","sender":"test-sender","publish_ts":"2026-01-01T00:00:00Z","body":"ping","urgency":"normal","envelope_type":"brenn"}"#.to_string()
-}
-
-fn single_activation() -> ProcessorActivation {
+/// One activation whose only new message has `body` as its text.
+fn activation_with_body(body: &str) -> ProcessorActivation {
+    let envelope = serde_json::json!({
+        "message_id": "00000000-0000-0000-0000-000000000003",
+        "source": "test",
+        "channel": "brenn:test",
+        "sender": "test-sender",
+        "publish_ts": "2026-01-01T00:00:00Z",
+        "body": body,
+        "urgency": "normal",
+        "envelope_type": "brenn",
+    });
     ProcessorActivation {
         ports: vec![ProcessorPortWindow {
             port: "in".to_string(),
-            envelopes: vec![make_envelope()],
+            envelopes: vec![envelope.to_string()],
             new_from: 0,
             dropped: 0,
         }],
@@ -45,30 +49,71 @@ fn single_activation() -> ProcessorActivation {
     }
 }
 
-/// An envelope whose body carries the `TRAP_AFTER_PUBLISH` sentinel the fixture
-/// keys on to take the publish-once-then-panic path.
-fn trap_after_publish_envelope() -> String {
-    r#"{"message_id":"00000000-0000-0000-0000-000000000002","source":"test","channel":"brenn:test","sender":"test-sender","publish_ts":"2026-01-01T00:00:00Z","body":"TRAP_AFTER_PUBLISH","urgency":"normal","envelope_type":"brenn"}"#.to_string()
+/// What one `admit` call saw.
+type SeenAdmit = (MqttTarget, usize, MqttPublishProps);
+
+/// A publisher whose admission is read from a shared cell at call time, so one
+/// loaded component serves several answers: loading compiles the guest, which
+/// dominates this suite's runtime.
+///
+/// `resolve` maps every `home:<suffix>` client string to `home`, as the host's
+/// parser joins and splits the address, and leaves every other one unchanged.
+struct ScriptedPublisher {
+    admission: Mutex<MqttAdmission>,
+    seen: Mutex<Vec<SeenAdmit>>,
 }
 
-fn trap_after_publish_activation() -> ProcessorActivation {
-    ProcessorActivation {
-        ports: vec![ProcessorPortWindow {
-            port: "in".to_string(),
-            envelopes: vec![trap_after_publish_envelope()],
-            new_from: 0,
-            dropped: 0,
-        }],
-        deferred: vec![],
-        now: None,
-        sync: None,
+impl ScriptedPublisher {
+    fn new(admission: MqttAdmission) -> Arc<Self> {
+        Arc::new(Self {
+            admission: Mutex::new(admission),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn answer(&self, admission: MqttAdmission) {
+        *self.admission.lock().expect("not poisoned") = admission;
+        self.seen.lock().expect("not poisoned").clear();
+    }
+
+    fn seen(&self) -> Vec<SeenAdmit> {
+        self.seen.lock().expect("not poisoned").clone()
     }
 }
 
-/// Load the mqtt-test fixture with a given `mqtt_publish` callback, and `out`
-/// bound so the hold path's buffered publishes appear in
-/// `ProcessorOutcome::Ok`.
-fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
+impl MqttPublisher for ScriptedPublisher {
+    fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String> {
+        let client = if client.starts_with("home:") {
+            "home"
+        } else {
+            client
+        };
+        Ok(MqttTarget {
+            client: client.to_string(),
+            topic: topic.to_string(),
+        })
+    }
+
+    fn admit(
+        &self,
+        target: &MqttTarget,
+        payload_len: usize,
+        props: &MqttPublishProps,
+    ) -> MqttAdmission {
+        self.seen
+            .lock()
+            .expect("not poisoned")
+            .push((target.clone(), payload_len, props.clone()));
+        self.admission.lock().expect("not poisoned").clone()
+    }
+}
+
+/// Load the fixture over `publisher`, with `out` bound so the interleave
+/// path's port publishes flush, and `mqtt_sinks` as the clients' buckets.
+fn load_mqtt_test(
+    publisher: &Arc<ScriptedPublisher>,
+    mqtt_sinks: HashMap<String, SinkBudget>,
+) -> ProcessorComponent {
     let grants: BTreeSet<ComponentGrant> = [ComponentGrant::Mqtt, ComponentGrant::Ports]
         .into_iter()
         .collect();
@@ -79,394 +124,339 @@ fn load_mqtt_test(mqtt_publish: MqttPublishFn) -> ProcessorComponent {
         grants,
         alerter: common::noop_alerter(),
         output_acl: common::allow_all(),
-        mqtt_publish: Some(mqtt_publish),
+        mqtt_sinks,
+        mqtt_publish: Some(Arc::clone(publisher) as MqttPublishFn),
         ..ProcessorLoadSpec::minimal(&component_path(), "mqtt-test")
     })
 }
 
-// ── test: authorized client reaches broker layer ──────────────────────────────
-
-/// Guest calls `mqtt-publish`; host callback returns `Broker("test-broker-error")`;
-/// guest propagates it as `ProcessingFailed("Broker:test-broker-error")`.
-///
-/// Proves the full host path
-/// (linked `mqtt` interface → `do_mqtt_publish` → bootstrap closure) is wired
-/// end-to-end through a real WASM activation and that the guest receives and
-/// propagates the broker outcome inline.
-#[test]
-fn mqtt_publish_broker_error_propagates_to_guest() {
-    let callback: MqttPublishFn = common::passthrough_mqtt(|_client, _topic, _payload, _props| {
-        MqttPublishOutcome::Broker("test-broker-error".to_string())
-    });
-    let comp = load_mqtt_test(callback);
-
-    let outcome = comp.handle(common::host_activation(single_activation()));
-
+/// The publishes of an ok activation.
+fn ok_publishes(outcome: ProcessorOutcome) -> Vec<ProcessorPublish> {
     match outcome {
-        ProcessorOutcome::Err(re) => {
-            let msg = re.to_string();
-            assert!(
-                msg.contains("Broker:test-broker-error"),
-                "expected ProcessingFailed containing 'Broker:test-broker-error', got: {msg:?}"
-            );
-        }
+        ProcessorOutcome::Ok { publishes, .. } => publishes,
+        other => panic!("expected ProcessorOutcome::Ok; got {other:?}"),
+    }
+}
+
+/// The rendering of an activation the guest failed.
+fn failure(outcome: ProcessorOutcome) -> String {
+    match outcome {
+        ProcessorOutcome::Err(re) => re.to_string(),
         other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
     }
 }
 
-// ── test: ACL deny → not-permitted ──
-
-/// Guest calls `mqtt-publish` for a client its `mqtt_publish` ACL does not
-/// authorize; the host callback (which in production is the `bootstrap` closure
-/// over `enforce_and_publish`, returning `MqttEgressError::AclDenied` →
-/// `MqttPublishOutcome::NotPermitted` for an unlisted client) returns
-/// `NotPermitted`; the guest receives `not-permitted` and propagates it as
-/// `ProcessingFailed("NotPermitted:")`.
-///
-/// The host `warn!` carrying
-/// the consumer slug on this path (an ACL deny on the WASM path must
-/// surface server-side, parity with the LLM intercept) fires in `do_mqtt_publish`
-/// before the WIT mapping; it is unit-pinned by
-/// `do_mqtt_publish_maps_each_outcome` (lib tests). Here we assert the observable
-/// end-to-end seam: a real guest activation receives the `not-permitted` variant.
-#[test]
-fn mqtt_publish_not_permitted_propagates_to_guest() {
-    let callback: MqttPublishFn = common::passthrough_mqtt(|_client, _topic, _payload, _props| {
-        MqttPublishOutcome::NotPermitted
-    });
-    let comp = load_mqtt_test(callback);
-
-    let outcome = comp.handle(common::host_activation(single_activation()));
-
-    match outcome {
-        ProcessorOutcome::Err(re) => {
-            let msg = re.to_string();
-            assert!(
-                msg.contains("NotPermitted:"),
-                "expected ProcessingFailed containing 'NotPermitted:', got: {msg:?}"
-            );
-        }
-        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
-    }
+/// A `PUBLISH_TO` body: the sentinel, then client, topic, QoS, retain, expiry,
+/// content type and payload, one per line.
+fn publish_to(
+    client: &str,
+    topic: &str,
+    qos: u8,
+    retain: bool,
+    expiry: Option<u32>,
+    content_type: Option<&str>,
+    payload: &str,
+) -> String {
+    format!(
+        "PUBLISH_TO\n{client}\n{topic}\n{qos}\n{}\n{}\n{}\n{payload}",
+        u8::from(retain),
+        expiry.map_or("-".to_string(), |n| n.to_string()),
+        content_type.unwrap_or("-"),
+    )
 }
 
-// ── test: no connector → no-connector ──
-
-/// Guest calls `mqtt-publish` for a client it is authorized to reach but for
-/// which no egress connector is configured; the host callback (in production the
-/// `bootstrap` closure over `enforce_and_publish`, returning
-/// `MqttEgressError::NoConnector` → `MqttPublishOutcome::NoConnector` when
-/// `resolve_by_app_client` finds none) returns `NoConnector`; the guest receives
-/// `no-connector` and propagates it as `ProcessingFailed("NoConnector:")`.
-///
-/// It is distinct from the
-/// `not-permitted` case (connector presence is connection definition, never
-/// authorization — ACL is checked before connector resolution): here ACL passes
-/// and the failure is the absence of a connector for the target client. Reuses
-/// the `processor-mqtt-test` fixture + `load_mqtt_test` helper.
-#[test]
-fn mqtt_publish_no_connector_propagates_to_guest() {
-    let callback: MqttPublishFn = common::passthrough_mqtt(|_client, _topic, _payload, _props| {
-        MqttPublishOutcome::NoConnector
-    });
-    let comp = load_mqtt_test(callback);
-
-    let outcome = comp.handle(common::host_activation(single_activation()));
-
-    match outcome {
-        ProcessorOutcome::Err(re) => {
-            let msg = re.to_string();
-            assert!(
-                msg.contains("NoConnector:"),
-                "expected ProcessingFailed containing 'NoConnector:', got: {msg:?}"
-            );
-        }
-        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
-    }
+/// The one buffered publish of an activation, which must be an MQTT entry.
+fn only_mqtt_entry(publishes: &[ProcessorPublish]) -> (&ProcessorPublish, &ProcessorMqttPublish) {
+    assert_eq!(publishes.len(), 1, "{publishes:?}");
+    let entry = &publishes[0];
+    (entry, entry.mqtt.as_ref().expect("an mqtt entry"))
 }
 
-// ── test: malformed/wildcard topic → invalid-payload ──
+// ── what an admitted publish buffers ─────────────────────────────────────────
 
-/// Guest calls `mqtt-publish` with a wildcard/malformed topic; the host callback
-/// (in production the `bootstrap` closure, which builds `mqtt:<client>:<topic>`
-/// from the guest-supplied client + topic and runs `parse_topic_name` on it,
-/// mapping a parse/wildcard failure to `MqttPublishOutcome::InvalidPayload(reason)`)
-/// returns `InvalidPayload`; the guest receives `invalid-payload(reason)`
-/// and propagates it as `ProcessingFailed("InvalidPayload:{reason}")`.
-///
-/// Address validation is the
-/// caller's responsibility (`parse_topic_name` stays at the call site; the
-/// shared `enforce_and_publish` receives an already-validated `MqttAddress`), so on
-/// the WASM path the validation lives in the bootstrap closure ahead of
-/// `enforce_and_publish` and a failure never reaches the broker. The unit-level
-/// outcome→WIT mapping for `InvalidPayload` is pinned by
-/// `do_mqtt_publish_maps_each_outcome` (lib tests, increment 6); this test pins the
-/// observable end-to-end seam (the variant carries its reason string through to the
-/// guest). Reuses the `processor-mqtt-test` fixture + `load_mqtt_test` helper.
+/// `mqtt-publish` and `mqtt-publish-expiring`, each from an activation that
+/// returns ok, yield one entry with `mqtt` set: the client's egress channel,
+/// the resolved target, the guest's properties, and the payload as the body.
 #[test]
-fn mqtt_publish_invalid_payload_propagates_to_guest() {
-    let callback: MqttPublishFn = common::passthrough_mqtt(|_client, _topic, _payload, _props| {
-        MqttPublishOutcome::InvalidPayload("wildcard not allowed in publish topic".to_string())
-    });
-    let comp = load_mqtt_test(callback);
+fn each_function_buffers_one_mqtt_entry() {
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
 
-    let outcome = comp.handle(common::host_activation(single_activation()));
-
-    match outcome {
-        ProcessorOutcome::Err(re) => {
-            let msg = re.to_string();
-            assert!(
-                msg.contains("InvalidPayload:wildcard not allowed in publish topic"),
-                "expected ProcessingFailed containing the InvalidPayload reason, got: {msg:?}"
-            );
+    let outcome = comp.handle(common::host_activation(activation_with_body(&publish_to(
+        "home",
+        "sensors/temp",
+        1,
+        true,
+        None,
+        Some("application/json"),
+        r#"{"c":21}"#,
+    ))));
+    let publishes = ok_publishes(outcome);
+    let (entry, mqtt) = only_mqtt_entry(&publishes);
+    let props = MqttPublishProps {
+        content_type: Some("application/json".to_string()),
+        qos: 1,
+        retain: true,
+        message_expiry_s: None,
+    };
+    let target = MqttTarget {
+        client: "home".to_string(),
+        topic: "sensors/temp".to_string(),
+    };
+    assert_eq!(
+        *mqtt,
+        ProcessorMqttPublish {
+            target: target.clone(),
+            props: props.clone(),
         }
-        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
-    }
+    );
+    assert_eq!(entry.channel_address, mqtt_egress_address("home"));
+    assert_eq!(entry.body.as_bytes(), br#"{"c":21}"#);
+    assert_eq!(entry.reply_to, None);
+    assert_eq!(entry.deliver_after, None);
+    assert_eq!(publisher.seen(), vec![(target, 8, props)]);
+
+    publisher.answer(MqttAdmission::Admitted);
+    let outcome = comp.handle(common::host_activation(activation_with_body(&publish_to(
+        "office",
+        "lights/state",
+        2,
+        false,
+        Some(90),
+        None,
+        "on",
+    ))));
+    let publishes = ok_publishes(outcome);
+    let (entry, mqtt) = only_mqtt_entry(&publishes);
+    assert_eq!(mqtt.target.client, "office");
+    assert_eq!(mqtt.target.topic, "lights/state");
+    assert_eq!(
+        mqtt.props,
+        MqttPublishProps {
+            content_type: None,
+            qos: 2,
+            retain: false,
+            message_expiry_s: Some(90),
+        }
+    );
+    assert_eq!(entry.channel_address, mqtt_egress_address("office"));
+    assert_eq!(entry.body.as_text(), Some("on"));
 }
 
-// ── test: trap after a successful publish does not roll back the broker send ──
-
-/// A guest activation that publishes once via `mqtt-publish` (which the host
-/// callback fulfils with `Ok`) and then traps. The broker send is synchronous and
-/// direct — it has *already happened* by the time the trap aborts the activation,
-/// and it is NOT rolled back. This is the cardinal semantic difference from
-/// `ports.publish`, whose buffered publishes are discarded when the activation
-/// returns `Err`/`Trap`.
-///
-/// The broker side
-/// effect is not retractable, so it cannot be observed *after* the trap; we pin it
-/// the only realizable way — a shared counter inside the host `MqttPublishFn`
-/// records how many times the callback (the broker round-trip) was invoked.
-/// Assertions: the activation traps (`ProcessorOutcome::Trap`), AND the callback
-/// fired exactly once. The publish committed to the broker before the trap; the
-/// trap did not undo it.
+/// An empty payload buffers an empty body.
 #[test]
-fn mqtt_publish_then_trap_does_not_roll_back_broker_send() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_cb = Arc::clone(&calls);
-    let callback: MqttPublishFn =
-        common::passthrough_mqtt(move |_client, _topic, _payload, _props| {
-            calls_cb.fetch_add(1, Ordering::SeqCst);
-            MqttPublishOutcome::Ok
-        });
-    let comp = load_mqtt_test(callback);
-
-    let outcome = comp.handle(common::host_activation(trap_after_publish_activation()));
-
-    match outcome {
-        ProcessorOutcome::Trap(_) => {
-            // The publish (broker round-trip) committed before the trap and was
-            // not rolled back: the callback ran exactly once despite the trap.
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                1,
-                "mqtt-publish callback must fire exactly once even though the \
-                 activation later traps — the synchronous broker send is not \
-                 retracted"
-            );
-        }
-        other => panic!("expected ProcessorOutcome::Trap after publish; got {other:?}"),
-    }
+fn an_empty_payload_buffers_an_empty_body() {
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
+    let outcome = comp.handle(common::host_activation(activation_with_body(&publish_to(
+        "home",
+        "retained/t",
+        1,
+        true,
+        None,
+        None,
+        "",
+    ))));
+    let publishes = ok_publishes(outcome);
+    let (entry, mqtt) = only_mqtt_entry(&publishes);
+    assert!(entry.body.is_empty());
+    assert!(mqtt.props.retain);
 }
 
-// ── test: shared per-activation call-count cap → quota-exceeded ──
-
-/// A guest that publishes via `mqtt-publish` enough times in a single activation
-/// to exhaust the host's per-activation call-count budget
-/// (`MAX_PUBLISH_CALLS_PER_ACTIVATION`, 512) receives
-/// `quota-exceeded`, even when the wired callback would otherwise return `Ok`.
-///
-/// The `mqtt-publish` surface
-/// shares the same `publish_call_count` budget as `ports.publish` so a hostile
-/// guest cannot flood across the combined surface. The budget gate
-/// runs *before* the callback inside `do_mqtt_publish` (the host returns
-/// `quota-exceeded` on the over-cap call without invoking the callback), so the
-/// `Ok`-returning callback here never produces the rejection — the host's cap does.
-///
-/// The fixture publishes in a bounded loop (`PUBLISH_ATTEMPTS` = cap + 1), stopping
-/// at the first error. With an always-`Ok` callback the loop runs until call 513
-/// trips the cap, at which point the host returns `quota-exceeded` and the guest
-/// propagates `ProcessingFailed("QuotaExceeded:")`.
-///
-/// The unit-level mapping (the cap is consumed across `ports.publish` +
-/// `mqtt-publish`, and an over-cap `mqtt-publish` returns `quota-exceeded`) is
-/// pinned by the increment-6 lib tests
-/// (`do_mqtt_publish_shares_call_budget_with_do_publish`,
-/// `do_mqtt_publish_call_budget_boundary_mqtt_only`); this test pins the observable
-/// end-to-end seam via a real WASM activation.
+/// MQTT entries flush in call order with the activation's port publishes.
 #[test]
-fn mqtt_publish_quota_exceeded_propagates_to_guest() {
-    // The cap is what bounds a real activation; assert the fixture loop is built to
-    // exceed it (guards against the fixture and the host cap drifting apart).
+fn mqtt_entries_keep_call_order_with_port_publishes() {
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
+    let publishes =
+        ok_publishes(comp.handle(common::host_activation(activation_with_body("INTERLEAVE"))));
+
+    assert_eq!(publishes.len(), INTERLEAVE_CALLS + 2, "{publishes:?}");
+    assert_eq!(publishes[0].channel_address, "brenn:out");
+    assert_eq!(publishes[0].body.as_text(), Some("before"));
+    let egress = mqtt_egress_address("test-client");
+    for (i, entry) in publishes[1..=INTERLEAVE_CALLS].iter().enumerate() {
+        assert!(entry.mqtt.is_some(), "entry {i}");
+        assert_eq!(entry.channel_address, egress);
+        assert_eq!(entry.body.as_text(), Some(i.to_string().as_str()));
+    }
+    let last = &publishes[INTERLEAVE_CALLS + 1];
+    assert_eq!(last.channel_address, "brenn:out");
+    assert_eq!(
+        last.body.as_text(),
+        Some(format!("ok={INTERLEAVE_CALLS} refused=0 kinds=").as_str())
+    );
+}
+
+/// The fixture's `INTERLEAVE_CALLS`.
+const INTERLEAVE_CALLS: usize = 20;
+
+/// A publish admitted before the guest returns `err`, or before it traps, is
+/// discarded with the activation: the outcome carries no publishes, though the
+/// host admitted the call.
+#[test]
+fn a_failed_activation_discards_its_mqtt_publishes() {
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
+
+    let msg = failure(comp.handle(common::host_activation(activation_with_body(
+        "ERR_AFTER_PUBLISH",
+    ))));
+    assert!(msg.contains("err-after-publish"), "{msg:?}");
+    assert_eq!(publisher.seen().len(), 1, "the publish was admitted");
+
+    publisher.answer(MqttAdmission::Admitted);
+    let outcome = comp.handle(common::host_activation(activation_with_body(
+        "TRAP_AFTER_PUBLISH",
+    )));
+    assert!(
+        matches!(outcome, ProcessorOutcome::Trap(_)),
+        "expected a trap; got {outcome:?}"
+    );
+    assert_eq!(publisher.seen().len(), 1, "the publish was admitted");
+}
+
+/// The admission's refusals reach the guest as their variants, with the
+/// reason text of an `invalid-payload`.
+#[test]
+fn admission_refusals_reach_the_guest() {
+    let publisher = ScriptedPublisher::new(MqttAdmission::NotPermitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
+    let body = publish_to("home", "t", 0, false, None, None, "x");
+
+    let msg = failure(comp.handle(common::host_activation(activation_with_body(&body))));
+    assert!(msg.contains("NotPermitted"), "{msg:?}");
+
+    publisher.answer(MqttAdmission::InvalidPayload(
+        "payload 9 bytes exceeds the client's cap of 4".to_string(),
+    ));
+    let msg = failure(comp.handle(common::host_activation(activation_with_body(&body))));
+    assert!(
+        msg.contains("InvalidPayload") && msg.contains("exceeds the client's cap of 4"),
+        "{msg:?}"
+    );
+}
+
+/// A zero expiry from a guest is refused as `invalid-payload` before the
+/// admission runs.
+#[test]
+fn publish_expiring_with_zero_expiry_is_invalid_payload() {
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
+
+    let msg = failure(comp.handle(common::host_activation(activation_with_body(
+        "PUBLISH_ZERO_EXPIRY",
+    ))));
+    assert!(
+        msg.contains("InvalidPayload:") && msg.contains("message-expiry-s"),
+        "unexpected error: {msg}"
+    );
+    assert!(publisher.seen().is_empty(), "the admission was not reached");
+}
+
+/// A loop the host keeps admitting ends at the 257th call, refused by the
+/// buffered-publish ceiling, well short of the 512-call ceiling.
+#[test]
+fn the_bounded_loop_ends_at_the_buffered_publish_ceiling() {
     const {
         assert!(
-            MAX_PUBLISH_CALLS_PER_ACTIVATION < 513,
-            "fixture PUBLISH_ATTEMPTS (513) must exceed the host per-activation call cap"
+            MAX_PUBLISHES_PER_ACTIVATION < MAX_PUBLISH_CALLS_PER_ACTIVATION,
+            "the buffered-publish ceiling is the first one an admitting loop meets"
         )
     };
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
 
-    // Count the callback (real broker round-trip) invocations. The host gate runs
-    // *before* the callback, so the cap-many calls succeed and the over-cap call is
-    // rejected without ever reaching the callback. A correct fixture therefore drives
-    // exactly `MAX_PUBLISH_CALLS_PER_ACTIVATION` callbacks before the cap
-    // trips. Asserting this (not merely "the outcome is QuotaExceeded") catches a
-    // fixture bug where the loop exits early and the rejection comes from some other
-    // cause — the substring check alone would still pass in that case (test-4).
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_cb = Arc::clone(&calls);
-    let callback: MqttPublishFn =
-        common::passthrough_mqtt(move |_client, _topic, _payload, _props| {
-            calls_cb.fetch_add(1, Ordering::SeqCst);
-            MqttPublishOutcome::Ok
-        });
-    let comp = load_mqtt_test(callback);
-
-    let outcome = comp.handle(common::host_activation(single_activation()));
-
-    match outcome {
-        ProcessorOutcome::Err(re) => {
-            let msg = re.to_string();
-            assert!(
-                msg.contains("QuotaExceeded:"),
-                "expected ProcessingFailed containing 'QuotaExceeded:', got: {msg:?}"
-            );
-        }
-        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
-    }
+    let msg = failure(comp.handle(common::host_activation(activation_with_body("ping"))));
+    assert!(msg.contains("QuotaExceeded:"), "{msg:?}");
     assert_eq!(
-        calls.load(Ordering::SeqCst),
-        MAX_PUBLISH_CALLS_PER_ACTIVATION,
-        "the fixture loop must drive exactly the cap-many successful callbacks before \
-         the over-cap call trips quota-exceeded — proving the cap (not an early fixture \
-         exit) produced the rejection (test-4)"
+        publisher.seen().len(),
+        MAX_PUBLISHES_PER_ACTIVATION + 1,
+        "every call up to and including the refused one passed the admission"
     );
+}
+
+/// Spellings that resolve to one client share its one token bucket: twenty
+/// client strings, one session, five tokens.
+#[test]
+fn spellings_of_one_client_share_one_bucket() {
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    // No carry between activations; one activation's grant is the input
+    // grant (1000) plus the fill (4000): five publishes.
+    let comp = load_mqtt_test(
+        &publisher,
+        HashMap::from([(
+            "home".to_string(),
+            SinkBudget {
+                fill_mt: 4000,
+                capacity_mt: 0,
+            },
+        )]),
+    );
+    let publishes = ok_publishes(comp.handle(common::host_activation(activation_with_body(
+        "INTERLEAVE_SPELL",
+    ))));
+    let tally = publishes
+        .last()
+        .and_then(|p| p.body.as_text())
+        .expect("the tally");
+    assert_eq!(
+        tally,
+        format!(
+            "ok=5 refused={} kinds=MqttPublishError::QuotaExceeded",
+            INTERLEAVE_CALLS - 5
+        )
+    );
+    let homes = publishes
+        .iter()
+        .filter(|p| p.mqtt.as_ref().is_some_and(|m| m.target.client == "home"))
+        .count();
+    assert_eq!(homes, 5);
 }
 
 // ── the guest SDK's own mqtt surface ─────────────────────────────────────────
 
-/// A single envelope as JSON, with the given `body`.
-fn envelope_with_body(body: &str) -> String {
-    format!(
-        r#"{{"message_id":"00000000-0000-0000-0000-000000000003","source":"test","channel":"brenn:test","sender":"test-sender","publish_ts":"2026-01-01T00:00:00Z","body":"{body}","urgency":"normal","envelope_type":"brenn"}}"#
-    )
-}
-
-fn activation_with_body(body: &str) -> ProcessorActivation {
-    ProcessorActivation {
-        ports: vec![ProcessorPortWindow {
-            port: "in".to_string(),
-            envelopes: vec![envelope_with_body(body)],
-            new_from: 0,
-            dropped: 0,
-        }],
-        deferred: vec![],
-        now: None,
-        sync: None,
-    }
-}
-
-/// Every argument one `mqtt-publish` call reached the host with.
-type PublishArgs = (String, String, Vec<u8>, MqttPublishProps);
-
-/// A callback that records its arguments and reports `outcome`.
-///
-/// The properties are `_props` in every other test here, so nothing
-/// reads what a guest sends it. These paths are about exactly that: the SDK
-/// wrappers choose the content type and encode the payload, and a wrong choice
-/// is invisible in the outcome.
-fn recording_callback(
-    outcome: MqttPublishOutcome,
-) -> (MqttPublishFn, Arc<std::sync::Mutex<Vec<PublishArgs>>>) {
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let seen_cb = Arc::clone(&seen);
-    let callback: MqttPublishFn = common::passthrough_mqtt(move |client, topic, payload, props| {
-        seen_cb
-            .lock()
-            .expect("the recording callback's lock is never poisoned")
-            .push((client, topic, payload, props));
-        outcome.clone()
-    });
-    (callback, seen)
-}
-
-/// A callback whose outcome is read from a shared cell at call time, so one loaded
-/// component can be driven through several outcomes.
-///
-/// `ProcessorComponent::load` cranelift-compiles the guest, which dominates the runtime of
-/// this suite; a loop that varies only the outcome must not pay for it per iteration.
-fn switchable_callback() -> (MqttPublishFn, Arc<std::sync::Mutex<MqttPublishOutcome>>) {
-    let cell = Arc::new(std::sync::Mutex::new(MqttPublishOutcome::Ok));
-    let cell_cb = Arc::clone(&cell);
-    let callback: MqttPublishFn =
-        common::passthrough_mqtt(move |_client, _topic, _payload, _props| {
-            cell_cb
-                .lock()
-                .expect("the switchable callback's lock is never poisoned")
-                .clone()
-        });
-    (callback, cell)
-}
-
 /// `mqtt::publish_json` sends `application/json` and a body that parses back to
 /// the value the guest handed it.
-///
-/// A wrapper that sent the `Debug` form, or labelled it `text/plain`, would be
-/// invisible to every other test: the outcome is `Ok` either way and no other
-/// assertion reads the content type.
 #[test]
 fn publish_json_sends_json_under_the_json_content_type() {
-    let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
-    let comp = load_mqtt_test(callback);
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
 
-    let outcome = comp.handle(common::host_activation(activation_with_body(
+    let publishes = ok_publishes(comp.handle(common::host_activation(activation_with_body(
         "PUBLISH_JSON",
-    )));
-    assert!(
-        matches!(outcome, ProcessorOutcome::Ok { .. }),
-        "expected Ok; got {outcome:?}"
-    );
-
-    let calls = seen.lock().expect("not poisoned");
-    assert_eq!(calls.len(), 1, "{calls:?}");
-    let (client, topic, payload, props) = &calls[0];
-    assert_eq!(client, "test-client");
-    assert_eq!(topic, "test/topic");
+    ))));
+    let (entry, mqtt) = only_mqtt_entry(&publishes);
+    assert_eq!(mqtt.target.client, "test-client");
+    assert_eq!(mqtt.target.topic, "test/topic");
     assert_eq!(
-        *props,
+        mqtt.props,
         MqttPublishProps {
             content_type: Some("application/json".to_string()),
             ..Default::default()
         }
     );
     // The fixture publishes the body it was handed, so the payload is that
-    // body as a JSON string — which is the point: it came back out of
-    // `serde_json`, not out of a `Debug` rendering.
-    let decoded: String =
-        serde_json::from_slice(payload).expect("publish_json sends JSON, not a Debug rendering");
+    // body as a JSON string.
+    let decoded: String = serde_json::from_slice(entry.body.as_bytes())
+        .expect("publish_json sends JSON, not a Debug rendering");
     assert_eq!(decoded, "PUBLISH_JSON");
 }
 
 /// `mqtt::publish_text` sends the bytes as given, under `text/plain`.
 #[test]
 fn publish_text_sends_the_body_under_the_text_content_type() {
-    let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
-    let comp = load_mqtt_test(callback);
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
 
-    let outcome = comp.handle(common::host_activation(activation_with_body(
+    let publishes = ok_publishes(comp.handle(common::host_activation(activation_with_body(
         "PUBLISH_TEXT",
-    )));
-    assert!(
-        matches!(outcome, ProcessorOutcome::Ok { .. }),
-        "expected Ok; got {outcome:?}"
-    );
-
-    let calls = seen.lock().expect("not poisoned");
-    assert_eq!(calls.len(), 1, "{calls:?}");
-    let (_, _, payload, props) = &calls[0];
-    assert_eq!(props.content_type.as_deref(), Some("text/plain"));
-    assert_eq!(props.message_expiry_s, None);
+    ))));
+    let (entry, mqtt) = only_mqtt_entry(&publishes);
+    assert_eq!(mqtt.props.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(mqtt.props.message_expiry_s, None);
     assert_eq!(
-        payload.as_slice(),
+        entry.body.as_bytes(),
         b"PUBLISH_TEXT",
         "the text wrapper sends the bytes it was given, unencoded"
     );
@@ -477,24 +467,15 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
 /// QoS and retain flag the guest chose.
 #[test]
 fn publish_text_expiring_sends_the_expiry() {
-    let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
-    let comp = load_mqtt_test(callback);
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
 
-    let outcome = comp.handle(common::host_activation(activation_with_body(
+    let publishes = ok_publishes(comp.handle(common::host_activation(activation_with_body(
         "PUBLISH_TEXT_EXPIRING",
-    )));
-    assert!(
-        matches!(outcome, ProcessorOutcome::Ok { .. }),
-        "expected Ok; got {outcome:?}"
-    );
-
-    let calls = seen.lock().expect("not poisoned");
-    assert_eq!(calls.len(), 1, "{calls:?}");
-    let (client, topic, payload, props) = &calls[0];
-    assert_eq!(client, "test-client");
-    assert_eq!(topic, "test/topic");
+    ))));
+    let (entry, mqtt) = only_mqtt_entry(&publishes);
     assert_eq!(
-        *props,
+        mqtt.props,
         MqttPublishProps {
             content_type: Some("text/plain".to_string()),
             qos: 1,
@@ -502,370 +483,37 @@ fn publish_text_expiring_sends_the_expiry() {
             message_expiry_s: Some(90),
         }
     );
-    assert_eq!(payload.as_slice(), b"PUBLISH_TEXT_EXPIRING");
+    assert_eq!(entry.body.as_bytes(), b"PUBLISH_TEXT_EXPIRING");
 }
 
-/// A zero expiry from a guest is refused by the host as `invalid-payload`
-/// before the callback runs.
+/// Every refusal this host returns, classified and rendered by the SDK. None
+/// is retryable: the bus has no backpressure, so a guest that believed a
+/// permanent refusal retryable would retry it on every activation, forever.
 #[test]
-fn publish_expiring_with_zero_expiry_is_invalid_payload() {
-    let (callback, seen) = recording_callback(MqttPublishOutcome::Ok);
-    let comp = load_mqtt_test(callback);
+fn the_sdk_classifies_and_renders_every_refusal() {
+    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let comp = load_mqtt_test(&publisher, HashMap::new());
 
-    let outcome = comp.handle(common::host_activation(activation_with_body(
-        "PUBLISH_ZERO_EXPIRY",
-    )));
-    match outcome {
-        ProcessorOutcome::Err(re) => {
-            let msg = re.to_string();
-            assert!(
-                msg.contains("InvalidPayload:") && msg.contains("message-expiry-s"),
-                "unexpected error: {msg}"
-            );
-        }
-        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
-    }
-    assert!(
-        seen.lock().expect("not poisoned").is_empty(),
-        "the callback must not be reached"
-    );
-}
-
-/// Every publish failure the guest SDK can meet, classified and rendered.
-///
-/// `is_transient` is the expensive one to get wrong in the retryable direction:
-/// the bus has no backpressure, so a guest that believes a permanent rejection
-/// may be retried retries it on every activation, forever. Only a broker
-/// disconnect is retryable, and this walks the whole variant set to say so.
-#[test]
-fn the_sdk_classifies_and_renders_every_publish_failure() {
-    let (callback, outcome_cell) = switchable_callback();
-    let comp = load_mqtt_test(callback);
-
-    for (outcome, expected) in [
+    for (admission, expected) in [
         (
-            MqttPublishOutcome::NotPermitted,
+            MqttAdmission::NotPermitted,
             "transient=false mqtt publish test-client/test/topic: not-permitted",
         ),
         (
-            MqttPublishOutcome::NoConnector,
-            "transient=false mqtt publish test-client/test/topic: no-connector",
-        ),
-        (
-            MqttPublishOutcome::InvalidPayload("too big".to_string()),
+            MqttAdmission::InvalidPayload("too big".to_string()),
             "transient=false mqtt publish test-client/test/topic: invalid-payload: too big",
         ),
+        // Admitted throughout: the loop meets the host's own ceiling.
         (
-            MqttPublishOutcome::BrokerRejected("topic refused".to_string()),
-            "transient=false mqtt publish test-client/test/topic: broker-rejected: topic refused",
-        ),
-        (
-            MqttPublishOutcome::Broker("disconnected".to_string()),
-            "transient=true mqtt publish test-client/test/topic: broker: disconnected",
+            MqttAdmission::Admitted,
+            "transient=false mqtt publish test-client/test/topic: quota-exceeded",
         ),
     ] {
-        *outcome_cell
-            .lock()
-            .expect("the switchable callback's lock is never poisoned") = outcome.clone();
-
-        let result = comp.handle(common::host_activation(activation_with_body("CLASSIFY")));
-
-        match result {
-            ProcessorOutcome::Err(re) => {
-                let msg = re.to_string();
-                assert!(
-                    msg.contains(expected),
-                    "{outcome:?}: expected {expected:?}, got {msg:?}"
-                );
-            }
-            other => panic!("{outcome:?}: expected ProcessorOutcome::Err; got {other:?}"),
-        }
+        publisher.answer(admission.clone());
+        let msg = failure(comp.handle(common::host_activation(activation_with_body("CLASSIFY"))));
+        assert!(
+            msg.contains(expected),
+            "{admission:?}: expected {expected:?}, got {msg:?}"
+        );
     }
-}
-
-/// The one failure no callback can produce: the host's own per-activation call
-/// cap. It is permanent for this activation, and the SDK must not offer it as
-/// retryable.
-#[test]
-fn the_sdk_classifies_a_quota_exhaustion_as_permanent() {
-    let (callback, _seen) = recording_callback(MqttPublishOutcome::Ok);
-    let comp = load_mqtt_test(callback);
-
-    let outcome = comp.handle(common::host_activation(activation_with_body("CLASSIFY")));
-
-    match outcome {
-        ProcessorOutcome::Err(re) => {
-            let msg = re.to_string();
-            assert!(
-                msg.contains("transient=false mqtt publish test-client/test/topic: quota-exceeded"),
-                "{msg:?}"
-            );
-        }
-        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
-    }
-}
-
-// ── the hold: time stopped in mqtt-publish ───────────────────────────────────
-
-/// What the hold publisher does on each call.
-#[derive(Clone)]
-struct HoldScript {
-    /// Map every client string to `home`, as the host's parser maps the
-    /// fixture's `home:<i>` spellings.
-    all_to_home: bool,
-    sleep: Duration,
-    outcome: MqttPublishOutcome,
-}
-
-/// A publisher whose behaviour is read from a shared script at call time, so
-/// one loaded component serves every hold case: loading compiles the guest,
-/// which dominates this suite's runtime.
-struct HoldPublisher {
-    script: Mutex<HoldScript>,
-    published: AtomicUsize,
-}
-
-impl HoldPublisher {
-    fn script(&self) -> HoldScript {
-        self.script
-            .lock()
-            .expect("the hold script's lock is never poisoned")
-            .clone()
-    }
-}
-
-impl MqttPublisher for HoldPublisher {
-    fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String> {
-        let client = if self.script().all_to_home {
-            "home".to_string()
-        } else {
-            client.to_string()
-        };
-        Ok(MqttTarget {
-            client,
-            topic: topic.to_string(),
-        })
-    }
-
-    fn publish(
-        &self,
-        _target: MqttTarget,
-        _payload: Vec<u8>,
-        _props: MqttPublishProps,
-    ) -> MqttPublishOutcome {
-        let script = self.script();
-        std::thread::sleep(script.sleep);
-        self.published.fetch_add(1, Ordering::SeqCst);
-        script.outcome
-    }
-}
-
-/// Fuel no hold case comes near: every case is about wall time.
-const HOLD_FUEL: u64 = 1 << 50;
-
-/// The fixture's `HOLD_CALLS`.
-const HOLD_CALLS: usize = 20;
-
-/// The scheduling allowance on top of a computed wall-time bound.
-const SLACK: Duration = Duration::from_millis(400);
-
-/// One epoch tick: the deadline every hold case runs under.
-const ONE_TICK: u64 = 1;
-
-/// What one hold activation produced.
-struct Held {
-    outcome: ProcessorOutcome,
-    wall: Duration,
-    published: usize,
-}
-
-impl Held {
-    /// The two buffered publishes, flushed: `before`, then the tally.
-    fn tally(&self) -> &str {
-        let ProcessorOutcome::Ok { publishes, .. } = &self.outcome else {
-            panic!("expected ProcessorOutcome::Ok; got {:?}", self.outcome);
-        };
-        let bodies: Vec<&str> = publishes
-            .iter()
-            .map(|p| p.body.as_text().expect("the fixture publishes text"))
-            .collect();
-        assert_eq!(bodies.len(), 2, "both buffered publishes flush: {bodies:?}");
-        assert_eq!(bodies[0], "before");
-        bodies[1]
-    }
-}
-
-fn run_hold(
-    comp: &ProcessorComponent,
-    publisher: &HoldPublisher,
-    sentinel: &str,
-    script: HoldScript,
-    budget: Duration,
-) -> Held {
-    *publisher
-        .script
-        .lock()
-        .expect("the hold script's lock is never poisoned") = script;
-    publisher.published.store(0, Ordering::SeqCst);
-    let started = Instant::now();
-    let outcome = comp.handle_with_mqtt_wait_budget(
-        common::host_activation(activation_with_body(sentinel)),
-        ONE_TICK,
-        HOLD_FUEL,
-        budget,
-    );
-    Held {
-        outcome,
-        wall: started.elapsed(),
-        published: publisher.published.load(Ordering::SeqCst),
-    }
-}
-
-/// Time stopped in `mqtt-publish` is not charged to the epoch deadline, and the
-/// per-client wait budget bounds it instead.
-///
-/// Every case runs under a one-tick (100 ms) deadline, which each outlasts in
-/// wall time: an activation charged for its broker waits would trap and flush
-/// nothing.
-#[test]
-fn the_hold_in_mqtt_publish_is_uncharged_and_bounded_per_client() {
-    let publisher = Arc::new(HoldPublisher {
-        script: Mutex::new(HoldScript {
-            all_to_home: false,
-            sleep: Duration::ZERO,
-            outcome: MqttPublishOutcome::Ok,
-        }),
-        published: AtomicUsize::new(0),
-    });
-    let comp = load_mqtt_test(Arc::clone(&publisher) as MqttPublishFn);
-    let spent = |n: usize| {
-        format!(
-            "ok={n} broker={} other=0 kinds=wait budget spent",
-            HOLD_CALLS - n
-        )
-    };
-
-    // Held past the whole deadline, the guest receives the error and runs on.
-    let held = run_hold(
-        &comp,
-        &publisher,
-        "HOLD",
-        HoldScript {
-            all_to_home: false,
-            sleep: Duration::from_millis(300),
-            outcome: MqttPublishOutcome::Broker("timed out".to_string()),
-        },
-        Duration::from_secs(1),
-    );
-    let tally = held.tally();
-    assert!(
-        tally.starts_with(&format!("ok=0 broker={HOLD_CALLS} other=0 kinds=timed out")),
-        "a broker timeout reaches the guest: {tally}"
-    );
-
-    // Each call ok and slow, together several times past the deadline.
-    let held = run_hold(
-        &comp,
-        &publisher,
-        "HOLD",
-        HoldScript {
-            all_to_home: false,
-            sleep: Duration::from_millis(50),
-            outcome: MqttPublishOutcome::Ok,
-        },
-        Duration::from_secs(5),
-    );
-    assert_eq!(
-        held.tally(),
-        format!("ok={HOLD_CALLS} broker=0 other=0 kinds="),
-        "{held_wall:?} of slow successes is not charged",
-        held_wall = held.wall
-    );
-    assert_eq!(held.published, HOLD_CALLS);
-
-    // The worst case when no call times out: the budget is crossed during some
-    // call, that call finishes, and every later one is refused at once. A sleep
-    // is never shorter than asked and may overrun, so the count is a range.
-    let budget = Duration::from_millis(250);
-    let call = Duration::from_millis(100);
-    let held = run_hold(
-        &comp,
-        &publisher,
-        "HOLD",
-        HoldScript {
-            all_to_home: false,
-            sleep: call,
-            outcome: MqttPublishOutcome::Ok,
-        },
-        budget,
-    );
-    let n = held.published;
-    assert!((1..=3).contains(&n), "publish ran {n} times");
-    assert_eq!(held.tally(), spent(n));
-    assert!(
-        held.wall < budget + call + SLACK,
-        "held {:?} for a {budget:?} budget",
-        held.wall
-    );
-
-    // The worst case when a call times out: one call spends the whole budget.
-    let held = run_hold(
-        &comp,
-        &publisher,
-        "HOLD",
-        HoldScript {
-            all_to_home: false,
-            sleep: Duration::from_millis(300),
-            outcome: MqttPublishOutcome::Broker("timed out".to_string()),
-        },
-        Duration::from_millis(300),
-    );
-    assert_eq!(held.published, 1, "the one timed-out call spent the budget");
-    assert_eq!(
-        held.tally(),
-        format!("ok=0 broker={HOLD_CALLS} other=0 kinds=timed out|wait budget spent")
-    );
-
-    // Respelling the client buys no time: twenty client strings, one session,
-    // one budget.
-    let held = run_hold(
-        &comp,
-        &publisher,
-        "HOLD_SPELL",
-        HoldScript {
-            all_to_home: true,
-            sleep: call,
-            outcome: MqttPublishOutcome::Ok,
-        },
-        budget,
-    );
-    let n = held.published;
-    assert!(
-        (1..=3).contains(&n),
-        "publish ran {n} times across {HOLD_CALLS} spellings of one client"
-    );
-    assert_eq!(held.tally(), spent(n));
-    assert!(
-        held.wall < budget + call + SLACK,
-        "held {:?} for a {budget:?} budget",
-        held.wall
-    );
-
-    // A guest that burns its own running time still traps.
-    let held = run_hold(
-        &comp,
-        &publisher,
-        "HOLD_SPIN",
-        HoldScript {
-            all_to_home: false,
-            sleep: Duration::ZERO,
-            outcome: MqttPublishOutcome::Ok,
-        },
-        budget,
-    );
-    assert!(
-        matches!(held.outcome, ProcessorOutcome::Trap(_)),
-        "a spinning guest traps on its own time; got {:?}",
-        held.outcome
-    );
 }

@@ -2554,6 +2554,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
                 reply_to: None,
                 deliver_after: None,
                 attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
+                mqtt: None,
             }],
         )
         .await;
@@ -2583,6 +2584,7 @@ async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
                 reply_to: None,
                 deliver_after: Some(due),
                 attachments: &brenn_messaging_store::blob::HeldAttachments::none(),
+                mqtt: None,
             }],
         )
         .await;

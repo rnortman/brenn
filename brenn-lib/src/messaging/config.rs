@@ -1763,9 +1763,8 @@ pub struct ResolvedWasmConsumer {
     /// Empty map when no config table is present.
     pub config: std::collections::HashMap<String, String>,
     /// Resolved access-control policy (grants + ACLs) for this component, built
-    /// from its `grants` + `subscribe_acl`/`publish_acl` config. Unused in
-    /// Phase 0-1 (WASM enforcement is Phase 3); built now so the policy model
-    /// spans both app kinds. See `crate::access::AppPolicy`.
+    /// from its `grants` + `subscribe_acl`/`publish_acl` config. See
+    /// `crate::access::AppPolicy`.
     pub policy: crate::access::AppPolicy,
     /// Per-component activation pacing (defaults applied). Always present; the
     /// off-loop dispatch task builds its `TokenBucket` from this.

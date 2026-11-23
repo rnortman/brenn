@@ -95,20 +95,32 @@ pub(crate) struct MqttAdmitted {
 impl MqttAdmitted {
     /// The transport metadata for a message committed at `committed_at`.
     pub(crate) fn transport(&self, committed_at: DateTime<Utc>) -> MqttPublishTransport {
-        let expires = match self.options.lifetime {
-            MqttLifetime::Seconds(s) => {
-                MqttExpiry::At(committed_at + chrono::Duration::seconds(i64::from(s.get())))
-            }
-            MqttLifetime::Forever => MqttExpiry::Never,
-        };
-        MqttPublishTransport {
-            client_slug: self.client.clone(),
-            topic: self.topic.clone(),
-            qos: self.options.qos,
-            retain: self.options.retain,
-            content_type: self.options.content_type.clone(),
-            expires,
+        mqtt_transport(&self.client, &self.topic, &self.options, committed_at)
+    }
+}
+
+/// The transport metadata of an MQTT publish to `client`'s `topic` committed at
+/// `committed_at`: the options as stated, and an expiry of the commit time plus
+/// the lifetime. The one rule for every sender's committed row.
+pub(crate) fn mqtt_transport(
+    client: &str,
+    topic: &str,
+    options: &MqttPublishOptions,
+    committed_at: DateTime<Utc>,
+) -> MqttPublishTransport {
+    let expires = match options.lifetime {
+        MqttLifetime::Seconds(s) => {
+            MqttExpiry::At(committed_at + chrono::Duration::seconds(i64::from(s.get())))
         }
+        MqttLifetime::Forever => MqttExpiry::Never,
+    };
+    MqttPublishTransport {
+        client_slug: client.to_owned(),
+        topic: topic.to_owned(),
+        qos: options.qos,
+        retain: options.retain,
+        content_type: options.content_type.clone(),
+        expires,
     }
 }
 
@@ -197,8 +209,8 @@ impl Messenger {
         };
 
         // A stated option the broker cannot carry is refused, never silently dropped.
-        // TODO(mqtt-egress-unwired): `deliver_after` and `reply_to` are refused
-        // here until the egress path carries them.
+        // TODO(mqtt-publish-reply-to-and-deliver-after-refused): `deliver_after`
+        // and `reply_to` are refused here until the egress path carries them.
         if deliver_after.is_some() {
             return refuse(MqttRefusal::DeliverAfter);
         }
@@ -233,6 +245,31 @@ impl Messenger {
             topic: parsed.topic,
             options: options.clone(),
         })
+    }
+
+    /// Decide whether a component under `policy` may publish `payload_len`
+    /// bytes to `mqtt:<client>:<topic>` with `options`. Spends nothing. The
+    /// decision is [`Self::admit_mqtt`]'s, with no `reply_to`, `deliver_after`
+    /// or `delivery_deadline`; the commit is the activation's flush, through
+    /// [`Self::publish_from_wasm`].
+    pub fn admit_mqtt_from_wasm(
+        &self,
+        policy: &AppPolicy,
+        client: &str,
+        topic: &str,
+        options: &MqttPublishOptions,
+        payload_len: u64,
+    ) -> Result<(), PublishResult> {
+        self.admit_mqtt(
+            policy,
+            &format!("mqtt:{client}:{topic}"),
+            options,
+            Some(payload_len),
+            None,
+            None,
+            None,
+        )
+        .map(|_| ())
     }
 
     /// Publish `payload` to the MQTT topic address `addr` on behalf of an app's
@@ -278,13 +315,9 @@ impl Messenger {
                 (MessageBody::text(""), HeldAttachments::none(), Some(bytes))
             }
             MqttPayload::Inline(bytes) => {
-                // A content type the admission will refuse also fails here; the
-                // fallback body only carries the publish as far as that refusal.
-                let body = MessageBody::from_parts(options.content_type.as_deref(), &bytes)
-                    .unwrap_or_else(|_| {
-                        MessageBody::from_parts(Some("application/octet-stream"), &bytes)
-                            .expect("application/octet-stream is a well-formed binary type")
-                    });
+                // A content type the admission will refuse is carried as
+                // octet-stream here; that body only goes as far as the refusal.
+                let body = MessageBody::carrying(options.content_type.as_deref(), &bytes);
                 (body, HeldAttachments::none(), None)
             }
             MqttPayload::Attached(attachments) => (MessageBody::text(""), attachments, None),

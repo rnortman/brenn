@@ -2246,7 +2246,8 @@ Five more declarations, each a body of attrs:
   addresses name channels through it. `outbound_payload_cap_bytes` bounds
   the bytes one `MqttSend` call publishes through the client (default
   4194304, 4 MiB); a call over it is refused `payload_too_large`. A
-  component's `mqtt-publish` is not held to it. `0`, or a value over
+  component's `mqtt-publish` is held to it as well, and a payload over it
+  answers `invalid-payload`. `0`, or a value over
   4294967295, refuses the document at load. `docs/message-bus.md` §2.7.2 has
   `MqttSend`'s contract.
 - `repo <name> { remote = …; }` — a git remote plus a slug, mounted by whichever

@@ -1646,9 +1646,9 @@ be delivered twice after a reconnect.
 `MqttSend` call, measured on the bytes published: the string's UTF-8 length,
 the serialized length of a JSON value, the decoded length of `body_base64`,
 the attachment's recorded size. A call
-over it is refused with `reason` `payload_too_large`. The bound is
-`MqttSend`'s alone: a component's `mqtt-publish` is held to
-`[messaging] max_body_bytes` and never to this key.
+over it is refused with `reason` `payload_too_large`. A component's
+`mqtt-publish` is held to this bound as well as to `[messaging] max_body_bytes`,
+and a payload over either answers `invalid-payload`.
 
 **The carrier.** A message's payload is its body when it fits
 `[messaging] max_body_bytes`. An inline payload over that cap is written to
@@ -1674,36 +1674,31 @@ does not affect the call: the hold keeps the bytes.
 
 **The broker's maximum packet size.** When the broker's CONNACK advertises a
 Maximum Packet Size, a packet that would exceed it is never sent, and the
-session stays up. For `MqttSend` the message is already committed: it is
-reported to the operator as refused, naming the packet's size and the
-broker's maximum. A component's `mqtt-publish` is refused before it is sent,
-after the budget, and answers `invalid-payload` with a fixed text and no
-broker-derived number, the numbers going to the host log. A broker that
-advertises no maximum arms no check.
+session stays up. The message, `MqttSend`'s or a component's, is already
+committed: it is reported to the operator as refused, naming the packet's size
+and the broker's maximum. A broker that advertises no maximum arms no check.
 
-**A component's wait.** A component's `mqtt-publish` does not go through the
-bus: it publishes on its MQTT session directly and waits for at most 10
-seconds from the call, for room to submit and at QoS 1 and 2 for the broker's
-acknowledgement. A publish the broker has not answered by then fails with
-`broker("timed out")`. Brenn neither recalls nor resends the message: on a
-connection that recovers it goes out and is acknowledged late, so a retry can
-deliver it twice; on a connection that is lost it is dropped with the
-connection. Time stopped in `mqtt-publish` is not charged to the activation's
-running-time limit; the host instead limits the total time one activation
-waits on one client, keyed on the client the host parsed out of the address.
-Once that is spent — 10 seconds of accumulated waiting, which one timed-out
-call reaches alone — every further publish to that client in the activation
-fails at once with `broker("wait budget spent")`. One activation is therefore
-stopped in publishes to one client for under 20 seconds, whatever the number
-of calls and however the guest spells the address; the next activation starts
-with a fresh budget.
+**A component's publish.** A component's `mqtt-publish` and
+`mqtt-publish-expiring` go through the same egress channel. The call is
+admitted at once by the same bus admission as `MqttSend` — the grant and
+per-topic ACL, the client and its channel, QoS and content type, the bound —
+after the component's own per-activation checks, and buffered with the
+activation's other publishes. When the activation returns ok the buffer is
+committed together: its MQTT publishes and its publishes to durable channels
+in one transaction, in call order. When it errs or traps the buffer is
+discarded. The call answers the admission and never a broker outcome; what
+happens after commit goes to the operator (§2.7.3), with `wasm:<slug>` as the
+sender. `mqtt-publish` is committed with no lifetime and
+`mqtt-publish-expiring` with a lifetime of its seconds, counted from the
+commit. Nothing in the call waits on the broker or its session.
 
 ### 2.7.3 MQTT egress
 
 Every `[[mqtt_client]]` has one egress channel, `brenn:egress/mqtt/<client>`,
 minted with the client at boot and by a reload that adds it. It is a durable,
-`non_text` channel the host alone writes: `MqttSend` commits to it, and no
-publish ACL, component output or surface output may name it. A component's
+`non_text` channel the host alone writes: `MqttSend` and a component's
+`mqtt-publish` commit to it, and no publish ACL, component output or surface
+output may name it. A component's
 `in` port may read a declared client's channel. Each message carries the
 publish in the envelope's `transport` key — `{"mqtt_publish": {"client_slug",
 "topic", "qos", "retain", "content_type", "expires"}}`, where `expires` is
@@ -1717,9 +1712,17 @@ budget. A client being added or removed by a reload can be absent for a
 moment; a publish in that moment is answered as for an unknown client. A
 removed client is not absent at once: its reader is retired before its
 channel leaves the directory, and the client stays registered until its
-session stops. A publish admitted for it after the reader is retired is
+session stops. An `MqttSend` admitted for it after the reader is retired is
 answered as committed and is never published, counted, logged or alerted
 (`TODO(correctness-publish-during-egress-retirement-silently-lost)`).
+
+A component's publish is admitted by the same checks at the call, and
+committed at the activation's flush with no send rate drawn: the component's
+per-activation ceilings and the client's token bucket bound it instead. The
+reload gap above is `MqttSend`'s alone. A consumer can name only declared
+clients, a reload that removes a client changes every consumer naming it, and
+such a consumer is stopped, its activation in flight flushed, before the
+client's reader is retired.
 
 **The reader.** Each client's session has one reader, a host task holding the
 system participant `system:mqtt-outbound`'s position on that client's channel.
@@ -1791,7 +1794,10 @@ within one eviction pass of the loss.
 `channel at prefix "brenn:egress/mqtt/" { … }` tunes every client's; an exact
 block `channel at "brenn:egress/mqtt/<client>" { … }` tunes one, and must name
 a declared client. The window is the outage to survive, counted in this
-client's publishes, and also the in-flight ceiling. A retune needs a restart:
+client's publishes, and also the in-flight ceiling. An activation commits its
+publishes at once, so a window smaller than one activation's publishes to the
+client drops the oldest of them even while the client is connected. A retune
+needs a restart:
 a reload that changes an egress channel's tuning is refused. The channel is
 durable and the cursor survives, so the restart loses nothing.
 
@@ -1800,8 +1806,8 @@ position on it and starts the reader before any policy can name the client.
 One that removes a client retires the reader before the channel leaves: what
 the channel held for the reader when it was retired is abandoned and reported
 dropped with the count, and the position and subscriber entry are removed with
-the channel. A publish committed after that is lost unreported (Admission,
-above). The removed
+the channel. An `MqttSend` committed after that is lost unreported
+(Admission, above). The removed
 channel's stored row and retained messages stay in the database
 (`TODO(mqtt-egress-removed-client-rows)`). One that changes a client keeps the
 channel and the cursor and starts a reader on the successor session.

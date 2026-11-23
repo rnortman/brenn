@@ -13,11 +13,10 @@ use brenn_envelope::testutils::{fixture_envelope, message_id};
 use brenn_envelope::{MessageBody, MessageEnvelope};
 use brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT;
 use brenn_wasm::{
-    GuestAlertSeverity, HostActivation, KvStore, MqttPublishFn, MqttPublishOutcome,
-    MqttPublishProps, MqttPublisher, MqttTarget, OutputAclFn, OutputPortSpec, ProcessorAlerter,
-    ProcessorLoadSpec, ProcessorUrgency, ProvidesCallError, ProvidesHost, ProvidesHostFn,
-    QueuedToolRequest, ReplayComponent, RequestAttachmentRefusal, SinkBudget, ToolCallError,
-    ToolHost, ToolHostFn,
+    GuestAlertSeverity, HostActivation, KvStore, MqttAdmission, MqttPublishFn, MqttPublishProps,
+    MqttPublisher, MqttTarget, OutputAclFn, OutputPortSpec, ProcessorAlerter, ProcessorLoadSpec,
+    ProcessorUrgency, ProvidesCallError, ProvidesHost, ProvidesHostFn, QueuedToolRequest,
+    ReplayComponent, RequestAttachmentRefusal, SinkBudget, ToolCallError, ToolHost, ToolHostFn,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -223,23 +222,18 @@ pub fn noop_alerter() -> Arc<dyn ProcessorAlerter> {
     Arc::new(NoopAlerter)
 }
 
-/// MQTT-publish callback that always reports the publish reached the broker.
+/// MQTT publisher that admits every publish, resolving every address unchanged.
 ///
 /// For tests that grant `Mqtt` but do not exercise the egress path (e.g. the
 /// superset-grants load test) — the `load` invariant requires a `Some` callback
 /// whenever the `Mqtt` grant is present.
 pub fn ok_mqtt_publish() -> MqttPublishFn {
-    passthrough_mqtt(|_client, _topic, _payload, _props| MqttPublishOutcome::Ok)
+    Arc::new(AdmitAllMqtt)
 }
 
-/// An [`MqttPublisher`] whose `resolve` returns the guest's `(client, topic)`
-/// unchanged and whose `publish` hands both back to a closure.
-struct PassThroughMqtt<F>(F);
+struct AdmitAllMqtt;
 
-impl<F> MqttPublisher for PassThroughMqtt<F>
-where
-    F: Fn(String, String, Vec<u8>, MqttPublishProps) -> MqttPublishOutcome + Send + Sync,
-{
+impl MqttPublisher for AdmitAllMqtt {
     fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String> {
         Ok(MqttTarget {
             client: client.to_string(),
@@ -247,25 +241,9 @@ where
         })
     }
 
-    fn publish(
-        &self,
-        target: MqttTarget,
-        payload: Vec<u8>,
-        props: MqttPublishProps,
-    ) -> MqttPublishOutcome {
-        (self.0)(target.client, target.topic, payload, props)
+    fn admit(&self, _: &MqttTarget, _: usize, _: &MqttPublishProps) -> MqttAdmission {
+        MqttAdmission::Admitted
     }
-}
-
-/// An MQTT publisher over a `(client, topic, payload, props)` closure, with a
-/// `resolve` that accepts every address unchanged.
-pub fn passthrough_mqtt(
-    publish: impl Fn(String, String, Vec<u8>, MqttPublishProps) -> MqttPublishOutcome
-    + Send
-    + Sync
-    + 'static,
-) -> MqttPublishFn {
-    Arc::new(PassThroughMqtt(publish))
 }
 
 /// `ToolHost` that reports every tool as unknown/ungranted.

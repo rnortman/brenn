@@ -41,33 +41,60 @@ All notable changes to Brenn are documented here.
   the caller's spelling); a string `body` is still published verbatim, and a
   number, boolean or null `body` is refused. `content_type` also types a
   `body`, and is refused beside an `attachment`, which publishes its own.
-- **A component's MQTT publish now waits at most 10 seconds, and a component
-  is no longer trapped for a slow broker.** A component's `mqtt-publish` gives
-  up on a broker that has not acknowledged within 10 seconds of the call; the
-  message may still be delivered, so a retry can deliver it twice. Time a
-  component spends waiting in `mqtt-publish` no longer counts against its running-time limit. Instead, once one activation
-  has spent 10 seconds in total waiting on one MQTT client, further publishes
-  to that client in that activation fail at once, so an activation waits on
-  any one client for under 20 seconds. Components see two new transient
-  `broker` error kinds, `"timed out"` and `"wait budget spent"`.
+- **BREAKING for component authors:** a component's `mqtt-publish` and
+  `mqtt-publish-expiring` now go through the bus, like `MqttSend`, and never
+  wait on the broker. The WIT shapes are unchanged and every existing component
+  loads and links; what a call means changes:
+  - The call returns once Brenn has decided the publish may be made. Nothing
+    has been sent yet: the message is committed to the client's egress
+    channel with the activation's other publishes when the activation returns
+    ok.
+  - A message published before a later `err` or trap is discarded with the
+    activation's other publishes. Before, it had already reached the broker.
+  - A disconnected, slow or silent broker is no longer an error. The message
+    waits on the client's egress channel and is sent when the client
+    connects. `broker(..)` is never returned.
+  - A broker refusal and a packet over the broker's maximum size go to the
+    operator as `warn` lines and phone alerts naming the component, and are
+    not told to the component. `broker-rejected(..)` is never returned.
+  - `mqtt-publish` is kept until sent, within the client's egress window;
+    before, it was attempted once.
+  - `mqtt-publish-expiring`'s interval starts when the activation commits, and
+    what is left of it when the message is handed to the broker is the
+    interval sent. Before, it started when the broker received the message.
+  - Each accepted call is a buffered publish, shared with `ports.publish`: at
+    most 256 per activation and 4 MiB of payload in total; past either the
+    call returns `quota-exceeded`.
+  - The payload is also held to the client's `outbound_payload_cap_bytes`, and
+    a malformed `content-type` is `invalid-payload`.
+
+  This change rests on a survey of the out-of-tree component repositories
+  named in `docs/component-packages.md`, which found one component that
+  publishes MQTT and none that relies on the broker's inline answer. A
+  component repository not named there was not and could not be surveyed.
+  Until this release is tagged the old behaviour can be restored without a new
+  contract version; after it, restoring it needs one.
+- **For authors of host tests:** `brenn_wasm::MqttPublisher::publish` is
+  replaced by `admit`, which returns an `MqttAdmission`, and
+  `MqttPublishOutcome` is gone. A test reads what a component published from
+  `ProcessorOutcome::Ok`'s `publishes`, where an MQTT entry has `mqtt` set.
 - A component's per-client publish rate limit now counts every publish that
   reaches the client, however the guest spelled the `client` string: `home:a`
   with topic `b` is charged to `home`.
-- **Fixed:** after an MQTT session's supervisor recovers from a panic,
-  publishes left over from the old connection are failed when the new one
-  comes up, so they can no longer shift the acknowledgements of later
-  publishes.
-- **BREAKING for operators:** `egress` is now a reserved channel name, in
-  preparation for routing MQTT publishes through the message bus. A declared
+- **Fixed:** after an MQTT session's supervisor recovers from a panic, a
+  message in flight on the dead connection is resolved by the rules for a
+  lost connection, and is never taken for a later message's acknowledgement.
+- **BREAKING for operators:** `egress` is now a reserved channel name, for
+  routing MQTT publishes through the message bus. A declared
   channel named `egress`, `egress.<x>` or `egress/<x>` no longer loads, and no
   publish ACL, component output or surface output may name a channel under
   `brenn:egress/`. The host mints one channel there per `[[mqtt_client]]`,
-  `brenn:egress/mqtt/<client>`, which carries that client's `MqttSend`
-  publishes. Its window (default 256) is the outage it survives; tune every
+  `brenn:egress/mqtt/<client>`, which carries that client's publishes, from
+  `MqttSend` and from components. Its window (default 256) is the outage it survives; tune every
   client's with `channel at prefix "brenn:egress/mqtt/"` or one client's with
   `channel at "brenn:egress/mqtt/<client>"`, and restart to apply a retune. A
   message dropped because the window overflowed is counted and alerted.
-  Known gap: a publish to a client that a config reload is removing can be
+  Known gap: an `MqttSend` to a client that a config reload is removing can be
   committed and lost without a report. A
   component's `in` port may read a declared client's channel; nothing else may
   name it.

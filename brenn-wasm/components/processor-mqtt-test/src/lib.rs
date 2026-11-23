@@ -1,59 +1,39 @@
 // MQTT-egress test fixture, built on the guest SDK.
 //
-// This component publishes over MQTT in a loop on every activation that
-// contains at least one new message, using that message's body bytes as the
-// MQTT payload. It surfaces the host-reported outcome back to the test runner
-// through its error:
+// On every activation that contains at least one new message, this component
+// makes MQTT publishes chosen by sentinels in that message's body, and reports
+// what the host answered through its own outcome. An MQTT publish is buffered
+// with the activation: the host commits it with the activation's other
+// publishes when the guest returns ok and discards it on an err or trap, so a
+// host test reads what was published off `ProcessorOutcome::Ok`.
 //
-//   - Host returns `Ok`  → keep publishing (up to a bounded cap), then return
-//     `Ok(None)` if every call succeeded.
-//   - Host returns an error variant → stop immediately and fail the activation
-//     with `"{error_name}:{detail}"`.
+// With no sentinel the fixture publishes the body in a bounded loop
+// (`PUBLISH_ATTEMPTS`, one past the host's per-activation call cap) and stops
+// at the first refusal, failing the activation with `"{variant}:{detail}"`. A
+// host that refuses the first call yields that variant; one that admits every
+// call yields `quota-exceeded` from the host's own ceilings.
 //
-// The loop goes through `brenn_guest::mqtt::try_publish`, which keeps the
-// host's own variant. The bounded loop (PUBLISH_ATTEMPTS, one past the host's
-// shared per-activation call-count cap of 512) lets one fixture serve two
-// shapes of test:
+// Sentinel paths:
 //
-//   - Single-call error tests wire a callback that errors on the *first* call;
-//     the loop stops at iteration 1 and reports that variant. Behaviour is
-//     identical to a single publish.
-//   - The quota-exceeded test wires a callback that always returns `Ok`; the loop
-//     drives enough MQTT publishes that the host's own per-activation
-//     call-count budget (`PROCESSOR_MAX_PUBLISH_CALLS_PER_ACTIVATION`) trips and
-//     the host returns `quota-exceeded` *before* invoking the callback — proving
-//     the cap is enforced on the synchronous MQTT surface end-to-end.
+//   - `TRAP_AFTER_PUBLISH` / `ERR_AFTER_PUBLISH`: publish once, then panic or
+//     return an error, so the host's discard of the buffered publish shows.
+//   - `PUBLISH_JSON`, `PUBLISH_TEXT`, `PUBLISH_TEXT_EXPIRING`: send the body
+//     once through the SDK wrapper that chooses the content type.
+//     `PUBLISH_ZERO_EXPIRY` sends a zero expiry, which the host refuses.
+//   - `CLASSIFY`: the bounded loop, reporting how the SDK classified and
+//     rendered the first refusal.
+//   - `INTERLEAVE`: buffer a `ports.publish` on `out`, make `INTERLEAVE_CALLS`
+//     MQTT publishes whatever each returns, then buffer the tally on `out` —
+//     the flush shows call order across the two interfaces.
+//     `INTERLEAVE_SPELL` does the same with call `i` naming client `home:<i>`.
+//   - `PUBLISH_TO`: one publish whose every argument is in the body (see
+//     `publish_to`).
 //
-// A third shape:
-// when the first new message's body contains the sentinel `TRAP_AFTER_PUBLISH`,
-// the fixture publishes exactly once (expecting `Ok`) and then panics, which
-// the host converts to `ProcessorOutcome::Trap`. Because MQTT egress is
-// synchronous and direct-to-broker (NOT the buffered `ports.publish` path), the
-// publish has already reached the broker by the time the trap aborts the
-// activation — and is NOT rolled back. The test observes this via a shared
-// counter in the host callback: the callback is invoked once even though the
-// activation traps.
-//
-// Three further shapes are keyed on their own body sentinels: `PUBLISH_JSON`
-// and `PUBLISH_TEXT` send the body once through the wrappers that choose a
-// content type, so the host reads what the SDK chose off the callback's
-// arguments (`PUBLISH_TEXT_EXPIRING` and `PUBLISH_ZERO_EXPIRY` do the same
-// through the expiring wrappers, the second against the host's zero-expiry
-// refusal); `CLASSIFY` runs the bounded loop and reports how the SDK
-// classified and rendered the first failure.
-//
-// Three hold shapes measure how long the host lets a component wait in
-// `mqtt-publish`: `HOLD` buffers one `ports.publish` on `out`, calls
-// `mqtt::try_publish` `HOLD_CALLS` times at QoS 1 without stopping at an error,
-// then buffers a second publish on `out` carrying the tally; `HOLD_SPELL` does
-// the same with call `i` naming the client `home:<i>`; `HOLD_SPIN` publishes
-// once and then spins until the host interrupts it.
-//
-// Addressing constants used by the fixture:
+// Fixed addressing on every path but `INTERLEAVE_SPELL` and `PUBLISH_TO`:
 //   client : "test-client"
 //   topic  : "test/topic"
-//   qos    : 0  (fire-and-forget; no broker round-trip delay in tests)
-//   retain : false
+//   qos    : 0, except the expiring path
+//   retain : false, except the expiring path
 
 use brenn_guest::mqtt::{self, PublishError};
 use brenn_guest::{Activation, Body, Error, Processor};
@@ -61,21 +41,19 @@ use brenn_guest::{Activation, Body, Error, Processor};
 struct ProcessorMqttTest;
 
 /// Bounded publish-loop ceiling: one past the host's shared per-activation
-/// call-count cap (`PROCESSOR_MAX_PUBLISH_CALLS_PER_ACTIVATION` = 512). An
-/// always-`Ok` callback drives the loop until the host's own budget trips and
-/// returns `quota-exceeded`; the `+ 1` guarantees the loop reaches the
-/// over-cap call rather than exiting clean one short. Single-call error tests
-/// never reach iteration 2 (they error on the first call).
+/// call-count cap (512), so a loop the host keeps admitting always reaches one
+/// of the host's own ceilings rather than exiting clean.
 const PUBLISH_ATTEMPTS: usize = 513;
 
-/// Sentinel substring in the body that selects the trap-after-publish path:
-/// publish exactly once, then panic so the host reports
-/// `ProcessorOutcome::Trap`.
+/// Sentinel selecting publish-once-then-panic.
 const TRAP_AFTER_PUBLISH: &str = "TRAP_AFTER_PUBLISH";
 
+/// Sentinel selecting publish-once-then-return-an-error.
+const ERR_AFTER_PUBLISH: &str = "ERR_AFTER_PUBLISH";
+
 /// Sentinel selecting `brenn_guest::mqtt::publish_json`: serialize the body
-/// text and send it, so the host callback observes the content type and the
-/// payload the SDK chose rather than one this fixture spelled.
+/// text and send it, so the host observes the content type and the payload the
+/// SDK chose rather than one this fixture spelled.
 const PUBLISH_JSON: &str = "PUBLISH_JSON";
 
 /// Sentinel selecting `brenn_guest::mqtt::publish_text`.
@@ -91,64 +69,100 @@ const PUBLISH_TEXT_EXPIRING: &str = "PUBLISH_TEXT_EXPIRING";
 const PUBLISH_ZERO_EXPIRY: &str = "PUBLISH_ZERO_EXPIRY";
 
 /// Sentinel selecting the classification path: publish through the SDK until
-/// something fails, then report how the SDK classified and rendered that
-/// failure. The host picks which failure by what its callback returns — and by
-/// letting the loop run to the per-activation call cap, which produces the one
-/// variant no callback can.
+/// something is refused, then report how the SDK classified and rendered that
+/// refusal.
 const CLASSIFY: &str = "CLASSIFY";
 
-/// Sentinel selecting the hold path with a fixed client string.
-const HOLD: &str = "HOLD";
+/// Sentinel selecting the interleave path with a fixed client string.
+const INTERLEAVE: &str = "INTERLEAVE";
 
-/// Sentinel selecting the hold path with a different client string per call,
-/// all of them spellings of `home` under the host's address parser. Checked
-/// before `HOLD`, which it contains.
-const HOLD_SPELL: &str = "HOLD_SPELL";
+/// Sentinel selecting the interleave path with a different client string per
+/// call, all of them spellings of `home` under the host's address parser.
+/// Checked before `INTERLEAVE`, which it contains.
+const INTERLEAVE_SPELL: &str = "INTERLEAVE_SPELL";
 
-/// Sentinel selecting one publish followed by a spin. Checked before `HOLD`,
-/// which it contains.
-const HOLD_SPIN: &str = "HOLD_SPIN";
+/// Sentinel selecting the parameterised single publish.
+const PUBLISH_TO: &str = "PUBLISH_TO";
 
-/// How many `mqtt-publish` calls the hold path makes.
-const HOLD_CALLS: usize = 20;
+/// How many `mqtt-publish` calls the interleave path makes.
+const INTERLEAVE_CALLS: usize = 20;
 
-/// The hold path: buffer a publish on `out`, make `HOLD_CALLS` MQTT publishes
-/// whatever each returns, then buffer the tally on `out`:
-/// `ok=<n> broker=<n> other=<n> kinds=<distinct kinds, |-separated>`.
-fn hold(spell: bool) -> Result<Option<Body>, Error> {
+/// The interleave path: buffer a publish on `out`, make `INTERLEAVE_CALLS` MQTT
+/// publishes whatever each returns, then buffer the tally on `out`:
+/// `ok=<n> refused=<n> kinds=<distinct refusals, |-separated>`.
+fn interleave(spell: bool) -> Result<Option<Body>, Error> {
     brenn_guest::publish("out", "before")?;
-    let (mut ok, mut broker, mut other) = (0usize, 0usize, 0usize);
+    let (mut ok, mut refused) = (0usize, 0usize);
     let mut kinds: Vec<String> = Vec::new();
-    for i in 0..HOLD_CALLS {
+    for i in 0..INTERLEAVE_CALLS {
         let client = if spell {
             format!("home:{i}")
         } else {
             String::from("test-client")
         };
-        let kind = match mqtt::try_publish(&client, "test/topic", b"x", None, 1, false) {
-            Ok(()) => {
-                ok += 1;
-                continue;
-            }
-            Err(PublishError::Broker(kind)) => {
-                broker += 1;
-                kind
-            }
+        let payload = format!("{i}");
+        match mqtt::try_publish(&client, "test/topic", payload.as_bytes(), None, 1, false) {
+            Ok(()) => ok += 1,
             Err(e) => {
-                other += 1;
-                format!("{e:?}")
+                refused += 1;
+                let kind = format!("{e:?}");
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
             }
-        };
-        if !kinds.contains(&kind) {
-            kinds.push(kind);
         }
     }
-    let tally = format!(
-        "ok={ok} broker={broker} other={other} kinds={}",
-        kinds.join("|")
-    );
+    let tally = format!("ok={ok} refused={refused} kinds={}", kinds.join("|"));
     brenn_guest::publish("out", &tally)?;
     Ok(None)
+}
+
+/// The parameterised publish. The body is the sentinel line, then one field per
+/// line: client, topic, QoS, retain (`0`/`1`), message expiry in seconds or `-`
+/// (`-` selects `mqtt-publish`, a number `mqtt-publish-expiring`), content type
+/// or `-`, and the payload as the remainder (which may span lines). Returns ok
+/// when the host admits the publish and its refusal's rendering otherwise.
+fn publish_to(text: &str) -> Result<Option<Body>, Error> {
+    let mut lines = text.splitn(8, '\n');
+    let _sentinel = lines.next();
+    let mut field = |name: &str| {
+        lines
+            .next()
+            .unwrap_or_else(|| panic!("PUBLISH_TO: missing field {name}"))
+    };
+    let client = field("client");
+    let topic = field("topic");
+    let qos: u8 = field("qos").parse().expect("PUBLISH_TO: qos is a number");
+    let retain = match field("retain") {
+        "0" => false,
+        "1" => true,
+        other => panic!("PUBLISH_TO: retain must be 0 or 1, got {other:?}"),
+    };
+    let expiry = match field("expiry") {
+        "-" => None,
+        n => Some(n.parse::<u32>().expect("PUBLISH_TO: expiry is a number")),
+    };
+    let content_type = match field("content type") {
+        "-" => None,
+        ct => Some(ct),
+    };
+    let payload = lines.next().unwrap_or("");
+    let outcome = match expiry {
+        None => mqtt::try_publish(client, topic, payload.as_bytes(), content_type, qos, retain),
+        Some(expiry) => mqtt::try_publish_expiring(
+            client,
+            topic,
+            payload.as_bytes(),
+            content_type,
+            qos,
+            retain,
+            expiry,
+        ),
+    };
+    match outcome {
+        Ok(()) => Ok(None),
+        Err(e) => Err(Error::failed(format!("{e:?}"))),
+    }
 }
 
 impl Processor for ProcessorMqttTest {
@@ -161,41 +175,33 @@ impl Processor for ProcessorMqttTest {
         let text = first_new.body().as_text().ok();
         let has = |sentinel: &str| text.is_some_and(|t| t.contains(sentinel));
 
-        if has(HOLD_SPIN) {
-            // The outcome is irrelevant: what is under test is the spin after it.
-            let _outcome = mqtt::try_publish("test-client", "test/topic", b"x", None, 1, false);
-            loop {
-                core::hint::black_box(());
-            }
+        if has(PUBLISH_TO) {
+            return publish_to(text.expect("the sentinel came from a text body"));
         }
-        if has(HOLD_SPELL) {
-            return hold(true);
+        if has(INTERLEAVE_SPELL) {
+            return interleave(true);
         }
-        if has(HOLD) {
-            return hold(false);
+        if has(INTERLEAVE) {
+            return interleave(false);
         }
 
-        // Trap-after-publish path: publish ONCE (expecting Ok), then panic. The
-        // panic becomes a wasm trap → `ProcessorOutcome::Trap`. The synchronous
-        // MQTT publish has already gone to the broker by this point and is not
-        // retracted by the trap; the test pins this via a host-callback
-        // counter that records exactly one invocation despite the trap.
+        // Publish once, then fail: the host discards the buffered publish with
+        // the activation.
         if has(TRAP_AFTER_PUBLISH) {
-            return match mqtt::publish("test-client", "test/topic", payload, None, 0, false) {
-                Ok(()) => panic!("trap-after-publish: publish succeeded, now trapping"),
-                // The trap-after-publish test wires an always-Ok callback, so
-                // this branch should be unreachable; surface it explicitly
-                // rather than silently swallowing.
-                Err(_) => Err(Error::failed(
-                    "trap-after-publish: unexpected publish error",
-                )),
-            };
+            mqtt::publish("test-client", "test/topic", payload, None, 0, false)?;
+            panic!("trap-after-publish: publish admitted, now trapping");
+        }
+        if has(ERR_AFTER_PUBLISH) {
+            mqtt::publish("test-client", "test/topic", payload, None, 0, false)?;
+            return Err(Error::failed(
+                "err-after-publish: publish admitted, now failing",
+            ));
         }
 
         // SDK content-type paths. Each sends exactly once and returns Ok, so
-        // the host test reads the callback's captured arguments rather than an
-        // outcome variant: what is under test is the payload and the content
-        // type the SDK chose, neither of which any other test observes.
+        // the host test reads the buffered publish rather than an outcome
+        // variant: what is under test is the payload and the content type the
+        // SDK chose.
         if has(PUBLISH_JSON) {
             let body = text.expect("the sentinel came from a text body");
             mqtt::publish_json("test-client", "test/topic", &body, 0, false)?;
@@ -229,10 +235,10 @@ impl Processor for ProcessorMqttTest {
             return Ok(None);
         }
 
-        // Classification path: the same bounded loop. The first failure is
+        // Classification path: the same bounded loop. The first refusal is
         // reported as the SDK saw it — whether a later activation may retry
         // it, and the diagnostic the SDK renders — so the host test pins
-        // `is_transient` and the error rendering against a real host outcome
+        // `is_transient` and the error rendering against a real host answer
         // instead of trusting the guest crate's own reading of its variants.
         if has(CLASSIFY) {
             for _ in 0..PUBLISH_ATTEMPTS {
@@ -243,8 +249,7 @@ impl Processor for ProcessorMqttTest {
                 };
                 let transient = mqtt::is_transient(&e);
                 // A second call for the rendered form: the flattening wrapper
-                // keeps no variant, and the callback answers the same way
-                // twice.
+                // keeps no variant, and the host answers the same way twice.
                 let message =
                     match mqtt::publish("test-client", "test/topic", payload, None, 0, false) {
                         Ok(()) => String::from("second call unexpectedly succeeded"),
@@ -255,10 +260,9 @@ impl Processor for ProcessorMqttTest {
             return Ok(None);
         }
 
-        // Publish repeatedly, stopping at the first error. A callback that errors
-        // on the first call reports that variant (single-call tests); an always-Ok
-        // callback runs until the host's per-activation call-count cap returns
-        // `quota-exceeded` (the quota test).
+        // Publish repeatedly, stopping at the first refusal. A host that refuses
+        // the first call reports that variant; one that admits every call runs
+        // until one of its per-activation ceilings returns `quota-exceeded`.
         for _ in 0..PUBLISH_ATTEMPTS {
             if let Err(e) = mqtt::try_publish("test-client", "test/topic", payload, None, 0, false)
             {
@@ -275,8 +279,8 @@ impl Processor for ProcessorMqttTest {
                 return Err(Error::failed(msg));
             }
         }
-        // Every publish succeeded (always-Ok callback that somehow never tripped
-        // the cap — should not happen given PUBLISH_ATTEMPTS > the cap).
+        // Every publish admitted: unreachable on a host whose call cap is under
+        // `PUBLISH_ATTEMPTS`.
         Ok(None)
     }
 }
