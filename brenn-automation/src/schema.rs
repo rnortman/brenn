@@ -30,8 +30,9 @@ pub fn run_automation_migrations(conn: &Connection) {
             trigger_kind        TEXT NOT NULL CHECK(trigger_kind IN ('cron')),
             trigger_payload     TEXT NOT NULL,
 
-            -- Sum-type action: same shape as trigger.
-            action_kind         TEXT NOT NULL CHECK(action_kind IN ('send_message')),
+            -- Sum-type action: JSON whose `kind` tag names the variant. The
+            -- kind and the payload's shape are validated together by
+            -- deserialisation at read; a corrupt row panics there.
             action_payload      TEXT NOT NULL,
 
             enabled             INTEGER NOT NULL DEFAULT 1,
@@ -88,6 +89,9 @@ pub fn run_automation_migrations(conn: &Connection) {
     .expect("run_automation_migrations");
 
     migrate_automation_action_payload_wake_to_urgency(conn);
+    // The action's kind is its payload's `kind` tag; a table created with a
+    // separate `action_kind` column loses it.
+    brenn_db::drop_column_if_present(conn, "automation_jobs", "action_kind");
 }
 
 /// Migration 4: rewrite `action_payload` JSON rows that carry the legacy
@@ -160,7 +164,7 @@ mod tests {
 
         conn.execute(
             "SELECT id, uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-             action_kind, action_payload, enabled, consecutive_failures, \
+             action_payload, enabled, consecutive_failures, \
              created_at, updated_at, last_fired_at, next_fire_at, auto_disabled_at \
              FROM automation_jobs WHERE 0",
             [],
@@ -203,16 +207,15 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, next_fire_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, ?8, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, ?7, ?7, ?8)",
             rusqlite::params![
                 uuid_bytes,
                 "test-app",
                 "My Job",
                 "cron",
                 r#"{"expr":"*/5 * * * *","tz":"UTC","persistent":false}"#,
-                "send_message",
                 r#"{"to":"brenn:ch","body":"hi","urgency":"low","reply_to":null,"delivery_deadline_secs":null}"#,
                 now,
                 next,
@@ -242,9 +245,9 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, next_fire_at) \
-             VALUES (?1, 'app', 'j', 'cron', '{}', 'send_message', '{}', 1, 0, ?2, ?2, ?2)",
+             VALUES (?1, 'app', 'j', 'cron', '{}', '{}', 1, 0, ?2, ?2, ?2)",
             rusqlite::params![uuid_bytes, now],
         )
         .expect("insert job");
@@ -281,6 +284,161 @@ mod tests {
         assert_eq!(fire_count_after, 0, "cascade delete should remove fires");
     }
 
+    /// The `automation_jobs` and `automation_fires` tables as created before
+    /// the action's kind lived only in its payload: an `action_kind` column
+    /// under its own `CHECK`.
+    fn rebuild_with_action_kind_column(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "
+            DROP TABLE automation_fires;
+            DROP TABLE automation_jobs;
+            CREATE TABLE automation_jobs (
+                id                  INTEGER PRIMARY KEY,
+                uuid                BLOB NOT NULL UNIQUE,
+                owner_app_slug      TEXT NOT NULL,
+                name                TEXT NOT NULL,
+                trigger_kind        TEXT NOT NULL CHECK(trigger_kind IN ('cron')),
+                trigger_payload     TEXT NOT NULL,
+                action_kind         TEXT NOT NULL CHECK(action_kind IN ('send_message')),
+                action_payload      TEXT NOT NULL,
+                enabled             INTEGER NOT NULL DEFAULT 1,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                last_fired_at       TEXT,
+                next_fire_at        TEXT NOT NULL,
+                auto_disabled_at    TEXT
+            );
+            CREATE INDEX idx_automation_jobs_next_fire
+                ON automation_jobs(next_fire_at) WHERE enabled = 1;
+            CREATE INDEX idx_automation_jobs_owner ON automation_jobs(owner_app_slug);
+            CREATE TABLE automation_fires (
+                id          INTEGER PRIMARY KEY,
+                job_id      INTEGER NOT NULL REFERENCES automation_jobs(id) ON DELETE CASCADE,
+                fired_at    TEXT NOT NULL,
+                outcome     TEXT NOT NULL CHECK(outcome IN (
+                                'ok', 'auth', 'budget', 'rate_limit',
+                                'rate_limit_suppressed_report', 'action_error', 'app_gone'
+                            )),
+                error_class TEXT,
+                detail      TEXT
+            );
+            CREATE INDEX idx_automation_fires_job_time
+                ON automation_fires(job_id, fired_at DESC);
+            ",
+        )
+        .expect("rebuild with the action_kind column");
+    }
+
+    const OLD_PAYLOAD: &str = r#"{"kind":"send_message","to":"brenn:ch","body":"hi","urgency":"low","reply_to":null,"delivery_deadline_secs":null}"#;
+
+    fn job_count_and_payload(conn: &rusqlite::Connection, job_id: i64) -> (i64, String) {
+        let fires: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM automation_fires WHERE job_id = ?1",
+                rusqlite::params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let payload: String = conn
+            .query_row(
+                "SELECT action_payload FROM automation_jobs WHERE id = ?1",
+                rusqlite::params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (fires, payload)
+    }
+
+    /// A table that still has `action_kind` loses it; its job, payload and
+    /// fire rows survive and the job reads; a second run changes nothing.
+    #[test]
+    fn migration_drops_the_action_kind_column_and_keeps_the_rows() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        rebuild_with_action_kind_column(&conn);
+        let uuid = uuid::Uuid::new_v4();
+        let now = "2026-06-01T09:00:00Z";
+        conn.execute(
+            "INSERT INTO automation_jobs \
+             (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
+              action_kind, action_payload, enabled, consecutive_failures, \
+              created_at, updated_at, next_fire_at) \
+             VALUES (?1, 'test-app', 'job', 'cron', \
+                     '{\"kind\":\"cron\",\"expr\":\"*/5 * * * *\",\"tz\":\"UTC\",\"persistent\":false}', \
+                     'send_message', ?2, 1, 0, ?3, ?3, ?3)",
+            rusqlite::params![uuid.as_bytes().to_vec(), OLD_PAYLOAD, now],
+        )
+        .expect("insert job with action_kind");
+        let job_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO automation_fires (job_id, fired_at, outcome) VALUES (?1, ?2, 'ok')",
+            rusqlite::params![job_id, now],
+        )
+        .expect("insert fire");
+
+        run_automation_migrations(&conn);
+        assert!(!brenn_db::column_exists(
+            &conn,
+            "automation_jobs",
+            "action_kind"
+        ));
+        assert_eq!(
+            job_count_and_payload(&conn, job_id),
+            (1, OLD_PAYLOAD.to_string())
+        );
+        let job = crate::db::get_job(&conn, uuid).expect("the job reads");
+        assert!(matches!(job.action, crate::job::Action::SendMessage(_)));
+
+        run_automation_migrations(&conn);
+        assert_eq!(
+            job_count_and_payload(&conn, job_id),
+            (1, OLD_PAYLOAD.to_string())
+        );
+        let foreign_key_faults: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_faults, 0);
+    }
+
+    /// A fresh database has no `action_kind` column and holds an MQTT job.
+    #[test]
+    fn a_fresh_table_has_no_action_kind_and_holds_an_mqtt_job() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        assert!(!brenn_db::column_exists(
+            &conn,
+            "automation_jobs",
+            "action_kind"
+        ));
+        let uuid = uuid::Uuid::new_v4();
+        let action = crate::job::Action::MqttPublish(crate::job::MqttPublishAction {
+            to: "mqtt:home:lights/kitchen/set".to_string(),
+            payload: crate::job::MqttActionPayload::from_bytes(b"ON".to_vec()),
+            qos: 1,
+            retain: false,
+            lifetime: brenn_lib::mqtt::MqttLifetime::Forever,
+            content_type: None,
+            status_to: None,
+        });
+        let now = chrono::Utc::now();
+        crate::db::insert_job(
+            &conn,
+            uuid,
+            "test-app",
+            "lights",
+            "cron",
+            r#"{"kind":"cron","expr":"0 18 * * *","tz":"UTC","persistent":false}"#,
+            &serde_json::to_string(&action).unwrap(),
+            true,
+            now,
+            now,
+        );
+        assert_eq!(crate::db::get_job(&conn, uuid).unwrap().action, action);
+    }
+
     fn insert_legacy_job(conn: &rusqlite::Connection, action_wake: &str) -> i64 {
         let uuid_bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
         let now = "2026-06-01T09:00:00Z";
@@ -291,11 +449,11 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, next_fire_at) \
              VALUES (?1, 'test-app', 'job', 'cron', \
                      '{\"expr\":\"*/5 * * * *\",\"tz\":\"UTC\",\"persistent\":false}', \
-                     'send_message', ?2, 1, 0, ?3, ?3, ?3)",
+                     ?2, 1, 0, ?3, ?3, ?3)",
             rusqlite::params![uuid_bytes, action_payload, now],
         )
         .expect("insert legacy job");
@@ -352,11 +510,10 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, next_fire_at) \
              VALUES (?1, 'test-app', 'job', 'cron', \
                      '{\"expr\":\"*/5 * * * *\",\"tz\":\"UTC\",\"persistent\":false}', \
-                     'send_message', \
                      '{\"to\":\"brenn:ch\",\"body\":\"hi\",\"urgency\":\"low\",\"reply_to\":null,\"delivery_deadline_secs\":null}', \
                      1, 0, ?2, ?2, ?2)",
             rusqlite::params![uuid_bytes, now],
@@ -378,11 +535,10 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, next_fire_at) \
              VALUES (?1, 'test-app', 'job2', 'cron', \
                      '{\"expr\":\"*/5 * * * *\",\"tz\":\"UTC\",\"persistent\":false}', \
-                     'send_message', \
                      '{\"to\":\"brenn:ch\",\"body\":\"hi\",\"urgency\":\"normal\",\"reply_to\":null,\"delivery_deadline_secs\":null}', \
                      1, 0, ?2, ?2, ?2)",
             rusqlite::params![uuid_bytes, now],

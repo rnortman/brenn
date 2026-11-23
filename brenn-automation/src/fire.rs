@@ -8,11 +8,15 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::AutomationEngine;
 use crate::error_payload::AutomationErrorPayload;
-use crate::job::{Action, JobSnapshot, Trigger, compute_next};
+use crate::job::{
+    Action, JobSnapshot, MqttPublishAction, SendMessageAction, Trigger, compute_next,
+};
 use brenn_db::auth::user::get_user_by_username;
 use brenn_db::conversation::{create_conversation, get_or_create_singleton_conversation};
 use brenn_lib::messaging::Urgency;
-use brenn_messaging::publish::{PublishOrigin, PublishResult};
+use brenn_messaging::publish::{
+    MqttPayload, MqttRefusal, PublishOrigin, PublishResult, StatusToRefusal,
+};
 
 use crate::schema::{
     OUTCOME_ACTION_ERROR, OUTCOME_APP_GONE, OUTCOME_AUTH, OUTCOME_BUDGET, OUTCOME_OK,
@@ -69,15 +73,17 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
 
     // Staleness guard: a job stores `action.to` at create time and fires
     // later, so a grant revoked or an ACL tightened after job creation must
-    // be honored here. Layer-1 checks the `MessagingPublish` grant
-    // specifically (the publish/subscribe split); layer-2 (per-channel
-    // `brenn_publish` ACL) is re-checked below after the destination is
-    // destructured. `Messenger::publish` re-checks the same policy as
+    // be honored here. For a `send_message` action, layer-1 checks the
+    // `MessagingPublish` grant specifically (the publish/subscribe split);
+    // layer-2 (per-channel `brenn_publish` ACL) is re-checked in
+    // `fire_send_message`. `Messenger::publish` re-checks the same policy as
     // defense-in-depth, but this explicit re-check yields a fire-specific
-    // audit detail.
-    if !app_config
-        .policy
-        .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
+    // audit detail. An `mqtt_publish` action's grants are the MQTT
+    // admission's to decide, at the publish.
+    if matches!(job.action, Action::SendMessage(_))
+        && !app_config
+            .policy
+            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
     {
         let detail = format!(
             "owner app {:?} holds no messaging_publish grant",
@@ -134,6 +140,11 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
         }
     };
 
+    // The conversation a fire publishes under, and so the send budget it
+    // draws one unit of, for either action kind.
+    // TODO(automation-fire-budget-needs-a-person): that budget is restored
+    // only by a person's interaction reaching the conversation, so a job meant
+    // to run unattended stops when it empties.
     let is_singleton = app_config.singleton;
     let sender_conv_id = {
         let conn = engine.db.lock().await;
@@ -159,30 +170,55 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
         .republish_chat_roster(&job.owner_app_slug)
         .await;
 
-    // Verify that the action destination still resolves in the directory.
-    let (action_to, action_body, action_urgency, action_reply_to, action_deadline_secs) =
-        match &job.action {
-            Action::SendMessage(sma) => (
-                sma.to.clone(),
-                sma.body.clone(),
-                sma.urgency,
-                sma.reply_to.clone(),
-                sma.delivery_deadline_secs,
-            ),
-        };
+    let origin = PublishOrigin::Conversation { id: sender_conv_id };
+    let (stored_outcome, error_class, detail) = match &job.action {
+        Action::SendMessage(sma) => {
+            fire_send_message(engine, &job, &app_config.policy, origin, fire_ts, sma).await
+        }
+        Action::MqttPublish(mpa) => fire_mqtt_publish(engine, &job, origin, mpa).await,
+    };
 
-    if engine.directory.resolve(&action_to).is_none() {
-        let detail = format!("destination address {action_to:?} not found in directory");
-        finish_fire(
-            engine,
-            &job,
-            fire_ts,
-            OUTCOME_AUTH,
-            Some(OUTCOME_AUTH),
-            Some(&detail),
-        )
-        .await;
-        return;
+    finish_fire(
+        engine,
+        &job,
+        fire_ts,
+        stored_outcome,
+        error_class,
+        detail.as_deref(),
+    )
+    .await;
+}
+
+/// A fire's stored outcome, its error class, and the detail naming its cause.
+type FireOutcome = (&'static str, Option<&'static str>, Option<String>);
+
+fn auth_failure(detail: String) -> FireOutcome {
+    (OUTCOME_AUTH, Some(OUTCOME_AUTH), Some(detail))
+}
+
+fn action_error(detail: String) -> FireOutcome {
+    (
+        OUTCOME_ACTION_ERROR,
+        Some(OUTCOME_ACTION_ERROR),
+        Some(detail),
+    )
+}
+
+/// Fire a `send_message` action: re-check the destination against the
+/// directory and the owner's `brenn:` publish ACL, then publish.
+async fn fire_send_message(
+    engine: &AutomationEngine,
+    job: &JobSnapshot,
+    policy: &brenn_lib::access::AppPolicy,
+    origin: PublishOrigin,
+    fire_ts: DateTime<Utc>,
+    sma: &SendMessageAction,
+) -> FireOutcome {
+    let action_to = &sma.to;
+    if engine.directory.resolve(action_to).is_none() {
+        return auth_failure(format!(
+            "destination address {action_to:?} not found in directory"
+        ));
     }
 
     // Layer-2 `brenn_publish` ACL re-check against `action_to`.
@@ -199,89 +235,57 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
                 job.uuid
             )
         });
-    if !app_config.policy.allows_brenn_publish(publish_channel) {
-        let detail = format!(
+    if !policy.allows_brenn_publish(publish_channel) {
+        return auth_failure(format!(
             "owner app {:?} publish ACL denies {action_to:?}",
             job.owner_app_slug
-        );
-        finish_fire(
-            engine,
-            &job,
-            fire_ts,
-            OUTCOME_AUTH,
-            Some(OUTCOME_AUTH),
-            Some(&detail),
-        )
-        .await;
-        return;
+        ));
     }
 
-    // (d) Action: call Messenger::publish.
-    let delivery_deadline =
-        action_deadline_secs.map(|secs| fire_ts + chrono::Duration::seconds(secs as i64));
+    let delivery_deadline = sma
+        .delivery_deadline_secs
+        .map(|secs| fire_ts + chrono::Duration::seconds(secs as i64));
 
     let publish_result = engine
         .messenger
         .publish(
-            PublishOrigin::Conversation { id: sender_conv_id },
+            origin,
             &job.owner_app_slug,
-            &action_to,
-            action_body.as_str().into(),
-            action_urgency,
-            action_reply_to.as_deref(),
+            action_to,
+            sma.body.as_str().into(),
+            sma.urgency,
+            sma.reply_to.as_deref(),
             None, // no deliver_after on automation fires
             delivery_deadline,
         )
         .await;
 
-    let (stored_outcome, error_class, detail) = match publish_result {
+    match publish_result {
         PublishResult::Ok { .. } => (OUTCOME_OK, None, None),
         PublishResult::BudgetExhausted => (
             OUTCOME_BUDGET,
             Some(OUTCOME_BUDGET),
             Some("budget exhausted".to_string()),
         ),
-        PublishResult::UnknownChannel(addr) => (
-            OUTCOME_AUTH,
-            Some(OUTCOME_AUTH),
-            Some(format!("unknown channel: {addr}")),
-        ),
-        PublishResult::MalformedAddress(addr) => (
-            OUTCOME_AUTH,
-            Some(OUTCOME_AUTH),
-            Some(format!("malformed address: {addr}")),
-        ),
-        PublishResult::MissingSender => (
-            OUTCOME_AUTH,
-            Some(OUTCOME_AUTH),
-            Some("missing sender".to_string()),
-        ),
+        PublishResult::UnknownChannel(addr) => auth_failure(format!("unknown channel: {addr}")),
+        PublishResult::MalformedAddress(addr) => auth_failure(format!("malformed address: {addr}")),
+        PublishResult::MissingSender => auth_failure("missing sender".to_string()),
         // The explicit `to` re-check above short-circuits before
         // `Messenger::publish`, so this arm is only reachable for `reply_to`:
         // a job whose `reply_to` was in scope at create time but whose owner
         // ACLs were later tightened. `addr` is therefore the `reply_to`
         // address; the detail names it so the operator is not pointed at the
         // publish target.
-        PublishResult::AclDenied(addr) => (
-            OUTCOME_AUTH,
-            Some(OUTCOME_AUTH),
-            Some(format!("publish ACL denied (reply_to): {addr}")),
-        ),
-        PublishResult::BodyTooLarge { len, max } => (
-            OUTCOME_ACTION_ERROR,
-            Some(OUTCOME_ACTION_ERROR),
-            Some(format!("body too large: {len} > {max}")),
-        ),
-        PublishResult::RateLimited => (
-            OUTCOME_ACTION_ERROR,
-            Some(OUTCOME_ACTION_ERROR),
-            Some("send rate limit exceeded".to_string()),
-        ),
-        PublishResult::DeferredQuotaExceeded { cap } => (
-            OUTCOME_ACTION_ERROR,
-            Some(OUTCOME_ACTION_ERROR),
-            Some(format!("deferred-message quota exceeded (cap {cap})")),
-        ),
+        PublishResult::AclDenied(addr) => {
+            auth_failure(format!("publish ACL denied (reply_to): {addr}"))
+        }
+        PublishResult::BodyTooLarge { len, max } => {
+            action_error(format!("body too large: {len} > {max}"))
+        }
+        PublishResult::RateLimited => action_error("send rate limit exceeded".to_string()),
+        PublishResult::DeferredQuotaExceeded { cap } => {
+            action_error(format!("deferred-message quota exceeded (cap {cap})"))
+        }
         // A job's publish passes no impetus — unreachable unless the
         // publish construction changes.
         PublishResult::ImpetusUnauthorized => unreachable!(
@@ -289,24 +293,121 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
              impetus; job uuid={}",
             job.uuid
         ),
-        // Only the MQTT entry runs the MQTT admission, and a job's publish does
-        // not go through it.
+        // Only the MQTT entry runs the MQTT admission, and a `brenn:` publish
+        // does not go through it.
         PublishResult::MqttRefused(refusal) => unreachable!(
             "automation fire publish returned MqttRefused({refusal:?}): only \
              Messenger::publish_mqtt runs the MQTT admission; job uuid={}",
             job.uuid
         ),
-    };
+    }
+}
 
-    finish_fire(
-        engine,
-        &job,
-        fire_ts,
-        stored_outcome,
-        error_class,
-        detail.as_deref(),
-    )
-    .await;
+/// Fire an `mqtt_publish` action: one publish through the MQTT admission
+/// under the owner app, which decides against the current policy and client
+/// table. The lifetime counts from the commit. Every answer a configuration
+/// change or a stored row can cause is a recorded outcome; only answers the
+/// call's own construction excludes panic.
+async fn fire_mqtt_publish(
+    engine: &AutomationEngine,
+    job: &JobSnapshot,
+    origin: PublishOrigin,
+    mpa: &MqttPublishAction,
+) -> FireOutcome {
+    let to = &mpa.to;
+    let result = engine
+        .messenger
+        .publish_mqtt(
+            origin,
+            &job.owner_app_slug,
+            to,
+            MqttPayload::Inline(mpa.payload.as_bytes().to_vec()),
+            &mpa.options(),
+        )
+        .await;
+    let refused = match result {
+        Ok(_) => return (OUTCOME_OK, None, None),
+        Err(refused) => refused,
+    };
+    let owner = &job.owner_app_slug;
+    match refused {
+        PublishResult::MissingSender => {
+            auth_failure(format!("owner app {owner:?} holds no mqtt_publish grant"))
+        }
+        PublishResult::AclDenied(addr) => auth_failure(format!(
+            "owner app {owner:?} MQTT publish ACL denies {addr:?}"
+        )),
+        PublishResult::UnknownChannel(addr) => auth_failure(format!(
+            "MQTT client of {addr:?} is not configured (or was removed)"
+        )),
+        PublishResult::MalformedAddress(addr) => {
+            action_error(format!("malformed MQTT address: {addr:?}"))
+        }
+        PublishResult::BudgetExhausted => (
+            OUTCOME_BUDGET,
+            Some(OUTCOME_BUDGET),
+            Some("budget exhausted".to_string()),
+        ),
+        PublishResult::RateLimited => action_error("send rate limit exceeded".to_string()),
+        PublishResult::MqttRefused(refusal) => mqtt_refusal_outcome(job, refusal),
+        other @ (PublishResult::Ok { .. }
+        | PublishResult::BodyTooLarge { .. }
+        | PublishResult::DeferredQuotaExceeded { .. }
+        | PublishResult::ImpetusUnauthorized) => unreachable!(
+            "automation MQTT fire got {other:?}: its publish carries an inline payload and no \
+             release time, reply address, deadline or impetus; job uuid={}",
+            job.uuid
+        ),
+    }
+}
+
+/// The outcome of a fire the MQTT admission refused on its options or
+/// payload.
+fn mqtt_refusal_outcome(job: &JobSnapshot, refusal: MqttRefusal) -> FireOutcome {
+    match refusal {
+        MqttRefusal::StatusTo { address, why } => match why {
+            StatusToRefusal::GrantAbsent => auth_failure(format!(
+                "status_to {address:?}: owner app {:?} holds no messaging_publish grant",
+                job.owner_app_slug
+            )),
+            StatusToRefusal::AclDenied => auth_failure(format!(
+                "status_to {address:?}: owner app {:?} publish ACL denies it",
+                job.owner_app_slug
+            )),
+            StatusToRefusal::Unknown => {
+                auth_failure(format!("status_to {address:?}: unknown channel"))
+            }
+            StatusToRefusal::Malformed => {
+                action_error(format!("status_to {address:?}: malformed address"))
+            }
+            StatusToRefusal::StatusOverBodyCap { len, max } => action_error(format!(
+                "status_to {address:?}: a delivery status of {len} bytes is over the body cap \
+                 {max}"
+            )),
+        },
+        MqttRefusal::InvalidQos { qos } => action_error(format!("invalid QoS {qos}")),
+        MqttRefusal::InvalidContentType { reason } => {
+            action_error(format!("invalid content type: {reason}"))
+        }
+        MqttRefusal::PayloadOverClientCap { len, cap } => action_error(format!(
+            "payload of {len} bytes is over the client's cap of {cap}"
+        )),
+        MqttRefusal::NeedsBlobStore { len, max_body } => action_error(format!(
+            "payload of {len} bytes is over the body cap {max_body} and no blob store is \
+             configured"
+        )),
+        MqttRefusal::BlobRefused { reason } => {
+            action_error(format!("payload blob refused: {reason}"))
+        }
+        other @ (MqttRefusal::DeliverAfter
+        | MqttRefusal::ReplyTo
+        | MqttRefusal::DeliveryDeadline
+        | MqttRefusal::PayloadShape) => unreachable!(
+            "automation MQTT fire refused with {other:?}: its publish carries an inline payload \
+             and no release time, reply address or deadline; job uuid={}",
+            job.uuid
+        ),
+    }
 }
 
 /// Write the fire record and update the job row. Handles report-rate-limit
@@ -979,9 +1080,9 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (id, uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, next_fire_at) \
-             VALUES (?1, ?2, ?3, ?4, 'cron', ?5, 'send_message', ?6, 1, ?7, ?8, ?8, ?8)",
+             VALUES (?1, ?2, ?3, ?4, 'cron', ?5, ?6, 1, ?7, ?8, ?8, ?8)",
             rusqlite::params![
                 job.row_id,
                 uuid_bytes,
@@ -2379,6 +2480,282 @@ mod tests {
                 .unwrap_or_default()
                 .contains("messaging_publish grant"),
             "detail must name the missing messaging_publish grant"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MQTT action
+    // -----------------------------------------------------------------------
+
+    use crate::test_support::{
+        MQTT_STATUS, edit_app_policy, grant_only, make_mqtt_engine, mqtt_action, mqtt_sender_policy,
+    };
+    use brenn_envelope::grants::AppCapability;
+    use brenn_lib::messaging::{MqttExpiry, TransportMeta};
+    use brenn_lib::mqtt::MqttLifetime;
+    use std::num::NonZeroU32;
+
+    const KITCHEN: &str = "mqtt:home:lights/kitchen/set";
+
+    fn mqtt_job(action: crate::job::MqttPublishAction) -> JobSnapshot {
+        JobSnapshot {
+            action: Action::MqttPublish(action),
+            ..make_job_snapshot(1, "test-app")
+        }
+    }
+
+    /// The rows on `client`'s egress channel.
+    async fn egress_rows(engine: &AutomationEngine, client: &str) -> Vec<MessageEnvelope> {
+        let channel = engine
+            .directory
+            .resolve(&brenn_messaging::mqtt_egress_address(client))
+            .unwrap();
+        let conn = engine.db.lock().await;
+        brenn_messaging_store::db::load_channel_retained_tail(&conn, channel.uuid, Depth::Unbounded)
+            .into_iter()
+            .map(|(_, envelope)| envelope)
+            .collect()
+    }
+
+    /// The outcome, detail and failure count the fire of job 1 left.
+    async fn last_fire(engine: &AutomationEngine) -> (String, String, i64) {
+        let conn = engine.db.lock().await;
+        let (outcome, detail) = conn
+            .query_row(
+                "SELECT outcome, coalesce(detail, '') FROM automation_fires \
+                 WHERE job_id = 1 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let failures = conn
+            .query_row(
+                "SELECT consecutive_failures FROM automation_jobs WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (outcome, detail, failures)
+    }
+
+    /// A fire commits one row to the client's egress channel carrying the
+    /// stored topic, options and bytes, sent by the owner app, with the
+    /// lifetime counted from the row's commit; an app without the `brenn:`
+    /// grant fires it.
+    #[tokio::test]
+    async fn mqtt_fire_commits_the_stored_publish() {
+        let mut policy = mqtt_sender_policy();
+        grant_only(&mut policy, AppCapability::MessagingPublish);
+        policy.grants.insert(AppCapability::MqttPublish);
+        let (engine, _) = make_mqtt_engine(policy, FakeIngressRouter::new()).await;
+        for (payload, lifetime) in [
+            (
+                b"{\"state\":\"ON\"}".to_vec(),
+                MqttLifetime::Seconds(NonZeroU32::new(300).unwrap()),
+            ),
+            (vec![0xff, 0x00], MqttLifetime::Forever),
+        ] {
+            let action = crate::job::MqttPublishAction {
+                qos: 2,
+                retain: true,
+                lifetime,
+                content_type: Some("application/json".to_string()),
+                status_to: Some(MQTT_STATUS.to_string()),
+                ..mqtt_action(KITCHEN, &payload)
+            };
+            let mut job = mqtt_job(action);
+            job.consecutive_failures = 2;
+            {
+                let conn = engine.db.lock().await;
+                conn.execute("DELETE FROM automation_jobs", []).unwrap();
+                insert_job_row(&conn, &job);
+            }
+            fire_one(&engine, job).await;
+            assert_eq!(last_fire(&engine).await, ("ok".into(), String::new(), 0));
+            let row = egress_rows(&engine, "home").await.pop().unwrap();
+            assert_eq!(row.body.as_bytes(), payload.as_slice());
+            assert!(row.sender.contains("test-app"), "{}", row.sender);
+            let Some(TransportMeta::MqttPublish(t)) = row.transport else {
+                panic!("no MQTT transport: {:?}", row.transport)
+            };
+            assert_eq!(
+                (t.client_slug.as_str(), t.topic.as_str(), t.qos, t.retain),
+                ("home", "lights/kitchen/set", 2, true)
+            );
+            assert_eq!(t.content_type.as_deref(), Some("application/json"));
+            assert_eq!(t.status_to.as_deref(), Some(MQTT_STATUS));
+            let expected = match lifetime {
+                MqttLifetime::Seconds(_) => {
+                    MqttExpiry::At(row.publish_ts + chrono::Duration::seconds(300))
+                }
+                MqttLifetime::Forever => MqttExpiry::Never,
+            };
+            assert_eq!(t.expires, expected);
+        }
+    }
+
+    /// Each refusal a configuration change or a stored row can cause is
+    /// recorded with its cause, counts as a failure, raises a report and
+    /// commits nothing.
+    #[tokio::test]
+    async fn mqtt_fire_refusals_are_recorded_never_panicked() {
+        type Edit = fn(&mut brenn_lib::access::AppPolicy);
+        let none: Edit = |_| {};
+        // (case, to, status_to, payload length, policy edit, outcome, detail)
+        type Case = (
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            usize,
+            Edit,
+            &'static str,
+            &'static str,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "grant revoked",
+                KITCHEN,
+                None,
+                2,
+                |p| grant_only(p, AppCapability::MessagingPublish),
+                "auth",
+                "mqtt_publish grant",
+            ),
+            (
+                "acl tightened",
+                KITCHEN,
+                None,
+                2,
+                |p| p.acls.mqtt_publish.clear(),
+                "auth",
+                "ACL denies",
+            ),
+            (
+                "client absent",
+                "mqtt:loft:lights/a/set",
+                None,
+                2,
+                none,
+                "auth",
+                "not configured",
+            ),
+            (
+                "channel closed",
+                "mqtt:away:lights/a/set",
+                None,
+                2,
+                none,
+                "auth",
+                "not configured",
+            ),
+            (
+                "status_to gone",
+                KITCHEN,
+                Some("brenn:gone"),
+                2,
+                none,
+                "auth",
+                "unknown channel",
+            ),
+            (
+                "status_to acl",
+                KITCHEN,
+                Some(MQTT_STATUS),
+                2,
+                |p| p.acls.brenn_publish.clear(),
+                "auth",
+                "publish ACL denies",
+            ),
+            (
+                "client cap",
+                KITCHEN,
+                None,
+                65,
+                none,
+                "action_error",
+                "over the client's cap",
+            ),
+        ];
+        for (case, to, status_to, len, edit, outcome, detail) in cases {
+            let ingress = FakeIngressRouter::new();
+            let (engine, apps) = make_mqtt_engine(
+                mqtt_sender_policy(),
+                ingress.clone() as Arc<dyn IngressRouter>,
+            )
+            .await;
+            let mut action = mqtt_action(to, &vec![b'x'; len]);
+            action.status_to = status_to.map(str::to_string);
+            let job = mqtt_job(action);
+            insert_job_row(&*engine.db.lock().await, &job);
+            edit_app_policy(&apps, edit);
+            fire_one(&engine, job).await;
+            let (got, got_detail, failures) = last_fire(&engine).await;
+            assert_eq!(
+                (got.as_str(), failures),
+                (outcome, 1),
+                "{case}: {got_detail}"
+            );
+            assert!(got_detail.contains(detail), "{case}: {got_detail}");
+            assert_eq!(ingress.events().await.len(), 1, "{case}: one report");
+            for client in ["home", "away"] {
+                assert!(egress_rows(&engine, client).await.is_empty(), "{case}");
+            }
+        }
+    }
+
+    /// A committed fire draws one unit of the send budget; an exhausted
+    /// budget fails the fire as `budget`; a closed egress channel refunds the
+    /// unit it drew; the threshold failure disables the job.
+    #[tokio::test]
+    async fn mqtt_fire_budget_refund_and_auto_disable() {
+        let (engine, _) = make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
+        let conv = {
+            let conn = engine.db.lock().await;
+            brenn_db::conversation::get_or_create_singleton_conversation(&conn, 1, "test-app").id
+        };
+        let set_budget = |conn: &rusqlite::Connection, n| {
+            brenn_messaging_store::db::reset_send_budget(conn, conv, n)
+        };
+        let budget =
+            async || brenn_messaging_store::db::read_send_budget(&*engine.db.lock().await, conv);
+        set_budget(&*engine.db.lock().await, 5);
+        let mut job = mqtt_job(mqtt_action(KITCHEN, b"ON"));
+        insert_job_row(&*engine.db.lock().await, &job);
+        fire_one(&engine, job.clone()).await;
+        assert_eq!(last_fire(&engine).await.0, "ok");
+        assert_eq!(budget().await, Some(4), "a committed fire draws one unit");
+        assert_eq!(egress_rows(&engine, "home").await.len(), 1);
+
+        set_budget(&*engine.db.lock().await, 5);
+        job.action = Action::MqttPublish(mqtt_action("mqtt:away:lights/a/set", b"ON"));
+        fire_one(&engine, job.clone()).await;
+        assert_eq!(
+            budget().await,
+            Some(5),
+            "the closed channel refunds its unit"
+        );
+
+        set_budget(&*engine.db.lock().await, 0);
+        job.action = Action::MqttPublish(mqtt_action(KITCHEN, b"ON"));
+        job.consecutive_failures = i64::from(engine.defaults.consecutive_failures_to_disable) - 1;
+        fire_one(&engine, job).await;
+        let (outcome, _, _) = last_fire(&engine).await;
+        assert_eq!(outcome, "budget");
+        let enabled: i64 = engine
+            .db
+            .lock()
+            .await
+            .query_row(
+                "SELECT enabled FROM automation_jobs WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 0, "the threshold failure disables the job");
+        assert_eq!(
+            egress_rows(&engine, "home").await.len(),
+            1,
+            "the refused fire commits nothing"
         );
     }
 }

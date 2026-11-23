@@ -1729,6 +1729,65 @@ impl ActiveBridge {
         )
     }
 
+    /// Like [`Self::test_new_for_mqtt_publish_with_status`] with the default
+    /// global config, plus an `AutomationEngine` over the messenger's database,
+    /// app table and directory. `"testapp"` is owned by the bridge's user
+    /// `test`, so its jobs can be created and fired.
+    pub(crate) async fn test_new_for_mqtt_automation(
+        matchers: &[(&str, &str)],
+        session_clients: &[&str],
+        status: &BrennStatusChannels<'_>,
+    ) -> Arc<Self> {
+        let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
+        let messenger = make_test_messenger_with_mqtt_publish(
+            db.clone(),
+            matchers,
+            brenn_lib::messaging::MessagingGlobalConfig::default(),
+            status,
+        )
+        .await;
+        let apps = messenger.app_table();
+        let mut owned = (*apps.load()).clone();
+        owned
+            .get_mut("testapp")
+            .expect("the MQTT messenger declares testapp")
+            .allowed_users = vec!["test".to_string()];
+        apps.store(Arc::new(owned));
+
+        let mqtt_service = brenn_mqtt::MqttService::new();
+        for client in session_clients {
+            crate::test_support::mqtt::register_test_client(&mqtt_service, client, 1024);
+        }
+        messenger.install_mqtt_clients(mqtt_service.clone());
+
+        let engine = brenn_automation::AutomationEngine::new(
+            db.clone(),
+            messenger.clone(),
+            apps,
+            messenger.directory().clone(),
+            Arc::new(crate::test_support::NoopEventRouter)
+                as Arc<dyn brenn_automation::IngressRouter>,
+            brenn_automation::AutomationGlobalConfig::default(),
+            brenn_obs::alerting::noop_alert_dispatcher().0,
+        );
+
+        Self::inject_for_test_full(
+            user_id,
+            conversation_id,
+            "testapp",
+            db,
+            tx,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                messenger: Some(messenger),
+                mqtt_service: Some(mqtt_service),
+                automation_engine: Some(engine),
+                allowed_users: vec!["test".into()],
+                ..Default::default()
+            },
+        )
+    }
+
     /// Test bridge with a real `PwaPushService` where `"testapp"` has
     /// `allowed_users: ["bob"]` — alice is absent, so `get_target` for any
     /// alice address returns `GetTargetResult::Forbidden`. DB is pre-seeded

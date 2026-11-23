@@ -6,14 +6,17 @@
 //! `compute_next` lives here because it is pure logic (cron + tz → next
 //! `DateTime<Utc>`) and is exercised by tests without a running engine.
 
+use base64ct::{Base64, Encoding as _};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use uuid::Uuid;
 
 use brenn_lib::messaging::Urgency;
+use brenn_lib::mqtt::{MqttLifetime, MqttPublishOptions};
 
 // The four automation tool names live with every other MCP tool name, so a
 // crate that formats or approves them needs no edge to this engine. Re-exported
@@ -63,27 +66,19 @@ pub struct CronTrigger {
 // Action sum type
 // ---------------------------------------------------------------------------
 
-/// Sum type for automation action variants. Only `SendMessage` exists this
-/// iteration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Sum type for automation action variants: a `brenn:` message or an MQTT
+/// publish. Stored as this JSON in `automation_jobs.action_payload`, the
+/// variant named by its `kind` tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
     SendMessage(SendMessageAction),
-}
-
-impl Action {
-    /// Return the `action_kind` SQL column value for this variant.
-    /// Must match the `CHECK(action_kind IN (...))` constraint in db.rs.
-    pub fn kind_str(&self) -> &'static str {
-        match self {
-            Action::SendMessage(_) => "send_message",
-        }
-    }
+    MqttPublish(MqttPublishAction),
 }
 
 /// Send-message action parameters. Mirrors the MCP send-message tool inputs
 /// except `deliver_after` (mutually exclusive with scheduled firing).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendMessageAction {
     /// Destination address in `brenn:<name>` form.
     pub to: String,
@@ -96,6 +91,182 @@ pub struct SendMessageAction {
     /// Relative delivery deadline in seconds from fire time. If `Some`,
     /// must be in `[1, 2_592_000]` (30 days).
     pub delivery_deadline_secs: Option<u32>,
+}
+
+/// MQTT publish action parameters: what an `MqttSend` call carries, with the
+/// payload fixed when the job is created or edited. It has no urgency,
+/// `reply_to` or delivery deadline, which a broker cannot carry.
+///
+/// Stored under the tool's own argument names, so a listed action given back
+/// to `AutoEdit` publishes the same bytes: the payload as exactly one of
+/// `body` (its text, when the bytes are UTF-8) and `body_base64` (standard
+/// base64 of the bytes otherwise); `lifetime_s` as a whole number of seconds
+/// or `"forever"`; `content_type` and `status_to` omitted when not set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MqttPublishWire", into = "MqttPublishWire")]
+pub struct MqttPublishAction {
+    /// Target address in `mqtt:<client>:<topic>` form, as given.
+    pub to: String,
+    pub payload: MqttActionPayload,
+    pub qos: u8,
+    pub retain: bool,
+    /// Counted from each fire's commit.
+    pub lifetime: MqttLifetime,
+    /// MQTT 5 Content Type to send; absent sends none.
+    pub content_type: Option<String>,
+    /// The `brenn:` channel that receives each fire's delivery statuses.
+    pub status_to: Option<String>,
+}
+
+impl MqttPublishAction {
+    /// The options each fire's publish takes.
+    pub fn options(&self) -> MqttPublishOptions {
+        MqttPublishOptions {
+            qos: self.qos,
+            retain: self.retain,
+            lifetime: self.lifetime,
+            content_type: self.content_type.clone(),
+            status_to: self.status_to.clone(),
+        }
+    }
+}
+
+/// The fixed payload of an MQTT action: the bytes each fire publishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttActionPayload(Vec<u8>);
+
+impl MqttActionPayload {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The stored JSON of an [`MqttPublishAction`], field for field.
+#[derive(Serialize, Deserialize)]
+struct MqttPublishWire {
+    to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_base64: Option<String>,
+    qos: u8,
+    retain: bool,
+    lifetime_s: StoredLifetime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status_to: Option<String>,
+}
+
+impl TryFrom<MqttPublishWire> for MqttPublishAction {
+    type Error = String;
+
+    fn try_from(wire: MqttPublishWire) -> Result<Self, String> {
+        let payload = match (wire.body, wire.body_base64) {
+            (Some(text), None) => MqttActionPayload(text.into_bytes()),
+            (None, Some(encoded)) => MqttActionPayload(
+                Base64::decode_vec(&encoded)
+                    .map_err(|e| format!("body_base64 is not standard base64: {e}"))?,
+            ),
+            (Some(_), Some(_)) => return Err("both body and body_base64 are set".to_string()),
+            (None, None) => return Err("neither body nor body_base64 is set".to_string()),
+        };
+        Ok(Self {
+            to: wire.to,
+            payload,
+            qos: wire.qos,
+            retain: wire.retain,
+            lifetime: wire.lifetime_s.0,
+            content_type: wire.content_type,
+            status_to: wire.status_to,
+        })
+    }
+}
+
+impl From<MqttPublishAction> for MqttPublishWire {
+    fn from(action: MqttPublishAction) -> Self {
+        // Text is stored as text; any other byte string as base64.
+        let (body, body_base64) = match String::from_utf8(action.payload.0) {
+            Ok(text) => (Some(text), None),
+            Err(e) => (None, Some(Base64::encode_string(e.as_bytes()))),
+        };
+        Self {
+            to: action.to,
+            body,
+            body_base64,
+            qos: action.qos,
+            retain: action.retain,
+            lifetime_s: StoredLifetime(action.lifetime),
+            content_type: action.content_type,
+            status_to: action.status_to,
+        }
+    }
+}
+
+/// `lifetime_s` as stored: a whole number from 1 to `u32::MAX`, or the string
+/// `"forever"`.
+struct StoredLifetime(MqttLifetime);
+
+const FOREVER: &str = "forever";
+
+impl Serialize for StoredLifetime {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            MqttLifetime::Seconds(s) => serializer.serialize_u32(s.get()),
+            MqttLifetime::Forever => serializer.serialize_str(FOREVER),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredLifetime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = StoredLifetime;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a whole number from 1 to {} or \"{FOREVER}\"", u32::MAX)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<StoredLifetime, E> {
+                u32::try_from(v)
+                    .ok()
+                    .and_then(NonZeroU32::new)
+                    .map(|s| StoredLifetime(MqttLifetime::Seconds(s)))
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<StoredLifetime, E> {
+                match u64::try_from(v) {
+                    Ok(v) => self.visit_u64(v),
+                    Err(_) => Err(E::invalid_value(serde::de::Unexpected::Signed(v), &self)),
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<StoredLifetime, E> {
+                if v == FOREVER {
+                    Ok(StoredLifetime(MqttLifetime::Forever))
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,13 +538,7 @@ mod tests {
         });
         let json = serde_json::to_string(&a).unwrap();
         let back: Action = serde_json::from_str(&json).unwrap();
-        match back {
-            Action::SendMessage(s) => {
-                assert_eq!(s.to, "brenn:test-channel");
-                assert_eq!(s.body, "hello");
-                assert_eq!(s.delivery_deadline_secs, Some(300));
-            }
-        }
+        assert_eq!(back, a);
     }
 
     #[test]
@@ -399,6 +564,151 @@ mod tests {
         });
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains(r#""kind":"send_message""#), "json={json}");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stored form of an MQTT action
+    // -------------------------------------------------------------------------
+
+    fn mqtt_action(payload: MqttActionPayload, lifetime: MqttLifetime) -> Action {
+        Action::MqttPublish(MqttPublishAction {
+            to: "mqtt:home:lights/kitchen/set".to_string(),
+            payload,
+            qos: 1,
+            retain: false,
+            lifetime,
+            content_type: Some("application/json".to_string()),
+            status_to: Some("brenn:light-status".to_string()),
+        })
+    }
+
+    fn secs(n: u32) -> MqttLifetime {
+        MqttLifetime::Seconds(NonZeroU32::new(n).unwrap())
+    }
+
+    /// Serialise `action`, assert the exact JSON, and assert it reads back
+    /// equal.
+    fn assert_stored(action: &Action, expected: &str) {
+        let json = serde_json::to_string(action).unwrap();
+        assert_eq!(json, expected);
+        let back: Action = serde_json::from_str(&json).unwrap();
+        assert_eq!(&back, action);
+    }
+
+    #[test]
+    fn mqtt_action_with_a_text_payload_is_stored_under_the_tools_names() {
+        assert_stored(
+            &mqtt_action(
+                MqttActionPayload::from_bytes(br#"{"state":"ON"}"#.to_vec()),
+                secs(300),
+            ),
+            r#"{"kind":"mqtt_publish","to":"mqtt:home:lights/kitchen/set","body":"{\"state\":\"ON\"}","qos":1,"retain":false,"lifetime_s":300,"content_type":"application/json","status_to":"brenn:light-status"}"#,
+        );
+    }
+
+    #[test]
+    fn mqtt_action_with_non_utf8_bytes_is_stored_as_base64() {
+        let payload = MqttActionPayload::from_bytes(vec![0xff, 0x00, 0xfe]);
+        assert_stored(
+            &mqtt_action(payload, secs(300)),
+            r#"{"kind":"mqtt_publish","to":"mqtt:home:lights/kitchen/set","body_base64":"/wD+","qos":1,"retain":false,"lifetime_s":300,"content_type":"application/json","status_to":"brenn:light-status"}"#,
+        );
+    }
+
+    #[test]
+    fn mqtt_action_forever_and_unset_options_are_stored_so() {
+        let action = Action::MqttPublish(MqttPublishAction {
+            to: "mqtt:home:lights/kitchen/set".to_string(),
+            payload: MqttActionPayload::from_bytes(b"ON".to_vec()),
+            qos: 0,
+            retain: true,
+            lifetime: MqttLifetime::Forever,
+            content_type: None,
+            status_to: None,
+        });
+        assert_stored(
+            &action,
+            r#"{"kind":"mqtt_publish","to":"mqtt:home:lights/kitchen/set","body":"ON","qos":0,"retain":true,"lifetime_s":"forever"}"#,
+        );
+    }
+
+    #[test]
+    fn mqtt_action_largest_lifetime_round_trips() {
+        let action = mqtt_action(MqttActionPayload::from_bytes(Vec::new()), secs(u32::MAX));
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains(r#""lifetime_s":4294967295"#), "{json}");
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), action);
+    }
+
+    #[test]
+    fn mqtt_action_rows_of_the_wrong_shape_do_not_read() {
+        let row = |rest: &str| {
+            format!(r#"{{"kind":"mqtt_publish","to":"mqtt:home:a","qos":1,"retain":false,{rest}}}"#)
+        };
+        for bad in [
+            row(r#""body":"x","body_base64":"eA==","lifetime_s":60"#),
+            row(r#""lifetime_s":60"#),
+            row(r#""body":"x","lifetime_s":0"#),
+            row(r#""body":"x","lifetime_s":4294967296"#),
+            row(r#""body":"x","lifetime_s":-1"#),
+            row(r#""body":"x","lifetime_s":"never""#),
+            row(r#""body":"x","lifetime_s":1.5"#),
+            row(r#""body":"x""#),
+            row(r#""body_base64":"not base64!","lifetime_s":60"#),
+            r#"{"kind":"mqtt_subscribe","to":"mqtt:home:a"}"#.to_string(),
+        ] {
+            assert!(
+                serde_json::from_str::<Action>(&bad).is_err(),
+                "must not deserialise: {bad}"
+            );
+        }
+    }
+
+    /// A row whose base64 decodes to UTF-8 reads as those bytes, equal to the
+    /// same bytes given as text, and is written back as text.
+    #[test]
+    fn mqtt_action_base64_of_text_reads_as_the_text() {
+        let row = |payload: &str| {
+            format!(
+                r#"{{"kind":"mqtt_publish","to":"mqtt:home:a",{payload},"qos":1,"retain":false,"lifetime_s":60}}"#
+            )
+        };
+        let from_base64: Action = serde_json::from_str(&row(r#""body_base64":"T04=""#)).unwrap();
+        let from_text: Action = serde_json::from_str(&row(r#""body":"ON""#)).unwrap();
+        assert_eq!(from_base64, from_text);
+        assert_eq!(
+            serde_json::to_string(&from_base64).unwrap(),
+            row(r#""body":"ON""#)
+        );
+    }
+
+    /// A `send_message` row as written before the MQTT action existed reads
+    /// and serialises back byte for byte.
+    #[test]
+    fn send_message_row_written_earlier_round_trips_byte_identically() {
+        let stored = r#"{"kind":"send_message","to":"brenn:ch","body":"hi","urgency":"low","reply_to":null,"delivery_deadline_secs":300}"#;
+        let action: Action = serde_json::from_str(stored).unwrap();
+        assert!(matches!(action, Action::SendMessage(_)));
+        assert_eq!(serde_json::to_string(&action).unwrap(), stored);
+    }
+
+    #[test]
+    fn mqtt_action_options_are_its_fields() {
+        let Action::MqttPublish(action) =
+            mqtt_action(MqttActionPayload::from_bytes(b"x".to_vec()), secs(9))
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            action.options(),
+            MqttPublishOptions {
+                qos: 1,
+                retain: false,
+                lifetime: secs(9),
+                content_type: Some("application/json".to_string()),
+                status_to: Some("brenn:light-status".to_string()),
+            }
+        );
     }
 
     #[test]

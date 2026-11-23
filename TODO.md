@@ -1,5 +1,81 @@
 # TODOs
 
+## `automation-fire-budget-needs-a-person`
+
+An automation's fire (`brenn:` and MQTT actions alike) draws one unit of
+the send budget of the conversation it fires under. That budget is never
+refilled by time; only a person's interaction reaching that conversation
+restores it — their chat message in it, or a delivered bus message
+carrying impetus, which only a sender holding the `mint_impetus` grant
+can mint. So schedules meant to run unattended stop when the pool
+empties — about four days for 26 daily jobs on the default of 100 — and
+each job is then auto-disabled after its consecutive failures. For an
+app that is not a singleton, fires use a per-app automation-events
+conversation: an untitled entry in the owner's conversation list, which
+nothing asks anyone to chat in and where a message starts a Claude Code
+session; unless the owner does that, the budget is a lifetime cap on the
+app's fires. Today's only remedy is sizing the app's `send_budget` for
+the longest absence, or for all fires ever. Left undone: a bound on
+automation fires that does not depend on a person chatting. Done when a
+fixed-payload recurring job keeps firing indefinitely with no human
+interaction, still under a runaway bound the security posture document
+names (the engine's own per-job fire rate and per-app job count, a
+time-based refill, or another), and `docs/security-posture.md` says
+which.
+
+## `mqtt-refused-status-alert-test-sees-two-alerts`
+
+`a_refused_status_holds_nothing_back_and_is_alerted` in `brenn-bootstrap`
+(`src/reload/mqtt_broker_tests/egress.rs`) failed once under the full
+`make check`, a pre-commit run of a change that touches no egress or alert
+code (the automation `mqtt_publish` action): two "status not published"
+alerts had been raised where the test asserts exactly one, both send-rate
+refusals of a delivery status. It passed three of three reruns. The cause
+is not established. The test gives its status channel a send rate that
+admits one status and makes two publishes that name it, so several
+statuses are refused by design — the second publish's `handed`, and every
+later status of both — and what the test pins is that they raise one
+alert: the one that opens the reader's "status not published" episode
+(`brenn-server/src/mqtt_egress.rs`, `open_or_withhold`), the rest being
+withheld. One reading from the source, not run: the reader's `Drained`
+report closes that episode (`close_episodes`), so if the reader runs dry
+between two refused statuses, the next refusal opens a second episode with
+its own alert, and the test, which polls until it sees any such alert and
+then asserts the count, sees two when both land before its first look. On
+that reading the second alert is the server doing what its episode rule
+says and the test asserts something the rule does not promise. Not
+excluded: that the server raises a duplicate or miscounted alert for one
+refused status. This is the alerting of the MQTT outgoing path; an
+operator alert raised twice for one failure, or a test that cannot tell,
+are both defects, and `make check` is the pre-commit gate, where a test
+that fails at random teaches retry-until-green. Done = the cause is
+established, and either the test is made deterministic (if the second
+alert is legitimate behaviour the test failed to pin down) or the
+duplicate alert is fixed in the server, with the test passing reliably
+under the full `make check`; a retry is not a fix. Code site
+(`TODO(mqtt-refused-status-alert-test-sees-two-alerts)`): the alert-count
+assertion in the test.
+
+
+## `scheduling-component-managed`
+
+The automation engine (`brenn-automation`) is a host cron timer loop
+that does not use `deliver_after`, against the instructions file's
+"There is no scheduler subsystem — do not add one, do not reach for
+cron or sleep loops" and `docs/message-bus.md`'s "no separate scheduler
+subsystem, no cron abstraction". The owner, 2026-10-29, as relayed by
+the PA agent's MQTT wishlist: "we need a new scheduling system here,
+and probably it should all be managed by wasm components. The scheduled
+stuff anyway. No LLM in the loop." The MQTT project did not build that:
+it gave the existing engine an MQTT action, with a payload fixed at
+create or edit, so that lighting schedules could reach MQTT. Left
+undone: recurring work scheduled by WASM components on `deliver_after`,
+which is also where a computed or templated payload belongs (vacation
+mode, agenda items). Done when either recurring schedules are owned by
+components on `deliver_after`, the host cron loop is gone and existing
+jobs — `brenn:` and MQTT actions alike — are migrated or recreated; or
+the instructions file and `docs/message-bus.md` name the automation
+engine as the sanctioned exception to the rule, and say why.
 ## `blob-append-finish-erases-write-error`
 
 `brenn-provider-kit`'s `Append::finish` writes the buffered tail and turns
@@ -512,7 +588,10 @@ to publish to and is sent as the MQTT 5 Response Topic, and
 `deliver_after` on an MQTT publish is accepted, the message parked on
 the bus and released into the client's egress channel with its
 lifetime counted from release. Documenting either refusal as final
-does not close this entry.
+does not close this entry. An automation's `mqtt_publish` action
+(`parse_mqtt_publish`, `brenn-server/src/automation_intercept.rs`) also
+refuses `reply_to`; done includes the action accepting a `reply_to` under
+the same rule as any other MQTT publish.
 
 ## `mqtt-qos2-completion-refusal-told-rejected`
 

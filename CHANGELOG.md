@@ -4,6 +4,26 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **New: recurring automations can send MQTT messages.** A scheduled job
+  (created with `AutoCreate`, changed with `AutoEdit`) can now publish to an
+  MQTT topic on a cron schedule with no LLM involved — for example lighting
+  schedules. Use an action of kind `mqtt_publish` with `to` set to
+  `mqtt:<client>:<topic>` and a fixed payload (`body` as text or JSON, or
+  `body_base64`), plus `content_type`, `qos`, `retain`, a required
+  `lifetime_s` (counted from each fire) and an optional `status_to`. It obeys
+  the same rules as the `MqttSend` tool: only apps with the MQTT publish
+  grant are offered it, the target is checked when the job is created or
+  edited and again on every fire, and each fire uses one unit of the send
+  budget of the conversation it fires under.
+- **Upgrade note:** on first start the `automation_jobs` table is migrated
+  (its `action_kind` column is dropped). After that, rolling back to an older
+  binary cannot create or edit automations.
+- **BREAKING for automation callers:** `AutoCreate` and `AutoEdit` now refuse
+  unknown keys in `action`, naming the key, instead of ignoring them. A
+  `send_message` action aimed at an `mqtt:` address, or with a non-text
+  `body`, is refused with a message pointing the right way.
+- **BREAKING for MqttSend callers:** a `retain` that is not `true`/`false`
+  is refused; it used to be read as `false`.
 - **BREAKING for MqttSend callers:** `MqttSend` now commits the message to the
   bus and returns, instead of waiting for the broker. A new argument,
   `lifetime_s`, is required: a number of seconds from 1 to 4294967295, or

@@ -371,6 +371,15 @@ pub async fn attach_mqtt_egress_reader(messenger: &Messenger, client: &str) {
         .await;
 }
 
+/// A declared-MQTT-client table: each client's outbound payload cap.
+pub struct StubMqttClients(pub HashMap<String, u32>);
+
+impl brenn_lib::mqtt::MqttClientDirectory for StubMqttClients {
+    fn outbound_payload_cap(&self, client: &str) -> Option<u32> {
+        self.0.get(client).copied()
+    }
+}
+
 /// A second `Messenger` over an existing database and channel — a host restart,
 /// as observable from inside one process.
 ///

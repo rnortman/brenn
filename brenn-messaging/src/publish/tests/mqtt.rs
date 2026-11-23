@@ -12,8 +12,8 @@ use crate::config::{
 use crate::db::{init_db_memory, load_channel_retained_tail, read_send_budget, upsert_channels};
 use crate::mqtt_outbound::mqtt_egress_entry;
 use crate::testutils::{
-    TempBlobDir, attach_mqtt_egress_reader, covering_system_publisher, install_blob_store_at,
-    seal_blob, surface_registrations, test_channel_entry,
+    StubMqttClients, TempBlobDir, attach_mqtt_egress_reader, covering_system_publisher,
+    install_blob_store_at, seal_blob, surface_registrations, test_channel_entry,
 };
 use crate::{
     AttachmentName, ChannelEntry, MessageBody, MessageEnvelope, MessagingDirectory, MqttExpiry,
@@ -21,7 +21,7 @@ use crate::{
 };
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::{ChannelMatcher, MqttPubMatcher};
-use brenn_lib::mqtt::{MqttClientDirectory, MqttLifetime, MqttPublishOptions};
+use brenn_lib::mqtt::{MqttLifetime, MqttPublishOptions};
 use chrono::{Duration, Utc};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -46,14 +46,6 @@ const EGRESS_HOME: &str = "brenn:egress/mqtt/home";
 /// A plain `brenn:` channel in the directory, named as a `status_to`.
 const STATUS: &str = "brenn:light-status";
 const ORIGIN: PublishOrigin = PublishOrigin::Conversation { id: CONVERSATION };
-
-struct StubClients(HashMap<String, u32>);
-
-impl MqttClientDirectory for StubClients {
-    fn outbound_payload_cap(&self, client: &str) -> Option<u32> {
-        self.0.get(client).copied()
-    }
-}
 
 struct Fixture {
     m: Arc<Messenger>,
@@ -183,7 +175,7 @@ async fn fixture_with(install_clients: bool, install_blobs: bool) -> Fixture {
         (m, None)
     };
     if install_clients {
-        m.install_mqtt_clients(Arc::new(StubClients(HashMap::from([
+        m.install_mqtt_clients(Arc::new(StubMqttClients(HashMap::from([
             (CLIENT.to_string(), CLIENT_CAP),
             (OTHER.to_string(), CLIENT_CAP),
             (UNCHANNELLED.to_string(), CLIENT_CAP),
@@ -1025,7 +1017,7 @@ async fn an_egress_channel_is_not_a_publish_target() {
 #[should_panic(expected = "install_mqtt_clients called twice")]
 async fn the_client_table_is_installed_once() {
     let f = fixture().await;
-    f.m.install_mqtt_clients(Arc::new(StubClients(HashMap::new())));
+    f.m.install_mqtt_clients(Arc::new(StubMqttClients(HashMap::new())));
 }
 
 // ── A component's MQTT publish: admitted at the call, committed at the flush ──
@@ -1166,6 +1158,78 @@ async fn the_components_admission_needs_the_grant() {
         f.m.admit_mqtt_from_wasm(&policy, CLIENT, "lights/kitchen/set", &options(), 2),
         Err(PublishResult::MissingSender)
     ));
+}
+
+/// The app entry answers each case with the admission's own decision under the
+/// app's current policy, and spends nothing deciding.
+#[tokio::test]
+async fn the_apps_admission_is_the_admissions_decision() {
+    let f = fixture().await;
+    let typed = |ct: &str| MqttPublishOptions {
+        content_type: Some(ct.to_string()),
+        ..options()
+    };
+    let cases: Vec<(&str, MqttPublishOptions, u64)> = vec![
+        (ADDR, options(), 2),
+        (ADDR, typed("application/json"), 2),
+        ("mqtt:home:lights/+/set", options(), 2),
+        ("brenn:light-status", options(), 2),
+        ("mqtt:home:locks/front/set", options(), 2),
+        ("mqtt:nowhere:lights/kitchen/set", options(), 2),
+        ("mqtt:loft:lights/kitchen/set", options(), 2),
+        (ADDR, typed("text/"), 2),
+        (
+            ADDR,
+            MqttPublishOptions {
+                qos: 3,
+                ..options()
+            },
+            2,
+        ),
+        (ADDR, naming(STATUS), 2),
+        (ADDR, naming("brenn:nowhere"), 2),
+        (ADDR, naming("light-status"), 2),
+        (ADDR, options(), u64::from(CLIENT_CAP)),
+        (ADDR, options(), u64::from(CLIENT_CAP) + 1),
+    ];
+    let policy = f.policy();
+    for (addr, opts, len) in cases {
+        let answer = f.m.admit_mqtt_for_app(APP, addr, &opts, len);
+        let expected =
+            f.m.admit_mqtt(&policy, addr, &opts, Some(len), None, None, None)
+                .map(|_| ());
+        assert_eq!(
+            format!("{answer:?}"),
+            format!("{expected:?}"),
+            "{addr} {opts:?} {len}"
+        );
+    }
+    assert!(f.m.admit_mqtt_for_app(APP, ADDR, &options(), 2).is_ok());
+    assert!(matches!(
+        f.m.admit_mqtt_for_app(APP, "mqtt:home:locks/front/set", &options(), 2),
+        Err(PublishResult::AclDenied(_))
+    ));
+    f.assert_spent_nothing().await;
+}
+
+/// The app entry reads the app table as it stands at the call, and an app the
+/// table does not hold is `MissingSender`.
+#[tokio::test]
+async fn the_apps_admission_reads_the_current_policy_and_knows_no_stranger() {
+    let f = fixture().await;
+    assert!(matches!(
+        f.m.admit_mqtt_for_app("stranger", ADDR, &options(), 2),
+        Err(PublishResult::MissingSender)
+    ));
+    f.edit_policy(|policy| {
+        policy.grants = brenn_lib::access::GrantSet::default();
+        policy.grants.insert(AppCapability::MessagingPublish);
+    });
+    assert!(matches!(
+        f.m.admit_mqtt_for_app(APP, ADDR, &options(), 2),
+        Err(PublishResult::MissingSender)
+    ));
+    f.assert_spent_nothing().await;
 }
 
 /// A component's MQTT entry commits to its client's egress channel as the

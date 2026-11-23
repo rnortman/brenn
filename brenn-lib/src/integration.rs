@@ -437,12 +437,11 @@ pub fn core_virtual_tools(app_config: &AppConfig) -> Vec<VirtualToolDef> {
     ));
     tools.extend(device_virtual_tools());
     tools.extend(usage_virtual_tools());
-    tools.extend(automation_virtual_tools());
-    tools.extend(mqtt_virtual_tools(
-        app_config
-            .policy
-            .has_grant(brenn_envelope::grants::AppCapability::MqttPublish),
-    ));
+    let mqtt = app_config
+        .policy
+        .has_grant(brenn_envelope::grants::AppCapability::MqttPublish);
+    tools.extend(automation_virtual_tools(mqtt));
+    tools.extend(mqtt_virtual_tools(mqtt));
     tools
 }
 
@@ -1350,35 +1349,122 @@ fn usage_virtual_tools() -> Vec<VirtualToolDef> {
 }
 
 /// Automation virtual tool schemas. Always registered — apps that are not
-/// configured for automation get a structured error at call time.
-fn automation_virtual_tools() -> Vec<VirtualToolDef> {
+/// configured for automation get a structured error at call time. The
+/// `mqtt_publish` action kind, its fields and its mention of `MqttSend` are
+/// offered only when `mqtt` is true (the app holds the `MqttPublish` grant),
+/// as `MqttSend` itself is.
+fn automation_virtual_tools(mqtt: bool) -> Vec<VirtualToolDef> {
+    let mut create_description = String::from(if mqtt {
+        concat!(
+            "Create a scheduled automation job. The job fires one action on a cron ",
+            "schedule: `send_message` publishes to a brenn: channel, `mqtt_publish` ",
+            "publishes a fixed MQTT message.\n\n",
+        )
+    } else {
+        concat!(
+            "Create a scheduled automation job. The job fires one action on a cron ",
+            "schedule: `send_message` publishes to a brenn: channel.\n\n",
+        )
+    });
+    create_description.push_str(concat!(
+        "`name`: short human-readable label (required, ≤128 chars).\n",
+        "`trigger`: cron trigger object with:\n",
+        "  - `kind`: \"cron\"\n",
+        "  - `expr`: 5-field cron expression (`min hour dom month dow`). ",
+        "Seconds-field (6-field) expressions are rejected. Example: `*/5 * * * *`.\n",
+        "  - `tz`: IANA timezone name (e.g. `UTC`, `America/New_York`). Required.\n",
+        "  - `persistent`: boolean. If true, a slot missed while the server was down ",
+        "fires once at restart, late — a light meant for 18:00 is switched when the ",
+        "server comes back — and a slot whose fire was cut off by a crash may fire ",
+        "twice, so a device command should set a state, not toggle one. If false, ",
+        "missed slots are skipped.\n",
+        "`action`, kind `send_message`:\n",
+        "  - `kind`: \"send_message\"\n",
+        "  - `to`: brenn: channel address (e.g. `brenn:my-channel`).\n",
+        "  - `body`: message body (markdown), a string.\n",
+        "  - `urgency`: \"very-low\", \"low\", \"normal\" or \"high\" (default \"low\").\n",
+        "  - `reply_to`: optional brenn: address.\n",
+        "  - `delivery_deadline_secs`: optional integer [1, 2592000].\n",
+    ));
+    if mqtt {
+        create_description.push_str(concat!(
+            "`action`, kind `mqtt_publish`:\n",
+            "  - `kind`: \"mqtt_publish\"\n",
+            "  - `to`: `mqtt:<client>:<topic>`.\n",
+            "  - exactly one of `body` (text, or a JSON object or array published as its ",
+            "JSON text) and `body_base64` (base64 of the exact bytes). The payload is fixed ",
+            "when the job is created or edited.\n",
+            "  - `content_type`: optional MQTT Content Type.\n",
+            "  - `qos`: 0, 1 or 2 (default 1). `retain`: boolean (default false).\n",
+            "  - `lifetime_s`: required; whole seconds from 1 to 4294967295, or \"forever\", ",
+            "counted from each fire. It is your bound on how late a command may arrive: a ",
+            "lifetime longer than the interval between fires can deliver two commands ",
+            "together after an outage.\n",
+            "  - `status_to`: optional brenn: channel for each fire's delivery statuses; ",
+            "they mean what they mean for MqttSend.\n",
+            "  The action needs this app's MQTT publish grant and an `acl publish` entry ",
+            "covering the topic, and the brenn: publish grant only for `status_to`. It is ",
+            "checked when the job is created or edited and again at every fire. A fire ",
+            "succeeds when the message is committed for the client and does not report ",
+            "delivery. `attachment`, `reply_to`, `urgency` and `delivery_deadline_secs` ",
+            "are refused on this kind.\n",
+        ));
+    }
+    create_description.push_str(concat!(
+        "Each fire draws one unit of the send budget of the ",
+        "conversation it fires under, which only a person's interaction with that ",
+        "conversation restores. A job whose fires keep failing is disabled.\n",
+        "`enabled`: optional boolean (default true).\n\n",
+        "Returns `{ ok: true, id, next_fire_at }` on success. ",
+        "Errors: `{ ok: false, error: \"...\" }`."
+    ));
+    let action_schema = if mqtt {
+        serde_json::json!({
+            "type": "object",
+            "description": "Action to fire: send_message or mqtt_publish. A field the kind does not define is refused.",
+            "properties": {
+                "kind": { "type": "string", "enum": ["send_message", "mqtt_publish"] },
+                "to": { "type": "string", "description": "send_message: brenn: channel address. mqtt_publish: mqtt:<client>:<topic>." },
+                "body": { "type": ["string", "object", "array"], "description": "send_message: message body (markdown), a string. mqtt_publish: a string, or a JSON object or array published as its JSON text." },
+                "body_base64": { "type": "string", "description": "mqtt_publish, instead of body: base64 of the exact bytes to publish." },
+                "content_type": { "type": "string", "description": "mqtt_publish: optional MQTT Content Type." },
+                "qos": { "type": "integer", "enum": [0, 1, 2], "description": "mqtt_publish: QoS level (default 1)." },
+                "retain": { "type": "boolean", "description": "mqtt_publish: set the MQTT retain flag (default false)." },
+                "lifetime_s": {
+                    "type": ["integer", "string"],
+                    "anyOf": [
+                        { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+                        { "type": "string", "enum": ["forever"] }
+                    ],
+                    "description": "mqtt_publish, required: seconds from each fire that Brenn keeps trying to deliver the message, at least 1, or \"forever\"."
+                },
+                "status_to": { "type": "string", "description": "mqtt_publish: optional brenn:<channel> this app may publish to; each fire's delivery statuses are published there." },
+                "urgency": { "type": "string", "enum": ["very-low", "low", "normal", "high"], "default": "low", "description": "send_message: urgency intent for this message; whether subscribers wake is their own wake_min policy." },
+                "reply_to": { "type": "string", "description": "send_message: optional brenn: reply address." },
+                "delivery_deadline_secs": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "send_message: optional delivery deadline." }
+            },
+            "required": ["kind", "to"]
+        })
+    } else {
+        serde_json::json!({
+            "type": "object",
+            "description": "Action to fire: send_message. A field the kind does not define is refused.",
+            "properties": {
+                "kind": { "type": "string", "enum": ["send_message"] },
+                "to": { "type": "string", "description": "brenn: channel address." },
+                "body": { "type": "string", "description": "Message body (markdown)." },
+                "urgency": { "type": "string", "enum": ["very-low", "low", "normal", "high"], "default": "low", "description": "Urgency intent for this message; whether subscribers wake is their own wake_min policy." },
+                "reply_to": { "type": "string", "description": "Optional brenn: reply address." },
+                "delivery_deadline_secs": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "Optional delivery deadline." }
+            },
+            "required": ["kind", "to", "body"]
+        })
+    };
     vec![
         VirtualToolDef {
             name: "AutoCreate".to_string(),
             cli: CliAccess::Available,
-            description: concat!(
-                "Create a scheduled automation job. The job fires a send-message action ",
-                "on a cron schedule.\n\n",
-                "`name`: short human-readable label (required, ≤128 chars).\n",
-                "`trigger`: cron trigger object with:\n",
-                "  - `kind`: \"cron\"\n",
-                "  - `expr`: 5-field cron expression (`min hour dom month dow`). ",
-                "Seconds-field (6-field) expressions are rejected. Example: `*/5 * * * *`.\n",
-                "  - `tz`: IANA timezone name (e.g. `UTC`, `America/New_York`). Required.\n",
-                "  - `persistent`: boolean. If true, fires once on server restart for missed ",
-                "occurrences. If false, missed occurrences are silently skipped.\n",
-                "`action`: send-message action object with:\n",
-                "  - `kind`: \"send_message\"\n",
-                "  - `to`: brenn: channel address (e.g. `brenn:my-channel`).\n",
-                "  - `body`: message body (markdown).\n",
-                "  - `wake`: \"none\" or \"immediate\" (default \"none\").\n",
-                "  - `reply_to`: optional brenn: address.\n",
-                "  - `delivery_deadline_secs`: optional integer [1, 2592000].\n",
-                "`enabled`: optional boolean (default true).\n\n",
-                "Returns `{ ok: true, id, next_fire_at }` on success. ",
-                "Errors: `{ ok: false, error: \"...\" }`."
-            )
-            .to_string(),
+            description: create_description,
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1394,23 +1480,11 @@ fn automation_virtual_tools() -> Vec<VirtualToolDef> {
                             "kind": { "type": "string", "enum": ["cron"] },
                             "expr": { "type": "string", "description": "5-field cron expression." },
                             "tz": { "type": "string", "description": "IANA timezone (e.g. UTC, America/New_York)." },
-                            "persistent": { "type": "boolean", "description": "Fire once on restart for missed slots." }
+                            "persistent": { "type": "boolean", "description": "If true, a slot missed while the server was down fires once at restart, late, and a slot cut off by a crash may fire twice: make a device command set a state, not toggle one. If false, missed slots are skipped." }
                         },
                         "required": ["kind", "expr", "tz"]
                     },
-                    "action": {
-                        "type": "object",
-                        "description": "Action to fire.",
-                        "properties": {
-                            "kind": { "type": "string", "enum": ["send_message"] },
-                            "to": { "type": "string", "description": "brenn: channel address." },
-                            "body": { "type": "string", "description": "Message body (markdown)." },
-                            "urgency": { "type": "string", "enum": ["very-low", "low", "normal", "high"], "default": "low", "description": "Urgency intent for this message; whether subscribers wake is their own wake_min policy." },
-                            "reply_to": { "type": "string" },
-                            "delivery_deadline_secs": { "type": "integer", "minimum": 1, "maximum": 2592000 }
-                        },
-                        "required": ["kind", "to", "body"]
-                    },
+                    "action": action_schema,
                     "enabled": { "type": "boolean", "default": true }
                 },
                 "required": ["name", "trigger", "action"]
@@ -1422,7 +1496,9 @@ fn automation_virtual_tools() -> Vec<VirtualToolDef> {
             description: concat!(
                 "List automation jobs owned by this app. Returns ",
                 "`{ ok: true, jobs: [...] }` with job details including `id`, `name`, ",
-                "`enabled`, `next_fire_at`, `last_fired_at`, and `consecutive_failures`.\n\n",
+                "`trigger`, `action`, `enabled`, `next_fire_at`, `last_fired_at`, and ",
+                "`consecutive_failures`. An `action` is shown in the shape AutoCreate and ",
+                "AutoEdit take.\n\n",
                 "Optional `enabled_only` (boolean, default false) filters to enabled jobs only."
             )
             .to_string(),
@@ -1444,7 +1520,8 @@ fn automation_virtual_tools() -> Vec<VirtualToolDef> {
                 "Edit an automation job. `id` is the UUID returned by AutoCreate. ",
                 "Caller's app must own the job. ",
                 "All fields other than `id` are optional — only provided fields are changed. ",
-                "Trigger and action have the same shape as AutoCreate. ",
+                "Trigger and action have the same shape as AutoCreate. An `action` replaces ",
+                "the whole action, including its kind: give every field. ",
                 "Editing recomputes next-fire from now; does not retroactively fire missed slots.\n\n",
                 "Returns `{ ok: true, next_fire_at }` on success. ",
                 "Errors: `{ ok: false, error: \"...\" }`. Cross-app attempts return forbidden."
@@ -3188,5 +3265,112 @@ mod tests {
             "commit description should say 'none' when all repos are read-only: {}",
             commit.description,
         );
+    }
+
+    #[test]
+    fn auto_create_describes_both_action_kinds() {
+        let tools = automation_virtual_tools(true);
+        let create = tools.iter().find(|t| t.name == "AutoCreate").unwrap();
+        let d = &create.description;
+        assert!(!d.contains("`wake`"), "{d}");
+        for needle in [
+            "`urgency`",
+            "mqtt_publish",
+            "`lifetime_s`",
+            "fires once at restart, late",
+            "set a state, not toggle one",
+            "send budget",
+        ] {
+            assert!(d.contains(needle), "missing {needle:?}: {d}");
+        }
+        let action = &create.input_schema["properties"]["action"];
+        assert_eq!(
+            action["properties"]["kind"]["enum"],
+            serde_json::json!(["send_message", "mqtt_publish"])
+        );
+        assert_eq!(action["required"], serde_json::json!(["kind", "to"]));
+        assert_eq!(
+            action["properties"]["body"]["type"],
+            serde_json::json!(["string", "object", "array"])
+        );
+    }
+
+    /// `AutoCreate` offers the `mqtt_publish` kind, and names `MqttSend`, only
+    /// to an app holding the `MqttPublish` grant, as `MqttSend` is offered.
+    #[test]
+    fn auto_create_offers_mqtt_publish_only_with_the_grant() {
+        let auto_create = |grants: &[AppCapability]| {
+            core_virtual_tools(&minimal_app_config_for_tool_test(grants))
+                .into_iter()
+                .find(|t| t.name == "AutoCreate")
+                .unwrap()
+        };
+
+        let without = auto_create(&[]);
+        let text = format!("{}\n{}", without.description, without.input_schema);
+        assert!(!text.to_lowercase().contains("mqtt"), "{text}");
+        let action = &without.input_schema["properties"]["action"];
+        assert_eq!(
+            action["properties"]["kind"]["enum"],
+            serde_json::json!(["send_message"])
+        );
+        assert_eq!(
+            action["required"],
+            serde_json::json!(["kind", "to", "body"])
+        );
+        assert_eq!(action["properties"]["body"]["type"], "string");
+        assert!(
+            without.description.contains("send budget"),
+            "{}",
+            without.description
+        );
+
+        let with = auto_create(&[AppCapability::MqttPublish]);
+        assert_eq!(
+            serde_json::to_value(&with).unwrap(),
+            serde_json::to_value(&automation_virtual_tools(true)[0]).unwrap()
+        );
+        assert!(
+            with.description.contains("MqttSend"),
+            "{}",
+            with.description
+        );
+        assert_eq!(
+            with.input_schema["properties"]["action"]["properties"]["kind"]["enum"],
+            serde_json::json!(["send_message", "mqtt_publish"])
+        );
+    }
+
+    /// Every MQTT publish argument `AutoCreate`'s action takes has the shape
+    /// `MqttSend`'s schema gives it; only the descriptions differ.
+    #[test]
+    fn auto_create_mqtt_arguments_match_mqtt_send_schema() {
+        let shape = |property: &serde_json::Value| {
+            let mut property = property.clone();
+            property.as_object_mut().unwrap().remove("description");
+            property
+        };
+        let create = automation_virtual_tools(true)
+            .into_iter()
+            .find(|t| t.name == "AutoCreate")
+            .unwrap();
+        let send = mqtt_virtual_tools(true)
+            .into_iter()
+            .find(|t| t.name == "MqttSend")
+            .unwrap();
+        let action = &create.input_schema["properties"]["action"]["properties"];
+        let send = &send.input_schema["properties"];
+        for key in [
+            "to",
+            "body",
+            "body_base64",
+            "content_type",
+            "qos",
+            "retain",
+            "lifetime_s",
+            "status_to",
+        ] {
+            assert_eq!(shape(&action[key]), shape(&send[key]), "{key}");
+        }
     }
 }

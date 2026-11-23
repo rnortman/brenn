@@ -16,7 +16,10 @@ use std::borrow::Cow;
 use brenn_automation::{
     AutomationEngine, CreateJob, CreateResult, DeleteResult, EditJob, EditResult, ListResult,
     MCP_AUTO_CREATE_TOOL, MCP_AUTO_DELETE_TOOL, MCP_AUTO_EDIT_TOOL, MCP_AUTO_LIST_TOOL,
-    job::{Action, CronTrigger, JobView, SendMessageAction, Trigger},
+    job::{
+        Action, CronTrigger, JobView, MqttActionPayload, MqttPublishAction, SendMessageAction,
+        Trigger,
+    },
 };
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use serde::Serialize;
@@ -25,6 +28,7 @@ use crate::active_bridge::{ActiveBridge, ToolOutcome};
 use crate::intercept_helpers::{
     PostCard, ToolOk, answer_post_tool_use, outcome_err, outcome_ok, outcome_rejection,
 };
+use crate::mqtt_publish_args::{self, ArgPayload, MqttPublishArgs};
 
 /// Returned to CC when `AutomationCreate` succeeds.
 #[derive(Serialize)]
@@ -184,6 +188,13 @@ async fn execute_create(
         CreateResult::TooManyJobs { count, max } => outcome_err(Cow::Owned(format!(
             "job limit reached: {count} jobs exist (max {max} per app); delete a job to free a slot"
         ))),
+        CreateResult::MqttRefused { to, refused } => crate::mqtt_intercept::answer_refused(
+            bridge,
+            REJECTION_CONTEXT,
+            tool_name,
+            &to,
+            refused,
+        ),
     }
 }
 
@@ -264,6 +275,13 @@ async fn execute_edit(
             "delivery_deadline_secs {v} out of range [1, 2592000]"
         ))),
         EditResult::Unauthorized(msg) => outcome_err(Cow::Owned(format!("unauthorized: {msg}"))),
+        EditResult::MqttRefused { to, refused } => crate::mqtt_intercept::answer_refused(
+            bridge,
+            REJECTION_CONTEXT,
+            tool_name,
+            &to,
+            refused,
+        ),
     }
 }
 
@@ -326,69 +344,176 @@ fn parse_trigger(tool_input: &serde_json::Value) -> Result<Trigger, String> {
     }
 }
 
-/// Parse the `action` field from tool input into an `Action`.
+/// The keys a `send_message` action takes.
+const SEND_MESSAGE_KEYS: [&str; 6] = [
+    "kind",
+    "to",
+    "body",
+    "urgency",
+    "reply_to",
+    "delivery_deadline_secs",
+];
+
+/// Parse the `action` field from tool input into an `Action`. A key the
+/// action's kind does not define is refused.
 fn parse_action(tool_input: &serde_json::Value) -> Result<Action, String> {
-    let action_obj = tool_input
+    let action_value = tool_input
         .get("action")
         .ok_or_else(|| "missing `action`".to_string())?;
+    let action_obj = action_value
+        .as_object()
+        .ok_or_else(|| "action must be an object".to_string())?;
     let kind = action_obj
         .get("kind")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "action.kind must be a string".to_string())?;
     match kind {
-        "send_message" => {
-            let to = action_obj
-                .get("to")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "action.to is required".to_string())?
-                .to_string();
-            let body = action_obj
-                .get("body")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "action.body is required".to_string())?
-                .to_string();
-            // Reject legacy `wake` key — a stale-habit sender would otherwise
-            // be silently defaulted to urgency `low`, baking wrong urgency into
-            // a recurring job.
-            if action_obj.get("wake").is_some() {
-                return Err("action.wake is no longer valid; use action.urgency \
-                     (\"very-low\"|\"low\"|\"normal\"|\"high\")"
-                    .to_string());
-            }
-            let urgency_str = action_obj
-                .get("urgency")
-                .and_then(|v| v.as_str())
-                .unwrap_or("low");
-            let urgency = brenn_lib::messaging::Urgency::parse(urgency_str)
-                .ok_or_else(|| format!("unknown action.urgency value: {urgency_str:?}"))?;
-            let reply_to = action_obj
-                .get("reply_to")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let delivery_deadline_secs = match action_obj.get("delivery_deadline_secs") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(v) => {
-                    let n = v.as_u64().ok_or_else(|| {
-                        "action.delivery_deadline_secs must be a positive integer".to_string()
-                    })?;
-                    // Reject before cast: a value > u32::MAX would wrap to a
-                    // small number that passes the range check.
-                    let n32 = u32::try_from(n).map_err(|_| {
-                        format!("action.delivery_deadline_secs {n} exceeds maximum (2592000)")
-                    })?;
-                    Some(n32)
-                }
-            };
-            Ok(Action::SendMessage(SendMessageAction {
-                to,
-                body,
-                urgency,
-                reply_to,
-                delivery_deadline_secs,
-            }))
-        }
+        "send_message" => parse_send_message(action_obj),
+        "mqtt_publish" => parse_mqtt_publish(action_value, action_obj),
         other => Err(format!("unknown action kind: {other:?}")),
     }
+}
+
+/// The first key of `action_obj` outside `keys`, refused naming it and `kind`.
+fn refuse_unknown_keys(
+    action_obj: &serde_json::Map<String, serde_json::Value>,
+    kind: &str,
+    keys: &[&str],
+) -> Result<(), String> {
+    match action_obj.keys().find(|k| !keys.contains(&k.as_str())) {
+        Some(key) => Err(format!(
+            "action.{key} is not a field of a {kind} action; remove it"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A `send_message` action.
+fn parse_send_message(
+    action_obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Action, String> {
+    // Reject legacy `wake` key — a stale-habit sender would otherwise be
+    // defaulted to urgency `low`, baking wrong urgency into a recurring job.
+    if action_obj.contains_key("wake") {
+        return Err("action.wake is no longer valid; use action.urgency \
+             (\"very-low\"|\"low\"|\"normal\"|\"high\")"
+            .to_string());
+    }
+    refuse_unknown_keys(action_obj, "send_message", &SEND_MESSAGE_KEYS)?;
+    let to = action_obj
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "action.to is required".to_string())?
+        .to_string();
+    if brenn_lib::messaging::ChannelScheme::of(&to)
+        == Some(brenn_lib::messaging::ChannelScheme::Mqtt)
+    {
+        return Err("action.to is an mqtt: address: use action kind \"mqtt_publish\"".to_string());
+    }
+    let body = match action_obj.get("body") {
+        None => return Err("action.body is required".to_string()),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(_) => return Err("action.body must be a string for send_message".to_string()),
+    };
+    let urgency_str = action_obj
+        .get("urgency")
+        .and_then(|v| v.as_str())
+        .unwrap_or("low");
+    let urgency = brenn_lib::messaging::Urgency::parse(urgency_str)
+        .ok_or_else(|| format!("unknown action.urgency value: {urgency_str:?}"))?;
+    let reply_to = action_obj
+        .get("reply_to")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let delivery_deadline_secs = match action_obj.get("delivery_deadline_secs") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                "action.delivery_deadline_secs must be a positive integer".to_string()
+            })?;
+            // Reject before cast: a value > u32::MAX would wrap to a small
+            // number that passes the range check.
+            let n32 = u32::try_from(n).map_err(|_| {
+                format!("action.delivery_deadline_secs {n} exceeds maximum (2592000)")
+            })?;
+            Some(n32)
+        }
+    };
+    Ok(Action::SendMessage(SendMessageAction {
+        to,
+        body,
+        urgency,
+        reply_to,
+        delivery_deadline_secs,
+    }))
+}
+
+/// An `mqtt_publish` action: its arguments are `MqttSend`'s, read by
+/// [`mqtt_publish_args`], less `attachment`.
+fn parse_mqtt_publish(
+    action_value: &serde_json::Value,
+    action_obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Action, String> {
+    if action_obj.contains_key("urgency") {
+        return Err(
+            "action.urgency does not apply to an mqtt_publish action: an MQTT message has no \
+             urgency"
+                .to_string(),
+        );
+    }
+    // TODO(mqtt-publish-reply-to-and-deliver-after-refused): accept `reply_to`
+    // under the rule every MQTT publish takes it by.
+    if action_obj.contains_key("reply_to") {
+        return Err(
+            "action.reply_to does not apply to an mqtt_publish action: an MQTT publish \
+             takes no reply address"
+                .to_string(),
+        );
+    }
+    if action_obj.contains_key("delivery_deadline_secs") {
+        return Err(
+            "action.delivery_deadline_secs does not apply to an mqtt_publish action: give \
+             lifetime_s, which bounds how late the broker may deliver it"
+                .to_string(),
+        );
+    }
+    let mut keys = vec!["kind"];
+    keys.extend(mqtt_publish_args::KEYS);
+    refuse_unknown_keys(action_obj, "mqtt_publish", &keys)?;
+    let to = mqtt_publish_args::target(action_value).map_err(|e| format!("action: {e}"))?;
+    if brenn_lib::messaging::ChannelScheme::of(to)
+        == Some(brenn_lib::messaging::ChannelScheme::Brenn)
+    {
+        return Err("action.to is a brenn: address: use action kind \"send_message\"".to_string());
+    }
+    let MqttPublishArgs {
+        to,
+        payload,
+        qos,
+        retain,
+        lifetime,
+        status_to,
+        ..
+    } = mqtt_publish_args::parse(action_value).map_err(|e| format!("action: {e}"))?;
+    let outbound = match payload {
+        ArgPayload::Inline(outbound) => outbound,
+        ArgPayload::Attachment { .. } => {
+            return Err(
+                "action.attachment is not available in an automation: a job holds \
+                 its payload itself; give body or body_base64"
+                    .to_string(),
+            );
+        }
+    };
+    Ok(Action::MqttPublish(MqttPublishAction {
+        to: to.to_string(),
+        payload: MqttActionPayload::from_bytes(outbound.bytes),
+        qos,
+        retain,
+        lifetime,
+        content_type: outbound.content_type,
+        status_to,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +543,14 @@ fn signal_address_denial(bridge: &ActiveBridge, kind: brenn_obs::security::Denia
 
 /// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
 fn reject(tool_name: &str, error: &str) -> ToolOutcome {
-    outcome_rejection("automation tool", tool_name, error)
+    outcome_rejection(REJECTION_CONTEXT, tool_name, error)
 }
+
+/// The log category of an automation tool's argument rejection.
+const REJECTION_CONTEXT: &str = "automation tool";
+
+#[cfg(test)]
+mod mqtt_tests;
 
 #[cfg(test)]
 mod tests {

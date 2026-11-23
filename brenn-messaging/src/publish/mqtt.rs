@@ -347,6 +347,35 @@ impl Messenger {
         .map(|_| ())
     }
 
+    /// Decide whether the app `app_slug` may publish `payload_len` bytes to the
+    /// MQTT topic address `addr` with `options`, against its policy in this
+    /// messenger's app table as it stands now. Spends nothing. An app the table
+    /// does not hold is `MissingSender`; otherwise the decision is
+    /// [`Self::admit_mqtt`]'s, with no `reply_to`, `deliver_after` or
+    /// `delivery_deadline`.
+    pub fn admit_mqtt_for_app(
+        &self,
+        app_slug: &str,
+        addr: &str,
+        options: &MqttPublishOptions,
+        payload_len: u64,
+    ) -> Result<(), PublishResult> {
+        let apps = self.apps.load();
+        let Some(app) = apps.get(app_slug) else {
+            return Err(PublishResult::MissingSender);
+        };
+        self.admit_mqtt(
+            &app.policy,
+            addr,
+            options,
+            Some(payload_len),
+            None,
+            None,
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// Publish `payload` to the MQTT topic address `addr` on behalf of an app's
     /// conversation, through the common publish gates with the MQTT admission
     /// at layer 2. Returns at commit, with the message on the client's egress

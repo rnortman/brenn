@@ -1697,12 +1697,52 @@ sender: a component cannot name a `status_to`. `mqtt-publish` is committed with 
 `mqtt-publish-expiring` with a lifetime of its seconds, counted from the
 commit. Nothing in the call waits on the broker or its session.
 
+**A recurring automation's publish.** An automation job (`AutoCreate`,
+`AutoEdit`) can fire an `mqtt_publish` action: a `to` of the form
+`mqtt:<client>:<topic>`, a payload fixed when the job is created or edited —
+text, a JSON object or array stored as its JSON text, or bytes given as
+base64; never an attachment, since a job that fires for months would have
+to hold a blob — and `MqttSend`'s `content_type`, `qos`, `retain`,
+`lifetime_s` and `status_to`. Its arguments are read by the same parser as
+`MqttSend`'s. At create and edit the action is put to the same bus admission,
+spending nothing, under the owner app; a refusal is answered as `MqttSend`'s
+is, security signal included, and the payload is also held to the body cap.
+At each fire the engine commits the message through the same admission as
+`MqttSend`, under the owner app, with the lifetime counted from that commit;
+the fire is `ok` at commit and never reports delivery, which goes to the
+operator or to the action's `status_to`. A refused fire is recorded with an
+outcome naming the cause — `auth` for a grant, ACL or client that is gone,
+`action_error` for an argument the admission no longer accepts or the send
+rate, `budget` for an empty send budget — counts toward the job's
+consecutive failures and auto-disable, and raises the job's error report.
+With `persistent` set, a slot missed while the server was down fires once at
+restart, late, and a slot whose fire was cut off by a crash between commit
+and bookkeeping fires again, so a device command should set a state rather
+than toggle one.
+
+**Sizing the send budget for automations.** Every automation fire, `brenn:`
+or MQTT, draws one unit of the send budget of the conversation it fires
+under. Time never refills that budget; only a person's interaction reaching
+that conversation does — their chat message in it, or a delivered bus
+message carrying impetus, which only a sender holding the `mint_impetus`
+grant can mint. So the budget is sized as fires per day times the days of
+absence to survive, on top of the conversation's own sends, bus-provoked
+turns and pushes. A singleton agent's fires draw its one conversation's
+budget, which the owner's ordinary chatting restores. Any other agent's
+fires draw the budget of that agent's automation-events conversation, which
+nothing asks anyone to interact with, so unless the owner opens that
+conversation and sends a message in it the budget is to be sized as a total
+number of fires, not a per-absence one. A job whose fires fail on an empty
+budget is disabled after `consecutive_failures_to_disable` failures and stays
+disabled until re-enabled. `TODO.md`'s `automation-fire-budget-needs-a-person`
+is the open work.
+
 ### 2.7.3 MQTT egress
 
 Every `[[mqtt_client]]` has one egress channel, `brenn:egress/mqtt/<client>`,
 minted with the client at boot and by a reload that adds it. It is a durable,
-`non_text` channel the host alone writes: `MqttSend` and a component's
-`mqtt-publish` commit to it, and no publish ACL, component output or surface
+`non_text` channel the host alone writes: `MqttSend`, a component's
+`mqtt-publish` and an automation's `mqtt_publish` fire commit to it, and no publish ACL, component output or surface
 output may name it. A component's
 `in` port may read a declared client's channel. Each message carries the
 publish in the envelope's `transport` key — `{"mqtt_publish": {"client_slug",
@@ -1711,7 +1751,8 @@ publish in the envelope's `transport` key — `{"mqtt_publish": {"client_slug",
 stated none, and `status_to` is the canonical `brenn:` address the call named
 for its delivery statuses, absent when it named none — and its payload as the body or as one attachment (§2.7.2).
 
-**Admission.** `MqttSend`'s publish is admitted by the bus as any publish is,
+**Admission.** `MqttSend`'s publish, and an automation's fire, is admitted by
+the bus as any publish is,
 against the client's channel: authority, the client and its channel, the
 MQTT checks, the body cap, the send rate (drawn per sender and client) and the
 budget. A client being added or removed by a reload can be absent for a

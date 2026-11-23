@@ -25,6 +25,7 @@ mod middleware;
 mod model_cache;
 pub mod mqtt_egress;
 mod mqtt_intercept;
+mod mqtt_publish_args;
 pub mod mqtt_router;
 mod mqtt_subscribe;
 mod path_validate;

@@ -9,21 +9,19 @@
 //! `execute_mqtt_tool` is the execution, independent of the hook.
 
 use std::borrow::Cow;
-use std::num::NonZeroU32;
 
 use serde::Serialize;
 
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_envelope::AttachmentName;
+use brenn_lib::mqtt::MqttPublishOptions;
 use brenn_lib::mqtt::address::{MqttAddress, parse_topic_name};
-use brenn_lib::mqtt::{MqttLifetime, MqttPublishOptions};
 use brenn_messaging::{
     MqttCommitted, MqttPayload, MqttRefusal, PublishOrigin, PublishResult, StatusToRefusal,
 };
 use brenn_messaging_store::blob::HeldAttachments;
 use brenn_mqtt::ConnectorHealthLabel;
-use brenn_mqtt::payload::{OutboundArg, decode_outbound};
 use brenn_obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
 
 use crate::active_bridge::{ActiveBridge, ToolOutcome};
@@ -31,6 +29,7 @@ use crate::intercept_helpers::{
     PostCard, answer_post_tool_use, outcome_err, outcome_ok, outcome_rejection,
 };
 use crate::messaging_intercept::{self, CHANNEL_NAME_RULE, brenn_channel_denied_msg};
+use crate::mqtt_publish_args::{self, ArgPayload, MqttPublishArgs};
 use brenn_render::tools::mqtt::MCP_MQTT_SEND_TOOL;
 
 /// Outcome of `try_handle_mqtt_tool`. `None` means "not an MQTT tool".
@@ -111,10 +110,6 @@ struct MqttSendOk {
     remaining_budget: u32,
 }
 
-/// How `lifetime_s` is given, for every rejection of it.
-const LIFETIME_FORMS: &str =
-    "give a whole number of seconds from 1 to 4294967295, or the string \"forever\"";
-
 /// `MqttSend`: [`prepare`], then one commit through the bus's MQTT admission.
 async fn execute_send(
     bridge: &ActiveBridge,
@@ -144,7 +139,7 @@ async fn execute_send(
         .await;
     match result {
         Ok(committed) => answer_committed(bridge, &address.client, committed).await,
-        Err(refused) => answer_refused(bridge, tool_name, &to, &address, refused),
+        Err(refused) => answer_refused(bridge, REJECTION_CONTEXT, tool_name, &to, refused),
     }
 }
 
@@ -178,22 +173,32 @@ async fn answer_committed(
     })
 }
 
-/// The answer to a publish the bus refused.
-fn answer_refused(
+/// The answer to an MQTT publish to `to` the bus refused, for `MqttSend` and
+/// for an automation's MQTT action alike. An argument rejection is logged
+/// under `rejection_context`, the calling tool family's category. Every
+/// caller has parsed `to` as a topic name before publishing.
+pub(crate) fn answer_refused(
     bridge: &ActiveBridge,
+    rejection_context: &str,
     tool_name: &str,
     to: &str,
-    address: &MqttAddress,
     refused: PublishResult,
 ) -> ToolOutcome {
-    let client = &address.client;
-    match refused {
-        PublishResult::MalformedAddress(_) => match parse_topic_name(to) {
-            Err(e) => reject(tool_name, &e.to_string()),
-            Ok(_) => unreachable!(
-                "the bus refused {to:?} as malformed after the intercept parsed it as a topic name"
+    let reject = |error: &str| outcome_rejection(rejection_context, tool_name, error);
+    let address = match parse_topic_name(to) {
+        Ok(address) => address,
+        Err(e) => match refused {
+            PublishResult::MalformedAddress(_) => return reject(&e.to_string()),
+            other => unreachable!(
+                "the bus answered {other:?} for {to:?}, which the caller parsed as a topic name                  before publishing: {e}"
             ),
         },
+    };
+    let client = &address.client;
+    match refused {
+        PublishResult::MalformedAddress(_) => unreachable!(
+            "the bus refused {to:?} as malformed after the intercept parsed it as a topic name"
+        ),
         PublishResult::MissingSender => answer_acl_denied(bridge, false, client, &address.topic),
         PublishResult::AclDenied(_) => answer_acl_denied(bridge, true, client, &address.topic),
         PublishResult::UnknownChannel(_) => {
@@ -204,26 +209,25 @@ fn answer_refused(
                 app_slug = %bridge.app_slug,
                 conversation_id = bridge.conversation_id,
                 client = %sanitize_untrusted_str(client, MAX_LOGGED_UNTRUSTED_BYTES),
-                "MqttSend: the MQTT client is not configured on this server"
+                tool = tool_name,
+                "the MQTT client is not configured on this server"
             );
             outcome_err(Cow::Owned(format!(
                 "MQTT client `{client}` is not configured on this server"
             )))
         }
         PublishResult::MqttRefused(MqttRefusal::StatusTo { address, why }) => {
-            answer_status_to_refused(bridge, tool_name, &address, why)
+            answer_status_to_refused(bridge, rejection_context, tool_name, &address, why)
         }
         PublishResult::MqttRefused(MqttRefusal::InvalidQos { .. }) => {
-            reject(tool_name, "invalid `qos`: must be 0, 1, or 2")
+            reject("invalid `qos`: must be 0, 1, or 2")
         }
-        PublishResult::MqttRefused(MqttRefusal::InvalidContentType { reason }) => reject(
-            tool_name,
-            &format!("invalid `content_type` argument: {reason}"),
-        ),
-        PublishResult::MqttRefused(MqttRefusal::PayloadShape) => reject(
-            tool_name,
-            "the payload must be exactly one of `body`, `body_base64` and `attachment`",
-        ),
+        PublishResult::MqttRefused(MqttRefusal::InvalidContentType { reason }) => {
+            reject(&format!("invalid `content_type` argument: {reason}"))
+        }
+        PublishResult::MqttRefused(MqttRefusal::PayloadShape) => {
+            reject("the payload must be exactly one of `body`, `body_base64` and `attachment`")
+        }
         PublishResult::MqttRefused(MqttRefusal::PayloadOverClientCap { len, cap }) => {
             messaging_intercept::refusal(
                 "payload_too_large",
@@ -273,6 +277,7 @@ fn answer_refused(
 /// string, so the answer is no existence oracle.
 fn answer_status_to_refused(
     bridge: &ActiveBridge,
+    rejection_context: &str,
     tool_name: &str,
     address: &str,
     why: StatusToRefusal,
@@ -295,7 +300,8 @@ fn answer_status_to_refused(
     match why {
         StatusToRefusal::Malformed => {
             let shown = sanitize_untrusted_str(address, MAX_LOGGED_UNTRUSTED_BYTES);
-            reject(
+            outcome_rejection(
+                rejection_context,
                 tool_name,
                 &format!(
                     "malformed `status_to` {shown:?}: must be of the form \"brenn:<name>\" with \
@@ -310,7 +316,8 @@ fn answer_status_to_refused(
             "`status_to`: {}",
             brenn_channel_denied_msg(address)
         ))),
-        StatusToRefusal::StatusOverBodyCap { len, max } => reject(
+        StatusToRefusal::StatusOverBodyCap { len, max } => outcome_rejection(
+            rejection_context,
             tool_name,
             &format!(
                 "the topic is too long for a delivery status about it to be published (a status \
@@ -339,15 +346,10 @@ async fn prepare(
     tool_name: &str,
     input: &serde_json::Value,
 ) -> Result<PreparedPublish, ToolOutcome> {
-    let to = match input.get("to").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            return Err(reject(tool_name, "missing or empty `to` argument"));
-        }
-    };
+    let to = mqtt_publish_args::target(input).map_err(|e| reject(tool_name, &e))?;
 
     // Cross-protocol misuse guards.
-    if brenn_lib::messaging::ChannelScheme::of(&to)
+    if brenn_lib::messaging::ChannelScheme::of(to)
         == Some(brenn_lib::messaging::ChannelScheme::Brenn)
     {
         return Err(reject(
@@ -356,7 +358,7 @@ async fn prepare(
                  Use BrennSend for `brenn:` addresses.",
         ));
     }
-    if brenn_lib::messaging::ChannelScheme::of(&to)
+    if brenn_lib::messaging::ChannelScheme::of(to)
         == Some(brenn_lib::messaging::ChannelScheme::PwaPush)
     {
         return Err(reject(
@@ -365,7 +367,7 @@ async fn prepare(
                  Use PwaPushSend for `pwa_push:` addresses.",
         ));
     }
-    if brenn_lib::messaging::ChannelScheme::of(&to)
+    if brenn_lib::messaging::ChannelScheme::of(to)
         == Some(brenn_lib::messaging::ChannelScheme::Webhook)
     {
         return Err(reject(
@@ -375,86 +377,22 @@ async fn prepare(
         ));
     }
 
-    let address = parse_topic_name(&to).map_err(|e| reject(tool_name, &e.to_string()))?;
-
-    let content_type = input.get("content_type");
-    let form = match (
-        input.get("body"),
-        input.get("body_base64"),
-        input.get("attachment"),
-    ) {
-        (Some(body), None, None) => PayloadForm::Inline(
-            decode_outbound(OutboundArg::Body(body), content_type)
-                .map_err(|e| reject(tool_name, &e.to_string()))?,
-        ),
-        (None, Some(b64), None) => PayloadForm::Inline(
-            decode_outbound(OutboundArg::Base64(b64), content_type)
-                .map_err(|e| reject(tool_name, &e.to_string()))?,
-        ),
-        (None, None, Some(reference)) => {
-            if content_type.is_some() {
-                return Err(reject(
-                    tool_name,
-                    "`content_type` is given with `attachment`: an attachment publishes its \
-                     own recorded content type; drop `content_type`",
-                ));
-            }
-            let Some((message_id, name)) = messaging_intercept::attachment_reference(reference)
-            else {
-                return Err(reject(
-                    tool_name,
-                    &format!(
-                        "`attachment` must be {}",
-                        messaging_intercept::ATTACHMENT_REFERENCE_SHAPE
-                    ),
-                ));
-            };
-            PayloadForm::Attachment { message_id, name }
-        }
-        (None, None, None) => {
-            return Err(reject(
-                tool_name,
-                "missing payload: give exactly one of `body`, `body_base64` and `attachment`",
-            ));
-        }
-        _ => {
-            return Err(reject(
-                tool_name,
-                "more than one payload argument is given: give exactly one of `body`, \
-                 `body_base64` and `attachment`",
-            ));
-        }
-    };
-
-    let qos = match input.get("qos") {
-        None => 1,
-        Some(v) => match v.as_u64().and_then(|n| u8::try_from(n).ok()) {
-            Some(qos) if qos <= 2 => qos,
-            _ => return Err(reject(tool_name, "invalid `qos`: must be 0, 1, or 2")),
-        },
-    };
-    let retain = input
-        .get("retain")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let lifetime = lifetime(input).map_err(|e| reject(tool_name, &e))?;
-    let status_to = match input.get("status_to") {
-        None => None,
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        Some(_) => {
-            return Err(reject(
-                tool_name,
-                "invalid `status_to` argument: give a `brenn:<channel>` address as a string",
-            ));
-        }
-    };
+    let MqttPublishArgs {
+        to,
+        address,
+        payload,
+        qos,
+        retain,
+        lifetime,
+        status_to,
+    } = mqtt_publish_args::parse(input).map_err(|e| reject(tool_name, &e))?;
 
     let messenger = messenger(bridge);
-    let (payload, content_type) = match form {
-        PayloadForm::Inline(outbound) => {
+    let (payload, content_type) = match payload {
+        ArgPayload::Inline(outbound) => {
             (MqttPayload::Inline(outbound.bytes), outbound.content_type)
         }
-        PayloadForm::Attachment { message_id, name } => {
+        ArgPayload::Attachment { message_id, name } => {
             let hold = messaging_intercept::admit_attachment_reference(
                 bridge,
                 messenger,
@@ -473,7 +411,7 @@ async fn prepare(
     };
 
     Ok(PreparedPublish {
-        to,
+        to: to.to_string(),
         address,
         payload,
         options: MqttPublishOptions {
@@ -484,30 +422,6 @@ async fn prepare(
             status_to,
         },
     })
-}
-
-/// The required `lifetime_s` argument: whole seconds from 1 to `u32::MAX`, or
-/// `"forever"`. The `Err` text names both forms.
-fn lifetime(input: &serde_json::Value) -> Result<MqttLifetime, String> {
-    let Some(value) = input.get("lifetime_s") else {
-        return Err(format!("missing `lifetime_s` argument: {LIFETIME_FORMS}"));
-    };
-    let lifetime = match value {
-        serde_json::Value::String(s) if s == "forever" => Some(MqttLifetime::Forever),
-        serde_json::Value::Number(n) => n
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .and_then(NonZeroU32::new)
-            .map(MqttLifetime::Seconds),
-        _ => None,
-    };
-    lifetime.ok_or_else(|| format!("invalid `lifetime_s` argument: {LIFETIME_FORMS}"))
-}
-
-/// The payload form of one call, as its arguments give it.
-enum PayloadForm<'a> {
-    Inline(brenn_mqtt::payload::OutboundPayload),
-    Attachment { message_id: &'a str, name: &'a str },
 }
 
 /// The answer to an `MqttSend` the app's `mqtt_publish` grant or ACL denies,
@@ -567,8 +481,11 @@ fn answer_acl_denied(
 
 /// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
 fn reject(tool_name: &str, error: &str) -> ToolOutcome {
-    outcome_rejection("mqtt tool", tool_name, error)
+    outcome_rejection(REJECTION_CONTEXT, tool_name, error)
 }
+
+/// The log category of an `MqttSend` argument rejection.
+const REJECTION_CONTEXT: &str = "mqtt tool";
 
 #[cfg(test)]
 mod attachment_tests;

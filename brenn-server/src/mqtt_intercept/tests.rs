@@ -185,6 +185,19 @@ async fn an_invalid_qos_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_non_boolean_retain_is_rejected() {
+    let bridge = bridge_with_bound(1024).await;
+    for retain in [json!("true"), json!(1), json!(null)] {
+        assert_rejected(
+            &bridge,
+            json!({ "to": "mqtt:home:t", "body": "42", "retain": retain, "lifetime_s": 60 }),
+            "invalid `retain`: must be true or false",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn neither_payload_form_is_rejected_naming_them() {
     let bridge = bridge_with_bound(1024).await;
     assert_rejected(
@@ -555,8 +568,9 @@ async fn a_client_with_no_session_is_not_configured_and_not_a_security_event() {
         json!({ "ok": false, "error": "MQTT client `ha` is not configured on this server" })
     );
     assert!(logs_contain(
-        "MqttSend: the MQTT client is not configured on this server"
+        "the MQTT client is not configured on this server"
     ));
+    assert!(logs_contain("tool=\"mcp__brenn__MqttSend\""));
     assert!(!logs_contain("app security event"));
     assert_eq!(send_budget_row(&bridge).await, None);
 }

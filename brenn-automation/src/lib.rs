@@ -1,8 +1,8 @@
 //! Automation engine — general trigger->action framework.
 //!
-//! This iteration instantiates one trigger (cron-time) and one action
-//! (send-message). Future variants plug into the same data model and
-//! execution loop without redesign.
+//! One trigger (cron-time) and two actions: a message to a `brenn:` channel
+//! (`send_message`) and a publish to an MQTT topic (`mqtt_publish`). Further
+//! variants plug into the same data model and execution loop without redesign.
 //!
 //! Module layout:
 //! - `db`        — DAO helpers over the automation tables.
@@ -35,13 +35,15 @@ use brenn_db::Db;
 use brenn_lib::config::AppTable;
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_messaging::Messenger;
+use brenn_messaging::publish::PublishResult;
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::security::DenialKind;
 
 pub use brenn_lib::config::AutomationGlobalConfig;
 pub use job::{
     Action, CreateJob, CronTrigger, EditJob, JobSnapshot, JobView, MCP_AUTO_CREATE_TOOL,
-    MCP_AUTO_DELETE_TOOL, MCP_AUTO_EDIT_TOOL, MCP_AUTO_LIST_TOOL, SendMessageAction, Trigger,
+    MCP_AUTO_DELETE_TOOL, MCP_AUTO_EDIT_TOOL, MCP_AUTO_LIST_TOOL, MqttActionPayload,
+    MqttPublishAction, SendMessageAction, Trigger,
 };
 pub use schema::run_automation_migrations;
 
@@ -94,6 +96,8 @@ pub enum CreateResult {
     /// App has reached the per-app job cap (`max_jobs_per_app`). Includes
     /// disabled jobs — delete a job to free a slot.
     TooManyJobs { count: u32, max: u32 },
+    /// The MQTT admission refused the action's publish to `to`.
+    MqttRefused { to: String, refused: PublishResult },
 }
 
 /// Result of `AutomationEngine::edit`.
@@ -120,7 +124,12 @@ pub enum EditResult {
         max: usize,
     },
     InvalidDeadline(u32),
-    /// Owner lost the `MessagingPublish` grant since the job was authored.
+    /// The MQTT admission refused the action's publish to `to`.
+    MqttRefused {
+        to: String,
+        refused: PublishResult,
+    },
+    /// Owner lost the grant the job's action needs since the job was authored.
     Unauthorized(String),
 }
 
@@ -195,18 +204,20 @@ impl AutomationEngine {
     pub async fn create(&self, caller_app_slug: &str, req: CreateJob) -> CreateResult {
         let now = Utc::now();
 
-        // Publish/subscribe split: create gates on the `MessagingPublish`
-        // grant specifically — a subscribe-only app cannot author a
-        // SendMessage job it could never fire. Per-channel ACL scope is
-        // checked in step 5 and re-runs at fire time.
+        // Publish/subscribe split: a `send_message` job gates on the
+        // `MessagingPublish` grant specifically — a subscribe-only app cannot
+        // author a job it could never fire. Per-channel ACL scope is checked
+        // with the action and re-runs at fire time. An `mqtt_publish` job's
+        // grants are the MQTT admission's to decide, with the action.
         let app_config = match self.apps.get(caller_app_slug) {
             Some(c) => c,
             // Unknown slug: no app entry — publish disabled by definition.
             None => return CreateResult::MissingSender,
         };
-        if !app_config
-            .policy
-            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
+        if matches!(req.action, Action::SendMessage(_))
+            && !app_config
+                .policy
+                .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
         {
             return CreateResult::MissingSender;
         }
@@ -244,13 +255,7 @@ impl AutomationEngine {
 
         // Action validation. ACL scope is checked BEFORE resolution so an
         // out-of-scope address discloses no channel-existence bit.
-        let max_body_bytes = self.messenger.max_body_bytes();
-        if let Err(e) = validate_action(
-            &req.action,
-            &app_config.policy,
-            &self.directory,
-            max_body_bytes,
-        ) {
+        if let Err(e) = self.validate_action(caller_app_slug, &req.action, &app_config.policy) {
             return e.into_create();
         }
 
@@ -260,7 +265,6 @@ impl AutomationEngine {
         let trigger_kind = req.trigger.kind_str();
         let trigger_payload =
             serde_json::to_string(&req.trigger).expect("Trigger serialization never fails");
-        let action_kind = req.action.kind_str();
         let action_payload =
             serde_json::to_string(&req.action).expect("Action serialization never fails");
 
@@ -283,7 +287,6 @@ impl AutomationEngine {
             &req.name,
             trigger_kind,
             &trigger_payload,
-            action_kind,
             &action_payload,
             req.enabled,
             now,
@@ -412,27 +415,33 @@ impl AutomationEngine {
             existing.next_fire_at
         };
 
-        // Publish grant pre-check: runs unconditionally — a name- or
-        // enabled-only edit on an owner that lost the grant is still rejected.
-        // A grant-absent owner gets a distinct `Unauthorized` rather than
-        // folding into the unified address error below.
-        if !app_config
-            .policy
-            .has_grant(brenn_envelope::grants::AppCapability::MessagingPublish)
+        // Publish grant pre-check, following the resulting action: runs even
+        // for a name- or enabled-only edit, so an owner that lost the grant
+        // its job needs is rejected. A grant-absent owner gets a distinct
+        // `Unauthorized` rather than folding into the unified address error
+        // below. An `mqtt_publish` action given in this request is left to
+        // its validation, so create and edit answer a missing grant the same
+        // way.
+        let needed = match (&new_action, req.action.is_some()) {
+            (Action::SendMessage(_), _) => {
+                Some(brenn_envelope::grants::AppCapability::MessagingPublish)
+            }
+            (Action::MqttPublish(_), false) => {
+                Some(brenn_envelope::grants::AppCapability::MqttPublish)
+            }
+            (Action::MqttPublish(_), true) => None,
+        };
+        if let Some(grant) = needed
+            && !app_config.policy.has_grant(grant)
         {
             return EditResult::Unauthorized(format!(
-                "app {caller_app_slug:?} holds no messaging_publish grant"
+                "app {caller_app_slug:?} holds no {} grant",
+                grant.word()
             ));
         }
 
-        let max_body_bytes = self.messenger.max_body_bytes();
         if req.action.is_some()
-            && let Err(e) = validate_action(
-                &new_action,
-                &app_config.policy,
-                &self.directory,
-                max_body_bytes,
-            )
+            && let Err(e) = self.validate_action(caller_app_slug, &new_action, &app_config.policy)
         {
             return e.into_edit();
         }
@@ -542,6 +551,46 @@ impl AutomationEngine {
         let conn = self.db.lock().await;
         db::get_due_jobs(&conn, Utc::now())
     }
+
+    /// Validate an action for a job owned by `owner_app_slug`, whose policy is
+    /// `policy`. A `send_message` action is checked here against `brenn:`
+    /// policy and the directory. An `mqtt_publish` action is first put to the
+    /// MQTT admission, so a caller without authority learns nothing else, and
+    /// its payload is then held to the bus's body cap, which bounds what a job
+    /// row stores.
+    fn validate_action(
+        &self,
+        owner_app_slug: &str,
+        action: &Action,
+        policy: &brenn_lib::access::AppPolicy,
+    ) -> Result<(), ActionValidationError> {
+        let max_body_bytes = self.messenger.max_body_bytes();
+        match action {
+            Action::SendMessage(sma) => {
+                validate_send_message(sma, policy, &self.directory, max_body_bytes)
+            }
+            Action::MqttPublish(mpa) => {
+                self.messenger
+                    .admit_mqtt_for_app(
+                        owner_app_slug,
+                        &mpa.to,
+                        &mpa.options(),
+                        mpa.payload.len() as u64,
+                    )
+                    .map_err(|refused| ActionValidationError::MqttRefused {
+                        to: mpa.to.clone(),
+                        refused,
+                    })?;
+                if mpa.payload.len() > max_body_bytes {
+                    return Err(ActionValidationError::BodyTooLarge {
+                        len: mpa.payload.len(),
+                        max: max_body_bytes,
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 fn validate_name(name: &str) -> Result<(), String> {
@@ -559,6 +608,7 @@ enum ActionValidationError {
     InvalidAddress { addr: String, kind: DenialKind },
     BodyTooLarge { len: usize, max: usize },
     InvalidDeadline(u32),
+    MqttRefused { to: String, refused: PublishResult },
 }
 
 impl ActionValidationError {
@@ -567,6 +617,7 @@ impl ActionValidationError {
             Self::InvalidAddress { addr, kind } => CreateResult::InvalidAddress { addr, kind },
             Self::BodyTooLarge { len, max } => CreateResult::BodyTooLarge { len, max },
             Self::InvalidDeadline(v) => CreateResult::InvalidDeadline(v),
+            Self::MqttRefused { to, refused } => CreateResult::MqttRefused { to, refused },
         }
     }
 
@@ -575,6 +626,7 @@ impl ActionValidationError {
             Self::InvalidAddress { addr, kind } => EditResult::InvalidAddress { addr, kind },
             Self::BodyTooLarge { len, max } => EditResult::BodyTooLarge { len, max },
             Self::InvalidDeadline(v) => EditResult::InvalidDeadline(v),
+            Self::MqttRefused { to, refused } => EditResult::MqttRefused { to, refused },
         }
     }
 }
@@ -664,34 +716,30 @@ fn validate_reply_to(
     Ok(())
 }
 
-fn validate_action(
-    action: &Action,
+fn validate_send_message(
+    sma: &SendMessageAction,
     policy: &brenn_lib::access::AppPolicy,
     directory: &MessagingDirectory,
     max_body_bytes: usize,
 ) -> Result<(), ActionValidationError> {
-    match action {
-        Action::SendMessage(sma) => {
-            validate_publish_target(&sma.to, policy, directory)?;
-            if let Some(rt) = &sma.reply_to {
-                validate_reply_to(rt, policy, directory)?;
-            }
-            // Body size.
-            if sma.body.len() > max_body_bytes {
-                return Err(ActionValidationError::BodyTooLarge {
-                    len: sma.body.len(),
-                    max: max_body_bytes,
-                });
-            }
-            // Delivery deadline bounds.
-            if let Some(d) = sma.delivery_deadline_secs
-                && !(1..=2_592_000).contains(&d)
-            {
-                return Err(ActionValidationError::InvalidDeadline(d));
-            }
-            Ok(())
-        }
+    validate_publish_target(&sma.to, policy, directory)?;
+    if let Some(rt) = &sma.reply_to {
+        validate_reply_to(rt, policy, directory)?;
     }
+    // Body size.
+    if sma.body.len() > max_body_bytes {
+        return Err(ActionValidationError::BodyTooLarge {
+            len: sma.body.len(),
+            max: max_body_bytes,
+        });
+    }
+    // Delivery deadline bounds.
+    if let Some(d) = sma.delivery_deadline_secs
+        && !(1..=2_592_000).contains(&d)
+    {
+        return Err(ActionValidationError::InvalidDeadline(d));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -709,6 +757,7 @@ mod tests {
         ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, NoiseLevel,
         ResolvedChannel, SubscriberEntry, SubscriberEntryKind, WakeMin, canonical_address,
     };
+    use brenn_messaging::publish::{MqttRefusal, StatusToRefusal};
     use brenn_messaging::{
         Messenger,
         config::{Depth, Sink},
@@ -963,7 +1012,6 @@ mod tests {
                 "preexisting-job",
                 trigger.kind_str(),
                 &serde_json::to_string(&trigger).unwrap(),
-                action.kind_str(),
                 &serde_json::to_string(&action).unwrap(),
                 true,
                 now,
@@ -1215,7 +1263,9 @@ mod tests {
 
     fn create_job_with_reply_to(to: &str, reply_to: &str) -> CreateJob {
         let mut j = minimal_create_job(to);
-        let Action::SendMessage(sma) = &mut j.action;
+        let Action::SendMessage(sma) = &mut j.action else {
+            unreachable!("minimal_create_job builds a send_message action")
+        };
         sma.reply_to = Some(reply_to.to_string());
         j
     }
@@ -1245,7 +1295,6 @@ mod tests {
             "seed-job",
             trigger.kind_str(),
             &serde_json::to_string(&trigger).unwrap(),
-            action.kind_str(),
             &serde_json::to_string(&action).unwrap(),
             true,
             now,
@@ -1443,5 +1492,343 @@ mod tests {
             Some(DenialKind::MalformedAddress),
             "{r:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MQTT action: create and edit
+    // -----------------------------------------------------------------------
+
+    use crate::job::MqttPublishAction;
+    use crate::test_support::{
+        MQTT_CLIENT_CAP, MQTT_STATUS, edit_app_policy, grant_only, make_mqtt_engine, mqtt_action,
+        mqtt_sender_policy,
+    };
+
+    const KITCHEN: &str = "mqtt:home:lights/kitchen/set";
+
+    fn mqtt_job(action: MqttPublishAction) -> CreateJob {
+        CreateJob {
+            name: "kitchen-on".to_string(),
+            trigger: Trigger::Cron(CronTrigger {
+                expr: "0 18 * * *".to_string(),
+                tz: "UTC".to_string(),
+                persistent: true,
+            }),
+            action: Action::MqttPublish(action),
+            enabled: true,
+        }
+    }
+
+    fn with_status_to(mut action: MqttPublishAction, status_to: &str) -> MqttPublishAction {
+        action.status_to = Some(status_to.to_string());
+        action
+    }
+
+    /// The MQTT grant and topic ACL alone, with no `brenn:` publish grant.
+    fn mqtt_only_policy() -> brenn_lib::access::AppPolicy {
+        let mut policy = mqtt_sender_policy();
+        grant_only(
+            &mut policy,
+            brenn_envelope::grants::AppCapability::MqttPublish,
+        );
+        policy
+    }
+
+    async fn job_count(engine: &AutomationEngine) -> u32 {
+        db::count_jobs_for_app(&*engine.db.lock().await, "test-app")
+    }
+
+    async fn stored_action(engine: &AutomationEngine, id: &str) -> Action {
+        let conn = engine.db.lock().await;
+        db::get_job(&conn, id.parse().unwrap()).unwrap().action
+    }
+
+    fn action_edit(id: &str, action: Action) -> EditJob {
+        EditJob {
+            id: id.to_string(),
+            name: None,
+            trigger: None,
+            action: Some(action),
+            enabled: None,
+        }
+    }
+
+    async fn create_ok(engine: &AutomationEngine, req: CreateJob) -> String {
+        match engine.create("test-app", req).await {
+            CreateResult::Ok { id, .. } => id,
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mqtt_create_needs_no_brenn_grant_unless_it_names_a_status_to() {
+        let (engine, _) = make_mqtt_engine(mqtt_only_policy(), FakeIngressRouter::new()).await;
+        let id = create_ok(&engine, mqtt_job(mqtt_action(KITCHEN, b"ON"))).await;
+        assert_eq!(
+            stored_action(&engine, &id).await,
+            Action::MqttPublish(mqtt_action(KITCHEN, b"ON"))
+        );
+
+        let (engine, _) = make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
+        let action = with_status_to(mqtt_action(KITCHEN, b"ON"), MQTT_STATUS);
+        let id = create_ok(&engine, mqtt_job(action.clone())).await;
+        assert_eq!(
+            stored_action(&engine, &id).await,
+            Action::MqttPublish(action)
+        );
+    }
+
+    /// Each create-time refusal names its cause and inserts nothing.
+    #[tokio::test]
+    async fn mqtt_create_refusals_insert_nothing() {
+        type Expect = fn(&CreateResult) -> bool;
+        let typed = |ct: &str| MqttPublishAction {
+            content_type: Some(ct.to_string()),
+            ..mqtt_action(KITCHEN, b"ON")
+        };
+        let over_cap = vec![b'x'; MQTT_CLIENT_CAP as usize + 1];
+        let cases: Vec<(&str, MqttPublishAction, Expect)> = vec![
+            (
+                "acl",
+                mqtt_action("mqtt:home:locks/front/set", b"ON"),
+                |r| {
+                    matches!(
+                        r,
+                        CreateResult::MqttRefused {
+                            refused: PublishResult::AclDenied(_),
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                "client",
+                mqtt_action("mqtt:loft:lights/kitchen/set", b"ON"),
+                |r| {
+                    matches!(
+                        r,
+                        CreateResult::MqttRefused {
+                            refused: PublishResult::UnknownChannel(_),
+                            ..
+                        }
+                    )
+                },
+            ),
+            (
+                "qos",
+                MqttPublishAction {
+                    qos: 3,
+                    ..mqtt_action(KITCHEN, b"ON")
+                },
+                |r| {
+                    matches!(
+                        r,
+                        CreateResult::MqttRefused {
+                            refused: PublishResult::MqttRefused(MqttRefusal::InvalidQos { qos: 3 }),
+                            ..
+                        }
+                    )
+                },
+            ),
+            ("content type", typed("text/"), |r| {
+                matches!(
+                    r,
+                    CreateResult::MqttRefused {
+                        refused: PublishResult::MqttRefused(MqttRefusal::InvalidContentType { .. }),
+                        ..
+                    }
+                )
+            }),
+            ("client cap", mqtt_action(KITCHEN, &over_cap), |r| {
+                matches!(
+                    r,
+                    CreateResult::MqttRefused {
+                        refused: PublishResult::MqttRefused(
+                            MqttRefusal::PayloadOverClientCap { .. }
+                        ),
+                        ..
+                    }
+                )
+            }),
+            (
+                "status_to malformed",
+                with_status_to(mqtt_action(KITCHEN, b"ON"), "light-status"),
+                |r| status_to_refused(r, StatusToRefusal::Malformed),
+            ),
+            (
+                "status_to unknown",
+                with_status_to(mqtt_action(KITCHEN, b"ON"), "brenn:nowhere"),
+                |r| status_to_refused(r, StatusToRefusal::Unknown),
+            ),
+        ];
+        for (case, action, expect) in cases {
+            let (engine, _) =
+                make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
+            let result = engine.create("test-app", mqtt_job(action)).await;
+            assert!(expect(&result), "{case}: {result:?}");
+            assert_eq!(job_count(&engine).await, 0, "{case}: nothing inserted");
+        }
+
+        // No MQTT grant.
+        let mut no_grant = mqtt_sender_policy();
+        grant_only(
+            &mut no_grant,
+            brenn_envelope::grants::AppCapability::MessagingPublish,
+        );
+        let (engine, _) = make_mqtt_engine(no_grant, FakeIngressRouter::new()).await;
+        let result = engine
+            .create("test-app", mqtt_job(mqtt_action(KITCHEN, b"ON")))
+            .await;
+        assert!(
+            matches!(
+                result,
+                CreateResult::MqttRefused {
+                    refused: PublishResult::MissingSender,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+
+        // A status_to named without the brenn: grant.
+        let (engine, _) = make_mqtt_engine(mqtt_only_policy(), FakeIngressRouter::new()).await;
+        let result = engine
+            .create(
+                "test-app",
+                mqtt_job(with_status_to(mqtt_action(KITCHEN, b"ON"), MQTT_STATUS)),
+            )
+            .await;
+        assert!(
+            status_to_refused(&result, StatusToRefusal::GrantAbsent),
+            "{result:?}"
+        );
+
+        // A status_to outside the brenn: publish ACL.
+        let mut narrow = mqtt_sender_policy();
+        narrow.acls.brenn_publish = vec![brenn_lib::access::acl::ChannelMatcher::Exact(
+            "records".to_string(),
+        )];
+        let (engine, _) = make_mqtt_engine(narrow, FakeIngressRouter::new()).await;
+        let result = engine
+            .create(
+                "test-app",
+                mqtt_job(with_status_to(mqtt_action(KITCHEN, b"ON"), MQTT_STATUS)),
+            )
+            .await;
+        assert!(
+            status_to_refused(&result, StatusToRefusal::AclDenied),
+            "{result:?}"
+        );
+        assert_eq!(job_count(&engine).await, 0);
+    }
+
+    fn status_to_refused(r: &CreateResult, expected: StatusToRefusal) -> bool {
+        matches!(
+            r,
+            CreateResult::MqttRefused {
+                refused: PublishResult::MqttRefused(MqttRefusal::StatusTo { why, .. }),
+                ..
+            } if *why == expected
+        )
+    }
+
+    /// A payload within the client's cap and over the bus's body cap is
+    /// refused as too large for a job to hold.
+    #[tokio::test]
+    async fn mqtt_create_holds_the_payload_to_the_body_cap() {
+        let (engine, _) = make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
+        let max = engine.messenger.max_body_bytes();
+        let result = engine
+            .create(
+                "test-app",
+                mqtt_job(mqtt_action(
+                    "mqtt:big:lights/kitchen/set",
+                    &vec![b'x'; max + 1],
+                )),
+            )
+            .await;
+        assert!(
+            matches!(result, CreateResult::BodyTooLarge { len, max: m } if len == max + 1 && m == max),
+            "{result:?}"
+        );
+        assert_eq!(job_count(&engine).await, 0);
+    }
+
+    #[tokio::test]
+    async fn mqtt_edit_changes_kind_both_ways_and_a_refused_edit_keeps_the_row() {
+        // The MQTT fixture's directory holds `light-status`; a `send_message`
+        // to it is in the sender policy's scope.
+        let (engine, _) = make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
+        let id = create_ok(&engine, minimal_create_job(MQTT_STATUS)).await;
+
+        let mqtt = Action::MqttPublish(mqtt_action(KITCHEN, b"ON"));
+        let r = engine
+            .edit("test-app", action_edit(&id, mqtt.clone()))
+            .await;
+        assert!(matches!(r, EditResult::Ok { .. }), "{r:?}");
+        assert_eq!(stored_action(&engine, &id).await, mqtt);
+
+        let refused = Action::MqttPublish(mqtt_action("mqtt:home:locks/front/set", b"ON"));
+        let r = engine.edit("test-app", action_edit(&id, refused)).await;
+        assert!(
+            matches!(
+                r,
+                EditResult::MqttRefused {
+                    refused: PublishResult::AclDenied(_),
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+        assert_eq!(stored_action(&engine, &id).await, mqtt, "row unchanged");
+
+        let back = minimal_create_job(MQTT_STATUS).action;
+        let r = engine
+            .edit("test-app", action_edit(&id, back.clone()))
+            .await;
+        assert!(matches!(r, EditResult::Ok { .. }), "{r:?}");
+        assert_eq!(stored_action(&engine, &id).await, back);
+    }
+
+    /// A name-only edit of an MQTT job follows the grant its action needs.
+    #[tokio::test]
+    async fn mqtt_name_only_edit_needs_the_mqtt_grant() {
+        let (engine, apps) = make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
+        let id = create_ok(&engine, mqtt_job(mqtt_action(KITCHEN, b"ON"))).await;
+        edit_app_policy(&apps, |p| {
+            grant_only(p, brenn_envelope::grants::AppCapability::MessagingPublish)
+        });
+        let rename = EditJob {
+            id,
+            name: Some("renamed".to_string()),
+            trigger: None,
+            action: None,
+            enabled: None,
+        };
+        let r = engine.edit("test-app", rename).await;
+        assert!(
+            matches!(&r, EditResult::Unauthorized(m) if m.contains("mqtt_publish grant")),
+            "{r:?}"
+        );
+    }
+
+    /// An app without the MQTT grant still creates and edits a `send_message`
+    /// job.
+    #[tokio::test]
+    async fn send_message_jobs_need_no_mqtt_grant() {
+        let mut policy = mqtt_sender_policy();
+        grant_only(
+            &mut policy,
+            brenn_envelope::grants::AppCapability::MessagingPublish,
+        );
+        let (engine, _) = make_mqtt_engine(policy, FakeIngressRouter::new()).await;
+        let id = create_ok(&engine, minimal_create_job(MQTT_STATUS)).await;
+        let r = engine
+            .edit(
+                "test-app",
+                action_edit(&id, minimal_create_job(MQTT_STATUS).action),
+            )
+            .await;
+        assert!(matches!(r, EditResult::Ok { .. }), "{r:?}");
     }
 }

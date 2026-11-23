@@ -933,11 +933,11 @@ impl Messenger {
         };
 
         // AUTHZ WARNING (security-5): the per-channel sender authorization
-        // (allowlist) below is live. The automation fire path
-        // (`automation/fire.rs`, `fire_one`) re-checks this same policy at fire
-        // time. Automation jobs store `action.to` at create time and fire later;
-        // a policy tightened after job creation would be stale at fire time
-        // unless that re-check is present.
+        // (allowlist) below is live. Automation jobs store their target at
+        // create time and fire later, so a policy tightened after job creation
+        // must be honoured at fire time: the automation fire (`fire_one`)
+        // re-checks `brenn:` policy itself for a `send_message` action, and an
+        // `mqtt_publish` action's fire is decided by the MQTT admission.
 
         // 2. Sender authority + publish authorization, resolved per principal
         //    source. Layer-1: gate on the `MessagingPublish` grant

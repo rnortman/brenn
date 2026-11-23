@@ -213,11 +213,10 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, next_fire_at) \
              VALUES (?1, ?2, 'disabled-job', 'cron', \
                      '{\"expr\":\"*/5 * * * *\",\"tz\":\"UTC\",\"persistent\":false}', \
-                     'send_message', \
                      '{\"to\":\"brenn:ch\",\"body\":\"hi\",\"wake\":\"none\",\"reply_to\":null,\"delivery_deadline_secs\":null}', \
                      0, 0, ?3, ?3, ?3)",
             rusqlite::params![uuid_bytes, app_slug, now],
@@ -236,11 +235,10 @@ mod tests {
             conn.execute(
                 "INSERT INTO automation_jobs \
                  (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-                  action_kind, action_payload, enabled, consecutive_failures, \
+                  action_payload, enabled, consecutive_failures, \
                   created_at, updated_at, next_fire_at) \
                  VALUES (?1, ?2, ?3, 'cron', \
                          '{\"expr\":\"*/5 * * * *\",\"tz\":\"UTC\",\"persistent\":false}', \
-                         'send_message', \
                          '{\"to\":\"brenn:ch\",\"body\":\"hi\",\"wake\":\"none\",\"reply_to\":null,\"delivery_deadline_secs\":null}', \
                          1, 0, ?4, ?4, ?4)",
                 rusqlite::params![uuid_bytes, app_slug, format!("job-{i}"), now],

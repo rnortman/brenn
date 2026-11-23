@@ -333,3 +333,135 @@ pub(super) fn make_engine_full(
         alerts,
     )
 }
+
+/// The MQTT client every MQTT test engine declares, with an egress channel and
+/// the egress reader's position on it.
+pub(super) const MQTT_CLIENT: &str = "home";
+/// A declared client with an egress channel and no reader position: its
+/// channel is closed.
+pub(super) const MQTT_CLOSED_CLIENT: &str = "away";
+/// `MQTT_CLIENT`'s and `MQTT_CLOSED_CLIENT`'s `outbound_payload_cap_bytes`.
+pub(super) const MQTT_CLIENT_CAP: u32 = 64;
+/// A declared client with an egress channel and a reader position whose cap is
+/// over the bus's body cap.
+pub(super) const MQTT_BIG_CLIENT: &str = "big";
+/// A `brenn:` channel in the directory, for a `status_to`.
+pub(super) const MQTT_STATUS: &str = "brenn:light-status";
+
+/// "test-app"'s policy in an MQTT test engine: the `brenn:` sender policy,
+/// the MQTT publish grant, and a topic ACL of `lights/+/set` on every client.
+pub(super) fn mqtt_sender_policy() -> brenn_lib::access::AppPolicy {
+    let mut policy = brenn_lib::access::AppPolicy::messaging_sender_policy();
+    policy
+        .grants
+        .insert(brenn_envelope::grants::AppCapability::MqttPublish);
+    for client in [MQTT_CLIENT, MQTT_CLOSED_CLIENT, MQTT_BIG_CLIENT, "loft"] {
+        policy
+            .acls
+            .mqtt_publish
+            .push(brenn_lib::access::acl::MqttPubMatcher {
+                client: client.to_string(),
+                topic_filter: "lights/+/set".to_string(),
+            });
+    }
+    policy
+}
+
+/// An engine whose singleton "test-app" (user `testuser`, id 1) holds
+/// `policy`, over a messenger with the clients `home` and `away` declared at
+/// [`MQTT_CLIENT_CAP`] and `big` at `u32::MAX`, their egress channels, the
+/// reader's position on `home`'s and `big`'s, and the channel at [`MQTT_STATUS`]. The engine
+/// and the messenger share one app table.
+pub(super) async fn make_mqtt_engine(
+    policy: brenn_lib::access::AppPolicy,
+    ingress_router: Arc<dyn IngressRouter>,
+) -> (Arc<AutomationEngine>, brenn_lib::config::AppTable) {
+    let db = init_db_memory();
+    let defaults = MessagingGlobalConfig::default();
+    let tuning = brenn_lib::messaging::config::SystemChannelTuning::default();
+    let entries = vec![
+        brenn_messaging::mqtt_outbound::mqtt_egress_entry(MQTT_CLIENT, &tuning, &defaults),
+        brenn_messaging::mqtt_outbound::mqtt_egress_entry(MQTT_CLOSED_CLIENT, &tuning, &defaults),
+        brenn_messaging::mqtt_outbound::mqtt_egress_entry(MQTT_BIG_CLIENT, &tuning, &defaults),
+        brenn_messaging::testutils::test_channel_entry("light-status", vec![]),
+    ];
+    {
+        let conn = db.lock().await;
+        conn.execute(
+            "INSERT INTO users (id, username, password_hash, created_at) \
+             VALUES (1, 'testuser', 'hash', '2024-01-01')",
+            [],
+        )
+        .unwrap();
+        brenn_messaging_store::db::upsert_channels(&conn, &entries);
+    }
+    let mut app_cfg = default_app_cfg("test-app", true);
+    app_cfg.policy = Arc::new(policy);
+    let mut apps = indexmap::IndexMap::new();
+    apps.insert("test-app".to_string(), app_cfg);
+    let apps = brenn_lib::config::AppTable::new(Arc::new(apps));
+    let directory = Arc::new(MessagingDirectory::with_entries(entries));
+    let messenger = Messenger::new(
+        db.clone(),
+        directory.clone(),
+        Arc::from("brenn://test"),
+        apps.clone(),
+        Arc::new(FakeWakeRouter),
+        defaults,
+    );
+    messenger.install_mqtt_clients(Arc::new(brenn_messaging::testutils::StubMqttClients(
+        [
+            (MQTT_CLIENT.to_string(), MQTT_CLIENT_CAP),
+            (MQTT_CLOSED_CLIENT.to_string(), MQTT_CLIENT_CAP),
+            (MQTT_BIG_CLIENT.to_string(), u32::MAX),
+        ]
+        .into(),
+    )));
+    for client in [MQTT_CLIENT, MQTT_BIG_CLIENT] {
+        brenn_messaging::testutils::attach_mqtt_egress_reader(&messenger, client).await;
+    }
+    let (alerts, _) = AlertDispatcher::noop();
+    let engine = AutomationEngine::new(
+        db,
+        messenger,
+        apps.clone(),
+        directory,
+        ingress_router,
+        AutomationGlobalConfig::default(),
+        alerts,
+    );
+    (engine, apps)
+}
+
+/// Set `policy`'s grants to `cap` alone.
+pub(super) fn grant_only(
+    policy: &mut brenn_lib::access::AppPolicy,
+    cap: brenn_envelope::grants::AppCapability,
+) {
+    policy.grants = brenn_lib::access::GrantSet::default();
+    policy.grants.insert(cap);
+}
+
+/// Replace "test-app"'s policy in `apps` with `edit` applied to it.
+pub(super) fn edit_app_policy(
+    apps: &brenn_lib::config::AppTable,
+    edit: impl FnOnce(&mut brenn_lib::access::AppPolicy),
+) {
+    let mut map = (*apps.load()).clone();
+    edit(map.get_mut("test-app").unwrap().policy_mut());
+    apps.store(Arc::new(map));
+}
+
+/// An MQTT action to `to` publishing `payload` with a 300-second lifetime and
+/// no content type or `status_to`.
+pub(super) fn mqtt_action(to: &str, payload: &[u8]) -> crate::job::MqttPublishAction {
+    crate::job::MqttPublishAction {
+        to: to.to_string(),
+        payload: crate::job::MqttActionPayload::from_bytes(payload.to_vec()),
+        qos: 1,
+        retain: false,
+        lifetime: brenn_lib::mqtt::MqttLifetime::Seconds(std::num::NonZeroU32::new(300).unwrap()),
+        content_type: None,
+        status_to: None,
+    }
+}

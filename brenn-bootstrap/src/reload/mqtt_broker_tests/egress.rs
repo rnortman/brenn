@@ -1231,6 +1231,7 @@ async fn a_refused_status_holds_nothing_back_and_is_alerted() {
         || async { "no status-not-published alert for ha".to_string() },
     )
     .await;
+    // TODO(mqtt-refused-status-alert-test-sees-two-alerts): once failed here under full `make check`, two alerts.
     assert_eq!(refused.len(), 1, "one alert opens the episode: {refused:?}");
     assert!(refused[0].2.contains(STATUS), "{refused:?}");
     assert_eq!(

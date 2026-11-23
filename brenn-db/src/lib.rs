@@ -436,7 +436,7 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, col_def: 
 
 /// Drop a column from a table if it exists. The column must carry no index,
 /// view or trigger: SQLite refuses the drop otherwise, and that panics here.
-fn drop_column_if_present(conn: &Connection, table: &str, column: &str) {
+pub fn drop_column_if_present(conn: &Connection, table: &str, column: &str) {
     if column_exists(conn, table, column) {
         conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
             .unwrap_or_else(|e| panic!("drop_column_if_present {table}.{column}: {e}"));

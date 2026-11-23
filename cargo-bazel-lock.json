@@ -1,5 +1,5 @@
 {
-  "checksum": "9cc6031ce87f6e6a547941d4ac335d072110b0169ca3403841d7b39013747417",
+  "checksum": "3f0b202b9f23242a439d0fb75571a21730698d8a78d81b7522d9688fabca5ceb",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -2908,6 +2908,10 @@
         ],
         "deps": {
           "common": [
+            {
+              "id": "base64ct 1.8.3",
+              "target": "base64ct"
+            },
             {
               "id": "chrono 0.4.45",
               "target": "chrono"

@@ -11,6 +11,7 @@ description = "Automation engine: cron-triggered jobs, per-fire auth and budget 
 # lives here.
 [dependencies]
 async-trait = "0.1.89"
+base64ct = { version = "1.8.3", features = ["alloc"] }
 brenn-db = { version = "0.1.0", path = "../brenn-db" }
 brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }

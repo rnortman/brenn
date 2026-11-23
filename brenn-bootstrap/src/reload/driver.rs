@@ -7756,7 +7756,14 @@ new sifter: Sifter {{
         let before = booted.messenger.app_table().load();
         let path = before[READER].virtual_tools_path();
         let staged = super::super::agents::staged_virtual_tools_path(&before[READER]);
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("MqttSend"));
+        // The tool's own entry: with the grant, `AutoCreate`'s description
+        // names `MqttSend` too.
+        const MQTT_SEND_ENTRY: &str = "\"name\": \"MqttSend\"";
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(MQTT_SEND_ENTRY)
+        );
 
         tree.write(&document(BROKER).replace(
             "acl publish [exact reload_requests, exact work];",
@@ -7770,7 +7777,7 @@ new sifter: Sifter {{
         assert!(
             std::fs::read_to_string(&path)
                 .expect("the live file is still there")
-                .contains("MqttSend"),
+                .contains(MQTT_SEND_ENTRY),
             "the staged rendering was renamed onto the live path",
         );
         assert!(

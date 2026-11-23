@@ -29,9 +29,9 @@ pub fn count_jobs_for_app(conn: &Connection, owner_app_slug: &str) -> u32 {
 }
 
 /// Insert a new automation job row. `uuid` is the caller-generated v4 UUID.
-/// `trigger_kind` and `action_kind` are derived from the enum variant via
-/// `Trigger::kind_str()` / `Action::kind_str()` to stay in sync with the
-/// CHECK constraint as new variants are added.
+/// `trigger_kind` is derived from the enum variant via `Trigger::kind_str()`
+/// to stay in sync with the CHECK constraint as new variants are added; the
+/// action's kind is the `kind` tag inside `action_payload`.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_job(
     conn: &Connection,
@@ -40,7 +40,6 @@ pub fn insert_job(
     name: &str,
     trigger_kind: &str,
     trigger_payload: &str,
-    action_kind: &str,
     action_payload: &str,
     enabled: bool,
     now: DateTime<Utc>,
@@ -52,16 +51,15 @@ pub fn insert_job(
     conn.execute(
         "INSERT INTO automation_jobs \
          (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-          action_kind, action_payload, enabled, consecutive_failures, \
+          action_payload, enabled, consecutive_failures, \
           created_at, updated_at, next_fire_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?8, ?9)",
         rusqlite::params![
             uuid_bytes,
             owner_app_slug,
             name,
             trigger_kind,
             trigger_payload,
-            action_kind,
             action_payload,
             enabled as i64,
             now_str,
@@ -441,9 +439,9 @@ mod tests {
             conn.execute(
                 "INSERT INTO automation_jobs \
                  (uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-                  action_kind, action_payload, enabled, consecutive_failures, \
+                  action_payload, enabled, consecutive_failures, \
                   created_at, updated_at, next_fire_at) \
-                 VALUES (?1, ?2, 'j', 'cron', '{}', 'send_message', '{}', ?3, 0, ?4, ?4, ?4)",
+                 VALUES (?1, ?2, 'j', 'cron', '{}', '{}', ?3, 0, ?4, ?4, ?4)",
                 rusqlite::params![uuid_bytes, slug, enabled, now],
             )
             .expect("insert job");

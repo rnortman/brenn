@@ -5,6 +5,9 @@
 //!
 //! Startup catch-up (the `persistent` flag) is handled by
 //! `run_startup_catchup` before the loop is spawned.
+//!
+//! TODO(scheduling-component-managed): this host cron loop does not use
+//! `deliver_after`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -314,9 +317,9 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (id, uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, last_fired_at, next_fire_at) \
-             VALUES (?1, ?2, 'test-app', 'test', 'cron', ?3, 'send_message', ?4, 1, 0, \
+             VALUES (?1, ?2, 'test-app', 'test', 'cron', ?3, ?4, 1, 0, \
                      ?5, ?5, ?6, ?7)",
             rusqlite::params![
                 row_id,
@@ -366,9 +369,9 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_jobs \
              (id, uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-              action_kind, action_payload, enabled, consecutive_failures, \
+              action_payload, enabled, consecutive_failures, \
               created_at, updated_at, last_fired_at, next_fire_at) \
-             VALUES (?1, ?2, 'test-app', 'test', 'cron', ?3, 'send_message', ?4, 1, 0, \
+             VALUES (?1, ?2, 'test-app', 'test', 'cron', ?3, ?4, 1, 0, \
                      '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL, '2026-01-01T09:00:00Z')",
             rusqlite::params![row_id, uuid_bytes, trigger, action],
         )
@@ -493,11 +496,10 @@ mod tests {
             conn.execute(
                 "INSERT INTO automation_jobs \
                  (id, uuid, owner_app_slug, name, trigger_kind, trigger_payload, \
-                  action_kind, action_payload, enabled, consecutive_failures, \
+                  action_payload, enabled, consecutive_failures, \
                   created_at, updated_at, next_fire_at) \
                  VALUES (1, x'00000000000000000000000000000001', 'test-app', 'test', \
                          'cron', '{\"kind\":\"cron\",\"expr\":\"0 9 * * *\",\"tz\":\"UTC\",\"persistent\":false}', \
-                         'send_message', \
                          '{\"kind\":\"send_message\",\"to\":\"brenn:test\",\"body\":\"hi\",\"wake\":\"none\",\"reply_to\":null,\"delivery_deadline_secs\":null}', \
                          1, 0, '2026-01-01', '2026-01-01', ?1)",
                 rusqlite::params![future_fire],

@@ -278,7 +278,8 @@ messaging { max_body_bytes = 393216; }
 ```
 
 - `default_send_budget` — a conversation's send budget when its app states
-  none. Default 100.
+  none. Default 100. Automation fires draw this budget; the agent's
+  `send_budget` entry ([Agents](#agents)) says how to size it.
 - `max_body_bytes` — the largest body any publish carries, in bytes. Default
   65 536 (64 KiB). It bounds every message on the bus, a tool result
   included: a result over it is answered to its caller as an `internal` error
@@ -1171,7 +1172,8 @@ families are `webhook:`, `mqtt:`, `brenn:tools/`, `brenn:tool-results/`,
 `brenn:app-tool-results/`, `brenn:device-location.` and
 `brenn:egress/mqtt/` (`docs/message-bus.md` §2.7). The last holds one channel
 per `mqtt_client`, `brenn:egress/mqtt/<client>`, carrying that client's
-`MqttSend` publishes (`docs/message-bus.md` §2.7.3): `channel at prefix
+`MqttSend` publishes and its automations' `mqtt_publish` fires
+(`docs/message-bus.md` §2.7.3): `channel at prefix
 "brenn:egress/mqtt/" { … }` tunes every client's, and `channel at
 "brenn:egress/mqtt/<client>" { … }` tunes one and is refused unless the
 document declares an `mqtt_client` of that slug. Its window is the outage to
@@ -2076,6 +2078,24 @@ any file the server user can open is auto-approved. A `--system-prompt` or
 no document byte and bounces nothing. `--permission-mode` through
 `cc_extra_args` is unsupported.
 
+`send_budget` is the send budget of each of the agent's conversations: a whole
+number of at least 1, falling back to `messaging { default_send_budget }`.
+Every publish, push and bus-provoked turn a conversation causes draws one
+unit, and so does every automation fire, `brenn:` or MQTT, of the agent's
+jobs. Time never refills it; only a person's interaction reaching the
+conversation does — their chat message in it, or a delivered bus message
+carrying impetus, which only a sender holding the `mint_impetus` grant can
+mint. Size it as fires per day times the days of absence to survive, on top
+of the conversation's own sends, bus-provoked turns and pushes. A singleton
+agent's fires draw its one conversation's budget, which the owner's ordinary
+chatting restores; any other agent's fires draw the budget of its
+automation-events conversation, which nothing asks anyone to interact with,
+so unless the owner opens that conversation and sends a message there, size
+it as a total number of fires. A job whose fires fail on an empty budget is
+disabled after `consecutive_failures_to_disable` failures and stays disabled
+until re-enabled. `TODO.md`'s `automation-fire-budget-needs-a-person` is the
+open work.
+
 #### Conversation epoch
 
 A singleton agent can be moved to a fresh conversation from the bus: it names a
@@ -2244,8 +2264,10 @@ Five more declarations, each a body of attrs:
   would make the type non-text (`text/csv; charset=windows-1252`) is refused.
 - `mqtt_client <name> { … }` — a broker connection; `mqtt:<client>:<topic>`
   addresses name channels through it. `outbound_payload_cap_bytes` bounds
-  the bytes one `MqttSend` call publishes through the client (default
-  4194304, 4 MiB); a call over it is refused `payload_too_large`. A
+  the bytes one `MqttSend` call, or one fire of an automation's
+  `mqtt_publish` action, publishes through the client (default 4194304,
+  4 MiB); a call over it is refused `payload_too_large`, and a job's fire
+  over it is recorded as a failure. A
   component's `mqtt-publish` is held to it as well, and a payload over it
   answers `invalid-payload`. `0`, or a value over
   4294967295, refuses the document at load. `docs/message-bus.md` §2.7.2 has
