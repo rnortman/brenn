@@ -206,6 +206,11 @@ impl Messenger {
     /// 7. QoS ≤ 2, a stated content type well formed.
     /// 8. the payload is the body, or one attachment beside an empty body.
     /// 9. the payload's length is within the client's outbound cap.
+    ///
+    /// A commit needs a third thing besides the client and its channel: the
+    /// egress reader's position on the channel. That is not checked here but
+    /// at the commit, with the write, so a publish admitted before a reload
+    /// closes the client's channel and committed after is still refused.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_mqtt(
         &self,
@@ -345,7 +350,10 @@ impl Messenger {
     /// Publish `payload` to the MQTT topic address `addr` on behalf of an app's
     /// conversation, through the common publish gates with the MQTT admission
     /// at layer 2. Returns at commit, with the message on the client's egress
-    /// channel.
+    /// channel. A commit that finds no egress reader's position on the channel
+    /// — the client's channel was closed by a reload — writes nothing, refunds
+    /// the send budget and is answered `UnknownChannel`, as for an unknown
+    /// client.
     ///
     /// An inline payload within the bus's body cap becomes a body typed by
     /// `options.content_type` when its bytes are valid for that type, and an

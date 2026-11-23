@@ -571,21 +571,33 @@ async fn an_eviction_raises_the_overflow_once() {
     );
 }
 
-/// `abandon` moves past everything retained and counts only what the window
-/// still served; the outrun part is the bus's, raised under the rung.
+/// `close` reports what the window still served as dropped for the removal;
+/// the outrun part is the bus's, raised under the rung.
 #[tokio::test]
-async fn abandon_counts_the_served_and_the_bus_raises_the_outrun() {
+async fn close_reports_the_served_and_the_bus_raises_the_outrun() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let _bus = f.hub.open(CLIENT).await;
     f.commit_n(WINDOW as usize + 1).await;
 
-    assert_eq!(bus.abandon().await.count, WINDOW);
+    f.hub.close(CLIENT).await;
     assert_eq!(
         f.router.alarms(),
         vec![(ADDRESS.to_string(), participant(), 1)]
     );
-    assert!(bus.unhanded(10).await.is_empty());
-    assert_eq!(bus.abandon().await.count, 0, "nothing left");
+    let alerts = f.alerts().await;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].0, "MQTT egress: dropped (home)");
+    assert!(
+        alerts[0].1.contains(&format!("{WINDOW} message(s)")),
+        "{}",
+        alerts[0].1
+    );
+    assert!(
+        alerts[0].1.contains("the client was removed"),
+        "{}",
+        alerts[0].1
+    );
+    assert_eq!(f.hub.counts(CLIENT), EgressCounts::default());
 }
 
 #[tokio::test]
@@ -605,6 +617,18 @@ async fn close_detaches_the_position_and_forgets_the_counts() {
         "no position"
     );
     assert_eq!(f.hub.counts(CLIENT), EgressCounts::default());
+    assert!(
+        f.alerts().await.is_empty(),
+        "nothing unread, nothing reported"
+    );
+    assert!(f.statuses().await.is_empty());
+}
+
+#[tokio::test]
+#[should_panic(expected = "never took or has already given up")]
+async fn closing_a_client_never_opened_panics() {
+    let f = Fixture::new().await;
+    f.hub.close(CLIENT).await;
 }
 
 #[tokio::test]
@@ -637,11 +661,7 @@ async fn every_failure_kind_is_logged_counted_and_alerted() {
         cause: UnknownCause::ConnectionLost,
     })
     .await;
-    bus.report(EgressReport::Dropped {
-        cause: DropCause::ClientRemoved,
-        count: 5,
-    })
-    .await;
+    bus.report(EgressReport::Dropped { count: 5 }).await;
 
     assert_eq!(
         f.hub.counts(CLIENT),
@@ -712,16 +732,8 @@ async fn an_episode_alerts_once_and_closes_with_a_summary() {
     bus.report(expired_never(meta("lights/a"))).await;
     assert_eq!(f.alerts().await.len(), 4, "a new episode alerts again");
 
-    bus.report(EgressReport::Dropped {
-        cause: DropCause::SessionStopped,
-        count: 2,
-    })
-    .await;
-    bus.report(EgressReport::Dropped {
-        cause: DropCause::SessionStopped,
-        count: 3,
-    })
-    .await;
+    bus.report(EgressReport::Dropped { count: 2 }).await;
+    bus.report(EgressReport::Dropped { count: 3 }).await;
     bus.report(EgressReport::Delivered(meta("lights/a"))).await;
     let alerts = f.alerts().await;
     assert_eq!(alerts.len(), 6, "{alerts:?}");
@@ -862,7 +874,6 @@ async fn each_report_lands_its_status_by_the_mapping() {
         (
             EgressReport::DroppedMessage {
                 message: message.clone(),
-                cause: DropCause::SessionStopped,
                 sent: Sent::Never,
             },
             K::Dropped { cause: D::Stopped },
@@ -871,19 +882,9 @@ async fn each_report_lands_its_status_by_the_mapping() {
         (
             EgressReport::DroppedMessage {
                 message: message.clone(),
-                cause: DropCause::SessionStopped,
                 sent: Sent::Possibly,
             },
             K::Unknown { cause: U::Stopped },
-            None,
-        ),
-        (
-            EgressReport::DroppedMessage {
-                message: message.clone(),
-                cause: DropCause::ClientRemoved,
-                sent: Sent::Never,
-            },
-            K::Dropped { cause: D::Removed },
             None,
         ),
         (
@@ -894,9 +895,18 @@ async fn each_report_lands_its_status_by_the_mapping() {
             None,
         ),
     ];
+    let mut reports: Vec<_> = reports
+        .into_iter()
+        .map(|(report, kind, code)| (HubReport::Reader(report), kind, code))
+        .collect();
+    reports.push((
+        HubReport::RemovedMessage(message.clone()),
+        K::Dropped { cause: D::Removed },
+        None,
+    ));
     let mut expected = Vec::new();
     for (report, kind, reason_code) in reports {
-        bus.report(report).await;
+        f.hub.record(CLIENT, report).await;
         expected.push(delivery::DeliveryStatus {
             message_id: message.id,
             kind,
@@ -908,35 +918,18 @@ async fn each_report_lands_its_status_by_the_mapping() {
             }),
         });
     }
-    bus.report(EgressReport::Dropped {
-        cause: DropCause::ClientRemoved,
-        count: 2,
-    })
-    .await;
+    bus.report(EgressReport::Dropped { count: 2 }).await;
+    f.hub.record(CLIENT, HubReport::Removed { count: 2 }).await;
     bus.report(EgressReport::Drained).await;
     bus.report(expired_never(meta("lights/kitchen/set"))).await;
     assert_eq!(f.statuses().await, expected);
     assert_eq!(f.hub.counts(CLIENT).status_unpublished, 0);
 }
 
-/// A message reported removed that the library may have sent is a host bug:
-/// the reader reports removed only messages it never read.
-#[test]
-#[should_panic(expected = "is reported removed and possibly sent")]
-fn a_removed_message_possibly_sent_panics() {
-    delivery_status(
-        CLIENT,
-        &EgressReport::DroppedMessage {
-            message: bob("lights/a"),
-            cause: DropCause::ClientRemoved,
-            sent: Sent::Possibly,
-        },
-    );
-}
-
-/// Every report the reader can make about a message naming a `status_to`,
-/// over every reader's cause, both `Sent` values and both rejection codes.
-fn every_report(message: &EgressMeta) -> Vec<EgressReport> {
+/// Every report the hub records about a message naming a `status_to`: the
+/// reader's over every cause, both `Sent` values and both rejection codes, and
+/// the hub's two removal reports.
+fn every_report(message: &EgressMeta) -> Vec<HubReport> {
     let mut reports = vec![
         EgressReport::Handed(message.clone()),
         EgressReport::Delivered(message.clone()),
@@ -962,25 +955,26 @@ fn every_report(message: &EgressMeta) -> Vec<EgressReport> {
             message: message.clone(),
             sent,
         });
-        for cause in [DropCause::SessionStopped, DropCause::ClientRemoved] {
-            if cause == DropCause::ClientRemoved && sent == Sent::Possibly {
-                continue;
-            }
-            reports.push(EgressReport::DroppedMessage {
-                message: message.clone(),
-                cause,
-                sent,
-            });
-            reports.push(EgressReport::Dropped { cause, count: 2 });
-        }
+        reports.push(EgressReport::DroppedMessage {
+            message: message.clone(),
+            sent,
+        });
     }
+    reports.push(EgressReport::Dropped { count: 2 });
+    let mut reports: Vec<HubReport> = reports.into_iter().map(HubReport::Reader).collect();
+    reports.push(HubReport::RemovedMessage(message.clone()));
+    reports.push(HubReport::Removed { count: 2 });
     reports
 }
 
 /// Whether `report` ends a message that has an unanswered copy: one the
 /// library accepted whose notice ended with its connection or was pending at
 /// a stop.
-fn unanswered(report: &EgressReport) -> bool {
+fn unanswered(report: &HubReport) -> bool {
+    let report = match report {
+        HubReport::Reader(report) => report,
+        HubReport::Removed { .. } | HubReport::RemovedMessage(_) => return false,
+    };
     match report {
         EgressReport::Handed(_)
         | EgressReport::Delivered(_)
@@ -1026,7 +1020,8 @@ fn a_refused_resend_carries_no_reason_member() {
             code,
             earlier: Sent::Possibly,
         };
-        let (_, status) = delivery_status(CLIENT, &report).expect("bob names a status_to");
+        let (_, status) =
+            delivery_status(CLIENT, &HubReport::Reader(report)).expect("bob names a status_to");
         let body: serde_json::Value =
             serde_json::from_str(&delivery::encode(&status)).expect("a status is JSON");
         assert_eq!(body["kind"], "unknown", "{body}");
@@ -1061,7 +1056,6 @@ async fn the_operator_is_told_alike_whether_or_not_the_message_was_sent() {
         }
         bus.report(EgressReport::DroppedMessage {
             message: refused.clone(),
-            cause: DropCause::SessionStopped,
             sent,
         })
         .await;
@@ -1240,7 +1234,6 @@ async fn a_broker_rejection_alerts_told_or_not() {
     .await;
     bus.report(EgressReport::DroppedMessage {
         message: bob("lights/g"),
-        cause: DropCause::SessionStopped,
         sent: Sent::Never,
     })
     .await;
@@ -1383,22 +1376,16 @@ fn assert_dropped_told(lines: &[&str], expected: &[&str]) -> Result<(), String> 
 async fn a_dropped_message_alerts_only_when_its_status_is_refused() {
     let f = Fixture::new().await;
     let bus = f.hub.open(CLIENT).await;
-    bus.report(EgressReport::DroppedMessage {
-        message: bob("lights/a"),
-        cause: DropCause::ClientRemoved,
-        sent: Sent::Never,
-    })
-    .await;
+    f.hub
+        .record(CLIENT, HubReport::RemovedMessage(bob("lights/a")))
+        .await;
     assert!(f.alerts().await.is_empty());
     assert_eq!(f.hub.counts(CLIENT).dropped, 1);
     logs_assert(|lines| assert_dropped_told(lines, &["told=true"]));
 
-    bus.report(EgressReport::DroppedMessage {
-        message: carol("lights/b"),
-        cause: DropCause::ClientRemoved,
-        sent: Sent::Never,
-    })
-    .await;
+    f.hub
+        .record(CLIENT, HubReport::RemovedMessage(carol("lights/b")))
+        .await;
     let alerts = f.alerts().await;
     assert_eq!(
         alerts
@@ -1419,11 +1406,7 @@ async fn a_dropped_message_alerts_only_when_its_status_is_refused() {
     assert_eq!(f.hub.counts(CLIENT).dropped, 2);
     logs_assert(|lines| assert_dropped_told(lines, &["told=true", "told=false"]));
 
-    bus.report(EgressReport::Dropped {
-        cause: DropCause::SessionStopped,
-        count: 3,
-    })
-    .await;
+    bus.report(EgressReport::Dropped { count: 3 }).await;
     assert_eq!(f.hub.counts(CLIENT).dropped, 5);
     logs_assert(|lines| assert_dropped_told(lines, &["told=true", "told=false", "told=false"]));
 }
@@ -1508,13 +1491,15 @@ async fn a_delivery_leaves_the_status_episode_open() {
     assert_one_alert_then_one_summary(&f, &bus).await;
 }
 
-/// `abandon` answers the metadata of the skipped messages that name a
-/// `status_to`, beside the count of all it skipped.
+/// `close` tells each unread message naming a `status_to` `dropped`,
+/// `removed`, counts the rest in one alert, and leaves no position: a guarded
+/// commit, as an MQTT publish makes, is refused after it.
 #[tokio::test]
-async fn abandon_names_the_messages_with_a_status_to() {
+async fn close_tells_each_named_message_removed_and_refuses_later_commits() {
+    use delivery::{DeliveryDropCause as D, DeliveryKind as K};
     let f = Fixture::new().await;
     let bus = f.hub.open(CLIENT).await;
-    f.commit_n(1).await;
+    let head = f.commit_n(1).await;
     let publish = MqttPublishTransport {
         status_to: Some(BOB_STATUS.to_string()),
         ..transport("lights/hall/set")
@@ -1523,11 +1508,180 @@ async fn abandon_names_the_messages_with_a_status_to() {
         .commit_publish_as(&identity(BOB), b"on", publish.clone())
         .await;
     f.commit_n(1).await;
+    // The reader handed the first before the removal.
+    let first = bus.unhanded(1).await;
+    assert_eq!(ids(&first), head);
+    bus.advance(message(&first[0]).seq).await;
 
-    let abandoned = bus.abandon().await;
-    assert_eq!(abandoned.count, 3);
+    f.hub.close(CLIENT).await;
     assert_eq!(
-        abandoned.named,
-        vec![EgressMeta::new(named, &identity(BOB), &publish)]
+        f.statuses().await,
+        vec![delivery::DeliveryStatus {
+            message_id: named,
+            kind: K::Dropped { cause: D::Removed },
+            mqtt: Some(delivery::MqttDelivery {
+                client: CLIENT.to_string(),
+                topic: publish.topic.clone(),
+                qos: publish.qos,
+                reason_code: None,
+            }),
+        }]
+    );
+    let alerts = f.alerts().await;
+    assert_eq!(alerts.len(), 1, "the named one was told: {alerts:?}");
+    assert_eq!(alerts[0].0, "MQTT egress: dropped (home)");
+    assert!(alerts[0].1.contains("1 message(s)"), "{}", alerts[0].1);
+
+    let refused = f
+        .messenger
+        .store_for_address(ADDRESS)
+        .append_while_attached(
+            NewMessage {
+                source: "test".to_string(),
+                sender: identity(BOB),
+                body: MessageBody::from_parts(Some("application/octet-stream"), b"late").unwrap(),
+                urgency: Urgency::Normal,
+                envelope_type: ChannelScheme::Brenn,
+                transport: Some(TransportMeta::MqttPublish(publish)),
+                reply_to: None,
+                delivery_deadline: None,
+                impetus: None,
+                publish_ts_ns: utc_to_ns(Utc::now()),
+                attachments: HeldAttachments::none(),
+            },
+            &f.hub.participant,
+        )
+        .await;
+    assert!(refused.is_none(), "a commit after the close is refused");
+}
+
+/// `close` reports the unread count first, then each named message in channel
+/// order. A drop an open episode withheld — here the refused message's — is
+/// raised in the episode's summary when the client is removed.
+#[tokio::test]
+async fn close_reports_the_count_then_each_named_message_in_channel_order() {
+    use delivery::{DeliveryDropCause as D, DeliveryKind as K};
+    let f = Fixture::new().await;
+    let _bus = f.hub.open(CLIENT).await;
+    let named = |topic: &str, status_to: &str| MqttPublishTransport {
+        status_to: Some(status_to.to_string()),
+        ..transport(topic)
+    };
+    // The channel's window is four messages.
+    let first = f
+        .commit_publish_as(&identity(BOB), b"on", named("lights/a/set", BOB_STATUS))
+        .await;
+    f.commit_n(1).await;
+    let second = f
+        .commit_publish_as(&identity(BOB), b"on", named("lights/b/set", BOB_STATUS))
+        .await;
+    f.commit_publish_as(&identity(CAROL), b"on", named("lights/d/set", CAROL_STATUS))
+        .await;
+
+    f.hub.close(CLIENT).await;
+    let statuses = f.statuses().await;
+    assert_eq!(
+        statuses.iter().map(|s| s.message_id).collect::<Vec<_>>(),
+        [first, second],
+        "told in channel order"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|s| s.kind == K::Dropped { cause: D::Removed })
+    );
+    let alerts = f.alerts().await;
+    assert_eq!(
+        alerts
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "MQTT egress: dropped (home)",
+            "MQTT egress: status not published (home)",
+            "MQTT egress: dropped (home), summary",
+        ]
+    );
+    assert!(
+        alerts[0].1.contains("1 message(s)") && alerts[0].1.contains("the client was removed"),
+        "the count of the unnamed, first: {}",
+        alerts[0].1
+    );
+    assert!(
+        alerts[2].1.contains("1 more message(s) dropped")
+            && alerts[2].1.contains("the client has since been removed"),
+        "{}",
+        alerts[2].1
+    );
+}
+
+/// A removal that follows a drop the reader reported as it ended is not lost
+/// in the open episode: `close` raises its summary before it forgets the
+/// client.
+#[tokio::test]
+async fn a_removal_withheld_by_an_open_drop_episode_is_summarised_at_close() {
+    let f = Fixture::new().await;
+    let bus = f.hub.open(CLIENT).await;
+    bus.report(EgressReport::Dropped { count: 1 }).await;
+    f.commit_n(3).await;
+
+    f.hub.close(CLIENT).await;
+    let alerts = f.alerts().await;
+    assert_eq!(
+        alerts
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "MQTT egress: dropped (home)",
+            "MQTT egress: dropped (home), summary",
+        ]
+    );
+    assert!(
+        alerts[0].1.contains("1 message(s)") && alerts[0].1.contains("session stopped"),
+        "{}",
+        alerts[0].1
+    );
+    assert!(
+        alerts[1].1.contains("3 more message(s) dropped")
+            && alerts[1].1.contains("the client has since been removed"),
+        "{}",
+        alerts[1].1
+    );
+}
+
+/// A removal report whose status the bus refuses is counted, logged and
+/// alerted as a status not published, beside the drop's own alert.
+#[tokio::test]
+async fn a_removal_whose_status_is_refused_alerts_the_refusal() {
+    let f = Fixture::new().await;
+    let _bus = f.hub.open(CLIENT).await;
+    let publish = MqttPublishTransport {
+        status_to: Some(CAROL_STATUS.to_string()),
+        ..transport("lights/hall/set")
+    };
+    f.commit_publish_as(&identity(CAROL), b"on", publish).await;
+
+    f.hub.close(CLIENT).await;
+    let alerts = f.alerts().await;
+    assert_eq!(
+        alerts
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "MQTT egress: status not published (home)",
+            "MQTT egress: dropped (home)",
+        ]
+    );
+    assert!(
+        alerts[0].1.contains("\"dropped\" status"),
+        "{}",
+        alerts[0].1
+    );
+    assert!(
+        alerts[1].1.contains("the client was removed"),
+        "{}",
+        alerts[1].1
     );
 }

@@ -16,8 +16,7 @@ use brenn_messaging_store::store::MessageSeq;
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::reader::{
-    Abandoned, DropCause, EgressBus, EgressItem, EgressMessage, EgressMeta, EgressReport, Sent,
-    UnknownCause, start_egress_reader,
+    EgressBus, EgressItem, EgressMessage, EgressReport, Sent, UnknownCause, start_egress_reader,
 };
 use brenn_mqtt::service::MqttEventRouter;
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
@@ -1617,35 +1616,6 @@ impl EgressBus for MemBus {
         self.entries.lock().unwrap().1 = seq.0 + 1;
     }
 
-    async fn abandon(&self) -> Abandoned {
-        let mut entries = self.entries.lock().unwrap();
-        let (items, next_owed) = &mut *entries;
-        let unhanded: Vec<EgressMeta> = items
-            .iter()
-            .filter_map(|item| match item {
-                EgressItem::Message(message) => (message.seq.0 >= *next_owed)
-                    .then(|| EgressMeta::new(message.id, &message.sender, &message.publish)),
-                EgressItem::PayloadGone { seq, meta } => {
-                    (seq.0 >= *next_owed).then(|| meta.clone())
-                }
-            })
-            .collect();
-        if let Some(last) = items.last() {
-            let last = match last {
-                EgressItem::Message(message) => message.seq.0,
-                EgressItem::PayloadGone { seq, .. } => seq.0,
-            };
-            *next_owed = (*next_owed).max(last + 1);
-        }
-        Abandoned {
-            count: unhanded.len() as u64,
-            named: unhanded
-                .into_iter()
-                .filter(|meta| meta.status_to.is_some())
-                .collect(),
-        }
-    }
-
     fn wakes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.wake.subscribe()
     }
@@ -2179,12 +2149,11 @@ async fn an_inbound_publish_during_the_wait_is_routed() {
     assert_eq!(echoed.payload, InboundPayload::new(b"echo".to_vec(), None));
 }
 
-/// A retire waits for the answer to what is in flight like a stop does, then
-/// abandons what it never handed — reporting a message that names a
-/// `status_to` dropped because the client was removed — and leaves the
+/// A retire waits for the answer to what is in flight like a stop does,
+/// reports it, makes no report about what it never handed, and leaves the
 /// session running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_retire_waits_for_the_answer_then_abandons() {
+async fn a_retire_waits_for_the_answer_then_exits() {
     broker_gate!();
 
     let harness = BrokerHarness::start();
@@ -2208,7 +2177,6 @@ async fn a_retire_waits_for_the_answer_then_abandons() {
     tokio::time::sleep(PAUSED_AFTER_STOP).await;
     // Committed after the retire: the reader, waiting, never hands it.
     let unhanded = egress.tracked(topic, 1, b"never-sent");
-    let unhanded_id = unhanded.id;
     egress.bus.append(unhanded);
     assert!(
         !retiring.is_finished(),
@@ -2224,19 +2192,11 @@ async fn a_retire_waits_for_the_answer_then_abandons() {
         Some(EgressReport::Delivered(meta)) if meta.id == in_flight => {}
         other => panic!("expected {in_flight} delivered, got {other:?}"),
     }
-    match egress.made() {
-        Some(EgressReport::DroppedMessage {
-            message,
-            cause,
-            sent,
-        }) => {
-            assert_eq!(message.id, unhanded_id);
-            assert_eq!(cause, DropCause::ClientRemoved);
-            assert_eq!(sent, Sent::Never);
-        }
-        other => panic!("expected {unhanded_id} dropped, got {other:?}"),
-    }
-    assert_eq!(egress.made(), None, "a report after the abandon");
+    assert_eq!(
+        egress.made(),
+        None,
+        "a report about what the reader never handed"
+    );
     assert_eq!(
         svc.ingress_health(&client_slug).await.0,
         ConnectorHealthLabel::Connected,

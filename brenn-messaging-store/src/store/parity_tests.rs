@@ -1778,6 +1778,221 @@ async fn a_message_appended_between_detach_and_attach_from_is_owed() {
     }
 }
 
+// ── Appending while attached, detaching with the unseen ────────────────────
+
+/// While the subscriber holds a position, the guarded append commits exactly as
+/// a plain one does: the next seq, retained, and new to the subscriber.
+#[tokio::test]
+async fn append_while_attached_appends_while_the_position_is_held() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        let a = append_seq(store.as_ref(), "a").await;
+        let msg = message_for(store.as_ref(), "alice", "b");
+        let outcome = store
+            .append_while_attached(msg, &sub)
+            .await
+            .expect("the subscriber holds a position");
+        assert_eq!(
+            outcome.committed.seq,
+            MessageSeq(a.0 + 1),
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            retained_bodies(store.as_ref()).await,
+            vec!["a", "b"],
+            "{}",
+            store.address()
+        );
+        let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
+        assert_eq!(new, vec!["a", "b"], "{}", store.address());
+    }
+}
+
+/// With no position — never attached, or detached — the guarded append writes
+/// nothing, and retention and the seq counter are as they were.
+#[tokio::test]
+async fn append_while_attached_writes_nothing_without_a_position() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        append_seq(store.as_ref(), "a").await;
+        let msg = message_for(store.as_ref(), "alice", "never");
+        assert!(
+            store.append_while_attached(msg, &sub).await.is_none(),
+            "never attached: {}",
+            store.address()
+        );
+
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        store.detach(&sub).await;
+        let msg = message_for(store.as_ref(), "alice", "detached");
+        assert!(
+            store.append_while_attached(msg, &sub).await.is_none(),
+            "detached: {}",
+            store.address()
+        );
+
+        assert_eq!(
+            retained_bodies(store.as_ref()).await,
+            vec!["a"],
+            "{}",
+            store.address()
+        );
+        let b = append_seq(store.as_ref(), "b").await;
+        assert_eq!(b, MessageSeq(2), "no seq was spent: {}", store.address());
+    }
+}
+
+/// The take returns exactly what the window at the push limit served as new the
+/// moment before, reports the outrun an advance over it would have, and leaves
+/// no position behind.
+#[tokio::test]
+async fn detach_taking_unseen_takes_the_windows_new_entries_and_the_position() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        for body in ["a", "b"] {
+            append_seq(store.as_ref(), body).await;
+        }
+        serve(store.as_ref(), &sub, DEPTH, 0).await;
+        for body in ["c", "d", "e"] {
+            append_seq(store.as_ref(), body).await;
+        }
+        let push = Depth::Bounded(2);
+        let before = store
+            .window(&sub, push, Depth::Bounded(0))
+            .await
+            .expect("attached");
+        let expected = head_entries(before.new_entries());
+        assert_eq!(
+            expected.iter().map(|(_, b)| b.as_str()).collect::<Vec<_>>(),
+            vec!["d", "e"],
+            "{}",
+            store.address()
+        );
+
+        let taken = store
+            .detach_taking_unseen(&sub, push)
+            .await
+            .expect("the subscriber held a position");
+        assert_eq!(head_entries(&taken.unseen), expected, "{}", store.address());
+        assert_eq!(
+            taken.outrun,
+            AdvanceOutcome {
+                dropped: 1,
+                noise_charge: 1,
+            },
+            "c was unseen, retained, and below the window: {}",
+            store.address()
+        );
+
+        assert!(
+            store.window(&sub, push, Depth::Bounded(0)).await.is_none(),
+            "{}",
+            store.address()
+        );
+        assert_eq!(store.detach(&sub).await, None, "{}", store.address());
+        assert!(
+            store.detach_taking_unseen(&sub, push).await.is_none(),
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            retained_bodies(store.as_ref()).await,
+            vec!["a", "b", "c", "d", "e"],
+            "the messages stay: {}",
+            store.address()
+        );
+    }
+}
+
+/// A position with nothing unseen gives up an empty set and a zero outrun; a
+/// subscriber never attached gives up nothing at all.
+#[tokio::test]
+async fn detach_taking_unseen_with_nothing_unseen_or_no_position() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        for body in ["a", "b"] {
+            append_seq(store.as_ref(), body).await;
+        }
+        serve(store.as_ref(), &sub, DEPTH, 0).await;
+        let taken = store
+            .detach_taking_unseen(&sub, ATTACH_DEPTH)
+            .await
+            .expect("the subscriber held a position");
+        assert!(taken.unseen.is_empty(), "{}", store.address());
+        assert_eq!(
+            taken.outrun,
+            AdvanceOutcome::default(),
+            "{}",
+            store.address()
+        );
+        assert!(
+            store
+                .detach_taking_unseen(&wasm_sub("ghost"), ATTACH_DEPTH)
+                .await
+                .is_none(),
+            "{}",
+            store.address()
+        );
+    }
+}
+
+/// Once the position is taken, the guarded append for that subscriber is
+/// refused, and the plain append still commits for everyone else.
+#[tokio::test]
+async fn append_while_attached_is_refused_after_the_take() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+        append_seq(store.as_ref(), "a").await;
+        let taken = store
+            .detach_taking_unseen(&sub, ATTACH_DEPTH)
+            .await
+            .expect("the subscriber held a position");
+        assert_eq!(
+            head_entries(&taken.unseen)
+                .into_iter()
+                .map(|(_, b)| b)
+                .collect::<Vec<_>>(),
+            vec!["a"],
+            "{}",
+            store.address()
+        );
+        let msg = message_for(store.as_ref(), "alice", "late");
+        assert!(
+            store.append_while_attached(msg, &sub).await.is_none(),
+            "{}",
+            store.address()
+        );
+        append_seq(store.as_ref(), "b").await;
+        assert_eq!(
+            retained_bodies(store.as_ref()).await,
+            vec!["a", "b"],
+            "{}",
+            store.address()
+        );
+    }
+}
+
+#[tokio::test]
+#[should_panic(expected = "a detach taking the unseen of a sampled subscriber")]
+async fn durable_detach_taking_unseen_at_a_sampled_depth_panics() {
+    let (store, _db) = durable_store(DEPTH).await;
+    store
+        .detach_taking_unseen(&wasm_sub("proc"), Depth::Bounded(0))
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "a detach taking the unseen of a sampled subscriber")]
+async fn ring_detach_taking_unseen_at_a_sampled_depth_panics() {
+    let store = parity_ring();
+    RetentionStore::detach_taking_unseen(&store, &wasm_sub("proc"), Depth::Bounded(0)).await;
+}
+
 fn parity_ring() -> RingStore {
     RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH))
 }

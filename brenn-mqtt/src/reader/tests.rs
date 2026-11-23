@@ -19,7 +19,6 @@ use crate::connection::{end_connected_session, install_connection, unpolled_clie
 enum Call {
     Unhanded(usize),
     Advance(u64),
-    Abandon,
 }
 
 #[derive(Default)]
@@ -186,28 +185,6 @@ impl EgressBus for ScriptBus {
         state.calls.push(Call::Advance(seq.0));
         state.timeline.push(format!("advance {}", seq.0));
         state.next_owed = seq.0 + 1;
-    }
-
-    async fn abandon(&self) -> Abandoned {
-        let mut state = self.state.lock().unwrap();
-        state.calls.push(Call::Abandon);
-        let next_owed = state.next_owed;
-        let unhanded: Vec<EgressMeta> = state
-            .entries
-            .iter()
-            .filter(|item| item_seq(item) >= next_owed)
-            .map(item_meta)
-            .collect();
-        if let Some(last) = state.entries.last() {
-            state.next_owed = state.next_owed.max(item_seq(last) + 1);
-        }
-        Abandoned {
-            count: unhanded.len() as u64,
-            named: unhanded
-                .into_iter()
-                .filter(|meta| meta.status_to.is_some())
-                .collect(),
-        }
     }
 
     fn wakes(&self) -> watch::Receiver<u64> {
@@ -1216,20 +1193,16 @@ async fn stop_reports_in_flight_unknown_and_held_dropped() {
                 message: meta(1, 1),
                 cause: UnknownCause::SessionStopped
             },
-            EgressReport::Dropped {
-                cause: DropCause::SessionStopped,
-                count: 1
-            },
+            EgressReport::Dropped { count: 1 },
         ]
     );
-    assert!(!bus.calls().contains(&Call::Abandon));
     assert_eq!(bus.advances(), [1, 2], "the third stays behind the cursor");
 }
 
-/// Retiring the reader reports as a stop does, abandons the rest of the
-/// channel, reports what that skipped, and leaves the session running.
+/// Retiring the reader reports as a stop does, leaves the rest of the channel
+/// unread and unreported, and leaves the session running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retire_abandons_the_channel_and_leaves_the_session() {
+async fn retire_reports_as_a_stop_and_leaves_the_channel_and_the_session() {
     let handle = make_handle();
     fake_supervisor(&handle).await;
     let _eventloop = install_unpolled(&handle, 1, None, None).await;
@@ -1248,15 +1221,13 @@ async fn retire_abandons_the_channel_and_leaves_the_session() {
                 message: meta(1, 1),
                 cause: UnknownCause::SessionStopped
             },
-            EgressReport::Dropped {
-                cause: DropCause::SessionStopped,
-                count: 1
-            },
-            EgressReport::Dropped {
-                cause: DropCause::ClientRemoved,
-                count: 2
-            },
+            EgressReport::Dropped { count: 1 },
         ]
+    );
+    assert_eq!(
+        bus.advances(),
+        [1, 2],
+        "the last two stay behind the cursor"
     );
     assert!(!*handle.stop_tx.borrow(), "the session is not stopped");
     assert!(handle.client.lock().await.is_some());
@@ -1456,13 +1427,9 @@ fn stopped_1_2_3() -> Vec<EgressReport> {
             message: named_meta(1, 1),
             cause: UnknownCause::SessionStopped,
         },
-        EgressReport::Dropped {
-            cause: DropCause::SessionStopped,
-            count: 1,
-        },
+        EgressReport::Dropped { count: 1 },
         EgressReport::DroppedMessage {
             message: named_meta(3, 1),
-            cause: DropCause::SessionStopped,
             sent: Sent::Possibly,
         },
     ]
@@ -1481,27 +1448,17 @@ async fn stop_reports_each_held_message_naming_a_status_to() {
     assert_eq!(bus.advances(), [1, 2, 3]);
 }
 
-/// A retire reports as a stop does, then splits what it abandoned the same
-/// way under `ClientRemoved`.
+/// A retire reports the held messages as a stop does and makes no report
+/// about the unread, which stay on the channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retire_reports_each_abandoned_message_naming_a_status_to() {
+async fn retire_reports_each_held_message_and_nothing_unread() {
     let handle = make_handle();
     let (bus, _eventloop) = outstanding_mix(&handle).await;
     handle.retire_egress_reader().await;
     let mut expected = handed_1_and_3();
     expected.extend(stopped_1_2_3());
-    expected.extend([
-        EgressReport::Dropped {
-            cause: DropCause::ClientRemoved,
-            count: 1,
-        },
-        EgressReport::DroppedMessage {
-            message: named_meta(4, 1),
-            cause: DropCause::ClientRemoved,
-            sent: Sent::Never,
-        },
-    ]);
     assert_eq!(bus.reports(), expected);
+    assert_eq!(bus.advances(), [1, 2, 3]);
     handle.stop_and_join().await;
 }
 
@@ -1581,7 +1538,6 @@ async fn a_message_given_back_by_a_full_channel_is_dropped_never_sent_at_a_stop(
                 },
                 EgressReport::DroppedMessage {
                     message: second,
-                    cause: DropCause::SessionStopped,
                     sent: Sent::Never,
                 },
             ],
@@ -1647,7 +1603,6 @@ async fn a_message_given_back_for_no_client_is_never_sent() {
                 EgressReport::Handed(only.clone()),
                 EgressReport::DroppedMessage {
                     message: only,
-                    cause: DropCause::SessionStopped,
                     sent: Sent::Never,
                 },
             ],
@@ -2111,7 +2066,6 @@ async fn the_connection_ending_ends_the_wait() {
             EgressReport::Handed(named_meta(1, 1)),
             EgressReport::DroppedMessage {
                 message: named_meta(1, 1),
-                cause: DropCause::SessionStopped,
                 sent: Sent::Possibly,
             },
             EgressReport::Handed(named_meta(2, 2)),
@@ -2152,10 +2106,10 @@ async fn held_messages_are_not_submitted_during_the_wait() {
     assert_eq!(bus.advances(), [1, 2, 3]);
 }
 
-/// A retire waits as a stop does, then abandons the channel and reports what
-/// that skipped, and leaves the session running.
+/// A retire waits for the in-flight answer as a stop does, reports it, and
+/// exits leaving the unread on the channel and the session running.
 #[tokio::test(start_paused = true)]
-async fn a_retire_waits_for_the_answer_then_abandons() {
+async fn a_retire_waits_for_the_answer_then_exits() {
     let handle = make_handle_waiting(10);
     let bus = ScriptBus::new(Some(256));
     let broker = connect_fake_supervised(&handle, Some(1), Answer::Withhold, &bus).await;
@@ -2174,18 +2128,9 @@ async fn a_retire_waits_for_the_answer_then_abandons() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     broker.release();
     retiring.await.unwrap();
-    assert_eq!(
-        bus.reports(),
-        vec![
-            EgressReport::Delivered(meta(1, 1)),
-            EgressReport::DroppedMessage {
-                message: named_meta(2, 1),
-                cause: DropCause::ClientRemoved,
-                sent: Sent::Never,
-            },
-        ]
-    );
-    assert!(bus.calls().contains(&Call::Abandon));
+    assert_eq!(bus.reports(), vec![EgressReport::Delivered(meta(1, 1)),]);
+    assert_eq!(bus.advances(), [1], "the retire handed nothing more");
+    assert!(!handle.egress_reader_running());
     assert!(!*handle.stop_tx.borrow(), "the session is not stopped");
     assert!(handle.client.lock().await.is_some());
     handle.stop_and_join().await;
@@ -2202,7 +2147,13 @@ async fn a_retire_after_the_stop_returns() {
     start_egress_reader(&handle, bus.clone());
     handle.stop_and_join().await;
     handle.retire_egress_reader().await;
-    assert!(!bus.calls().contains(&Call::Abandon));
+    assert!(!handle.egress_reader_running());
+    assert!(
+        bus.reports()
+            .iter()
+            .all(|report| *report == EgressReport::Drained),
+        "the retire adds no report",
+    );
 }
 
 /// The stop's summary counts what was in flight when the wait began, what the
@@ -2312,10 +2263,9 @@ async fn a_stop_during_a_pass_leaves_the_rest_of_the_read() {
 }
 
 /// A retire that arrives while the reader is waiting out the session's stop
-/// is carried out: once the wait ends the channel is abandoned and what that
-/// skipped is reported dropped for the removal.
+/// returns once the reader has exited, and adds no report about the channel.
 #[tokio::test(start_paused = true)]
-async fn a_retire_during_the_stops_wait_abandons() {
+async fn a_retire_during_the_stops_wait_returns_once_the_reader_exits() {
     let handle = make_handle_waiting(10);
     let bus = ScriptBus::new(Some(256));
     let broker = connect_fake_supervised(&handle, Some(1), Answer::Withhold, &bus).await;
@@ -2337,19 +2287,8 @@ async fn a_retire_during_the_stops_wait_abandons() {
     broker.release();
     retiring.await.unwrap();
     handle.stop_and_join().await;
-    assert_eq!(
-        bus.reports(),
-        vec![
-            EgressReport::Delivered(meta(1, 1)),
-            EgressReport::DroppedMessage {
-                message: named_meta(2, 1),
-                cause: DropCause::ClientRemoved,
-                sent: Sent::Never,
-            },
-        ]
-    );
+    assert_eq!(bus.reports(), vec![EgressReport::Delivered(meta(1, 1)),]);
     assert_eq!(bus.advances(), [1], "the stop handed nothing more");
-    assert!(bus.calls().contains(&Call::Abandon));
 }
 
 /// One QoS 1 message that cannot be written: the broker reads nothing after

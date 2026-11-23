@@ -684,9 +684,12 @@ async fn start_egress_readers(
 /// Take each client this reload removes out of egress service while its
 /// channel is still in the directory: retire its reader (which waits up to the
 /// client's `stop_wait_secs` for the outcomes of what it has in flight, then
-/// reports what it held and what it abandons), remove the participant's
-/// subscriber entry, and drop the position. The session stops later, after
-/// `swap_agents`.
+/// reports what it had outstanding), remove the participant's subscriber
+/// entry, and close the channel: in one step with respect to commits, the
+/// position is dropped and everything the channel held unread is taken, then
+/// reported `dropped`, `removed`. From then on a commit to the channel is
+/// refused. A reader that had already ended for the session's stop is closed
+/// the same way. The session stops later, after `swap_agents`.
 ///
 /// The retires run concurrently, so the step waits up to the largest
 /// `stop_wait_secs` among the removed clients, not their sum; the directory
@@ -697,13 +700,7 @@ async fn start_egress_readers(
 /// that leaves the directory.
 async fn retire_egress_readers(env: &ReloadEnv, delta: &PlanDelta) {
     // TODO(mqtt-egress-removed-client-rows): nothing reaps a removed client's
-    // egress channel row or its retained messages, nor does anything report
-    // the unread messages of a removed client whose reader ended before the
-    // retire.
-    // TODO(correctness-publish-during-egress-retirement-silently-lost): a
-    // publish admitted for a removed client after its reader abandons, and
-    // committed before or after `remove_channels`, is never published or
-    // reported.
+    // egress channel row or its retained messages.
     let kind = SubscriberEntryKind::System(MQTT_OUTBOUND_COMPONENT.to_string());
     let live = env.messenger.directory();
     let mut retires = tokio::task::JoinSet::new();

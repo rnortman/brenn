@@ -344,6 +344,33 @@ pub async fn attach_wasm_port(
         .await;
 }
 
+/// Put `client`'s egress channel in service: take the egress reader's position
+/// on it at the channel's `retain_depth`.
+/// An MQTT commit lands only while that position exists, so a fixture without a
+/// hub calls this for every client it publishes to; one that wants the channel
+/// out of service does not.
+///
+/// # Panics
+///
+/// If the client's egress channel is not in the messenger's directory.
+pub async fn attach_mqtt_egress_reader(messenger: &Messenger, client: &str) {
+    let address = super::mqtt_egress_address(client);
+    let depth = messenger
+        .directory()
+        .resolve(&address)
+        .unwrap_or_else(|| panic!("testutils: egress channel {address:?} is not in the directory"))
+        .resolved_channel
+        .retain_depth;
+    messenger
+        .attach_subscriber(
+            &address,
+            super::mqtt_outbound::MQTT_OUTBOUND_COMPONENT,
+            &super::mqtt_outbound::mqtt_outbound_participant(),
+            depth,
+        )
+        .await;
+}
+
 /// A second `Messenger` over an existing database and channel — a host restart,
 /// as observable from inside one process.
 ///

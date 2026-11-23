@@ -195,6 +195,18 @@ pub struct AdvanceOutcome {
     pub noise_charge: u64,
 }
 
+/// What a subscriber had not been served when it gave up its position, as
+/// [`RetentionStore::detach_taking_unseen`] reports it.
+#[derive(Debug, Clone)]
+pub struct Relinquished {
+    /// What `window(subscriber, push_limit, Depth::Bounded(0))` would have
+    /// served as new at the instant of the detach, oldest first.
+    pub unseen: Vec<(MessageSeq, Arc<MessageEnvelope>)>,
+    /// What an advance over `unseen` — through its last, from its first — would
+    /// have reported; zero when `unseen` is empty.
+    pub outrun: AdvanceOutcome,
+}
+
 /// One subscriber a store currently owes work, with what the wake decision
 /// needs to be made about it.
 ///
@@ -239,6 +251,16 @@ pub(crate) fn assert_sampled_head_unasked(address: &str, push_limit: Depth) {
         push_limit.is_push_enabled(),
         "messaging store: {address}: a head read for a sampled subscriber, which is never \
          handed anything"
+    );
+}
+
+/// Panics if `push_limit` is zero: a sampled subscriber holds no position,
+/// so a detach taking its unseen is a host bug.
+pub(crate) fn assert_sampled_detach_unasked(address: &str, push_limit: Depth) {
+    assert!(
+        push_limit.is_push_enabled(),
+        "messaging store: {address}: a detach taking the unseen of a sampled subscriber, which \
+         holds no position"
     );
 }
 
@@ -634,6 +656,26 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// and is not an error.
     async fn detach(&self, subscriber: &ParticipantId) -> Option<MessageSeq>;
 
+    /// Give up `subscriber`'s position and return what it had not been served
+    /// at `push_limit`, with what an advance over that would have reported.
+    ///
+    /// One operation, so that no commit and no advance falls between the read
+    /// and the detach: a message appended before it is in `unseen` (or counted
+    /// in `outrun` when the window passed it), and one appended after it found
+    /// no position. The read does not retune any depth cache.
+    ///
+    /// `None` when the store holds no position for this subscriber.
+    ///
+    /// # Panics
+    ///
+    /// On a sampled (`push_limit = 0`) request: a sampled subscriber holds no
+    /// position to give up.
+    async fn detach_taking_unseen(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+    ) -> Option<Relinquished>;
+
     /// Commit a message into retention, immediately deliverable, and report
     /// whatever the message it displaced from the window cost a subscriber.
     ///
@@ -641,6 +683,18 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// Who reads it is decided by each subscriber's own position, at its own
     /// read, so a commit resolves no subscriber set and owes nobody anything.
     async fn append(&self, msg: NewMessage) -> AppendOutcome;
+
+    /// [`RetentionStore::append`], only while `subscriber` holds a position on
+    /// this channel. The check and the write are one step, so no
+    /// [`RetentionStore::detach_taking_unseen`] can fall between them.
+    ///
+    /// `None`, with nothing written and no blob adopted, when it holds none:
+    /// `msg` is dropped, releasing whatever blob only it held.
+    async fn append_while_attached(
+        &self,
+        msg: NewMessage,
+        subscriber: &ParticipantId,
+    ) -> Option<AppendOutcome>;
 
     /// Park a message until `release_at`, invisible to every read until then.
     ///

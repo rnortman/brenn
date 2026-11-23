@@ -18,7 +18,7 @@ use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::{ParticipantId, mqtt_egress_address};
 use brenn_messaging::Messenger;
 use brenn_messaging::config_reload::Outcome;
-use brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT;
+use brenn_messaging::mqtt_outbound::mqtt_outbound_participant;
 use brenn_messaging_store::blob::HeldAttachments;
 use brenn_messaging_store::db::{
     SubscriberCursorRow, load_channel_retained_window_seq, load_subscriber_cursor, utc_to_ns,
@@ -33,7 +33,7 @@ use super::driver::tests::{
 };
 
 pub(crate) fn participant() -> ParticipantId {
-    ParticipantId::for_system(MQTT_OUTBOUND_COMPONENT)
+    mqtt_outbound_participant()
 }
 
 /// The uuid of `client`'s egress channel in the live directory.
@@ -180,8 +180,8 @@ async fn an_added_client_gets_a_position_an_entry_and_a_running_reader() {
     booted.stop_mqtt();
 }
 
-/// A removed client's reader is retired before its channel leaves: what it
-/// was owed is abandoned and raised to the operator by count, its position and
+/// A removed client's reader is retired before its channel leaves: the close
+/// raises what it was owed to the operator by count, its position and
 /// subscriber entry go, and the channel leaves the directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_clients_reader_is_retired_and_what_it_was_owed_is_alerted() {
@@ -446,12 +446,25 @@ async fn statuses(messenger: &Messenger) -> Vec<DeliveryStatus> {
 /// `unnamed` naming none to `spare`, and reload with `spare` removed. Returns
 /// the booted process and the named messages' ids.
 async fn remove_spare_owing(named: usize, unnamed: usize) -> (Booted, Vec<Uuid>) {
+    let (booted, ids, _) = remove_spare(named, unnamed, false).await;
+    (booted, ids)
+}
+
+/// [`remove_spare_owing`], first stopping `spare`'s session and waiting for
+/// its reader to exit when `stopped_first`, as a shutdown that races the
+/// reload leaves it. Also returns `spare`'s egress channel uuid.
+async fn remove_spare(
+    named: usize,
+    unnamed: usize,
+    stopped_first: bool,
+) -> (Booted, Vec<Uuid>, Uuid) {
     let one = [("ha", 8883u16, None)];
     let two = [("ha", 8883u16, None), ("spare", 8884u16, None)];
     let tree = Tree::holding(&status_document(&two));
     let components = tempfile::tempdir().expect("a components root");
     install_package(components.path(), &staged_module(&tree));
     let mut booted = boot_over(&tree, components.path(), None).await;
+    let uuid = egress_uuid(&booted.messenger, "spare");
     let sender = ParticipantId::for_app(STATUS_SENDER, booted.messenger.source());
     let ids = commit_as(
         &booted.messenger,
@@ -462,6 +475,15 @@ async fn remove_spare_owing(named: usize, unnamed: usize) -> (Booted, Vec<Uuid>)
     )
     .await;
     commit_as(&booted.messenger, "spare", unnamed, sender.as_str(), None).await;
+    if stopped_first {
+        let spare = booted
+            .mqtt
+            .0
+            .get_client("spare")
+            .expect("a declared client");
+        spare.stop_and_join().await;
+        assert!(!spare.egress_reader_running());
+    }
 
     tree.write(&status_document(&one));
     install_package(components.path(), &staged_module(&tree));
@@ -469,7 +491,7 @@ async fn remove_spare_owing(named: usize, unnamed: usize) -> (Booted, Vec<Uuid>)
     let status = booted.last_status().await;
     assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
     assert_eq!(status.delta.mqtt_clients_removed, vec!["spare".to_string()]);
-    (booted, ids)
+    (booted, ids, uuid)
 }
 
 /// Assert `found` tells each of `ids`, in order, `dropped`, `removed`.
@@ -527,6 +549,37 @@ async fn a_full_window_of_messages_naming_a_status_to_is_told_and_the_reload_com
             .iter()
             .any(|(_, title, _)| title.contains("dropped") && title.contains("spare")),
         "every dropped message was told, so none is alerted: {alerts:?}"
+    );
+    booted.stop_mqtt();
+}
+
+/// A removal whose reader had already ended for the session's stop reports
+/// the channel's unread messages all the same: each naming a `status_to` is
+/// told `dropped`, `removed`, the operator's alert counts the rest, and the
+/// position goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removal_after_the_readers_stop_reports_what_the_channel_held() {
+    let (booted, ids, uuid) = remove_spare(2, 3, true).await;
+    assert_all_removed(&statuses(&booted.messenger).await, &ids);
+    let alerts = booted.alerts().await;
+    let dropped: Vec<_> = alerts
+        .iter()
+        .filter(|(_, title, _)| title.contains("dropped") && title.contains("spare"))
+        .collect();
+    assert_eq!(dropped.len(), 1, "{alerts:?}");
+    assert!(
+        dropped[0]
+            .2
+            .contains("\"spare\": 3 message(s) dropped unsent"),
+        "the untold messages are counted: {dropped:?}"
+    );
+    assert!(
+        dropped[0].2.contains("the client was removed"),
+        "{dropped:?}"
+    );
+    assert!(
+        egress_cursor(&booted.messenger, uuid).await.is_none(),
+        "the removed client's position outlived it",
     );
     booted.stop_mqtt();
 }

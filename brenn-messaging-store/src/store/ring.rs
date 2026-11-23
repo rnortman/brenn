@@ -44,8 +44,9 @@ use crate::db::ns_to_utc;
 use crate::store::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
     DeliverableSubscriber, MessageSeq, NewMessage, OverflowEvent, Parked, ReleaseOutcome, Released,
-    ResumeCursor, RetentionStore, StoreReplay, SubscriberWindow, assert_sampled_head_unasked,
-    depth_bound, instant_of, release_time_of,
+    Relinquished, ResumeCursor, RetentionStore, StoreReplay, SubscriberWindow,
+    assert_sampled_detach_unasked, assert_sampled_head_unasked, depth_bound, instant_of,
+    release_time_of,
 };
 use brenn_lib::messaging::ParticipantId;
 use brenn_lib::messaging::config::Depth;
@@ -289,8 +290,38 @@ impl RingStore {
     /// If the envelope names a blob `holds` does not cover.
     pub fn append(&self, envelope: MessageEnvelope, holds: BlobHolds) -> Appended {
         let entry = HeldEnvelope::new(envelope, holds);
+        let state = self.state();
+        self.append_locked(state, entry)
+    }
+
+    /// [`RingStore::append`], only while `subscriber` holds a position. The
+    /// check and the append share one state lock. `None`, with the entry and
+    /// its holds dropped, when it holds none.
+    ///
+    /// # Panics
+    ///
+    /// If the envelope names a blob `holds` does not cover.
+    pub fn append_while_attached(
+        &self,
+        envelope: MessageEnvelope,
+        holds: BlobHolds,
+        subscriber: &ParticipantId,
+    ) -> Option<Appended> {
+        let entry = HeldEnvelope::new(envelope, holds);
+        let state = self.state();
+        if !state.core.is_attached(subscriber) {
+            return None;
+        }
+        Some(self.append_locked(state, entry))
+    }
+
+    /// Append `entry` under the held state lock, release it, and announce.
+    fn append_locked(
+        &self,
+        mut state: std::sync::MutexGuard<'_, RingState>,
+        entry: HeldEnvelope,
+    ) -> Appended {
         let envelope = Arc::clone(&entry.envelope);
-        let mut state = self.state();
         let report = state.core.append(entry);
         let overflow = Self::overflow_events(&state, report.overflow);
         drop(state);
@@ -477,6 +508,39 @@ impl RingStore {
             .map(|cursor| cursor.next_owed());
         state.app_slugs.remove(subscriber);
         dropped
+    }
+
+    /// Drop a subscriber's position and return the entries its window at
+    /// `push_limit` would have served as new, oldest first, with what an
+    /// advance over them would have reported — all under one state lock.
+    /// `None` when the subscriber held no position. `push_limit` is a pushing
+    /// depth; [`RetentionStore::detach_taking_unseen`] refuses a sampled one.
+    pub fn detach_taking_unseen(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: u64,
+    ) -> Option<(Vec<brenn_queue::Retained<Arc<MessageEnvelope>>>, Advance)> {
+        let mut state = self.state();
+        let window = state.core.window(subscriber, push_limit, 0)?;
+        let unseen: Vec<_> = window
+            .entries
+            .into_iter()
+            .skip(window.new_from)
+            .map(envelope_only)
+            .collect();
+        let outrun = match (unseen.first(), unseen.last()) {
+            (Some(first), Some(last)) => state
+                .core
+                .advance(subscriber, last.seq, first.seq)
+                .expect("ring: the position the window was cut from is still held"),
+            _ => Advance {
+                dropped: 0,
+                noise_charge: 0,
+            },
+        };
+        state.core.detach(subscriber);
+        state.app_slugs.remove(subscriber);
+        Some((unseen, outrun))
     }
 
     pub fn is_attached(&self, subscriber: &ParticipantId) -> bool {
@@ -993,6 +1057,43 @@ impl RetentionStore for RingStore {
 
     async fn detach(&self, subscriber: &ParticipantId) -> Option<MessageSeq> {
         RingStore::detach(self, subscriber).map(MessageSeq)
+    }
+
+    async fn detach_taking_unseen(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+    ) -> Option<Relinquished> {
+        assert_sampled_detach_unasked(self.address(), push_limit);
+        let (unseen, outrun) =
+            RingStore::detach_taking_unseen(self, subscriber, depth_bound(push_limit))?;
+        Some(Relinquished {
+            unseen: unseen
+                .into_iter()
+                .map(|entry| (MessageSeq(entry.seq), entry.message))
+                .collect(),
+            outrun: AdvanceOutcome {
+                dropped: outrun.dropped,
+                noise_charge: outrun.noise_charge,
+            },
+        })
+    }
+
+    async fn append_while_attached(
+        &self,
+        msg: NewMessage,
+        subscriber: &ParticipantId,
+    ) -> Option<AppendOutcome> {
+        let (envelope, holds) = self.envelope_of(msg);
+        let message_uuid = envelope.message_id;
+        let appended = RingStore::append_while_attached(self, envelope, holds, subscriber)?;
+        Some(AppendOutcome {
+            committed: Committed {
+                message_uuid,
+                seq: MessageSeq(appended.retained.seq),
+            },
+            overflow: appended.overflow,
+        })
     }
 
     /// Names no targets: subscribers on a ring-backed channel carry their own

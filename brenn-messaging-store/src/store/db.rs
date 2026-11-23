@@ -24,9 +24,9 @@ use brenn_lib::messaging::config::Depth;
 
 use super::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
-    DeliverableSubscriber, MessageSeq, NewMessage, Parked, ReleaseOutcome, Released, ResumeCursor,
-    RetentionStore, StoreReplay, StoreRetained, SubscriberWindow, assert_sampled_head_unasked,
-    compose_window, depth_bound,
+    DeliverableSubscriber, MessageSeq, NewMessage, Parked, ReleaseOutcome, Released, Relinquished,
+    ResumeCursor, RetentionStore, StoreReplay, StoreRetained, SubscriberWindow,
+    assert_sampled_detach_unasked, assert_sampled_head_unasked, compose_window, depth_bound,
 };
 
 fn store_retained((seq, envelope): (i64, MessageEnvelope)) -> StoreRetained {
@@ -208,6 +208,32 @@ impl DbStore {
         }
     }
 
+    /// What an advance from a position at `next_owed` over a window whose oldest
+    /// entry is `seen_floor` passes without having served: both figures
+    /// subtractions between seqs.
+    fn passed_over(
+        &self,
+        conn: &rusqlite::Connection,
+        next_owed: u64,
+        seen_floor: MessageSeq,
+    ) -> AdvanceOutcome {
+        let dropped = seen_floor.0.saturating_sub(next_owed);
+        AdvanceOutcome {
+            dropped,
+            // Losses below the frontier were already charged by eviction; only
+            // the still-retained part is charged here. A consumer that lost
+            // nothing is charged nothing whatever the frontier is, so the read
+            // that finds it stays off the keeping-up path.
+            noise_charge: if dropped == 0 {
+                0
+            } else {
+                seen_floor
+                    .0
+                    .saturating_sub(next_owed.max(self.frontier(conn)))
+            },
+        }
+    }
+
     /// Whether a parked row is `sender`'s to cancel or edit.
     fn owned_by(lookup: &db::DeferredLookup, sender: &str) -> bool {
         lookup.sender == sender
@@ -340,21 +366,7 @@ impl RetentionStore for DbStore {
         let conn = self.db.lock().await;
         let cursor = db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)?;
         let next_owed = retained_seq(cursor.next_owed_seq).0;
-        let dropped = seen_floor.0.saturating_sub(next_owed);
-        let outcome = AdvanceOutcome {
-            dropped,
-            // Losses below the frontier were already charged by eviction; only
-            // the still-retained part is charged here. A consumer that lost
-            // nothing is charged nothing whatever the frontier is, so the read
-            // that finds it stays off the keeping-up path.
-            noise_charge: if dropped == 0 {
-                0
-            } else {
-                seen_floor
-                    .0
-                    .saturating_sub(next_owed.max(self.frontier(&conn)))
-            },
-        };
+        let outcome = self.passed_over(&conn, next_owed, seen_floor);
         if through.0 >= next_owed {
             db::set_subscriber_cursor_position(
                 &conn,
@@ -408,6 +420,32 @@ impl RetentionStore for DbStore {
         dropped
     }
 
+    /// The cursor is read, the window cut from it, and the row deleted under one
+    /// connection hold; the cursor's depth cache is not retuned, since the row
+    /// is about to go.
+    async fn detach_taking_unseen(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+    ) -> Option<Relinquished> {
+        assert_sampled_detach_unasked(&self.address, push_limit);
+        let conn = self.db.lock().await;
+        let cursor = db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)?;
+        let next_owed = retained_seq(cursor.next_owed_seq);
+        let entries = db::load_channel_retained_window_seq(&conn, self.channel_uuid, push_limit)
+            .into_iter()
+            .map(|(seq, envelope)| (retained_seq(seq), Arc::new(envelope)))
+            .collect();
+        let window = compose_window(entries, next_owed, push_limit);
+        let unseen = window.new_entries().to_vec();
+        let outrun = match unseen.first() {
+            Some((floor, _)) => self.passed_over(&conn, next_owed.0, *floor),
+            None => AdvanceOutcome::default(),
+        };
+        db::delete_subscriber_cursor(&conn, self.channel_uuid, subscriber);
+        Some(Relinquished { unseen, outrun })
+    }
+
     /// Writes the message row, and nothing per subscriber.
     ///
     /// Reports no overflow: a commit charges nothing. What a subscriber lost is
@@ -421,6 +459,21 @@ impl RetentionStore for DbStore {
             committed: Self::committed(self.insert(&conn, &msg, None)),
             overflow: Vec::new(),
         }
+    }
+
+    /// The cursor lookup and the insert share one connection hold.
+    async fn append_while_attached(
+        &self,
+        msg: NewMessage,
+        subscriber: &ParticipantId,
+    ) -> Option<AppendOutcome> {
+        msg.attachments.make_durable();
+        let conn = self.db.lock().await;
+        db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)?;
+        Some(AppendOutcome {
+            committed: Self::committed(self.insert(&conn, &msg, None)),
+            overflow: Vec::new(),
+        })
     }
 
     /// Writes the message row without a retention position, which is the whole of

@@ -1935,7 +1935,7 @@ async fn make_test_messenger_with_mqtt_publish(
     }
     let mut messenger_apps = indexmap::IndexMap::new();
     messenger_apps.insert("testapp".to_string(), testapp_cfg);
-    brenn_messaging::Messenger::new(
+    let messenger = brenn_messaging::Messenger::new(
         db,
         Arc::new(brenn_lib::messaging::MessagingDirectory::with_entries(
             channels,
@@ -1944,7 +1944,13 @@ async fn make_test_messenger_with_mqtt_publish(
         Arc::new(messenger_apps),
         Arc::new(brenn_messaging::query::NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
         global,
-    )
+    );
+    // `matchers` may name a client more than once; this relies on a repeat
+    // attach keeping the position already held.
+    for (client, _) in matchers {
+        brenn_messaging::testutils::attach_mqtt_egress_reader(&messenger, client).await;
+    }
+    messenger
 }
 
 /// Build a `Messenger` (empty directory) whose `"testapp"` policy does **not**

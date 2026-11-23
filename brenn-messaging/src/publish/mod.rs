@@ -1,6 +1,6 @@
 //! `Messenger::publish` and the dispatch path that fires after commit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -21,6 +21,7 @@ use brenn_lib::mqtt::{MqttPublishOptions, parse_topic_name};
 use super::gates::{
     check_body_size, publish_acl_allows, reply_to_visible, resolve_publish_sender, well_formed_name,
 };
+use super::mqtt_outbound::mqtt_outbound_participant;
 use super::store::AttachFeedTarget;
 use super::{
     AttachScope, ChannelEntry, ChannelScheme, Impetus, Messenger, ParticipantId,
@@ -1311,12 +1312,7 @@ impl Messenger {
                 match mqtt::write_payload_blob(store, bytes, options).await {
                     Ok(held) => held,
                     Err(refused) => {
-                        if let PublishOrigin::Conversation { id } = origin {
-                            let budget = conversation_send_budget
-                                .expect("Conversation origin requires a send budget");
-                            let conn = self.db.lock().await;
-                            refund_send_budget(&conn, id, budget);
-                        }
+                        self.refund_draw(origin, conversation_send_budget).await;
                         return refused;
                     }
                 }
@@ -1325,6 +1321,7 @@ impl Messenger {
         };
 
         let publish_ts_ns = db::utc_to_ns(Utc::now());
+        let is_mqtt = mqtt_admitted.is_some();
         let transport = mqtt_admitted.map(|admitted| {
             super::TransportMeta::MqttPublish(admitted.transport(db::ns_to_utc(publish_ts_ns)))
         });
@@ -1350,6 +1347,10 @@ impl Messenger {
             publish_ts_ns,
             attachments,
         };
+        assert!(
+            deliver_after.is_none() || !is_mqtt,
+            "an MQTT publish to {addr} carries a release time its admission refuses"
+        );
         let (message_id, retained_seq) = match deliver_after {
             Some(release_at) => match store.park(message, release_at).await {
                 Ok(parked) => (parked.message_uuid, None),
@@ -1357,17 +1358,28 @@ impl Messenger {
                     // The cap is only knowable at the park, after the budget
                     // draw: a sender retrying against a full deferred set must
                     // not drain its budget without landing a message.
-                    if let PublishOrigin::Conversation { id } = origin {
-                        let budget = conversation_send_budget
-                            .expect("Conversation origin requires a send budget");
-                        let conn = self.db.lock().await;
-                        refund_send_budget(&conn, id, budget);
-                    }
+                    self.refund_draw(origin, conversation_send_budget).await;
                     return PublishResult::DeferredQuotaExceeded { cap };
                 }
             },
             None => {
-                let outcome = store.append(message).await;
+                // An MQTT commit lands only while the egress reader holds its
+                // position on the channel, checked with the write: a client
+                // whose channel was closed takes no row nobody would read or
+                // report. The publish is then answered as for an unknown client,
+                // and the budget drawn in step 5 is refunded.
+                let outcome = if is_mqtt {
+                    let reader = mqtt_outbound_participant();
+                    match store.append_while_attached(message, &reader).await {
+                        Some(outcome) => outcome,
+                        None => {
+                            self.refund_draw(origin, conversation_send_budget).await;
+                            return PublishResult::UnknownChannel(addr.to_string());
+                        }
+                    }
+                } else {
+                    store.append(message).await
+                };
                 self.enact_overflow_events(&channel, &outcome.overflow);
                 (
                     outcome.committed.message_uuid,
@@ -1479,6 +1491,17 @@ impl Messenger {
             return Vec::new();
         }
         targets
+    }
+
+    /// Give back the send-budget unit a Conversation-origin publish drew, for
+    /// a publish refused after the draw. Other origins drew nothing.
+    async fn refund_draw(&self, origin: PublishOrigin, conversation_send_budget: Option<u32>) {
+        if let PublishOrigin::Conversation { id } = origin {
+            let budget =
+                conversation_send_budget.expect("Conversation origin requires a send budget");
+            let conn = self.db.lock().await;
+            refund_send_budget(&conn, id, budget);
+        }
     }
 
     /// Hand a message that has just entered retention to every attached,
@@ -2024,6 +2047,9 @@ impl Messenger {
             // the committed rows itself. The dominant case is all publishes
             // targeting one channel.
             let mut targets_cache: HashMap<&str, ResolvedChannelTargets> = HashMap::new();
+            // Egress channels this flush has found the egress reader's position
+            // on, under the held transaction.
+            let mut egress_in_service: HashSet<&str> = HashSet::new();
 
             // Monotonic publish_ts_ns assignment: each message gets
             // max(prev_ts + 1, now) to guarantee strictly increasing timestamps
@@ -2102,6 +2128,21 @@ impl Messenger {
                         );
                         (entry.clone(), feed)
                     });
+
+                // An egress row is read and reported only from the reader's
+                // position; one written with no position on the channel would
+                // be answered committed and never handed or reported. A
+                // consumer naming a client is retired before the client's
+                // channel is closed, so reaching this without one is a host bug.
+                if publish.mqtt.is_some() && egress_in_service.insert(channel_addr) {
+                    let reader = mqtt_outbound_participant();
+                    assert!(
+                        db::load_subscriber_cursor(&tx, channel.uuid, &reader).is_some(),
+                        "publish_from_wasm: MQTT entry for {channel_addr:?}, whose egress reader \
+                         holds no position on it; a consumer naming a client is retired before \
+                         the client is removed (slug={consumer_slug})"
+                    );
+                }
 
                 let now_ns = db::utc_to_ns(Utc::now());
                 let publish_ts_ns = match prev_ts {

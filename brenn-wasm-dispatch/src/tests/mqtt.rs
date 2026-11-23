@@ -91,6 +91,7 @@ async fn rig(slug: &str) -> Rig {
     )
     .await;
     messenger.install_mqtt_clients(Arc::new(StubClients));
+    brenn_messaging::testutils::attach_mqtt_egress_reader(&messenger, CLIENT).await;
 
     let (alert_dispatcher, alerts, alert_task) = make_capturing_alerter_with_severity();
     let outputs = vec![output("out", &out)];

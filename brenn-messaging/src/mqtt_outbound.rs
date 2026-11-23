@@ -18,13 +18,20 @@ use crate::config::{
 };
 use crate::system::SystemParticipantSpec;
 use crate::{
-    ChannelEntry, ChannelScheme, MQTT_EGRESS_PREFIX, egress_channel_uuid, mqtt_egress_address,
+    ChannelEntry, ChannelScheme, MQTT_EGRESS_PREFIX, ParticipantId, egress_channel_uuid,
+    mqtt_egress_address,
 };
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::AppPolicy;
 
 /// System-participant component name; the identity is `system:mqtt-outbound`.
 pub const MQTT_OUTBOUND_COMPONENT: &str = "mqtt-outbound";
+
+/// The egress reader's identity, under which it holds its position on every
+/// egress channel and against which an MQTT commit is checked.
+pub fn mqtt_outbound_participant() -> ParticipantId {
+    ParticipantId::for_system(MQTT_OUTBOUND_COMPONENT)
+}
 
 /// The participant's overflow rung, on every egress channel it subscribes to:
 /// a message the window drops before the reader reached it is counted and

@@ -190,28 +190,6 @@ hook that compares `std::thread::current().id()` with the id recorded at
 install. Done = a panic on another thread during any of the three tests' windows
 does not change what they assert. The comment is at the test lock.
 
-## `correctness-publish-during-egress-retirement-silently-lost`
-
-A reload that removes an MQTT client retires the client's egress reader
-(`retire_egress_readers`, which abandons and reports what the channel held)
-before `remove_channels` takes the channel out of the directory, and the
-client stays in the MQTT service's table until its session stops after
-`swap_agents`. An `MqttSend` admitted in between, or admitted before the
-directory removal and committed after it, is answered as committed, lands
-past the abandoned position (or after the position is detached) and is never
-published, counted, logged or alerted. Admission and commit are not
-serialised against the directory removal, so reordering the steps narrows
-the window without closing it. Done = no commit to a removed client's egress
-channel can be answered committed without being published or reported
-dropped: for example admission refuses a client whose egress is closing,
-checked at commit under the same lock the retirement takes, or a count of the
-channel's entries past the abandoned position taken once no commit can land
-and reported as `Dropped { ClientRemoved }`.
-
-A publish lost this way that named a `status_to` hears nothing on it, neither
-`handed` nor an outcome; done also requires that its `status_to` be told it
-was dropped.
-
 ## `dense-request-arguments-outgrow-guest`
 
 A provider's guest parses every new request of an activation into an owned
@@ -492,48 +470,22 @@ position skips whatever the channel still retains and logs the count. Done =
 removed channels are reaped under the general policy, or this channel family
 is reaped at removal.
 
-A removed client's channel can also hold messages its reader never read
-that name a `status_to`, with nobody left to report them. A removal carried
-out while the reader is running tells each of them `dropped`, `removed`;
-on two paths nothing does, and the sender learns that its message was not
-sent only by its lifetime passing with no `handed`, and never for a message
-sent with `lifetime_s` `"forever"`. One is a reload that
-removes the client while the server is shutting down, when the reader has
-already ended for the session's stop and the retire has nothing to carry it
-out (`MqttClientHandle::retire_egress_reader`, `brenn-mqtt/src/state.rs`,
-which logs a `warn`). The other is a client deleted from the configuration
-while the server is down: its channel is not in the directory at boot and
-no reader is started for it. On both, the reader's position is deleted —
-by `MqttEgressHub::close` in the reload commit, by the boot cursor
-reconcile (`brenn-messaging/src/reconcile.rs`) after a restart — and the
-position is the only record of which retained messages were unread: a
-message before it was handed and has had its statuses. The report is
-therefore made while the position exists, or the position is kept until
-it is made. The reader is the only reporter of egress outcomes and has
-exited on both paths, so whatever reports here acts on a removed client's
-channel after the task that served it is gone. On the reload path the
-channel is still in the live directory, the position still exists and the
-hub still holds the client when the retire finds the reader ended:
-`retire_egress_readers` resolves the channel and calls `close` only after
-every retire returns, so the unread messages and their `status_to` can be
-read there (`ClientEgress::skip_unhanded`) and told through the hub before
-`close`. On the restart path the channel has left the directory the hub
-reads through and the boot cursor reconcile deletes the position, so the
-report has to come from where the reaping lives. A client added again under the same slug skips
-these messages and logs only their count (`MqttEgressHub::open`,
-`brenn-server/src/mqtt_egress.rs`).
-
-Reaping the rows without reporting does not close this entry. Done also
-requires that every unread message naming a `status_to` on a removed
-client's channel is told `dropped`, `removed` before its rows or the
-reader's position go, on both paths, with a test for each. Code sites:
-on the reload path, `retire_egress_readers` in
-`brenn-bootstrap/src/reload/commit.rs` and `retire_egress_reader` in
-`brenn-mqtt/src/state.rs`; on the restart path, `start_mqtt_egress` in
-`brenn-bootstrap/src/mqtt.rs`, which starts readers for declared clients
-only; and `MqttEgressHub::open` in `brenn-server/src/mqtt_egress.rs`,
-where a client added again passes the messages either path left.
-
+A client deleted from the configuration while the server is down is never
+reported. Its channel is not in the directory at boot, no reader is started
+for it (`start_mqtt_egress`, `brenn-bootstrap/src/mqtt.rs`), and the boot
+cursor reconcile (`brenn-messaging/src/reconcile.rs`) deletes the position,
+the only record of which retained messages were unread. Those messages are
+never counted for the operator, and a sender that named a `status_to` is told
+nothing: it sees no `handed` and its lifetime pass, and nothing at all under
+`lifetime_s` `"forever"`. A report needs a way to read a channel the directory
+does not hold before the reconcile deletes the position, which is
+MQTT-specific code in the generic messaging boot; that is the cost to weigh
+before building it. A client removed by a reload is reported by
+`MqttEgressHub::close` (`brenn-server/src/mqtt_egress.rs`), which is where the
+same report would be made. Done = such messages are reported `dropped`,
+`removed` before the position goes, with a test, or this half is closed as not
+worth that code. Reaping without that report or that decision does not close
+this entry.
 ## `mqtt-publish-acl-ops-config`
 
 Per-topic MQTT publish ACLs exist (`acl publish [topic_filter …]`), but
@@ -631,26 +583,6 @@ new in a trapped activation, or the kit reads a result again on the next
 one. Done = a real-host test in which an activation traps on a result and
 its caller is answered an error without waiting for the ceiling. The comment
 sits at `fail_delivered_requests` in `brenn-wasm-dispatch/src/lib.rs`.
-
-## `quality-removed-and-possibly-sent-representable-then-panicked`
-
-`brenn_mqtt::reader::EgressReport::DroppedMessage { message, cause:
-DropCause, sent: Sent }` can hold `DropCause::ClientRemoved` with
-`Sent::Possibly`, which the reader never produces: a removed message is one
-it never read, and the retire arm fills `sent` with `Sent::Never` only
-because the field exists. The hub's `delivery_status`
-(`brenn-server/src/mqtt_egress.rs`) panics on that combination, and its
-tests keep a panic case and a skip in `every_report` to police it. Decide
-whether the report type excludes it — e.g. a `DroppedMessage` cause that
-carries `sent` only on its session-stopped arm, so `report_dropped` takes the
-cause per message and the hub's match is total — or whether the runtime
-panic stays, weighing a third cause vocabulary beside the reader's
-`DropCause` and the status body's `DeliveryDropCause`. The current shape was
-specified by the design that added `sent`. Done = either the type cannot
-hold a removed, possibly-sent message and the panic, its test and the skip
-are gone, or the decision to keep the panic is recorded and this entry and
-its comment are removed. The comment sits at the panicking arm of
-`delivery_status`.
 
 ## `tool-provide-attachment-count`
 

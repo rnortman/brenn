@@ -12,8 +12,8 @@ use crate::config::{
 use crate::db::{init_db_memory, load_channel_retained_tail, read_send_budget, upsert_channels};
 use crate::mqtt_outbound::mqtt_egress_entry;
 use crate::testutils::{
-    TempBlobDir, covering_system_publisher, install_blob_store_at, seal_blob,
-    surface_registrations, test_channel_entry,
+    TempBlobDir, attach_mqtt_egress_reader, covering_system_publisher, install_blob_store_at,
+    seal_blob, surface_registrations, test_channel_entry,
 };
 use crate::{
     AttachmentName, ChannelEntry, MessageBody, MessageEnvelope, MessagingDirectory, MqttExpiry,
@@ -188,6 +188,9 @@ async fn fixture_with(install_clients: bool, install_blobs: bool) -> Fixture {
             (OTHER.to_string(), CLIENT_CAP),
             (UNCHANNELLED.to_string(), CLIENT_CAP),
         ]))));
+    }
+    for client in [CLIENT, OTHER] {
+        attach_mqtt_egress_reader(&m, client).await;
     }
     let resolve = |client: &str| {
         m.directory
@@ -1623,5 +1626,283 @@ async fn the_committed_row_carries_the_status_to() {
     assert!(
         f.rows(&f.status).await.is_empty(),
         "admission publishes no status"
+    );
+}
+
+// ── A closed egress channel ─────────────────────────────────────────────
+
+fn egress_reader() -> ParticipantId {
+    crate::mqtt_outbound::mqtt_outbound_participant()
+}
+
+impl Fixture {
+    /// Close `home`'s egress channel as a reload's removal does, leaving the
+    /// client registered and the channel in the directory.
+    async fn close_home(&self) {
+        let taken = self
+            .m
+            .detach_subscriber_taking_unseen(
+                EGRESS_HOME,
+                &egress_reader(),
+                self.outbound.resolved_channel.retain_depth,
+                crate::mqtt_outbound::MQTT_OUTBOUND_NOISE,
+            )
+            .await;
+        assert!(taken.is_some(), "the fixture's reader held a position");
+    }
+
+    fn full_budget(&self) -> u32 {
+        self.m.apps.load().get(APP).unwrap().messaging_send_budget()
+    }
+}
+
+/// A publish admitted and committed after the channel was closed, the client
+/// still registered and the channel still in the directory, is answered as for
+/// an unknown client: nothing is stored and the drawn budget is refunded. The
+/// send-rate token it drew shows it passed admission.
+#[tokio::test]
+async fn a_commit_to_a_closed_egress_channel_is_unknown_and_refunded() {
+    let f = fixture().await;
+    f.close_home().await;
+    let refusal = expect_refused(f.send_inline(b"on").await);
+    assert!(
+        matches!(&refusal, PublishResult::UnknownChannel(a) if a == ADDR),
+        "{refusal:?}"
+    );
+    assert!(f.rows(&f.outbound).await.is_empty(), "nothing stored");
+    assert!(f.rate_drawn(), "the publish passed admission");
+    assert_eq!(f.budget().await, Some(f.full_budget()), "budget refunded");
+
+    // The other client's channel is still in service.
+    f.send(OTHER_ADDR, MqttPayload::Inline(b"on".to_vec()), &options())
+        .await
+        .expect("committed");
+    assert_eq!(f.rows(&f.other).await.len(), 1);
+}
+
+/// A publish that passed admission while the channel was in service, and whose
+/// commit comes after the close and after the channel left the directory, is
+/// refused at the commit. The publish is held at its budget draw by the
+/// database lock — admission takes no lock before it — and the close and the
+/// directory removal happen through that held lock.
+#[tokio::test]
+async fn a_commit_admitted_before_the_close_and_landing_after_it_is_refused() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let f = fixture().await;
+    let conn = f.m.db.lock().await;
+    let mut publish = Box::pin(f.send_inline(b"on"));
+    assert!(
+        matches!(
+            publish
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ),
+        "the publish waits on the database lock"
+    );
+    assert!(
+        f.rate_drawn(),
+        "the publish passed admission before the close"
+    );
+    crate::db::delete_subscriber_cursor(&conn, f.outbound.uuid, &egress_reader());
+    assert!(f.m.directory.remove_channel(&f.outbound.uuid));
+    drop(conn);
+
+    let refusal = expect_refused(publish.await);
+    assert!(
+        matches!(&refusal, PublishResult::UnknownChannel(a) if a == ADDR),
+        "{refusal:?}"
+    );
+    assert!(f.rows(&f.outbound).await.is_empty(), "nothing stored");
+    assert_eq!(f.budget().await, Some(f.full_budget()), "budget refunded");
+}
+
+/// Polls `fut` once with a waker that does nothing and asserts it is pending.
+/// A future pending on the database lock holds its place in the lock's queue,
+/// and a later `.await` finds the lock handed to it.
+fn poll_pending<F: std::future::Future + ?Sized>(fut: std::pin::Pin<&mut F>, what: &str) {
+    use std::task::{Context, Poll, Waker};
+    assert!(
+        matches!(
+            fut.poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ),
+        "{what}"
+    );
+}
+
+/// A publish whose commit is queued on the database lock ahead of the close's
+/// take is committed and is in what the take returns. The database lock hands
+/// itself over in queue order, so the order is fixed: the publish is parked at
+/// its commit by a holder queued behind its budget draw, and the take queues
+/// after it.
+#[tokio::test]
+async fn a_commit_queued_before_the_take_is_in_what_the_take_returns() {
+    let f = fixture().await;
+    let held = f.m.db.lock().await;
+    let mut publish = Box::pin(f.send_inline(b"on"));
+    poll_pending(publish.as_mut(), "the publish waits at its budget draw");
+    let mut holder = Box::pin(f.m.db.lock());
+    poll_pending(holder.as_mut(), "the holder queues behind the publish");
+    drop(held);
+    poll_pending(
+        publish.as_mut(),
+        "the publish draws its budget and waits at its commit",
+    );
+    let held = holder.await;
+    let reader = egress_reader();
+    let mut take = Box::pin(f.m.detach_subscriber_taking_unseen(
+        EGRESS_HOME,
+        &reader,
+        f.outbound.resolved_channel.retain_depth,
+        crate::mqtt_outbound::MQTT_OUTBOUND_NOISE,
+    ));
+    poll_pending(take.as_mut(), "the take queues behind the commit");
+    drop(held);
+
+    let (committed, unseen) = tokio::join!(publish, take);
+    let committed = committed.expect("committed ahead of the take");
+    let unseen = unseen.expect("the fixture's reader held a position");
+    assert_eq!(
+        unseen
+            .iter()
+            .map(|(_, envelope)| envelope.message_id)
+            .collect::<Vec<_>>(),
+        vec![committed.message_id],
+        "the take returns the commit for its report"
+    );
+}
+
+/// A publish whose commit is queued on the database lock behind the close's
+/// take is refused: the take reads what is unread and gives up the position in
+/// one hold, so no commit lands between the two. The take queues behind the
+/// publish's budget draw and ahead of its commit.
+#[tokio::test]
+async fn a_commit_queued_behind_the_take_is_refused_and_not_in_what_it_returns() {
+    let f = fixture().await;
+    let held = f.m.db.lock().await;
+    let mut publish = Box::pin(f.send_inline(b"on"));
+    poll_pending(publish.as_mut(), "the publish waits at its budget draw");
+    assert!(
+        f.rate_drawn(),
+        "the publish passed admission before the close"
+    );
+    let reader = egress_reader();
+    let mut take = Box::pin(f.m.detach_subscriber_taking_unseen(
+        EGRESS_HOME,
+        &reader,
+        f.outbound.resolved_channel.retain_depth,
+        crate::mqtt_outbound::MQTT_OUTBOUND_NOISE,
+    ));
+    poll_pending(take.as_mut(), "the take queues behind the budget draw");
+    drop(held);
+    poll_pending(
+        publish.as_mut(),
+        "the publish draws its budget and waits at its commit, behind the take",
+    );
+
+    let (unseen, published) = tokio::join!(take, publish);
+    let unseen = unseen.expect("the fixture's reader held a position");
+    assert!(unseen.is_empty(), "nothing was committed before the take");
+    let refusal = expect_refused(published);
+    assert!(
+        matches!(&refusal, PublishResult::UnknownChannel(a) if a == ADDR),
+        "{refusal:?}"
+    );
+    assert!(f.rows(&f.outbound).await.is_empty(), "nothing stored");
+    assert_eq!(f.budget().await, Some(f.full_budget()), "budget refunded");
+}
+
+/// A payload over the body cap refused at the commit leaves no blob behind: the
+/// refused append dropped the only hold on it.
+#[tokio::test]
+async fn an_over_cap_payload_refused_at_the_commit_leaves_no_blob() {
+    let f = fixture().await;
+    f.close_home().await;
+    let over = vec![b'x'; f.m.max_body_bytes() + 1];
+    let refusal = expect_refused(f.send_inline(&over).await);
+    assert!(
+        matches!(refusal, PublishResult::UnknownChannel(_)),
+        "{refusal:?}"
+    );
+    assert_eq!(f.blobs(), (0, 0), "no blob left");
+    assert!(f.rows(&f.outbound).await.is_empty(), "nothing stored");
+    assert_eq!(f.budget().await, Some(f.full_budget()), "budget refunded");
+}
+
+#[tokio::test]
+#[should_panic(expected = "whose egress reader holds no position on it")]
+async fn a_flushed_mqtt_entry_to_a_closed_egress_channel_panics() {
+    let f = fixture().await;
+    f.close_home().await;
+    let none = HeldAttachments::none();
+    f.m.publish_from_wasm(
+        COMPONENT,
+        &[wasm_mqtt(
+            EGRESS_HOME,
+            CLIENT,
+            "lights/kitchen/set",
+            b"on",
+            options(),
+            &none,
+        )],
+    )
+    .await;
+}
+
+/// The position is checked for each egress channel a flush writes to, not only
+/// the first: an entry to a closed channel after one to a channel in service
+/// still panics.
+#[tokio::test]
+#[should_panic(expected = "whose egress reader holds no position on it")]
+async fn a_flushed_mqtt_entry_to_a_closed_channel_after_an_open_one_panics() {
+    let f = fixture().await;
+    f.close_home().await;
+    let none = HeldAttachments::none();
+    let egress_away = crate::mqtt_egress_address(OTHER);
+    f.m.publish_from_wasm(
+        COMPONENT,
+        &[
+            wasm_mqtt(&egress_away, OTHER, "lights/b/set", b"1", options(), &none),
+            wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"2", options(), &none),
+        ],
+    )
+    .await;
+}
+
+/// The take returns what the position had not been served, enacts the outrun
+/// its window passed under the rung it is given, and forgets the tally with the
+/// position.
+#[tokio::test]
+async fn detach_taking_unseen_enacts_the_outrun_and_forgets_the_tally() {
+    let f = fixture().await;
+    let probe = ParticipantId::for_system("probe");
+    f.m.attach_subscriber(STATUS, "probe", &probe, Depth::Bounded(8))
+        .await;
+    for body in ["a", "b", "c"] {
+        crate::testutils::insert_bus_message(&f.m, &f.status, body, crate::ChannelScheme::Brenn)
+            .await;
+    }
+    let taken =
+        f.m.detach_subscriber_taking_unseen(STATUS, &probe, Depth::Bounded(1), NoiseLevel::Alarm)
+            .await
+            .expect("the probe held a position");
+    let bodies: Vec<_> = taken
+        .iter()
+        .map(|(_, envelope)| envelope.body.as_text().unwrap().to_owned())
+        .collect();
+    assert_eq!(bodies, vec!["c"]);
+    assert_eq!(
+        f.router.alarms.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a and b were outrun, under the alarm rung"
+    );
+    assert_eq!(f.m.drop_counter(STATUS, &probe), 0, "the tally went too");
+    assert!(
+        f.m.detach_subscriber_taking_unseen(STATUS, &probe, Depth::Bounded(1), NoiseLevel::Alarm)
+            .await
+            .is_none()
     );
 }

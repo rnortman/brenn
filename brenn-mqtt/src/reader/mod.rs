@@ -22,11 +22,10 @@
 //! reader waits up to the client's `stop_wait_secs` for the notices of what
 //! is in flight, reports each as what it resolved to and the rest unknown,
 //! and exits; the handle's reader-live watch goes `false` after its last
-//! report has committed. A retire that arrives while the reader is ending for
-//! the stop is still carried out: the channel is abandoned and its messages
-//! reported dropped for the removal. A reader started on a handle whose stop
-//! is already set hands nothing: it skips its first pass and its first wake is
-//! the stop.
+//! report has committed. A retired reader leaves the channel as it is; what it
+//! never read is reported when the client's channel is closed. A reader
+//! started on a handle whose stop is already set hands nothing: it skips its
+//! first pass and its first wake is the stop.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -122,16 +121,6 @@ pub enum Sent {
     Possibly,
 }
 
-/// Why handed or unhanded messages were given up; whether the library ever
-/// had them is the report's `sent`, where it carries one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DropCause {
-    /// The session stopped while the reader held them for a resubmit.
-    SessionStopped,
-    /// The client was removed with them still on its channel.
-    ClientRemoved,
-}
-
 /// What became of the messages the reader handled. The bus side's report sink
 /// is the one place each is logged, counted and raised.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,32 +153,21 @@ pub enum EgressReport {
         message: EgressMeta,
         cause: UnknownCause,
     },
-    /// `count` messages naming no `status_to` were given up, whether or not
-    /// the library ever had them.
+    /// `count` held messages naming no `status_to` were given up as the
+    /// reader ended, whether or not the library ever had them.
     Dropped {
-        cause: DropCause,
         count: u64,
     },
-    /// One message naming a `status_to` was given up; `sent` says whether the
-    /// library ever had it.
+    /// One held message naming a `status_to` was given up as the reader
+    /// ended; `sent` says whether the library ever had it.
     DroppedMessage {
         message: EgressMeta,
-        cause: DropCause,
         sent: Sent,
     },
     /// A message naming a `status_to` left retention before it was read.
     PayloadGone(EgressMeta),
     /// Nothing is outstanding and the channel holds nothing unhanded.
     Drained,
-}
-
-/// What [`EgressBus::abandon`] skipped.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Abandoned {
-    /// How many unhanded messages the position moved past.
-    pub count: u64,
-    /// The metadata of those among them that name a `status_to`.
-    pub named: Vec<EgressMeta>,
 }
 
 /// The reader's view of its client's egress channel: one subscriber position.
@@ -199,8 +177,6 @@ pub trait EgressBus: Send + Sync + 'static {
     async fn unhanded(&self, limit: usize) -> Vec<EgressItem>;
     /// Move the position past `seq`.
     async fn advance(&self, seq: MessageSeq);
-    /// Move the position past everything retained; what was unhanded.
-    async fn abandon(&self) -> Abandoned;
     /// Changes whenever the channel may hold a message this reader has not read.
     fn wakes(&self) -> watch::Receiver<u64>;
     /// The channel's retain depth, `None` when unbounded.
@@ -368,8 +344,8 @@ impl Reader {
                 () = std::future::ready(()), if again => Wake::Again,
             };
             match wake {
-                Wake::Stop => return self.end(Ending::Stop, &mut retire).await,
-                Wake::Retire => return self.end(Ending::Retire, &mut retire).await,
+                Wake::Stop => return self.end(Ending::Stop).await,
+                Wake::Retire => return self.end(Ending::Retire).await,
                 Wake::Channel => self.unread = true,
                 Wake::Room | Wake::Again => {}
                 Wake::Notice(seq, result) => {
@@ -673,16 +649,12 @@ impl Reader {
         answered
     }
 
-    /// The reader's last act before it exits: settle, report what is still
-    /// outstanding, and on a retire move the position past everything left on
-    /// the channel and report it dropped. Logs one line as it begins and one
-    /// when its last report has been made, so a stop that hangs in a bus call
-    /// leaves a begin line with no end naming the client.
-    ///
-    /// Ending for the stop, it then closes `retire`: a retire sent before the
-    /// close is carried out here, and one sent after it fails, so a retire is
-    /// never left unread.
-    async fn end(&mut self, ending: Ending, retire: &mut oneshot::Receiver<()>) {
+    /// The reader's last act before it exits, for a stop or a retire alike:
+    /// settle and report what is still outstanding. The channel is left as it
+    /// is. Logs one line as it begins and one when its last report has been
+    /// made, so a stop that hangs in a bus call leaves a begin line with no end
+    /// naming the client.
+    async fn end(&mut self, ending: Ending) {
         let handle = Arc::clone(&self.handle);
         let client = handle.config.identity.slug.as_str();
         tracing::info!(
@@ -695,26 +667,9 @@ impl Reader {
         );
         self.settle(ending).await;
         self.report_stopped().await;
-        let retired = match ending {
-            Ending::Retire => true,
-            Ending::Stop => {
-                retire.close();
-                retire.try_recv().is_ok()
-            }
-        };
-        if retired {
-            let Abandoned { count, named } = self.bus.abandon().await;
-            let named = named
-                .into_iter()
-                .map(|message| (message, Sent::Never))
-                .collect();
-            self.report_dropped(DropCause::ClientRemoved, count, named)
-                .await;
-        }
         tracing::info!(
             client,
             ending = ending.as_str(),
-            retired,
             "MQTT egress reader ended: every outcome reported",
         );
     }
@@ -768,7 +723,8 @@ impl Reader {
     }
 
     /// Report what the reader still has as it exits: in flight is unknown,
-    /// held is dropped.
+    /// held is dropped: one count for those naming no `status_to`, if any,
+    /// then one report per message naming one.
     async fn report_stopped(&mut self) {
         for (_, InFlight { message, .. }) in std::mem::take(&mut self.in_flight) {
             self.bus
@@ -779,49 +735,20 @@ impl Reader {
                 .await;
         }
         let held = std::mem::take(&mut self.held);
-        let count = held.len() as u64;
-        let named = held
-            .values()
-            .filter(|held| held.message.publish.status_to.is_some())
-            .map(|held| (EgressMeta::of(&held.message), held.sent))
-            .collect();
-        self.report_dropped(DropCause::SessionStopped, count, named)
-            .await;
-    }
-
-    /// Report `count` messages dropped for `cause`, of which `named` are the
-    /// ones naming a `status_to`, each with whether the library ever had it:
-    /// one count for the rest, if any, then one report per named message.
-    async fn report_dropped(
-        &mut self,
-        cause: DropCause,
-        count: u64,
-        named: Vec<(EgressMeta, Sent)>,
-    ) {
-        let unnamed = count.checked_sub(named.len() as u64).unwrap_or_else(|| {
-            panic!(
-                "{} dropped messages name a status_to out of {count} dropped",
-                named.len()
-            )
-        });
-        if unnamed > 0 {
+        let (named, unnamed): (Vec<Held>, Vec<Held>) = held
+            .into_values()
+            .partition(|held| held.message.publish.status_to.is_some());
+        if !unnamed.is_empty() {
             self.bus
                 .report(EgressReport::Dropped {
-                    cause,
-                    count: unnamed,
+                    count: unnamed.len() as u64,
                 })
                 .await;
         }
-        for (message, sent) in named {
-            assert!(
-                message.status_to.is_some(),
-                "message {} is reported dropped by itself and names no status_to",
-                message.id
-            );
+        for Held { message, sent } in named {
             self.bus
                 .report(EgressReport::DroppedMessage {
-                    message,
-                    cause,
+                    message: EgressMeta::of(&message),
                     sent,
                 })
                 .await;

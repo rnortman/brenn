@@ -293,6 +293,7 @@ async fn build(
     if let Some(bound) = mqtt_bound {
         crate::test_support::mqtt::register_test_client(bridge.mqtt_service(), MQTT_CLIENT, bound);
         m.install_mqtt_clients(bridge.mqtt_service().clone());
+        brenn_messaging::testutils::attach_mqtt_egress_reader(&m, MQTT_CLIENT).await;
     }
     Fixture { bridge, m, blobs }
 }

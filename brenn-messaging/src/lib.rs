@@ -1932,6 +1932,39 @@ impl Messenger {
         dropped
     }
 
+    /// Give up `subscriber`'s position on `channel_address` and return what it
+    /// had not been served at `push_depth`, oldest first — read and dropped in
+    /// one store step, so no commit lands between the two. The outrun the read
+    /// passed is enacted under `noise`, as an advance over it would have, and
+    /// the metered tally then goes with the position, as for
+    /// [`Messenger::detach_subscriber`].
+    ///
+    /// `None` when the subscriber held no position: nothing is enacted.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel, or `push_depth` is sampled.
+    pub async fn detach_subscriber_taking_unseen(
+        &self,
+        channel_address: &str,
+        subscriber: &ParticipantId,
+        push_depth: config::Depth,
+        noise: config::NoiseLevel,
+    ) -> Option<Vec<(store::MessageSeq, Arc<MessageEnvelope>)>> {
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "messaging: detach requested for channel {channel_address:?} not in the directory"
+            )
+        });
+        let taken = self
+            .store_for(&entry)
+            .detach_taking_unseen(subscriber, push_depth)
+            .await?;
+        self.enact_overflow_noise(&entry.address, subscriber, noise, taken.outrun.noise_charge);
+        self.forget_metered_drops(&entry.address, subscriber);
+        Some(taken.unseen)
+    }
+
     /// Advance `subscriber`'s position on `channel_address` over a window it
     /// has been served, and enact the noise for whatever that window skipped.
     ///

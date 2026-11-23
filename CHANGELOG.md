@@ -120,6 +120,15 @@ All notable changes to Brenn are documented here.
 - **Fixed:** after an MQTT session's supervisor recovers from a panic, a
   message in flight on the dead connection is resolved by the rules for a
   lost connection, and is never taken for a later message's acknowledgement.
+- **Fixed:** an `MqttSend` to a client that a config reload is removing is
+  no longer answered "committed" and then silently lost. It is either
+  refused, as for a client that is not configured, or reported as dropped
+  with cause `removed` — to the operator, and to its `status_to` when it
+  names one. A client removed by a reload while the server is shutting down
+  has its unsent messages reported the same way, and any open alert for the
+  client is closed with a summary that names the removal. Still not
+  reported: messages left for a client deleted from the config while the
+  server was down.
 - **BREAKING for operators:** `egress` is now a reserved channel name, for
   routing MQTT publishes through the message bus. A declared
   channel named `egress`, `egress.<x>` or `egress/<x>` no longer loads, and no
@@ -129,9 +138,7 @@ All notable changes to Brenn are documented here.
   `MqttSend` and from components. Its window (default 256) is the outage it survives; tune every
   client's with `channel at prefix "brenn:egress/mqtt/"` or one client's with
   `channel at "brenn:egress/mqtt/<client>"`, and restart to apply a retune. A
-  message dropped because the window overflowed is counted and alerted.
-  Known gap: an `MqttSend` to a client that a config reload is removing can be
-  committed and lost without a report. A
+  message dropped because the window overflowed is counted and alerted. A
   component's `in` port may read a declared client's channel; nothing else may
   name it.
 - **For component authors:** the SDK's `TransportMeta` gains the variant

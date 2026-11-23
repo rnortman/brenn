@@ -1715,20 +1715,22 @@ for its delivery statuses, absent when it named none — and its payload as the 
 against the client's channel: authority, the client and its channel, the
 MQTT checks, the body cap, the send rate (drawn per sender and client) and the
 budget. A client being added or removed by a reload can be absent for a
-moment; a publish in that moment is answered as for an unknown client. A
-removed client is not absent at once: its reader is retired before its
-channel leaves the directory, and the client stays registered until its
-session stops. An `MqttSend` admitted for it after the reader is retired is
-answered as committed and is never published, counted, logged or alerted
-(`TODO(correctness-publish-during-egress-retirement-silently-lost)`).
+moment; a publish in that moment is answered as for an unknown client. The
+commit needs one thing more: the reader's position on the channel, checked in
+the same step as the write. A removed client's channel takes commits until
+the reload closes it (Reload, below), and every one of them is then either
+published or reported; from the close on, a publish is answered as for an
+unknown client, whatever the directory and the client table still say,
+including a publish admitted before the close and committed after it.
 
 A component's publish is admitted by the same checks at the call, and
 committed at the activation's flush with no send rate drawn: the component's
-per-activation ceilings and the client's token bucket bound it instead. The
-reload gap above is `MqttSend`'s alone. A consumer can name only declared
+per-activation ceilings and the client's token bucket bound it instead. A
+component never meets a closed channel: a consumer can name only declared
 clients, a reload that removes a client changes every consumer naming it, and
 such a consumer is stopped, its activation in flight flushed, before the
-client's reader is retired.
+client's reader is retired. A flush that finds no reader's position on the
+channel is a host bug and panics.
 
 **The reader.** Each client's session has one reader, a host task holding the
 system participant `system:mqtt-outbound`'s position on that client's channel.
@@ -1781,16 +1783,16 @@ counted and raises no alert. One with no `status_to`, or whose status could
 not be published, is alerted.
 Alerts are coalesced per client and kind: the first failure of a kind raises
 an alert and opens an episode; later failures of that kind are logged and
-counted only; the client's next delivery, or its reader running dry, closes
-every open episode and raises one summary alert per episode that withheld
-any, with how many. A reconnect that finds 200 expired messages raises two
+counted only; the client's next delivery, its reader running dry, or its
+removal by a reload closes every open episode and raises one summary alert per
+episode that withheld any, with how many. A reconnect that finds 200 expired messages raises two
 alerts, not 200.
 
 A status that could not be published (*Delivery status*, below) is a `warn`
 line naming the client, the message id, the status kind, the address and the
 refusal; a count per client; and an alert under a fifth kind, *status not
-published*. That episode closes only when the reader runs dry, never on a
-delivery or a published status: a throttled status channel refuses only the
+published*. That episode closes only when the reader runs dry or the client
+is removed, never on a delivery or a published status: a throttled status channel refuses only the
 excess, and one client serves many senders, so refused and published statuses
 interleave, and closing on either would raise an alert per alternation. A
 cause that outlasts the run alerts again in the next.
@@ -1846,33 +1848,33 @@ durable and the cursor survives, so the restart loses nothing.
 
 **Reload.** A reload that adds a client mints its channel, gives the reader a
 position on it and starts the reader before any policy can name the client.
-One that removes a client retires the reader before the channel leaves: what
-the channel held for the reader when it was retired is abandoned and reported
-dropped with the count, each message naming a `status_to` told `dropped`,
-`removed` there, and the position and subscriber entry are removed with
-the channel. A reload that removes or changes a client waits for that
+One that removes a client retires the reader before the channel leaves: the
+reader hands nothing more and reports what it had outstanding. The reload
+then closes the channel: in one step with respect to commits it drops the
+position and takes everything the channel held unread, and reports all of
+it `dropped`, `removed` — by count to the operator, and to each message's
+`status_to` when it names one. The subscriber entry is removed, and the
+channel leaves the directory. The close is the same whether or not the reader
+was still running, so a removal that races a server shutdown is reported the
+same way. A reload that removes or changes a client waits for that
 client's stop (Stopping, above): the removed clients' readers are retired
 together, each waiting up to its client's `stop_wait_secs`, and then the
 changed clients' sessions are stopped together, under the same rule. A reload
 that both removes and changes clients against brokers that do not answer can
-therefore wait up to two bounds. A removal that races a server shutdown is
-still carried out if the client's reader is waiting out the stop when the
-retire comes; if the reader has already finished, what the channel still
-holds is not reported dropped (`TODO(mqtt-egress-removed-client-rows)`), and
-a `warn` line names the client. A client deleted from the configuration
-while the server is down is not reported either: no reader is started for it
-at the next start, and what its channel holds is told nothing
-(`TODO(mqtt-egress-removed-client-rows)`). An
-`MqttSend` admitted for a removed client after its reader is retired is lost
-unreported (Admission, above). The removed
+therefore wait up to two bounds. A client deleted from the configuration
+while the server is down is not reported: no reader is started for it at the
+next start, and what its channel holds is told nothing
+(`TODO(mqtt-egress-removed-client-rows)`). The removed
 channel's stored row and retained messages stay in the database
 (`TODO(mqtt-egress-removed-client-rows)`). One that changes a client keeps the
 channel and the cursor and starts a reader on the successor session.
 
 **A fresh position.** A position created on a channel that already retains
 messages — a client added again under a slug that was removed — skips them:
-they were committed for the earlier client and are not published. The skip is
-logged at `warn` with the count. A restart resumes an existing position and
+they were committed for the earlier client and are not published. Each was
+already reported, an outcome while its client ran or `dropped`, `removed` at
+the removal, except what a client deleted while the server was down left
+unread (Reload, above). The skip is logged at `warn` with the count. A restart resumes an existing position and
 hands off exactly what was not handed.
 
 #### Delivery status
@@ -1968,18 +1970,15 @@ the rest.
 - Silences. A message the egress channel's window dropped before the
   reader reached it gets no status: the store reports overflow as a count. A
   message in flight when the server crashed has a `handed` and never an
-  outcome. A message committed in the moment its client is being removed gets
-  nothing (`TODO(correctness-publish-during-egress-retirement-silently-lost)`).
-  And nothing is published while the client has no connection: `expired`
+  outcome, and a server that dies while a removal is being reported leaves
+  the rest of that removal unreported. And nothing is published while the client has no connection: `expired`
   comes when a connection next lets the reader reach the message — hours
   later if the client is down that long, never if it stays down or the window
   drops the message first. What a removed client's channel still holds
-  unread is told nothing when a reload removes the client during a server
-  shutdown after its reader has finished the stop, or when the client is
-  deleted from the configuration while the server is down (Reload, above;
+  unread is told nothing when the client is deleted from the configuration
+  while the server is down (Reload, above;
   `TODO(mqtt-egress-removed-client-rows)`); a message sent with `lifetime_s`
-  `"forever"` then has no end of lifetime to infer from. Apart from that
-  removal, a clean shutdown is not a silence: it waits for every session's
+  `"forever"` then has no end of lifetime to infer from. A clean shutdown is not a silence: it waits for every session's
   reader and commits every status before the process exits.
 
 **When a status is not published.** A status is published at report time on

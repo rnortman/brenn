@@ -40,7 +40,7 @@ pub use payload::{
     InboundClass, InboundPayload, OutboundArg, OutboundPayload, classify_inbound, decode_outbound,
 };
 pub use reader::{
-    DropCause, EgressBus, EgressItem, EgressMessage, EgressMeta, EgressReport, UnknownCause,
+    EgressBus, EgressItem, EgressMessage, EgressMeta, EgressReport, UnknownCause,
     start_egress_reader,
 };
 pub use service::{

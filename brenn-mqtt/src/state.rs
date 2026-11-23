@@ -580,16 +580,13 @@ impl MqttClientHandle {
     }
 
     /// Retire the egress reader and wait for it to exit, leaving the session
-    /// running. The reader waits up to [`Self::stop_wait`] for the outcomes of
-    /// what it has in flight, reports what it had outstanding, moves its
-    /// position past everything the channel retains and reports how many that
-    /// skipped.
-    ///
-    /// A reader still ending for the session's stop carries the retire out
-    /// before it exits. One that has already finished ending for the stop is
-    /// not retired: what the channel still holds for it is not abandoned or
-    /// reported dropped, a `warn` line says so, and this returns once the
-    /// reader has exited.
+    /// running. The reader hands nothing more, waits up to
+    /// [`Self::stop_wait`] for the outcomes of what it has in flight, reports
+    /// what it had outstanding and exits, leaving its position where it is. A
+    /// reader already ending, or ended, for the session's stop is waited for
+    /// in the same way. What the channel holds unread is the hub's to report
+    /// when it closes the client's channel, whether or not a reader was still
+    /// running.
     ///
     /// # Panics
     ///
@@ -608,14 +605,6 @@ impl MqttClientHandle {
                 *self.stop_tx.borrow(),
                 "the egress reader of MQTT client {:?} exited without being retired or stopped",
                 self.config.identity.slug,
-            );
-            // TODO(mqtt-egress-removed-client-rows): the messages this reader
-            // left unread are never reported `dropped`, `removed`: nothing
-            // reports a removed client's channel once its reader has ended.
-            tracing::warn!(
-                client = %self.config.identity.slug,
-                "MQTT egress reader already ended for the session's stop when its client was \
-                 removed: messages still on its channel are not reported dropped for the removal",
             );
         }
         self.egress_reader_exited().await;
