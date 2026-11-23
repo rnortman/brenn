@@ -18,6 +18,11 @@ rust_library(
     edition = "2024",
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    # TODO(small-edit-recompile-fan-out): this crate's compile takes every crate
+    # below it, direct or transitive, as an input, so a one-line edit in a crate
+    # below it (measured for `//brenn-lib`, `//brenn-messaging` and
+    # `//brenn-wasm`) recompiles this crate and its test crate, and that compile
+    # is most of a small-edit `make check` whose test run is served from cache.
     deps = all_crate_deps(normal = True) + testutils_deps([
         # Only `test_support::http` names it, and that module compiles out with
         # the feature.
@@ -64,7 +69,7 @@ rust_library(
 
 # Tests reach guest components at `brenn-wasm/target/components/`, relative to
 # the runfiles root the test runs from, which is where the staged fixtures land.
-# `large` (900s), not the `medium` default (300s): this binary runs ~1,350
+# `large` (900s), not the `medium` default (300s): this binary runs ~2,000
 # tests, which fits comfortably in 300s on a dev machine and does not on a cold
 # 4-vCPU CI runner sharing itself with the rest of the graph. The size is also
 # what Bazel schedules the action's local resources against, so the repo's
@@ -73,7 +78,7 @@ rust_library(
 # `data` is the thirteen components this crate's tests actually open, one
 # fixture target each — not the whole set. Runfiles are inputs to the test
 # action, so every component named here is an edge from a guest crate to all
-# ~1,350 tests; the others cost nothing when they change. The seven
+# ~2,000 tests; the others cost nothing when they change. The seven
 # specifications listed are the five Google Workspace classes, the
 # `google-maps-tools` class and the `processor-kit-file-test` fixture, whose
 # `provide` statements the e2e rigs lower; each component's fixture already
@@ -85,7 +90,7 @@ rust_library(
 # without its fixture fails loudly on a missing runfile.
 #
 # TODO(crate-split): those thirteen still couple every component edit to the whole
-# binary, because the fixture-reading tests share this target with ~1,310 that
+# binary, because the fixture-reading tests share this target with ~1,800 that
 # read none — and any source edit re-runs all of them regardless. The cure is
 # finer crates: the dispatch families that read only a guest left with
 # `brenn-wasm-dispatch`, and the three that also drive the tool executor and the
@@ -210,7 +215,7 @@ rust_test(
 
 # Its own suite because `//surface:dist` is downstream of every surface crate,
 # the wasm-bindgen CLI and the transpiler. On the unit-test target above, a
-# surface edit would rerun that target's ~2,500 tests; here it reruns one.
+# surface edit would rerun that target's ~2,000 tests; here it reruns one.
 rust_test(
     name = "surface_manifest_parity",
     srcs = ["tests/surface_manifest_parity.rs"],

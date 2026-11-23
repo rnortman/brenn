@@ -5,6 +5,8 @@
 //! own. The rig's blob store has production limits and the component runs
 //! under the production fuel and memory unless a case says otherwise.
 
+use std::cell::Cell;
+
 use base64ct::{Base64UrlUnpadded, Encoding};
 use brenn_envelope::AttachmentName;
 use brenn_messaging_store::blob::{BlobLimits, BlobUsage};
@@ -122,12 +124,87 @@ fn leaf_bytes(mime_type: &str, charset: &str, bytes: &[u8]) -> Value {
 /// what is left. The answer and that `n`.
 fn filled(id: &str, len: usize, payload_of: fn(usize) -> Value) -> (String, usize) {
     let size = |n: usize| message(id, "", &payload_of(n)).len();
+    let lo = largest_fitting(len, size);
+    let payload = payload_of(lo);
+    let framed = message(id, "", &payload).len();
+    let answer = message(id, &"s".repeat(len - framed), &payload);
+    assert_eq!(answer.len(), len);
+    (answer, lo)
+}
+
+/// The largest `n` whose `size(n)` is at most `len`, for a `size` that
+/// grows with every unit.
+fn largest_fitting(len: usize, size: impl Fn(usize) -> usize) -> usize {
     const SPAN: usize = 1024;
     let (one, span) = (size(1), size(1 + SPAN));
     assert!(one <= len, "one unit of the shape fits {len} bytes");
-    // The answer grows by about `(span - one) / SPAN` a unit; base64url's
-    // groups of four and the body's `size` growing a digit make the
-    // estimate off by a unit or two either way.
+    assert!(span > one, "the answer grows with its units");
+    // The answer grows by about `(span - one) / SPAN` a unit over the probed
+    // span and by a different amount at the answer — the body's `size` gains
+    // digits and units need not all be one length — so an estimate from that
+    // slope misses by a share of `n`. It is corrected once by its measured
+    // miss; the answer is then bracketed from it and bisected, every bound
+    // measured.
+    let units_in = |bytes: usize| bytes * SPAN / (span - one);
+    let mut at = 1 + units_in(len - one);
+    let measured = size(at);
+    let corrected = if measured <= len {
+        at + units_in(len - measured)
+    } else {
+        at.saturating_sub(units_in(measured - len)).max(1)
+    };
+    let mut fits = measured <= len;
+    if corrected != at {
+        at = corrected;
+        fits = size(at) <= len;
+    }
+    let (mut lo, mut hi);
+    let mut step = 1;
+    if fits {
+        lo = at;
+        loop {
+            let probe = lo + step;
+            if size(probe) <= len {
+                lo = probe;
+                step *= 2;
+            } else {
+                hi = probe;
+                break;
+            }
+        }
+    } else {
+        hi = at;
+        loop {
+            let probe = hi.saturating_sub(step);
+            if probe <= 1 {
+                lo = 1;
+                break;
+            }
+            if size(probe) <= len {
+                lo = probe;
+                break;
+            }
+            hi = probe;
+            step *= 2;
+        }
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if size(mid) <= len {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// The reference [`largest_fitting`] is held to: from the same estimate,
+/// one unit at a time.
+fn walked(len: usize, size: impl Fn(usize) -> usize) -> usize {
+    const SPAN: usize = 1024;
+    let (one, span) = (size(1), size(1 + SPAN));
+    assert!(one <= len, "one unit of the shape fits {len} bytes");
     let mut lo = 1 + (len - one) * SPAN / (span - one);
     while size(lo) > len {
         lo -= 1;
@@ -135,11 +212,77 @@ fn filled(id: &str, len: usize, payload_of: fn(usize) -> Value) -> (String, usiz
     while size(lo + 1) <= len {
         lo += 1;
     }
-    let payload = payload_of(lo);
-    let framed = message(id, "", &payload).len();
-    let answer = message(id, &"s".repeat(len - framed), &payload);
-    assert_eq!(answer.len(), len);
-    (answer, lo)
+    lo
+}
+
+/// For every shape, at four consecutive bounds (every residue of base64url's
+/// groups of four) and at one where the estimate misses by tens of units
+/// either way, the search finds the `n` the unit walk finds.
+#[test]
+fn the_fill_search_finds_what_a_unit_walk_finds_for_every_shape() {
+    let bounds = [
+        16 * 1024,
+        16 * 1024 + 1,
+        16 * 1024 + 2,
+        16 * 1024 + 3,
+        64 * 1024,
+    ];
+    for shape in SHAPES {
+        let size = |n: usize| message("m1", "", &(shape.payload)(n)).len();
+        for len in bounds {
+            assert_eq!(
+                largest_fitting(len, size),
+                walked(len, size),
+                "{} at {len} bytes",
+                shape.name
+            );
+        }
+    }
+}
+
+/// On sizes that grow with every unit — whatever the estimate's miss, in
+/// either direction — the search finds the largest `n` that fits, in a
+/// number of `size` calls that does not walk.
+#[test]
+fn the_fill_search_brackets_any_growing_size() {
+    type Size = fn(usize) -> usize;
+    let sizes: [(&str, Size); 5] = [
+        ("a line", |n| 100 + 7 * n),
+        ("steeper at the answer", |n| n + n * n / 4096),
+        ("flatter at the answer", |n| 4 * n + 64 * n.isqrt()),
+        ("a line and its digits", |n| {
+            50 + 3 * n + n.ilog10() as usize
+        }),
+        ("a step after the first unit", |n| {
+            if n == 1 { 1 } else { 4096 + n }
+        }),
+    ];
+    for (name, size) in sizes {
+        let scanned = |len: usize| {
+            let mut n = 1;
+            while size(n + 1) <= len {
+                n += 1;
+            }
+            n
+        };
+        let mut lens = vec![size(1), size(2) - 1];
+        for n in [2, 3, 1000, 50_000, 1_000_000] {
+            lens.extend([size(n), size(n) - 1]);
+        }
+        for len in lens {
+            let calls = Cell::new(0);
+            let found = largest_fitting(len, |n| {
+                calls.set(calls.get() + 1);
+                size(n)
+            });
+            assert_eq!(found, scanned(len), "{name} at {len}");
+            assert!(
+                calls.get() <= 64,
+                "{name} at {len}: {} calls of `size`",
+                calls.get()
+            );
+        }
+    }
 }
 
 /// One form of a shape's message as it is expected to be answered.
@@ -213,7 +356,8 @@ fn html_parts(n: usize) -> Expected {
 
 /// A `messages.get` answer built by hand of `n` repetitions of one unit, and
 /// what the tool answers for it: its forms, or `None` when its decoding notes
-/// alone are over the result ceiling.
+/// alone are over the result ceiling. Its answer grows with every unit: each
+/// unit appended is non-empty.
 struct Shape {
     name: &'static str,
     payload: fn(usize) -> Value,

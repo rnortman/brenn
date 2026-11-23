@@ -18,6 +18,10 @@ All notable changes to Brenn are documented here.
   inline payload over `[messaging] max_body_bytes` needs a blob store and is
   refused as `payload_unstorable` without one. The `MqttSend` card's badge
   reads "committed".
+- **Development:** `make check` no longer spends about eleven minutes on the
+  `brenn-server` test suite. Three Gmail message-body tests searched for the
+  largest body that fits one byte step at a time; they now bracket and bisect,
+  and the whole suite runs in about a minute. No runtime behaviour changes.
 - **BREAKING for operators:** MQTT publish ACLs are per topic. Until now, an
   app or component allowed to publish through a broker client could publish to
   every topic on it; it is now limited to the topics its ACL names. A publish entry

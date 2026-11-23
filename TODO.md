@@ -3642,6 +3642,18 @@ tranche 3 per the reopen condition recorded there, or target the specific slow
 suites the data names (cheapening the wasm engine tests with a shared engine or
 precompiled guests is the obvious candidate).
 
+What that candidate is worth for `//brenn-server:brenn-server_test`, on a
+developer machine, 2026-11-23: the three Gmail body bound tests
+(`brenn-server/src/wasm_dispatch_tests/google_gmail_body_e2e.rs`) each build a
+rig for every one of 33 message shapes, and every rig compiles the guest
+component afresh. Everything a shape does outside building its message — the
+rig, the call and the assertions — took 0.9 s a shape, about 30 s over one
+test; the three tests run side by side, so that is about half of the target's
+58 s test run. The 30 s is the most a shared engine or a component cache could
+save there: the guest compile's own share of it was not isolated. It was
+measured under a debugger on one of the three tests, before the tests' fill
+search was fixed, and not re-measured after; the fix did not touch it.
+
 Separate from `bazel-ci-cache-pressure` on purpose: the two read-outs share a
 cadence but answer different questions — durations here, cache saturation there
 — and they prescribe different remedies.
@@ -3654,7 +3666,7 @@ Code site (`TODO(bazel-ci-timings)`): `.github/workflows/ci.yml`, beside the
 
 `brenn-lib` and `brenn-server` are each one `rust_test(crate = ...)` target over
 a whole crate, so any source edit re-runs every test in it. On the CD runner the
-brenn-server target took 472s at ~2,500 tests; it is at 1,348 and brenn-lib at
+brenn-server target took 472s at ~2,500 tests; it is at 1,996 and brenn-lib at
 967 as the tranches land. Only
 finer crates reduce that work — within-target partitions (wrapper targets,
 libtest filters, sharding) all keep the whole crate in the input closure, so
@@ -3866,7 +3878,7 @@ left brenn-lib. Remaining:
   with `brenn-messaging-store`.
 
 **The residue against the ~300-test criterion**, for the gate that accepts or
-rejects it: `brenn-server` (1,348) and `brenn-lib` (967) are blocked by the two
+rejects it: `brenn-server` (1,996) and `brenn-lib` (967) are blocked by the two
 cycles written down above, `brenn-messaging` (470) by the inherent-impl
 constraint, and `brenn-messaging-boot` (339) is over the count but not over what
 the count was a proxy for — it runs in 0.39s locally, ~8s at the repo's measured
@@ -3903,6 +3915,45 @@ Done = tranche 3 landed, or the residue recorded and accepted at a review gate.
 
 Code sites (`TODO(crate-split)`): `brenn-lib/BUILD.bazel` and
 `brenn-server/BUILD.bazel`, above their `rust_test` targets.
+
+## `small-edit-recompile-fan-out`
+
+A one-line source edit in a low crate recompiles most of the graph. Measured
+on a developer machine with the `make check` timing recorder
+(`docs/build-timing.md`), 2026-11-23: an edit in `brenn-lib` executed 244–245
+spawns (Rustc 207–209 s and Clippy 139 s summed over parallel actions), in
+`brenn-messaging` 116 (127.6 s, 95.5 s), in `brenn-wasm` 113 (125.6 s,
+83.5 s). Each ends in `Rustc` (33–39 s) and `Clippy` (28–30 s) of
+`//brenn-server:brenn-server_test`: a crate's compile takes every crate below
+it, direct or transitive, as an input, and all three sit below `brenn-server`.
+Which other edits cost the same is not measured. In those checks the test
+run was served from cache, and that chain was 40–51 s of a 46–58 s check.
+With the Gmail body fill search fixed, a check after an edit to `brenn-server`
+itself, which re-ran `brenn-server_test`, took 99 s: 34 s compiling
+`brenn-server` and its test crate (the chain's last links only, no low crate
+recompiled) and 58 s running the test. When a small edit re-runs the test, the
+run is the larger part; when the test is served from cache, the chain is most
+of the check. About half of that 58 s run is not this entry's to cut: it is
+what the Gmail body bound tests do for each of 33 shapes outside their fill
+search, about 30 s; `bazel-ci-timings` says what that is made of, names the
+remedy and gives the figure's limits.
+
+Nobody has analysed whether it can be cut or by how much. Candidates:
+`crate-split`'s tranche 3 (the state-ownership/registry inversion that would
+let `brenn-server` shed modules); a narrower cut that takes the tests needing
+few dependencies out of the `brenn-server` test crate; splitting very large
+source files, if file size and not crate size turns out to be the cost — not
+established either way. This is distinct from `crate-split`'s reopen
+condition, which is about the residue targets' test *run* time on CI and
+cannot fire from local records.
+
+Done = the timing store is read for which edits recompile what and for how
+long, and either a design names a cut with an expected saving in seconds per
+small-edit check and it is built, or the entry closes with the numbers that
+show no cut pays.
+
+Code site (`TODO(small-edit-recompile-fan-out)`): `brenn-server/BUILD.bazel`,
+above the `brenn-server` library's `deps`.
 
 
 ## `attach-upgrade-preamble`
