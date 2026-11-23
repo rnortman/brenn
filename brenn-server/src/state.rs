@@ -129,14 +129,14 @@ pub struct AppState {
     /// spawn attempts while armed; see [`SpawnBackoff`].
     #[cfg_attr(test, allow(dead_code))]
     pub spawn_backoff: SpawnBackoff,
-    /// Process-wide flag set by `shutdown_signal` when SIGTERM / SIGINT
+    /// Process-wide flag set by `serve_until_shutdown` when SIGTERM / SIGINT
     /// arrives. Bridges' `SessionEvent::Died` handler consults it (alongside
     /// `drain_on_idle`) to suppress the "CC session died" warning alert
     /// during intentional server teardown. Independent from the per-session
     /// `shutting_down` flag: that one gates the reader-task EOF alert in
     /// `brenn-cc`; this one gates the event-loop's Died handler.
     ///
-    /// `shutdown_signal` also iterates `active_bridges` and calls
+    /// `serve_until_shutdown` also iterates `active_bridges` and calls
     /// `mark_shutting_down()` on each session so the reader path stays
     /// quiet too.
     pub server_shutting_down: Arc<AtomicBool>,

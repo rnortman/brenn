@@ -186,7 +186,10 @@ impl MqttEgressHub {
         if matches!(attached, Attached::Created) {
             // Only the count is logged: a skipped message naming a
             // `status_to` was told at its client's removal, or was committed
-            // during a retirement and is lost untold.
+            // during a retirement and is lost untold, or was left unread by a
+            // removal whose reader had already ended for a shutdown or by a
+            // client deleted while the server was down, and is lost untold
+            // (TODO(mqtt-egress-removed-client-rows)).
             let skipped = bus.skip_unhanded().await.count;
             if skipped > 0 {
                 tracing::warn!(

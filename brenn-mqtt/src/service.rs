@@ -9,7 +9,7 @@
 //! `AppState` + `ActiveBridges`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::RwLock;
 
@@ -23,6 +23,7 @@ use crate::state::{
 };
 use brenn_lib::messaging::Urgency;
 use brenn_lib::mqtt::config::MqttClientConfig;
+use brenn_lib::panic_util::join_set_reraising;
 
 // ---------------------------------------------------------------------------
 // MqttEventRouter trait
@@ -108,13 +109,47 @@ pub enum IngressUnsubscribeOutcome {
 /// `[[mqtt_client]]` is declared.
 pub struct MqttService {
     pub(crate) router: Arc<RwLock<Option<Arc<dyn MqttEventRouter>>>>,
-    /// Per-client session handles, keyed by `client_slug`. One session per client
-    /// carries both the publish path and the ingress delivery path.
+    /// The session registry. One lock over the client map, the stopping flag and
+    /// the displaced sessions, so a session cannot slip between `stop_all`'s
+    /// signal and an `add_client` or `remove_client` racing it.
     ///
     /// A reload's commit adds, replaces and removes entries. The lock is held
     /// only for a lookup or a mutation, never across an await, so a caller that
     /// obtained a handle keeps serving through a commit that replaces it.
-    pub(crate) clients: std::sync::RwLock<HashMap<String, Arc<MqttClientHandle>>>,
+    registry: std::sync::RwLock<Registry>,
+}
+
+/// What [`MqttService`] holds under its registry lock.
+#[derive(Default)]
+struct Registry {
+    /// Per-client session handles, keyed by `client_slug`. One session per
+    /// client carries both the publish path and the ingress delivery path.
+    clients: HashMap<String, Arc<MqttClientHandle>>,
+    /// Set by [`MqttService::stop_all`] and never cleared: the process is
+    /// shutting down, so every session registered from here on is born stopped.
+    stopping: bool,
+    /// Sessions the registry has let go of — replaced by `add_client` or taken
+    /// by `remove_client` — that may not have finished stopping. Weak: the
+    /// caller that took the session holds it for as long as it is stopping it,
+    /// so a dead entry is a session nobody is stopping any more.
+    displaced: Vec<Weak<MqttClientHandle>>,
+}
+
+impl Registry {
+    /// Record `handle` as let go of, pruning entries nothing holds.
+    fn displace(&mut self, handle: &Arc<MqttClientHandle>) {
+        self.displaced.retain(|weak| weak.strong_count() > 0);
+        self.displaced.push(Arc::downgrade(handle));
+    }
+
+    /// Every registered session and every displaced one still held.
+    fn every_session(&self) -> Vec<Arc<MqttClientHandle>> {
+        self.clients
+            .values()
+            .cloned()
+            .chain(self.displaced.iter().filter_map(Weak::upgrade))
+            .collect()
+    }
 }
 
 /// `last_error` reported for a client with no registered session — the honest
@@ -159,10 +194,7 @@ impl MqttService {
     /// Construct an empty service. Populate with `add_client` then `set_router`
     /// before serving requests.
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            router: Arc::new(RwLock::new(None)),
-            clients: std::sync::RwLock::new(HashMap::new()),
-        })
+        Arc::new(Self::default())
     }
 
     /// Set the inbound event router (called once from the binary crate after
@@ -178,51 +210,104 @@ impl MqttService {
     }
 
     /// Register a per-client session handle, keyed by `client_slug`, replacing
-    /// any entry the slug already had.
+    /// any entry the slug already had. The replaced handle is kept as displaced
+    /// for [`Self::join_all`].
+    ///
+    /// On a service that [`Self::stop_all`] has stopped, the handle's stop is
+    /// signalled before it is inserted: its supervisor never connects and an
+    /// egress reader started on it hands nothing.
     pub fn add_client(&self, handle: Arc<MqttClientHandle>) {
-        self.clients
-            .write()
-            .expect(CLIENTS_LOCK)
-            .insert(handle.config.identity.slug.clone(), handle);
+        let mut registry = self.registry.write().expect(CLIENTS_LOCK);
+        if registry.stopping {
+            handle.stop();
+        }
+        let slug = handle.config.identity.slug.clone();
+        if let Some(replaced) = registry.clients.insert(slug, handle) {
+            registry.displace(&replaced);
+        }
     }
 
     /// Take the session handle for `client_slug` out of the registry.
     ///
     /// The caller owns the returned handle and is responsible for stopping its
-    /// supervisor.
+    /// supervisor. The handle is kept as displaced for [`Self::join_all`].
     ///
     /// # Panics
     ///
     /// Panics if no entry is registered for the slug — an absent entry is a
     /// host bug.
     pub fn remove_client(&self, client_slug: &str) -> Arc<MqttClientHandle> {
-        self.clients
-            .write()
-            .expect(CLIENTS_LOCK)
-            .remove(client_slug)
-            .unwrap_or_else(|| {
-                panic!(
-                    "MqttService::remove_client: no session registered for client \
-                     {client_slug:?}"
-                )
-            })
+        let mut registry = self.registry.write().expect(CLIENTS_LOCK);
+        let handle = registry.clients.remove(client_slug).unwrap_or_else(|| {
+            panic!("MqttService::remove_client: no session registered for client {client_slug:?}")
+        });
+        registry.displace(&handle);
+        handle
     }
 
-    /// Signal every registered supervisor to stop, without waiting for any of
-    /// them to exit. Returns the number of supervisors signalled.
+    /// Mark the service stopping and signal every registered and every
+    /// displaced session to stop, without waiting for any of them. Every
+    /// session registered afterwards is born stopped ([`Self::add_client`]).
+    /// Returns the number of sessions signalled.
     pub fn stop_all(&self) -> usize {
-        let clients = self.clients.read().expect(CLIENTS_LOCK);
-        for handle in clients.values() {
+        let mut registry = self.registry.write().expect(CLIENTS_LOCK);
+        registry.stopping = true;
+        let sessions = registry.every_session();
+        for handle in &sessions {
             handle.stop();
         }
-        clients.len()
+        sessions.len()
+    }
+
+    /// Stop and join every registered and every displaced session, all
+    /// concurrently, and return how many were joined. Each join waits for the
+    /// session's egress reader to report what it had in flight and for its
+    /// supervisor to end ([`MqttClientHandle::stop_and_join`]), so the wait as a
+    /// whole ends at the largest `stop_wait_secs` among them plus bus commits.
+    ///
+    /// A session whose supervisor was never spawned is skipped: it is a
+    /// successor a reload registered and has not yet spawned, born stopped, so
+    /// it never connects and its reader hands nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Self::stop_all`] has not been called: a session registered
+    /// after this snapshot would not be born stopped and would outlive the
+    /// join. Panics with a join's own panic.
+    pub async fn join_all(&self) -> usize {
+        let sessions = {
+            let registry = self.registry.read().expect(CLIENTS_LOCK);
+            assert!(
+                registry.stopping,
+                "MqttService::join_all before stop_all: sessions registered after the join's \
+                 snapshot would not be stopped",
+            );
+            registry.every_session()
+        };
+        let mut joins = tokio::task::JoinSet::new();
+        for handle in sessions {
+            joins.spawn(async move {
+                if handle.supervisor_spawned().await {
+                    handle.stop_and_join().await;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        join_set_reraising(joins, "MqttService::join_all")
+            .await
+            .into_iter()
+            .filter(|joined| *joined)
+            .count()
     }
 
     /// Look up the session handle for `client_slug`.
     pub fn get_client(&self, client_slug: &str) -> Option<Arc<MqttClientHandle>> {
-        self.clients
+        self.registry
             .read()
             .expect(CLIENTS_LOCK)
+            .clients
             .get(client_slug)
             .cloned()
     }
@@ -230,9 +315,10 @@ impl MqttService {
     /// Whether `handle` is still the session the registry holds for
     /// `client_slug` — the same allocation, not an equal value.
     fn still_registered(&self, client_slug: &str, handle: &Arc<MqttClientHandle>) -> bool {
-        self.clients
+        self.registry
             .read()
             .expect(CLIENTS_LOCK)
+            .clients
             .get(client_slug)
             .is_some_and(|current| Arc::ptr_eq(current, handle))
     }
@@ -244,9 +330,10 @@ impl MqttService {
     /// fresh boot of the candidate dial something else". Secrets included —
     /// they are what the config is compared on.
     pub fn baseline(&self) -> HashMap<String, Arc<MqttClientConfig>> {
-        self.clients
+        self.registry
             .read()
             .expect(CLIENTS_LOCK)
+            .clients
             .iter()
             .map(|(slug, handle)| (slug.clone(), handle.config.clone()))
             .collect()
@@ -259,9 +346,10 @@ impl MqttService {
     /// are assertions comparing the set element for element.
     pub fn client_slugs(&self) -> Vec<String> {
         let mut slugs: Vec<String> = self
-            .clients
+            .registry
             .read()
             .expect(CLIENTS_LOCK)
+            .clients
             .keys()
             .cloned()
             .collect();
@@ -518,7 +606,7 @@ impl Default for MqttService {
     fn default() -> Self {
         Self {
             router: Arc::new(RwLock::new(None)),
-            clients: std::sync::RwLock::new(HashMap::new()),
+            registry: std::sync::RwLock::new(Registry::default()),
         }
     }
 }
@@ -531,6 +619,7 @@ impl Default for MqttService {
 mod tests {
     use super::*;
     use crate::connection::unpolled_client;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn make_handle(client: &str) -> Arc<MqttClientHandle> {
         let (tx, _rx) = tokio::sync::watch::channel(false);
@@ -1092,6 +1181,99 @@ mod tests {
             !*spare_rx.borrow_and_update(),
             "a handle the registry does not hold is untouched"
         );
+    }
+
+    /// A handle whose supervisor is a task that ends at the stop signal and sets
+    /// the returned flag as it does.
+    async fn supervised_handle(client: &str) -> (Arc<MqttClientHandle>, Arc<AtomicBool>) {
+        let handle = make_handle(client);
+        let mut stop_rx = handle.stop_tx.subscribe();
+        let ended = Arc::new(AtomicBool::new(false));
+        let ended_by_task = ended.clone();
+        let join = tokio::spawn(async move {
+            stop_rx
+                .wait_for(|stop| *stop)
+                .await
+                .expect("the stop sender outlives us");
+            ended_by_task.store(true, Ordering::SeqCst);
+        });
+        handle.set_supervisor(join).await;
+        (handle, ended)
+    }
+
+    /// `stop_all` reaches the sessions the registry has let go of while their
+    /// takers still hold them — a predecessor a reload replaced, a client it
+    /// removed — and not one nobody holds any more.
+    #[tokio::test]
+    async fn stop_all_signals_displaced_handles_and_marks_the_service_stopping() {
+        let svc = MqttService::new();
+        let replaced = make_handle("home");
+        svc.add_client(replaced.clone());
+        svc.add_client(make_handle("home"));
+        let removed = make_handle("attic");
+        svc.add_client(removed.clone());
+        assert!(Arc::ptr_eq(&svc.remove_client("attic"), &removed));
+        svc.add_client(make_handle("spare"));
+        svc.remove_client("spare");
+
+        assert_eq!(
+            svc.stop_all(),
+            3,
+            "the registered successor and the two displaced handles still held; the dropped \
+             one is pruned",
+        );
+        assert!(*replaced.stop_tx.borrow(), "the replaced predecessor");
+        assert!(*removed.stop_tx.borrow(), "the removed client");
+        assert!(*svc.get_client("home").unwrap().stop_tx.borrow());
+        assert!(svc.registry.read().unwrap().stopping);
+    }
+
+    /// A client a reload registers after the shutdown signal is born stopped,
+    /// so its supervisor never connects and its reader hands nothing.
+    #[tokio::test]
+    async fn a_client_added_to_a_stopping_service_is_born_stopped() {
+        let svc = MqttService::new();
+        svc.stop_all();
+        let late = make_handle("home");
+        let stop_rx = late.stop_tx.subscribe();
+        svc.add_client(late);
+        assert!(*stop_rx.borrow(), "signalled before it was registered");
+    }
+
+    /// `join_all` joins the registered sessions and a displaced predecessor,
+    /// and skips a successor whose supervisor was never spawned, which would
+    /// otherwise panic in `stop_and_join`.
+    #[tokio::test]
+    async fn join_all_joins_displaced_sessions_and_skips_unspawned_ones() {
+        let svc = MqttService::new();
+        let (predecessor, predecessor_ended) = supervised_handle("home").await;
+        svc.add_client(predecessor.clone());
+        let unspawned = make_handle("home");
+        svc.add_client(unspawned.clone());
+        let (attic, attic_ended) = supervised_handle("attic").await;
+        svc.add_client(attic);
+
+        svc.stop_all();
+        assert_eq!(svc.join_all().await, 2);
+        assert!(predecessor_ended.load(Ordering::SeqCst));
+        assert!(attic_ended.load(Ordering::SeqCst));
+        assert!(
+            !unspawned.supervisor_spawned().await,
+            "the unspawned successor was not joined",
+        );
+        assert_eq!(
+            svc.join_all().await,
+            2,
+            "a second join finds both sessions already joined and returns",
+        );
+    }
+
+    /// Joining before the service is stopping would let a session registered
+    /// after the snapshot run past the join.
+    #[tokio::test]
+    #[should_panic(expected = "join_all before stop_all")]
+    async fn join_all_before_stop_all_panics() {
+        MqttService::new().join_all().await;
     }
 
     /// `stop_and_join` signals the supervisor and returns only once the task

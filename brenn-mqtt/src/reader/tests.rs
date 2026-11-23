@@ -13,32 +13,13 @@ use tokio::sync::mpsc;
 
 use brenn_lib::mqtt::test_support::test_client_config;
 
-use crate::connection::{install_connection, unpolled_client};
+use crate::connection::{end_connected_session, install_connection, unpolled_client};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
     Unhanded(usize),
     Advance(u64),
     Abandon,
-}
-
-/// How long one bus call takes.
-#[derive(Debug, Clone, Copy, Default)]
-enum Pace {
-    #[default]
-    Instant,
-    Takes(Duration),
-    Never,
-}
-
-impl Pace {
-    async fn wait(self) {
-        match self {
-            Self::Instant => {}
-            Self::Takes(duration) => tokio::time::sleep(duration).await,
-            Self::Never => std::future::pending().await,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -48,10 +29,9 @@ struct BusState {
     next_owed: u64,
     calls: Vec<Call>,
     reports: Vec<EgressReport>,
-    /// Calls and reports, in the order they completed.
+    /// Calls and reports, and the in-process broker reading a DISCONNECT, in
+    /// the order they completed.
     timeline: Vec<String>,
-    advance_pace: Pace,
-    report_pace: Pace,
 }
 
 struct ScriptBus {
@@ -157,16 +137,11 @@ impl ScriptBus {
         self.state.lock().unwrap().timeline.clone()
     }
 
-    fn pace(&self, advance: Pace, report: Pace) {
-        let mut state = self.state.lock().unwrap();
-        state.advance_pace = advance;
-        state.report_pace = report;
-    }
-
-    /// Every completed bus call, `Drained` reports included.
-    fn completed_calls(&self) -> u64 {
-        let state = self.state.lock().unwrap();
-        (state.calls.len() + state.reports.len()) as u64
+    /// Whether the in-process broker has read a DISCONNECT.
+    fn broker_disconnected(&self) -> bool {
+        self.timeline()
+            .iter()
+            .any(|entry| entry == BROKER_DISCONNECT)
     }
 
     fn drained(&self) -> bool {
@@ -207,8 +182,6 @@ impl EgressBus for ScriptBus {
         if let Some(rx) = gate {
             rx.await.unwrap();
         }
-        let pace = self.state.lock().unwrap().advance_pace;
-        pace.wait().await;
         let mut state = self.state.lock().unwrap();
         state.calls.push(Call::Advance(seq.0));
         state.timeline.push(format!("advance {}", seq.0));
@@ -246,8 +219,6 @@ impl EgressBus for ScriptBus {
     }
 
     async fn report(&self, report: EgressReport) {
-        let pace = self.state.lock().unwrap().report_pace;
-        pace.wait().await;
         let mut state = self.state.lock().unwrap();
         if report != EgressReport::Drained {
             state
@@ -322,8 +293,15 @@ fn expired(message: EgressMeta, sent: Sent) -> EgressReport {
 }
 
 fn make_handle() -> Arc<MqttClientHandle> {
+    make_handle_waiting(0)
+}
+
+/// A handle whose client's stop waits up to `stop_wait_secs` for the broker.
+fn make_handle_waiting(stop_wait_secs: u32) -> Arc<MqttClientHandle> {
     let (tx, _rx) = watch::channel(false);
-    MqttClientHandle::new(Arc::new(test_client_config("home")), vec![], tx)
+    let mut config = test_client_config("home");
+    config.identity.stop_wait_secs = stop_wait_secs;
+    MqttClientHandle::new(Arc::new(config), vec![], tx)
 }
 
 /// Record a supervisor that exits when the handle is stopped.
@@ -376,13 +354,25 @@ async fn settle() {
 enum Answer {
     Success,
     Reject(&'static str),
-    /// QoS 1: no PUBACK until [`FakeBroker::release`].
+    /// QoS 1: no PUBACK until [`FakeBroker::release`]. QoS 2: no PUBREC ever.
     Withhold,
 }
 
+/// What a case tells the in-process broker to do.
+enum BrokerCommand {
+    /// Acknowledge every withheld QoS 1 publish with success.
+    Release,
+    /// Close the connection.
+    HangUp,
+}
+
+/// The timeline entry the in-process broker writes when it reads a
+/// DISCONNECT.
+const BROKER_DISCONNECT: &str = "broker disconnect";
+
 struct FakeBroker {
     received: Arc<StdMutex<Vec<rumqttc::Publish>>>,
-    release: mpsc::UnboundedSender<()>,
+    commands: mpsc::UnboundedSender<BrokerCommand>,
 }
 
 impl FakeBroker {
@@ -399,7 +389,12 @@ impl FakeBroker {
 
     /// Acknowledge every withheld QoS 1 publish with success.
     fn release(&self) {
-        self.release.send(()).unwrap();
+        self.commands.send(BrokerCommand::Release).unwrap();
+    }
+
+    /// Close the connection without a word.
+    fn hang_up(&self) {
+        self.commands.send(BrokerCommand::HangUp).unwrap();
     }
 }
 
@@ -409,11 +404,15 @@ async fn write_packet(stream: &mut DuplexStream, write: impl FnOnce(&mut BytesMu
     stream.write_all(&out).await.unwrap();
 }
 
+/// Answer one client over `stream`. A DISCONNECT ends the session and, when
+/// `timeline` is given, is written to that bus's timeline as
+/// [`BROKER_DISCONNECT`].
 async fn serve(
     mut stream: DuplexStream,
     received: Arc<StdMutex<Vec<rumqttc::Publish>>>,
     answer: Answer,
-    mut release: mpsc::UnboundedReceiver<()>,
+    mut commands: mpsc::UnboundedReceiver<BrokerCommand>,
+    timeline: Option<Arc<ScriptBus>>,
 ) {
     use rumqttc::{
         ConnAck, ConnectReturnCode, Packet, PingResp, PubAck, PubAckProperties, PubAckReason,
@@ -440,6 +439,7 @@ async fn serve(
                 match (publish.qos, answer.clone()) {
                     (rumqttc::mqttbytes::QoS::AtMostOnce, _) => {}
                     (rumqttc::mqttbytes::QoS::AtLeastOnce, Answer::Withhold) => withheld.push(pkid),
+                    (rumqttc::mqttbytes::QoS::ExactlyOnce, Answer::Withhold) => {}
                     (rumqttc::mqttbytes::QoS::AtLeastOnce, answer) => {
                         let ack = match answer {
                             Answer::Reject(reason) => PubAck {
@@ -501,7 +501,16 @@ async fn serve(
                 })
                 .await;
             }
-            Ok(Packet::Disconnect(_)) => return,
+            Ok(Packet::Disconnect(_)) => {
+                if let Some(bus) = timeline {
+                    bus.state
+                        .lock()
+                        .unwrap()
+                        .timeline
+                        .push(BROKER_DISCONNECT.to_string());
+                }
+                return;
+            }
             Ok(other) => panic!("the in-process broker does not expect {other:?}"),
             Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {
                 tokio::select! {
@@ -510,7 +519,10 @@ async fn serve(
                             return;
                         }
                     }
-                    Some(()) = release.recv() => {
+                    Some(command) = commands.recv() => {
+                        if let BrokerCommand::HangUp = command {
+                            return;
+                        }
                         for pkid in withheld.drain(..) {
                             let ack = PubAck {
                                 pkid,
@@ -530,13 +542,13 @@ async fn serve(
     }
 }
 
-/// Connect `handle` to a fresh in-process broker that answers QoS 1/2 with
-/// `answer`, with the connection stating `receive_max`.
-async fn connect_fake(
-    handle: &Arc<MqttClientHandle>,
-    receive_max: Option<u16>,
+/// A client connected to a fresh in-process broker that answers QoS 1/2 with
+/// `answer`, its event loop past the CONNACK. A DISCONNECT the broker reads
+/// goes on `timeline`'s timeline, when given.
+async fn fake_connection(
     answer: Answer,
-) -> FakeBroker {
+    timeline: Option<Arc<ScriptBus>>,
+) -> (rumqttc::AsyncClient, rumqttc::EventLoop, FakeBroker) {
     use rumqttc::{AsyncClient, Event, MqttOptions, Packet};
 
     let (client_end, broker_end) = tokio::io::duplex(1 << 16);
@@ -551,8 +563,14 @@ async fn connect_fake(
     let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
 
     let received = Arc::new(StdMutex::new(Vec::new()));
-    let (release_tx, release_rx) = mpsc::unbounded_channel();
-    tokio::spawn(serve(broker_end, Arc::clone(&received), answer, release_rx));
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    tokio::spawn(serve(
+        broker_end,
+        Arc::clone(&received),
+        answer,
+        commands_rx,
+        timeline,
+    ));
 
     loop {
         match eventloop.poll().await.unwrap() {
@@ -560,19 +578,147 @@ async fn connect_fake(
             _ => continue,
         }
     }
+    let broker = FakeBroker {
+        received,
+        commands: commands_tx,
+    };
+    (client, eventloop, broker)
+}
+
+/// Connect `handle` to a fresh in-process broker that answers QoS 1/2 with
+/// `answer`, with the connection stating `receive_max`, and poll it from a
+/// task that only wakes the reader.
+async fn connect_fake(
+    handle: &Arc<MqttClientHandle>,
+    receive_max: Option<u16>,
+    answer: Answer,
+) -> FakeBroker {
+    let (client, mut eventloop, broker) = fake_connection(answer, None).await;
     install_connection(handle, client, None, receive_max).await;
     let polled = Arc::clone(handle);
     tokio::spawn(async move {
         while let Ok(event) = eventloop.poll().await {
-            if let Event::Outgoing(_) = event {
+            if let rumqttc::Event::Outgoing(_) = event {
                 polled.egress_wake.notify_one();
             }
         }
     });
-    FakeBroker {
-        received,
-        release: release_tx,
+    broker
+}
+
+/// Routes nothing: the in-process broker sends no inbound publish.
+struct NoRoutes;
+
+#[async_trait]
+impl crate::service::MqttEventRouter for NoRoutes {
+    async fn deliver_inbound(
+        &self,
+        _client_slug: &str,
+        _topic: &str,
+        _payload: crate::payload::InboundPayload,
+        _qos: u8,
+    ) {
+        panic!("the in-process broker sends no inbound publish");
     }
+}
+
+/// [`connect_fake`] under a stand-in supervisor recorded on `handle`: it polls
+/// the connection while the session runs, and at the stop empties the client
+/// cell and ends the session the way the real supervisor's stop does. The
+/// broker writes the DISCONNECT it reads on `bus`'s timeline.
+async fn connect_fake_supervised(
+    handle: &Arc<MqttClientHandle>,
+    receive_max: Option<u16>,
+    answer: Answer,
+    bus: &Arc<ScriptBus>,
+) -> FakeBroker {
+    let (client, eventloop, broker) = fake_connection(answer, Some(Arc::clone(bus))).await;
+    supervise(handle, client, eventloop, receive_max).await;
+    broker
+}
+
+/// Install `client` on `handle` under a stand-in supervisor recorded there:
+/// it polls `eventloop` while the session runs, and at the stop empties the
+/// client cell and ends the session the way the real supervisor's stop does.
+async fn supervise(
+    handle: &Arc<MqttClientHandle>,
+    client: rumqttc::AsyncClient,
+    mut eventloop: rumqttc::EventLoop,
+    receive_max: Option<u16>,
+) {
+    install_connection(handle, client.clone(), None, receive_max).await;
+    let supervised = Arc::clone(handle);
+    let mut stop = handle.stop_tx.subscribe();
+    let join = tokio::spawn(async move {
+        let router: Arc<dyn crate::service::MqttEventRouter> = Arc::new(NoRoutes);
+        loop {
+            tokio::select! {
+                biased;
+                stopped = async { stop.wait_for(|stopped| *stopped).await.map(drop) } => {
+                    stopped.unwrap();
+                    drop(supervised.client.lock().await.take());
+                    end_connected_session(&supervised, &router, client, eventloop).await;
+                    return;
+                }
+                event = eventloop.poll() => match event {
+                    Ok(rumqttc::Event::Outgoing(_)) => supervised.egress_wake.notify_one(),
+                    Ok(_) => {}
+                    Err(e) => panic!("the in-process broker's connection failed before the stop: {e}"),
+                }
+            }
+        }
+    });
+    handle.set_supervisor(join).await;
+}
+
+/// A client connected to an in-process broker that answers the CONNECT and
+/// then reads nothing more, over a pipe that holds only `capacity` bytes each
+/// way: once that fills, the client's writes wait. The broker's end of the
+/// pipe is returned, for the case to hold open or drop.
+async fn stalled_connection(
+    capacity: usize,
+) -> (rumqttc::AsyncClient, rumqttc::EventLoop, DuplexStream) {
+    use rumqttc::{AsyncClient, ConnAck, ConnectReturnCode, Event, MqttOptions, Packet};
+
+    let (client_end, mut broker_end) = tokio::io::duplex(capacity);
+    let client_end = Arc::new(StdMutex::new(Some(client_end)));
+    let mut opts = MqttOptions::new("test-reader", ("127.0.0.1", 1));
+    opts.set_socket_connector(move |_host, _network| {
+        let stream = client_end.lock().unwrap().take();
+        async move {
+            stream.ok_or_else(|| std::io::Error::other("the in-process broker accepts once"))
+        }
+    });
+    let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
+    let handshake = tokio::spawn(async move {
+        let mut buf = BytesMut::new();
+        loop {
+            match Packet::read(&mut buf, None) {
+                Ok(Packet::Connect(..)) => break,
+                Ok(other) => panic!("the stalled broker expects a CONNECT first, not {other:?}"),
+                Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {
+                    assert_ne!(broker_end.read_buf(&mut buf).await.unwrap(), 0);
+                }
+                Err(e) => panic!("the stalled broker could not read the CONNECT: {e:?}"),
+            }
+        }
+        let connack = ConnAck {
+            session_present: false,
+            code: ConnectReturnCode::Success,
+            properties: None,
+        };
+        write_packet(&mut broker_end, |out| {
+            connack.write(out).unwrap();
+        })
+        .await;
+        broker_end
+    });
+    loop {
+        if let Event::Incoming(Packet::ConnAck(_)) = eventloop.poll().await.unwrap() {
+            break;
+        }
+    }
+    (client, eventloop, handshake.await.unwrap())
 }
 
 #[test]
@@ -1333,11 +1479,6 @@ async fn stop_reports_each_held_message_naming_a_status_to() {
     expected.extend(stopped_1_2_3());
     assert_eq!(bus.reports(), expected);
     assert_eq!(bus.advances(), [1, 2, 3]);
-    assert_eq!(
-        handle.egress_reader_progress.load(Ordering::Relaxed),
-        bus.completed_calls(),
-        "the counter moves once per completed bus call"
-    );
 }
 
 /// A retire reports as a stop does, then splits what it abandoned the same
@@ -1361,11 +1502,6 @@ async fn retire_reports_each_abandoned_message_naming_a_status_to() {
         },
     ]);
     assert_eq!(bus.reports(), expected);
-    assert_eq!(
-        handle.egress_reader_progress.load(Ordering::Relaxed),
-        bus.completed_calls(),
-        "the counter moves once per completed bus call"
-    );
     handle.stop_and_join().await;
 }
 
@@ -1763,153 +1899,6 @@ async fn a_message_given_back_then_refused_has_no_earlier_copy() {
     handle.stop_and_join().await;
 }
 
-/// What a slow bus call costs in the watchdog tests: four of them fill one
-/// join window.
-const SLOW: Duration = Duration::from_secs(5);
-
-/// Messages enough that their reports outlast the join window many times.
-const BACKLOG: u64 = 30;
-
-/// A retire whose exit owes far more slow reports than one join window
-/// holds joins: the reader keeps completing bus calls.
-#[tokio::test(start_paused = true)]
-async fn a_long_retire_joins_while_the_reader_progresses() {
-    let handle = make_handle();
-    let bus = ScriptBus::new(Some(256));
-    for seq in 1..=BACKLOG {
-        bus.commit_quietly(named_item(seq, 1));
-    }
-    bus.pace(Pace::Instant, Pace::Takes(SLOW));
-    start_egress_reader(&handle, bus.clone());
-    handle.retire_egress_reader().await;
-    assert_eq!(bus.reports().len() as u64, BACKLOG);
-    assert!(
-        bus.reports().iter().all(|report| matches!(
-            report,
-            EgressReport::DroppedMessage {
-                cause: DropCause::ClientRemoved,
-                sent: Sent::Never,
-                ..
-            }
-        )),
-        "every abandoned message was never read, so never sent"
-    );
-    assert_eq!(
-        handle.egress_reader_progress.load(Ordering::Relaxed),
-        bus.completed_calls()
-    );
-}
-
-/// A retire whose report never returns panics the join after one window.
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "neither exited nor completed one bus call within 20s")]
-async fn a_retire_stuck_on_a_report_panics_the_join() {
-    let handle = make_handle();
-    let bus = ScriptBus::new(Some(256));
-    bus.commit_quietly(named_item(1, 1));
-    bus.pace(Pace::Instant, Pace::Never);
-    start_egress_reader(&handle, bus.clone());
-    handle.retire_egress_reader().await;
-}
-
-/// Commit [`BACKLOG`] QoS 1 messages naming no `status_to` and wait until the
-/// reader has them all in flight.
-async fn all_in_flight(handle: &Arc<MqttClientHandle>) -> (Arc<ScriptBus>, rumqttc::EventLoop) {
-    fake_supervisor(handle).await;
-    let eventloop = install_unpolled(handle, 64, None, None).await;
-    let bus = ScriptBus::new(Some(256));
-    for seq in 1..=BACKLOG {
-        bus.commit_quietly(item(seq, 1));
-    }
-    start_egress_reader(handle, bus.clone());
-    until("every submit", || bus.advances().len() as u64 == BACKLOG).await;
-    (bus, eventloop)
-}
-
-/// A stop whose exit owes far more slow reports than one join window holds
-/// joins.
-#[tokio::test(start_paused = true)]
-async fn a_long_stop_joins_while_the_reader_progresses() {
-    let handle = make_handle();
-    let (bus, _eventloop) = all_in_flight(&handle).await;
-    bus.pace(Pace::Instant, Pace::Takes(SLOW));
-    handle.stop_and_join().await;
-    assert_eq!(bus.reports().len() as u64, BACKLOG);
-}
-
-/// A stop whose report never returns panics the join after one window.
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "neither exited nor completed one bus call within 20s")]
-async fn a_stop_stuck_on_a_report_panics_the_join() {
-    let handle = make_handle();
-    let (bus, _eventloop) = all_in_flight(&handle).await;
-    bus.pace(Pace::Instant, Pace::Never);
-    handle.stop_and_join().await;
-}
-
-/// Start a reader on a connected client over [`BACKLOG`] expired messages
-/// naming a `status_to`, every advance and report paced by `pace`, and wait
-/// until its pass over them has begun.
-async fn expired_backlog(
-    handle: &Arc<MqttClientHandle>,
-    advance: Pace,
-) -> (Arc<ScriptBus>, rumqttc::EventLoop) {
-    fake_supervisor(handle).await;
-    let eventloop = install_unpolled(handle, 64, None, None).await;
-    let bus = ScriptBus::new(Some(256));
-    let past = Utc::now() - TimeDelta::seconds(1);
-    for seq in 1..=BACKLOG {
-        bus.commit_quietly(EgressItem::Message(named(seq, 1, MqttExpiry::At(past))));
-    }
-    bus.pace(advance, Pace::Takes(SLOW));
-    start_egress_reader(handle, bus.clone());
-    until("the pass's read", || bus.reads() == 1).await;
-    (bus, eventloop)
-}
-
-fn assert_all_expired(bus: &ScriptBus) {
-    let reports = bus.reports();
-    assert_eq!(reports.len() as u64, BACKLOG, "{reports:?}");
-    assert!(
-        reports.iter().all(|report| matches!(
-            report,
-            EgressReport::Expired {
-                sent: Sent::Never,
-                ..
-            }
-        )),
-        "the pass gives its messages their own outcome: {reports:?}"
-    );
-}
-
-/// A retire signalled during a pass that alone outlasts the join window many
-/// times joins, and every message of the pass is reported expired.
-#[tokio::test(start_paused = true)]
-async fn a_retire_during_a_long_pass_joins() {
-    let handle = make_handle();
-    let (bus, _eventloop) = expired_backlog(&handle, Pace::Takes(SLOW)).await;
-    handle.retire_egress_reader().await;
-    assert_all_expired(&bus);
-}
-
-/// The same pass under a stop.
-#[tokio::test(start_paused = true)]
-async fn a_stop_during_a_long_pass_joins() {
-    let handle = make_handle();
-    let (bus, _eventloop) = expired_backlog(&handle, Pace::Takes(SLOW)).await;
-    handle.stop_and_join().await;
-    assert_all_expired(&bus);
-}
-
-/// A pass stuck on an advance panics the join after one window.
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "neither exited nor completed one bus call within 20s")]
-async fn a_pass_stuck_on_an_advance_panics_the_join() {
-    let handle = make_handle();
-    let (_bus, _eventloop) = expired_backlog(&handle, Pace::Never).await;
-    handle.retire_egress_reader().await;
-}
-
 #[tokio::test]
 #[should_panic(expected = "start_egress_reader called twice")]
 async fn a_second_reader_on_one_handle_panics() {
@@ -1922,4 +1911,527 @@ async fn a_second_reader_on_one_handle_panics() {
 #[should_panic(expected = "no egress reader running")]
 async fn retiring_with_no_reader_panics() {
     make_handle().retire_egress_reader().await;
+}
+
+/// A message in flight at the stop and answered inside the bound is reported
+/// delivered, not unknown, and its report is committed before the broker
+/// reads the session's DISCONNECT.
+#[tokio::test(start_paused = true)]
+async fn a_stop_waits_for_the_answer_and_reports_it_before_the_disconnect() {
+    let handle = make_handle_waiting(10);
+    let bus = ScriptBus::new(Some(256));
+    let broker = connect_fake_supervised(&handle, None, Answer::Withhold, &bus).await;
+    bus.commit_quietly(named_item(1, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("the publish reaches the broker", || {
+        broker.received().len() == 1
+    })
+    .await;
+
+    let start = tokio::time::Instant::now();
+    handle.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    broker.release();
+    handle.stop_and_join().await;
+    let waited = start.elapsed();
+    assert!(
+        waited >= Duration::from_secs(1) && waited < Duration::from_secs(10),
+        "the stop waited for the answer and not for the bound: {waited:?}"
+    );
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Handed(named_meta(1, 1)),
+            EgressReport::Delivered(named_meta(1, 1)),
+        ]
+    );
+    until("the broker reads the DISCONNECT", || {
+        bus.broker_disconnected()
+    })
+    .await;
+    let timeline = bus.timeline();
+    assert_eq!(
+        timeline[timeline.len() - 2..],
+        ["report delivered 1", BROKER_DISCONNECT]
+    );
+}
+
+/// A message the broker never answers is reported unknown when the bound
+/// passes: the stop takes the bound, not less, and only the time of its
+/// reports more. The DISCONNECT, requested once the bound has passed, is
+/// still written: the poll is tried before the deadline.
+#[tokio::test(start_paused = true)]
+async fn a_stop_never_answered_ends_at_the_bound() {
+    let bound = Duration::from_secs(10);
+    let handle = make_handle_waiting(10);
+    let bus = ScriptBus::new(Some(256));
+    let broker = connect_fake_supervised(&handle, None, Answer::Withhold, &bus).await;
+    bus.commit_quietly(named_item(1, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("the publish reaches the broker", || {
+        broker.received().len() == 1
+    })
+    .await;
+
+    let start = tokio::time::Instant::now();
+    handle.stop_and_join().await;
+    let waited = start.elapsed();
+    assert!(
+        waited >= bound && waited < bound + Duration::from_millis(100),
+        "{waited:?}"
+    );
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Handed(named_meta(1, 1)),
+            EgressReport::Unknown {
+                message: named_meta(1, 1),
+                cause: UnknownCause::SessionStopped,
+            },
+        ]
+    );
+    until("the broker reads the DISCONNECT", || {
+        bus.broker_disconnected()
+    })
+    .await;
+}
+
+/// With nothing in flight the stop awaits no timer, and the session still
+/// disconnects.
+#[tokio::test(start_paused = true)]
+async fn a_stop_with_nothing_in_flight_waits_on_no_timer() {
+    let handle = make_handle_waiting(60);
+    let bus = ScriptBus::new(Some(256));
+    let _broker = connect_fake_supervised(&handle, None, Answer::Success, &bus).await;
+    start_egress_reader(&handle, bus.clone());
+    until("the idle pass", || bus.drained()).await;
+
+    let start = tokio::time::Instant::now();
+    handle.stop_and_join().await;
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    until("the broker reads the DISCONNECT", || {
+        bus.broker_disconnected()
+    })
+    .await;
+}
+
+/// With a bound of zero a notice that has already resolved is still read and
+/// reported as what it resolved to, and one that has not is unknown at once.
+///
+/// Staged: the reader is held in an advance while the first message's notice
+/// resolves, and the stop is set before it is let go, so the notice is first
+/// read by the stop's wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_a_bound_of_zero_an_answered_notice_is_still_read() {
+    let handle = make_handle();
+    fake_supervisor(&handle).await;
+    let broker = connect_fake(&handle, None, Answer::Withhold).await;
+    let bus = ScriptBus::new(Some(256));
+    let (open, gate) = oneshot::channel();
+    *bus.gate.lock().await = Some((2, gate));
+    bus.commit_quietly(item(1, 0));
+    bus.commit_quietly(item(2, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("the QoS 0 publish is flushed", || {
+        broker.received().len() == 1
+    })
+    .await;
+    settle().await;
+    assert!(
+        bus.reports().is_empty(),
+        "the reader is held in the advance"
+    );
+
+    handle.stop();
+    open.send(()).unwrap();
+    handle.stop_and_join().await;
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Delivered(meta(1, 0)),
+            EgressReport::Unknown {
+                message: meta(2, 1),
+                cause: UnknownCause::SessionStopped,
+            },
+        ]
+    );
+}
+
+/// Nothing is handed after the stop: a message unread at the stop and one
+/// committed during the wait both stay behind the position.
+#[tokio::test(start_paused = true)]
+async fn nothing_is_handed_after_the_stop() {
+    let handle = make_handle_waiting(10);
+    let bus = ScriptBus::new(Some(256));
+    let broker = connect_fake_supervised(&handle, Some(1), Answer::Withhold, &bus).await;
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(item(2, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("the publish reaches the broker", || {
+        broker.received().len() == 1
+    })
+    .await;
+
+    handle.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    bus.commit(item(3, 1));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    broker.release();
+    handle.stop_and_join().await;
+    assert_eq!(bus.reports(), vec![EgressReport::Delivered(meta(1, 1))]);
+    assert_eq!(bus.advances(), [1], "2 and 3 stay behind the position");
+    assert_eq!(broker.received().len(), 1);
+}
+
+/// A connection that ends during the wait ends it before the bound: QoS 2 in
+/// flight is unknown for the lost connection, and QoS 1, which would be sent
+/// again on a next connection, is reported as the stop finds it.
+#[tokio::test(start_paused = true)]
+async fn the_connection_ending_ends_the_wait() {
+    let handle = make_handle_waiting(60);
+    let bus = ScriptBus::new(Some(256));
+    let broker = connect_fake_supervised(&handle, None, Answer::Withhold, &bus).await;
+    bus.commit_quietly(named_item(1, 1));
+    bus.commit_quietly(named_item(2, 2));
+    start_egress_reader(&handle, bus.clone());
+    until("both publishes reach the broker", || {
+        broker.received().len() == 2
+    })
+    .await;
+
+    let start = tokio::time::Instant::now();
+    handle.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    broker.hang_up();
+    handle.stop_and_join().await;
+    assert!(start.elapsed() < Duration::from_secs(60));
+    assert_eq!(
+        bus.reports_by_id(),
+        vec![
+            EgressReport::Handed(named_meta(1, 1)),
+            EgressReport::DroppedMessage {
+                message: named_meta(1, 1),
+                cause: DropCause::SessionStopped,
+                sent: Sent::Possibly,
+            },
+            EgressReport::Handed(named_meta(2, 2)),
+            EgressReport::Unknown {
+                message: named_meta(2, 2),
+                cause: UnknownCause::ConnectionLost,
+            },
+        ]
+    );
+    assert!(!bus.broker_disconnected(), "no DISCONNECT is owed");
+}
+
+/// Held messages are not submitted during the wait, though the client is
+/// there and has room: one given back by a full request channel, and one held
+/// from a lost connection.
+#[tokio::test(start_paused = true)]
+async fn held_messages_are_not_submitted_during_the_wait() {
+    let handle = make_handle_waiting(5);
+    let (bus, mut eventloop) = outstanding_mix(&handle).await;
+    let start = tokio::time::Instant::now();
+    handle.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        queued(&mut eventloop),
+        1,
+        "only message 1 is with the library"
+    );
+    handle.egress_wake.notify_one();
+    handle.stop_and_join().await;
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(5),
+        "message 1 is never answered"
+    );
+    let mut expected = handed_1_and_3();
+    expected.extend(stopped_1_2_3());
+    assert_eq!(bus.reports(), expected);
+    assert_eq!(bus.advances(), [1, 2, 3]);
+}
+
+/// A retire waits as a stop does, then abandons the channel and reports what
+/// that skipped, and leaves the session running.
+#[tokio::test(start_paused = true)]
+async fn a_retire_waits_for_the_answer_then_abandons() {
+    let handle = make_handle_waiting(10);
+    let bus = ScriptBus::new(Some(256));
+    let broker = connect_fake_supervised(&handle, Some(1), Answer::Withhold, &bus).await;
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(named_item(2, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("the publish reaches the broker", || {
+        broker.received().len() == 1
+    })
+    .await;
+
+    let retiring = tokio::spawn({
+        let handle = Arc::clone(&handle);
+        async move { handle.retire_egress_reader().await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    broker.release();
+    retiring.await.unwrap();
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Delivered(meta(1, 1)),
+            EgressReport::DroppedMessage {
+                message: named_meta(2, 1),
+                cause: DropCause::ClientRemoved,
+                sent: Sent::Never,
+            },
+        ]
+    );
+    assert!(bus.calls().contains(&Call::Abandon));
+    assert!(!*handle.stop_tx.borrow(), "the session is not stopped");
+    assert!(handle.client.lock().await.is_some());
+    handle.stop_and_join().await;
+}
+
+/// A retire that finds the reader already gone for the session's stop
+/// returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retire_after_the_stop_returns() {
+    let handle = make_handle();
+    fake_supervisor(&handle).await;
+    let _eventloop = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    start_egress_reader(&handle, bus.clone());
+    handle.stop_and_join().await;
+    handle.retire_egress_reader().await;
+    assert!(!bus.calls().contains(&Call::Abandon));
+}
+
+/// The stop's summary counts what was in flight when the wait began, what the
+/// broker answered during it, and what was left unknown; a wait with nothing
+/// in flight has no summary.
+#[tokio::test(start_paused = true)]
+async fn the_stop_summary_counts_the_wait() {
+    let handle = make_handle_waiting(5);
+    let broker = connect_fake(&handle, None, Answer::Withhold).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(item(2, 1));
+    bus.commit_quietly(item(3, 2));
+    let mut reader = Reader::new(Arc::clone(&handle), bus.clone(), bus.window_depth());
+    reader.pass().await;
+    until("three publishes reach the broker", || {
+        broker.received().len() == 3
+    })
+    .await;
+    broker.release();
+
+    let summary = reader.settle(Ending::Stop).await;
+    assert_eq!(
+        summary,
+        Some(SettleSummary {
+            ending: Ending::Stop,
+            bound: Duration::from_secs(5),
+            waited: Duration::from_secs(5),
+            began: 3,
+            answered: 2,
+            connection_ended: 0,
+            left: 1,
+        })
+    );
+    reader.report_stopped().await;
+    assert_eq!(reader.settle(Ending::Retire).await, None);
+}
+
+/// Messages whose connection ends during the wait are counted unknown, not
+/// answered, so the summary warns.
+#[tokio::test(start_paused = true)]
+async fn the_stop_summary_counts_a_lost_connection_unknown() {
+    let handle = make_handle_waiting(5);
+    let broker = connect_fake(&handle, None, Answer::Withhold).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(item(2, 2));
+    let mut reader = Reader::new(Arc::clone(&handle), bus.clone(), bus.window_depth());
+    reader.pass().await;
+    until("two publishes reach the broker", || {
+        broker.received().len() == 2
+    })
+    .await;
+    broker.hang_up();
+
+    let summary = reader.settle(Ending::Stop).await.unwrap();
+    assert_eq!(
+        (
+            summary.began,
+            summary.answered,
+            summary.connection_ended,
+            summary.left
+        ),
+        (2, 0, 2, 0)
+    );
+    assert_eq!(summary.unknown(), 2);
+    assert!(summary.waited < Duration::from_secs(5));
+}
+
+/// A stop that lands while a pass is handing its read leaves the rest of the
+/// read on the channel: the message being handed goes to the client, and the
+/// next is neither advanced over nor submitted.
+///
+/// Staged: the reader is held in the first message's advance while the stop
+/// is set; the client stays installed, as it does until the supervisor sees
+/// the stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_during_a_pass_leaves_the_rest_of_the_read() {
+    let handle = make_handle();
+    fake_supervisor(&handle).await;
+    let broker = connect_fake(&handle, None, Answer::Withhold).await;
+    let bus = ScriptBus::new(Some(256));
+    let (open, gate) = oneshot::channel();
+    *bus.gate.lock().await = Some((1, gate));
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(item(2, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("the reader reads the channel", || bus.reads() == 1).await;
+    settle().await;
+    assert!(
+        bus.advances().is_empty(),
+        "the reader is held in the advance"
+    );
+
+    handle.stop();
+    open.send(()).unwrap();
+    handle.stop_and_join().await;
+    assert_eq!(bus.advances(), [1], "2 stays behind the position");
+    assert_eq!(
+        bus.reports(),
+        vec![EgressReport::Unknown {
+            message: meta(1, 1),
+            cause: UnknownCause::SessionStopped,
+        }]
+    );
+    assert!(broker.topics().iter().all(|topic| topic != "lights/2"));
+}
+
+/// A retire that arrives while the reader is waiting out the session's stop
+/// is carried out: once the wait ends the channel is abandoned and what that
+/// skipped is reported dropped for the removal.
+#[tokio::test(start_paused = true)]
+async fn a_retire_during_the_stops_wait_abandons() {
+    let handle = make_handle_waiting(10);
+    let bus = ScriptBus::new(Some(256));
+    let broker = connect_fake_supervised(&handle, Some(1), Answer::Withhold, &bus).await;
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(named_item(2, 1));
+    start_egress_reader(&handle, bus.clone());
+    until("the publish reaches the broker", || {
+        broker.received().len() == 1
+    })
+    .await;
+
+    handle.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let retiring = tokio::spawn({
+        let handle = Arc::clone(&handle);
+        async move { handle.retire_egress_reader().await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    broker.release();
+    retiring.await.unwrap();
+    handle.stop_and_join().await;
+    assert_eq!(
+        bus.reports(),
+        vec![
+            EgressReport::Delivered(meta(1, 1)),
+            EgressReport::DroppedMessage {
+                message: named_meta(2, 1),
+                cause: DropCause::ClientRemoved,
+                sent: Sent::Never,
+            },
+        ]
+    );
+    assert_eq!(bus.advances(), [1], "the stop handed nothing more");
+    assert!(bus.calls().contains(&Call::Abandon));
+}
+
+/// One QoS 1 message that cannot be written: the broker reads nothing after
+/// the CONNECT and the pipe is too small for the publish.
+fn unwritable(seq: u64) -> EgressItem {
+    let mut message = message(seq, 1, MqttExpiry::Never);
+    message.payload = Bytes::from(vec![0u8; 4096]);
+    EgressItem::Message(message)
+}
+
+/// The DISCONNECT's deadline is the stop's, counted from the stop: when the
+/// reader has used the whole bound waiting on a publish the connection cannot
+/// write, the session ends at the bound and not at twice it.
+#[tokio::test(start_paused = true)]
+async fn a_disconnect_that_cannot_be_written_ends_at_the_stops_deadline() {
+    let bound = Duration::from_secs(5);
+    let handle = make_handle_waiting(5);
+    let bus = ScriptBus::new(Some(256));
+    let (client, eventloop, _broker) = stalled_connection(256).await;
+    supervise(&handle, client, eventloop, None).await;
+    bus.commit_quietly(unwritable(1));
+    start_egress_reader(&handle, bus.clone());
+    until("the reader hands the publish", || bus.advances() == [1]).await;
+    settle().await;
+
+    let start = tokio::time::Instant::now();
+    tokio::time::timeout(4 * bound, handle.stop_and_join())
+        .await
+        .expect("the stop is bounded although the DISCONNECT cannot be written");
+    let waited = start.elapsed();
+    assert!(
+        waited >= bound && waited < bound + Duration::from_millis(100),
+        "{waited:?}"
+    );
+    assert_eq!(
+        bus.reports(),
+        vec![EgressReport::Unknown {
+            message: meta(1, 1),
+            cause: UnknownCause::SessionStopped,
+        }]
+    );
+}
+
+/// A connection that fails while the DISCONNECT waits to be written ends the
+/// session at once, not at the bound.
+///
+/// Staged: an untracked publish fills the pipe, so the reader has nothing in
+/// flight and exits at the stop; the broker hangs up once it has.
+#[tokio::test(start_paused = true)]
+async fn a_connection_failing_under_the_disconnect_ends_the_stop() {
+    let handle = make_handle_waiting(60);
+    let bus = ScriptBus::new(Some(256));
+    let (client, eventloop, broker) = stalled_connection(256).await;
+    client
+        .try_publish(
+            "lights/fill",
+            rumqttc::QoS::AtMostOnce,
+            false,
+            vec![0u8; 4096],
+        )
+        .unwrap();
+    supervise(&handle, client, eventloop, None).await;
+    start_egress_reader(&handle, bus.clone());
+    until("the idle pass", || bus.drained()).await;
+
+    let start = tokio::time::Instant::now();
+    handle.stop();
+    until("the reader exits", || !handle.egress_reader_running()).await;
+    drop(broker);
+    tokio::time::timeout(Duration::from_secs(120), handle.stop_and_join())
+        .await
+        .expect("the stop ends when the connection fails");
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(bus.reports().is_empty());
+}
+
+/// Two stoppers of one session, concurrently and then once more, all return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_and_join_is_shared_and_idempotent() {
+    let handle = make_handle();
+    fake_supervisor(&handle).await;
+    start_egress_reader(&handle, ScriptBus::new(Some(256)));
+    tokio::join!(handle.stop_and_join(), handle.stop_and_join());
+    handle.stop_and_join().await;
 }

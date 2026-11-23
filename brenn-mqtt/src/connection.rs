@@ -27,11 +27,9 @@ use crate::state::{
 };
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsVersionMin};
 
-// Maximum time to wait for the DISCONNECT drain (flush DISCONNECT bytes to the
-// broker) before giving up. The drain blocks on broker liveness; this cap
-// prevents a non-conforming or slow-to-close broker from hanging the supervisor
-// task indefinitely after the terminal state is already written.
-const DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+// How long the watchdog waits before respawning a panicked supervisor body. A
+// stop ends the wait at once.
+const RESPAWN_PAUSE: Duration = Duration::from_secs(1);
 
 // What the SubAck arm logs as the filter when no pending SUBSCRIBE was bound to
 // the acked pkid — a broker resending a SubAck from a session brenn did not
@@ -171,38 +169,6 @@ pub async fn assert_ingress_unsubscribe(
         .unsubscribe(topic_filter.to_string())
         .await
         .map_err(|e| e.to_string())
-}
-
-/// How [`queue_disconnect`] ended.
-#[derive(Debug)]
-enum DisconnectQueued {
-    /// The graceful DISCONNECT is on the request channel.
-    Queued,
-    /// A poll made to free a slot failed: the connection is gone.
-    ConnectionGone,
-    /// The send failed for a reason other than a full request channel.
-    SendFailed(rumqttc::ClientError),
-}
-
-/// Queue the graceful DISCONNECT on the supervisor's own `client` without
-/// waiting for room on its request channel. The supervisor is the only task
-/// that frees a slot, so on a full channel this polls `eventloop` once — which
-/// takes a request off — and retries. Events those polls return are discarded.
-async fn queue_disconnect(
-    client: &AsyncClient,
-    eventloop: &mut rumqttc::EventLoop,
-) -> DisconnectQueued {
-    loop {
-        match client.try_disconnect() {
-            Ok(()) => return DisconnectQueued::Queued,
-            Err(rumqttc::ClientError::TryRequest(_)) => {
-                if eventloop.poll().await.is_err() {
-                    return DisconnectQueued::ConnectionGone;
-                }
-            }
-            Err(e) => return DisconnectQueued::SendFailed(e),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +375,7 @@ pub(crate) fn backoff_duration(
 /// in the background.
 ///
 /// The body is wrapped by a watchdog that catches panics, logs at error, and
-/// respawns after a brief pause.
+/// respawns after a brief pause that a stop ends at once.
 ///
 /// The returned join handle resolves when the supervisor has exited — on the
 /// stop signal or on an authoritative give-up. Callers must hand it to
@@ -421,6 +387,7 @@ pub fn spawn_client_supervisor(
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut pause_rx = stop_rx.clone();
         loop {
             let handle2 = handle.clone();
             let router2 = router.clone();
@@ -433,7 +400,7 @@ pub fn spawn_client_supervisor(
                         client = %handle.config.identity.slug,
                         "MQTT supervisor task panicked; respawning. This is a bug.",
                     );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    respawn_pause(&mut pause_rx).await;
                     // continue — respawn
                 }
                 Err(e) => {
@@ -447,6 +414,15 @@ pub fn spawn_client_supervisor(
             }
         }
     })
+}
+
+/// The watchdog's pause before a respawn: [`RESPAWN_PAUSE`], or until the stop
+/// is requested if that is sooner.
+async fn respawn_pause(stop_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    tokio::select! {
+        () = tokio::time::sleep(RESPAWN_PAUSE) => {}
+        () = stop_requested(stop_rx) => {}
+    }
 }
 
 /// Where an arriving session's filter set comes from.
@@ -491,8 +467,8 @@ pub enum ArrivingFilters<'a> {
 ///   resolved the successor directly or was re-aimed at it — therefore applies
 ///   on top of the inherited set rather than being discarded by it, and
 ///   `add_subscription`'s id numbering stays monotone because no edit can
-///   precede the inherit. A read of the successor's set blocks for the duration
-///   of the drain, which `MqttClientHandle::stop_and_join`'s own timeout bounds.
+///   precede the inherit. A read of the successor's set blocks for the
+///   predecessor's stop, which the client's `stop_wait_secs` bounds.
 /// - **Record the join handle.** `MqttClientHandle::stop_and_join` panics
 ///   without one, so a session that is brought up any other way cannot be
 ///   stopped.
@@ -529,12 +505,11 @@ pub async fn register_and_spawn(
 /// Whether the supervisor has been asked to stop, right now.
 ///
 /// A closed channel counts, as defence against a future ownership change
-/// rather than against anything reachable today: each client's channel has two
-/// senders, one held by the process's shutdown handle and one inside the
-/// `MqttClientHandle` this supervisor itself holds, so a running supervisor
-/// cannot observe the channel closed. Should the handle stop carrying one, a
-/// closed channel means the owner is gone and there is nothing left to keep a
-/// broker session up for.
+/// rather than against anything reachable today: each client's channel has one
+/// sender, held by the `MqttClientHandle` this supervisor itself holds, so a
+/// running supervisor cannot observe the channel closed. Should the handle
+/// stop carrying it, a closed channel means the owner is gone and there is
+/// nothing left to keep a broker session up for.
 fn stopping_now(stop_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
     *stop_rx.borrow() || stop_rx.has_changed().is_err()
 }
@@ -612,8 +587,9 @@ async fn supervisor_body(
         // This task is the only poller of `eventloop`, and only a poll frees a
         // slot on the client's bounded request channels. So every request this
         // task submits on `client` is a non-blocking `try_*` send interleaved
-        // with `poll` — `try_assert_ingress_subscription` in the main loop,
-        // `try_disconnect` on the stop path. The awaiting forms are for other
+        // with `poll` — `try_assert_ingress_subscription` in the main loop.
+        // The stop path's `try_disconnect_now` goes through the library's
+        // unbounded immediate channel instead. The awaiting forms are for other
         // tasks only. The bound is kept so a stalled broker turns into a prompt
         // `NotConnected` on the publish path rather than unbounded growth.
         let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
@@ -819,8 +795,9 @@ async fn supervisor_body(
             tokio::select! {
                 biased;
                 _ = stop_requested(&mut stop_rx) => {
-                    // Write Disconnected BEFORE the drain so the observable
-                    // health transition does not gate on broker liveness.
+                    // Write Disconnected before the stop waits on anything, so
+                    // the observable health transition does not gate on broker
+                    // liveness.
                     if terminal_reason.is_none() {
                         let disconnected = SupervisorState::Disconnected {
                             last_error: None,
@@ -832,50 +809,12 @@ async fn supervisor_body(
                         }
                         terminal_reason = Some(disconnected);
                     }
-                    let client_opt = handle.client.lock().await.take();
-                    if let Some(c) = client_opt {
-                        // Queue the graceful DISCONNECT barrier without waiting
-                        // for room — this task is the one that makes room — then
-                        // drain. Both are under the one timeout.
-                        let drain_result = tokio::time::timeout(DISCONNECT_DRAIN_TIMEOUT, async {
-                            match queue_disconnect(&c, &mut eventloop).await {
-                                DisconnectQueued::Queued => {}
-                                DisconnectQueued::ConnectionGone => return,
-                                DisconnectQueued::SendFailed(e) => {
-                                    tracing::warn!(
-                                        client = %client_slug,
-                                        broker = %broker.identity.slug,
-                                        error = %e,
-                                        "could not queue DISCONNECT",
-                                    );
-                                    return;
-                                }
-                            }
-                            while eventloop.poll().await.is_ok() {}
-                            // TODO(mqtt-disconnect-lost-to-reset): the
-                            // `EventLoop`'s drop below closes the socket with
-                            // whatever the broker sent after the last read still
-                            // unread; that close is an RST, and the broker may
-                            // discard the DISCONNECT with it. rumqttc offers no
-                            // read-to-EOF after `RequestsDone`.
-                        })
-                        .await;
-                        if drain_result.is_err() {
-                            tracing::warn!(
-                                client = %client_slug,
-                                broker = %broker.identity.slug,
-                                "DISCONNECT drain timed out after {}s; broker may not have \
-                                 closed the TCP connection promptly",
-                                DISCONNECT_DRAIN_TIMEOUT.as_secs(),
-                            );
-                        }
-                    }
-                    // A stop is terminal for this session. The library resolved
-                    // every notice the drain's acknowledgements answered;
-                    // dropping the event loop and the client ends the rest.
-                    drop(eventloop);
-                    drop(client);
-                    clear_subscribe_tracking(&handle).await;
+                    // From here no caller can start a publish, SUBSCRIBE or
+                    // UNSUBSCRIBE on this session, and the loop above that
+                    // moves deferred subscribes onto the connection does not
+                    // run again.
+                    drop(handle.client.lock().await.take());
+                    end_connected_session(&handle, &router, client, eventloop).await;
                     break 'supervisor;
                 }
                 event = eventloop.poll() => {
@@ -976,6 +915,114 @@ async fn supervisor_body(
             );
         }
     }
+}
+
+/// End a connected session whose stop was requested. The caller has written
+/// the terminal state and emptied the client cell.
+///
+/// The connection is serviced as on a live session — inbound publishes
+/// routed, acknowledgements resolving the egress reader's notices,
+/// keep-alive, publishes the reader submitted before the stop written as the
+/// broker's Receive Maximum allows — until the reader is not live. The reader
+/// owns the wait for outcomes and its bound; this waits on the reader alone. A
+/// handle with no reader running passes at once.
+///
+/// If the connection fails meanwhile it has ended: no DISCONNECT is owed, and
+/// dropping the event loop resolves every notice still outstanding, which
+/// ends the reader's wait. Otherwise the DISCONNECT is requested through the
+/// library's immediate channel, which waits for no acknowledgement, and the
+/// event loop is polled until it reports the request done or until the
+/// client's stop bound, counted from this call, has passed with a poll still
+/// pending. The poll is tried before the deadline, so a socket that takes the
+/// packet gets it even when the reader's wait used the whole bound.
+///
+/// # Panics
+///
+/// If the immediate DISCONNECT cannot be queued: its receiver is the event
+/// loop this function owns.
+pub(crate) async fn end_connected_session(
+    handle: &Arc<MqttClientHandle>,
+    router: &Arc<dyn MqttEventRouter>,
+    client: AsyncClient,
+    mut eventloop: rumqttc::EventLoop,
+) {
+    let client_slug = handle.config.identity.slug.as_str();
+    let bound = handle.stop_wait();
+    let deadline = tokio::time::Instant::now() + bound;
+    tracing::info!(
+        client = %client_slug,
+        bound_secs = bound.as_secs(),
+        reader_live = *handle.egress_reader_live.borrow(),
+        "MQTT session stopping: servicing the connection until the egress reader exits",
+    );
+    let connection_ended = loop {
+        tokio::select! {
+            biased;
+            () = handle.egress_reader_exited() => break false,
+            event = eventloop.poll() => match event {
+                Ok(event) => handle_event(event, handle, router).await,
+                Err(e) => {
+                    tracing::info!(
+                        client = %client_slug,
+                        error = %e,
+                        "broker connection ended while the session was stopping; no DISCONNECT \
+                         is owed",
+                    );
+                    break true;
+                }
+            }
+        }
+    };
+    let disconnect = if connection_ended {
+        "not owed: the connection ended"
+    } else {
+        client.try_disconnect_now().unwrap_or_else(|e| {
+            panic!(
+                "MQTT client {client_slug:?}: the immediate DISCONNECT could not be queued \
+                 although its event loop is alive: {e}"
+            )
+        });
+        let disconnect_deadline = tokio::time::sleep_until(deadline);
+        tokio::pin!(disconnect_deadline);
+        loop {
+            tokio::select! {
+                biased;
+                event = eventloop.poll() => match event {
+                    Ok(event) => handle_event(event, handle, router).await,
+                    Err(ConnectionError::RequestsDone) => break "written",
+                    Err(e) => {
+                        tracing::warn!(
+                            client = %client_slug,
+                            error = %e,
+                            "broker connection failed while the DISCONNECT was being written",
+                        );
+                        break "connection failed while writing it";
+                    }
+                },
+                () = &mut disconnect_deadline => {
+                    tracing::warn!(
+                        client = %client_slug,
+                        bound_secs = bound.as_secs(),
+                        "DISCONNECT not written within the stop bound; closing the connection \
+                         without it",
+                    );
+                    break "not written within the stop bound";
+                }
+            }
+        }
+    };
+    // TODO(mqtt-disconnect-lost-to-reset): the `EventLoop`'s drop below closes
+    // the socket with whatever the broker sent after the last read still
+    // unread; that close is an RST, and the broker may discard the DISCONNECT
+    // with it. rumqttc offers no read-to-EOF after `RequestsDone`.
+    drop(eventloop);
+    drop(client);
+    clear_subscribe_tracking(handle).await;
+    tracing::info!(
+        client = %client_slug,
+        disconnect,
+        "MQTT session stopped: connection closed",
+    );
 }
 
 /// Clear the per-connect SUBSCRIBE attribution bookkeeping on disconnect so a
@@ -1632,84 +1679,36 @@ mod tests {
         ));
     }
 
-    /// The stop path's DISCONNECT goes out even when the request channel is
-    /// full at the stop: the supervisor polls once to make room rather than
-    /// waiting for a slot only its own poll can free, then queues it.
-    ///
-    /// The broker is a bare socket that answers CONNECT with a success CONNACK
-    /// and discards everything after.
-    #[tokio::test]
-    async fn queue_disconnect_polls_a_full_channel_then_queues() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    /// The watchdog's pause before a respawn ends at a stop: no fixed sleep is
+    /// reachable after the stop is requested, whether it lands before the pause
+    /// or during it.
+    #[tokio::test(start_paused = true)]
+    async fn the_respawn_pause_does_not_delay_a_stop() {
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let start = tokio::time::Instant::now();
+        respawn_pause(&mut stop_rx).await;
+        assert_eq!(start.elapsed(), RESPAWN_PAUSE, "with no stop it pauses");
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
-        let broker = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            let mut buf = [0u8; 4096];
-            let n = sock.read(&mut buf).await.expect("read CONNECT");
-            assert!(n > 0, "the client sent no CONNECT");
-            // CONNACK: no session present, reason Success, no properties.
-            sock.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
-                .await
-                .expect("write CONNACK");
-            while sock.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        let start = tokio::time::Instant::now();
+        let pause = tokio::spawn(async move {
+            respawn_pause(&mut stop_rx).await;
+            stop_rx
         });
-
-        let opts = MqttOptions::new("test-queue-disconnect", ("127.0.0.1", port));
-        let (client, mut eventloop) = AsyncClient::builder(opts).capacity(1).build();
-        let connected = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Event::Incoming(Incoming::ConnAck(_)) = eventloop
-                    .poll()
-                    .await
-                    .expect("connect to the stand-in broker")
-                {
-                    break;
-                }
-            }
-        })
-        .await;
-        connected.expect("no CONNACK");
-
-        let handle = test_handle();
+        tokio::task::yield_now().await;
+        stop_tx.send_replace(true);
+        let mut stop_rx = pause.await.expect("the pause task");
         assert_eq!(
-            try_assert_ingress_subscription(&handle, &client, &sub("home/a", 1)),
-            Ok(SubscribeSend::Sent),
-        );
-        assert!(
-            matches!(
-                client.try_disconnect(),
-                Err(rumqttc::ClientError::TryRequest(_))
-            ),
-            "the request channel is full before the stop",
+            start.elapsed(),
+            Duration::ZERO,
+            "a stop during the pause ends it"
         );
 
-        let queued = tokio::time::timeout(
-            Duration::from_secs(5),
-            queue_disconnect(&client, &mut eventloop),
-        )
-        .await
-        .expect("queueing the DISCONNECT did not return");
-        assert!(matches!(queued, DisconnectQueued::Queued), "{queued:?}");
-
-        let wrote_disconnect = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match eventloop.poll().await {
-                    Ok(Event::Outgoing(Outgoing::Disconnect)) => break true,
-                    Ok(_) => continue,
-                    Err(_) => break false,
-                }
-            }
-        })
-        .await
-        .expect("the drain did not end");
-        assert!(wrote_disconnect, "the queued DISCONNECT was never written");
-
-        drop(eventloop);
-        broker.await.expect("stand-in broker");
+        respawn_pause(&mut stop_rx).await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "a stop before the pause skips it"
+        );
     }
 
     /// Two SUBSCRIBEs bound to distinct pkids resolve to their own filters at

@@ -58,7 +58,7 @@ async fn died_with_server_shutting_down_suppresses_alerts() {
     let (bridge, event_tx, mut broadcast_rx, _ab) = test_bridge_with_dispatcher(dispatcher).await;
 
     // Flip the server-shutdown flag before firing Died. This
-    // simulates what shutdown_signal does on SIGTERM.
+    // simulates what serve_until_shutdown does on SIGTERM.
     bridge.server_shutting_down.store(true, Ordering::SeqCst);
 
     event_tx

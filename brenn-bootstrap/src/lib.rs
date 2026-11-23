@@ -1523,10 +1523,10 @@ pub async fn run_server(
         state.alert_dispatcher.clone(),
     );
 
-    // Capture the handles `shutdown_signal` needs before `state` is consumed
-    // by `build_router`. `active_bridges` and `server_shutting_down` are
-    // cheap `Clone` (Arc-backed); the MQTT service is the live registry, whose
-    // supervisors are signalled to send DISCONNECT on SIGTERM/SIGINT.
+    // Capture the handles `serve_until_shutdown` needs before `state` is
+    // consumed by `build_router`. `active_bridges` and `server_shutting_down`
+    // are cheap `Clone` (Arc-backed); the MQTT service is the live registry,
+    // whose sessions are stopped at SIGTERM/SIGINT and joined before exit.
     let shutdown_handle = shutdown::ShutdownHandle {
         active_bridges: state.active_bridges.clone(),
         server_shutting_down: state.server_shutting_down.clone(),
@@ -1559,17 +1559,13 @@ pub async fn run_server(
 
     info!("listening on {}", listener.local_addr().unwrap());
 
-    use std::net::SocketAddr;
-    // TODO(surface-small-row-delivery-latency): small binary rows round-trip a
-    // surface page's websocket about 20 ms slower than megabyte rows; the
-    // listener's sockets keep Nagle's algorithm on.
-    axum::serve(
+    shutdown::serve_until_shutdown(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        app,
+        shutdown_handle,
+        shutdown::os_shutdown_signal(),
     )
-    .with_graceful_shutdown(shutdown::shutdown_signal(shutdown_handle))
-    .await
-    .expect("server error");
+    .await;
 
     info!("shutdown complete");
 

@@ -196,6 +196,7 @@ fn the_named_declarations_each_get_their_own_vocabulary() {
     );
     assert!(client.body.attrs.tls_version_min.is_some());
     assert!(client.body.attrs.session_expiry_secs.is_some());
+    assert!(client.body.attrs.stop_wait_secs.is_some());
 
     let server = file.mcp_servers().next().expect("an mcp server");
     assert!(server.body.attrs.args.is_some());

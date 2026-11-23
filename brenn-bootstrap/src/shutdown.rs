@@ -12,20 +12,21 @@ const BUS_GC_STAGGER_SECS: u64 = 45 * 60;
 
 use brenn_server::active_bridge::ActiveBridges;
 
-/// Handles passed into `shutdown_signal` so it can mark live CC sessions
-/// shutting-down before yielding control back to `axum::serve`'s graceful
-/// shutdown. All three are cheap `Clone` (Arc-backed). `mqtt` is the live
-/// client registry, signalled on SIGTERM/SIGINT so each supervisor sends MQTT
-/// DISCONNECT before process exit — read at signal time rather than captured at
-/// boot, so a client a reload added is disconnected as cleanly as a declared
-/// one.
+/// Handles [`serve_until_shutdown`] acts on at the shutdown signal and after
+/// the server returns. All three are cheap `Clone` (Arc-backed). `mqtt` is the
+/// live client registry: every session in it, and every one a reload has let go
+/// of and is still stopping, is signalled at the signal and joined before the
+/// function returns, so each egress reader has reported what it had in flight
+/// and each supervisor has sent its DISCONNECT before the process exits. A
+/// client a reload adds after the signal is born stopped.
 pub(crate) struct ShutdownHandle {
     pub(crate) active_bridges: ActiveBridges,
     pub(crate) server_shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) mqtt: std::sync::Arc<brenn_mqtt::MqttService>,
 }
 
-pub(crate) async fn shutdown_signal(handle: ShutdownHandle) {
+/// Resolve at the first SIGINT or SIGTERM.
+pub(crate) async fn os_shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to install SIGTERM handler");
@@ -37,7 +38,43 @@ pub(crate) async fn shutdown_signal(handle: ShutdownHandle) {
         }
         _ = sigterm.recv() => { info!("received SIGTERM"); }
     }
+}
 
+/// Serve `app` on `listener` until `signal` resolves, then shut down: mark the
+/// process shutting down, signal every MQTT session to stop, let `axum` drain
+/// its in-flight requests, and join every MQTT session before returning.
+///
+/// The sessions' stops start at the signal and run beside the HTTP drain, so
+/// the whole takes the longer of the two, not their sum.
+pub(crate) async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    handle: ShutdownHandle,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let mqtt = handle.mqtt.clone();
+    // TODO(surface-small-row-delivery-latency): small binary rows round-trip a
+    // surface page's websocket about 20 ms slower than megabyte rows; the
+    // listener's sockets keep Nagle's algorithm on.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        signal.await;
+        begin_shutdown(handle).await;
+    })
+    .await
+    .expect("server error");
+
+    let joined = mqtt.join_all().await;
+    if joined > 0 {
+        info!(count = joined, "joined MQTT sessions");
+    }
+}
+
+/// What the shutdown signal sets off before `axum`'s graceful shutdown begins.
+async fn begin_shutdown(handle: ShutdownHandle) {
     // Mark the process as shutting down BEFORE letting axum begin its
     // graceful shutdown. Two effects:
     //   1. Flip the global flag so each bridge's `SessionEvent::Died` arm
@@ -56,14 +93,13 @@ pub(crate) async fn shutdown_signal(handle: ShutdownHandle) {
         .mark_all_sessions_shutting_down()
         .await;
 
-    // Signal all MQTT supervisors to disconnect cleanly. Each supervisor will
-    // send MQTT DISCONNECT and exit its event loop on the next poll cycle.
+    // Start every MQTT session's stop: each egress reader waits, up to its
+    // client's `stop_wait_secs`, for the outcomes of what it has in flight,
+    // and each supervisor disconnects once its reader has exited.
+    // `serve_until_shutdown` joins them after the HTTP drain.
     let signalled = handle.mqtt.stop_all();
     if signalled > 0 {
-        info!(
-            count = signalled,
-            "signalled MQTT supervisors to disconnect"
-        );
+        info!(count = signalled, "signalled MQTT sessions to stop");
     }
 
     info!("marked active bridges shutting down, yielding to graceful shutdown");

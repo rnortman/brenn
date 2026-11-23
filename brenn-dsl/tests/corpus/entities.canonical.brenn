@@ -116,6 +116,7 @@ mqtt_client broker {
   reconnect_backoff_initial_secs = 1;
   reconnect_backoff_max_secs = 60;
   session_expiry_secs = 300;
+  stop_wait_secs = 30;
   qos = 1;
   urgency = normal;
 }

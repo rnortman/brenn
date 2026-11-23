@@ -2250,6 +2250,38 @@ Five more declarations, each a body of attrs:
   answers `invalid-payload`. `0`, or a value over
   4294967295, refuses the document at load. `docs/message-bus.md` §2.7.2 has
   `MqttSend`'s contract.
+
+  `stop_wait_secs` (default 60) is the longest a stop of the client's session
+  — a server shutdown, a reload that changes the client, or one that removes
+  it — waits for the broker: first for the answers to messages already in
+  flight, then for the connection to take the DISCONNECT. One deadline, set
+  when the stop is requested. It is a maximum, not a wait: a session with
+  nothing in flight stops at once, and on a broker that answers the wait ends
+  with the last acknowledgement. Nothing is handed or resent during it, and
+  nothing reads it while the session runs; a message still unanswered when it
+  ends is reported `unknown`, `stopped`. `0` means do not wait: answers that
+  have already arrived are still reported as what they are, everything else
+  in flight is `unknown` at once, and the DISCONNECT goes out only if the
+  connection takes it without waiting. A negative value, a non-integer or one
+  over 4294967295 refuses the document at load. Changing it restarts the
+  session, whose stop runs under the old value.
+
+  Why 60. The wait costs nothing unless the broker is not answering, so the
+  number is chosen for that case, where a longer wait only ever turns an
+  `unknown` into an outcome. Its ceiling is the service manager's stop
+  timeout: the value must be shorter than it (systemd: `TimeoutStopSec`, 90 s
+  unless set), or the process is killed in the middle of the wait and every
+  session's stop becomes a crash — each in-flight message a `handed` with no
+  outcome. So the default is set from that ceiling down, not from a measured
+  latency up; no figure for how long a broker on a bad link takes to answer
+  is known. Ten seconds without an answer is ordinary, so the default is well
+  clear of that, and the margin under 90 is wide because the two errors are
+  unlike: overrunning the ceiling by a second crashes every session, while
+  stopping thirty seconds short loses only the answers that would have come
+  in those thirty seconds. That it is 60 and not 45 or 75 is a judgement about
+  that margin, not a derivation. A server shutdown stops every session at
+  once, so it waits for brokers no longer than the largest `stop_wait_secs`
+  among them; what follows the wait does not wait on a broker.
 - `repo <name> { remote = …; }` — a git remote plus a slug, mounted by whichever
   agents want it.
 - `mcp_server <name> { … }` — an MCP server every app that wants it references
@@ -2852,7 +2884,16 @@ What converges is components, surfaces and their wiring:
   resumes the same persistent session at the broker; a removed one is stopped,
   with an orderly DISCONNECT, only after the last authority that could name it
   is gone. The status body's `mqtt_clients_added`, `mqtt_clients_removed` and
-  `mqtt_clients_changed` say what moved. An agent's `mqtt_publish` or
+  `mqtt_clients_changed` say what moved. A reload waits for brokers in two
+  steps, one after the other: the removed clients' readers are retired
+  together, up to the largest `stop_wait_secs` among them, and later the
+  changed clients' sessions are stopped together, up to the largest among
+  those. A reload that only removes or only changes clients waits at most one
+  bound; one that does both, against brokers that are not answering on both
+  sides, waits up to two — 120 s at the default. On brokers that answer each
+  wait is milliseconds. Anything that waits for a reload's outcome, such as a
+  deploy script polling its status, must allow for that, or it gives up
+  before the reload has applied. An agent's `mqtt_publish` or
   `mqtt_subscribe` call that was already in flight when the reload removed the
   client it names is answered as a tool error naming that client — the agent
   asked for something the document said was there when it asked — and, for a

@@ -8,22 +8,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 
 use brenn_lib::mqtt::config::MqttClientConfig;
 
 use crate::reader::ReaderSlot;
-
-/// How long [`MqttClientHandle::stop_and_join`] waits for a supervisor it has
-/// asked to stop.
-///
-/// Wide enough for every path the supervisor can be on when the signal lands —
-/// a DISCONNECT drain, a panic-respawn pause, then another drain — and narrow
-/// enough that a reload's commit cannot sit here unnoticed.
-const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Poisoning message for [`MqttClientHandle::pending_subscribes`]. Its critical
 /// sections are synchronous and short, so poisoning means a holder panicked
@@ -326,22 +318,32 @@ pub struct MqttClientHandle {
     /// until the re-assert loop's SUBSCRIBEs are answered again.
     subscribe_outcomes: Mutex<HashMap<String, SubAckOutcome>>,
 
-    /// The wake channel used to send a "stop" signal to the supervisor task.
-    pub stop_tx: tokio::sync::watch::Sender<bool>,
+    /// The stop signal, observed by the supervisor and the egress reader.
+    pub stop_tx: watch::Sender<bool>,
 
-    /// The outer supervisor task's join handle, set by
-    /// [`Self::set_supervisor`] right after the spawn. `None` before the spawn
-    /// and after [`Self::stop_and_join`] has taken it.
-    supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The outer supervisor task, recorded by [`Self::set_supervisor`] right
+    /// after the spawn and joined by [`Self::stop_and_join`]. A
+    /// `tokio::sync::Mutex` because the join is awaited under it, so a second
+    /// stopper queues behind the first and finds the session joined.
+    supervisor: Mutex<SupervisorSlot>,
 
     /// The egress reader, recorded by [`crate::reader::start_egress_reader`].
     /// A `std::sync::Mutex`: every section is a synchronous take or store.
     pub(crate) egress_reader: std::sync::Mutex<ReaderSlot>,
 
-    /// The reader completed a bus call: moves by one after every awaited
-    /// call the egress reader makes on its bus. The reader's join reads it
-    /// to tell a reader that is working from one that is stuck.
-    pub(crate) egress_reader_progress: AtomicU64,
+    /// Whether an egress reader is running on this handle: set `true` before
+    /// its task is spawned, and `false` by the task as its last act, after its
+    /// last report has committed. Every wait for the reader's exit reads this.
+    pub(crate) egress_reader_live: watch::Sender<bool>,
+}
+
+/// The supervisor recorded on a handle.
+enum SupervisorSlot {
+    /// No supervisor was spawned for this handle yet.
+    NotSpawned,
+    Running(tokio::task::JoinHandle<()>),
+    /// The supervisor has been joined after the session's stop.
+    Joined,
 }
 
 /// Poisoning message for [`MqttClientHandle::egress_reader`].
@@ -371,10 +373,16 @@ impl MqttClientHandle {
             inflight_subscribes: Mutex::new(HashMap::new()),
             subscribe_outcomes: Mutex::new(HashMap::new()),
             stop_tx,
-            supervisor: Mutex::new(None),
+            supervisor: Mutex::new(SupervisorSlot::NotSpawned),
             egress_reader: std::sync::Mutex::new(ReaderSlot::Never),
-            egress_reader_progress: AtomicU64::new(0),
+            egress_reader_live: watch::Sender::new(false),
         })
+    }
+
+    /// The longest a stop of this session waits for the broker: the client's
+    /// `stop_wait_secs`.
+    pub fn stop_wait(&self) -> Duration {
+        Duration::from_secs(u64::from(self.config.identity.stop_wait_secs))
     }
 
     /// Read the current health label + last_error without holding a long-lived lock.
@@ -497,10 +505,11 @@ impl MqttClientHandle {
         self.subscribe_outcomes.lock().await.clear();
     }
 
-    /// Signal the supervisor to stop (sends `true` on the stop watch channel).
-    /// Idempotent: repeated calls are safe.
+    /// Signal the session to stop: sets the stop watch to `true`, whether or
+    /// not anything is subscribed yet, so a task that subscribes later sees the
+    /// stop. Idempotent.
     pub fn stop(&self) {
-        let _ = self.stop_tx.send(true);
+        self.stop_tx.send_replace(true);
     }
 
     /// Record the supervisor task's join handle.
@@ -513,109 +522,118 @@ impl MqttClientHandle {
     pub async fn set_supervisor(&self, join: tokio::task::JoinHandle<()>) {
         let mut slot = self.supervisor.lock().await;
         assert!(
-            slot.is_none(),
+            matches!(*slot, SupervisorSlot::NotSpawned),
             "MqttClientHandle::set_supervisor called twice for client {:?}",
             self.config.identity.slug,
         );
-        *slot = Some(join);
+        *slot = SupervisorSlot::Running(join);
     }
 
-    /// Signal the supervisor and the egress reader to stop, then wait for the
-    /// reader, if one is running, and then the supervisor to exit.
+    /// Whether a supervisor has been recorded on this handle.
+    pub async fn supervisor_spawned(&self) -> bool {
+        !matches!(*self.supervisor.lock().await, SupervisorSlot::NotSpawned)
+    }
+
+    /// Signal the session to stop, wait for its egress reader to exit, then
+    /// join its supervisor.
     ///
-    /// The supervisor's stop arm drains the DISCONNECT under its own timeout
-    /// and its connect and backoff sleeps race the stop signal, so every path
-    /// out of it is short; and the wait for it is under [`STOP_JOIN_TIMEOUT`],
-    /// because a commit step that stalls here stalls the whole reload with no
-    /// `mqtt:` route installed and no status published, which is a worse
-    /// failure than a loud death. The reader's exit commits one report per
-    /// outstanding message, so its wait is bounded by progress instead: it
-    /// panics only when [`STOP_JOIN_TIMEOUT`] passes with no bus call
-    /// completed. Returning means the broker connection is gone and the
-    /// client id is free for a successor to take.
+    /// The reader stops handing and waits up to [`Self::stop_wait`] for the
+    /// outcomes of what it has in flight, reports them, and exits. The
+    /// supervisor keeps the connection serviced until then, so the broker's
+    /// answers arrive, and then disconnects under the same bound. Neither wait
+    /// here has a timeout of its own: every wait a stopping session can be in
+    /// is that bound, a bus call, or a select that races the stop signal.
+    /// Returning means the broker connection is gone and the client id is free
+    /// for a successor to take.
+    ///
+    /// Idempotent and shareable: a second caller, concurrent or later, queues
+    /// on the supervisor slot behind the first and returns once the session is
+    /// joined.
     ///
     /// # Panics
     ///
-    /// Panics if no handle was recorded; if the reader stalls as above; if
-    /// the supervisor's wait outlives [`STOP_JOIN_TIMEOUT`], which means the
-    /// supervisor has a path out that does not race the stop signal; or if the supervisor task ended in a way
-    /// `tokio` reports as an error — the outer task catches its body's panics
-    /// itself, so a join error here means the runtime tore the task down.
+    /// Panics if no supervisor was ever recorded, or if the supervisor task
+    /// ended in a way `tokio` reports as an error — the outer task catches its
+    /// body's panics itself, so a join error here means the runtime tore the
+    /// task down.
     pub async fn stop_and_join(&self) {
         self.stop();
-        let reader = self.take_egress_reader();
-        if let Some((join, _retire)) = reader {
-            self.join_egress_reader(join).await;
-        }
-        let join = self.supervisor.lock().await.take().unwrap_or_else(|| {
-            panic!(
+        self.egress_reader_exited().await;
+        let mut slot = self.supervisor.lock().await;
+        match std::mem::replace(&mut *slot, SupervisorSlot::Joined) {
+            SupervisorSlot::NotSpawned => panic!(
                 "MqttClientHandle::stop_and_join with no supervisor recorded for client {:?}",
                 self.config.identity.slug,
-            )
-        });
-        let joined = tokio::time::timeout(STOP_JOIN_TIMEOUT, join)
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "MQTT supervisor for client {:?} did not exit within {}s of being asked to \
-                     stop — every path out of it is supposed to race the stop signal, so this is \
-                     a host bug",
-                    self.config.identity.slug,
-                    STOP_JOIN_TIMEOUT.as_secs(),
-                )
-            });
-        if let Err(e) = joined {
-            panic!(
-                "MQTT supervisor for client {:?} could not be joined: {e}",
-                self.config.identity.slug,
-            );
+            ),
+            SupervisorSlot::Running(join) => {
+                if let Err(e) = join.await {
+                    panic!(
+                        "MQTT supervisor for client {:?} could not be joined: {e}",
+                        self.config.identity.slug,
+                    );
+                }
+                // The one place a session's stop has completed, once per
+                // session: its reader has exited and its supervisor has ended.
+            }
+            SupervisorSlot::Joined => {}
         }
     }
 
     /// Retire the egress reader and wait for it to exit, leaving the session
-    /// running. The reader reports what it had outstanding, moves its position
-    /// past everything the channel retains and reports how many that skipped.
+    /// running. The reader waits up to [`Self::stop_wait`] for the outcomes of
+    /// what it has in flight, reports what it had outstanding, moves its
+    /// position past everything the channel retains and reports how many that
+    /// skipped.
+    ///
+    /// A reader still ending for the session's stop carries the retire out
+    /// before it exits. One that has already finished ending for the stop is
+    /// not retired: what the channel still holds for it is not abandoned or
+    /// reported dropped, a `warn` line says so, and this returns once the
+    /// reader has exited.
     ///
     /// # Panics
     ///
-    /// If no reader is running on this handle, or as
-    /// [`Self::stop_and_join`] does when the reader completes no bus call for
-    /// [`STOP_JOIN_TIMEOUT`] without exiting.
+    /// If no reader was started on this handle or it was already retired, or
+    /// if the reader has exited and the session's stop is not set.
     pub async fn retire_egress_reader(&self) {
-        let (join, retire) = self.take_egress_reader().unwrap_or_else(|| {
+        let retire = self.take_egress_reader().unwrap_or_else(|| {
             panic!(
                 "MqttClientHandle::retire_egress_reader with no egress reader running for client \
                  {:?}",
                 self.config.identity.slug,
             )
         });
-        retire
-            .send(())
-            .expect("a running egress reader holds its retire receiver until it exits");
-        self.join_egress_reader(join).await;
+        if retire.send(()).is_err() {
+            assert!(
+                *self.stop_tx.borrow(),
+                "the egress reader of MQTT client {:?} exited without being retired or stopped",
+                self.config.identity.slug,
+            );
+            // TODO(mqtt-egress-removed-client-rows): the messages this reader
+            // left unread are never reported `dropped`, `removed`: nothing
+            // reports a removed client's channel once its reader has ended.
+            tracing::warn!(
+                client = %self.config.identity.slug,
+                "MQTT egress reader already ended for the session's stop when its client was \
+                 removed: messages still on its channel are not reported dropped for the removal",
+            );
+        }
+        self.egress_reader_exited().await;
     }
 
-    /// Whether an egress reader was started on this handle and has been
-    /// neither retired nor joined.
+    /// Whether an egress reader is running on this handle: started, and not
+    /// yet exited for a retire or the session's stop.
     #[cfg(any(test, feature = "testutils"))]
     pub fn egress_reader_running(&self) -> bool {
-        matches!(
-            *self.egress_reader.lock().expect(EGRESS_READER_POISONED),
-            ReaderSlot::Running { .. }
-        )
+        *self.egress_reader_live.borrow()
     }
 
-    /// Take the running reader out of its slot, leaving the slot `Gone`.
-    /// `None` when no reader is running.
-    fn take_egress_reader(
-        &self,
-    ) -> Option<(
-        tokio::task::JoinHandle<()>,
-        tokio::sync::oneshot::Sender<()>,
-    )> {
+    /// Take the running reader's retire sender out of its slot, leaving the
+    /// slot `Gone`. `None` when no reader is running.
+    fn take_egress_reader(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
         let mut slot = self.egress_reader.lock().expect(EGRESS_READER_POISONED);
         match std::mem::replace(&mut *slot, ReaderSlot::Gone) {
-            ReaderSlot::Running { join, retire } => Some((join, retire)),
+            ReaderSlot::Running { retire } => Some(retire),
             previous @ (ReaderSlot::Never | ReaderSlot::Gone) => {
                 *slot = previous;
                 None
@@ -623,33 +641,14 @@ impl MqttClientHandle {
         }
     }
 
-    /// Wait for the reader to exit, in windows of [`STOP_JOIN_TIMEOUT`]. A
-    /// window in which the reader completed a bus call starts another: a
-    /// reader with many statuses to commit is working, however long that
-    /// takes. A window in which it completed none ends the wait in a panic.
-    async fn join_egress_reader(&self, mut join: tokio::task::JoinHandle<()>) {
-        loop {
-            let before = self.egress_reader_progress.load(Ordering::Relaxed);
-            let Ok(joined) = tokio::time::timeout(STOP_JOIN_TIMEOUT, &mut join).await else {
-                if self.egress_reader_progress.load(Ordering::Relaxed) == before {
-                    panic!(
-                        "MQTT egress reader for client {:?} neither exited nor completed one bus \
-                         call within {}s of being asked to exit — it waits on no broker, so the \
-                         store has stopped or this is a host bug",
-                        self.config.identity.slug,
-                        STOP_JOIN_TIMEOUT.as_secs(),
-                    );
-                }
-                continue;
-            };
-            if let Err(e) = joined {
-                panic!(
-                    "MQTT egress reader for client {:?} could not be joined: {e}",
-                    self.config.identity.slug,
-                );
-            }
-            return;
-        }
+    /// Return once no egress reader is running on this handle: at once when
+    /// none was started or the reader has already exited.
+    pub(crate) async fn egress_reader_exited(&self) {
+        self.egress_reader_live
+            .subscribe()
+            .wait_for(|live| !*live)
+            .await
+            .expect("the handle owns the reader-live sender and outlives this wait");
     }
 }
 

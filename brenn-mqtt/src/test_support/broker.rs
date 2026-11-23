@@ -607,6 +607,29 @@ pub fn log_records_disconnect_before_reconnect(log: &str, client_id: &str) -> bo
     false
 }
 
+/// Whether `log` records the broker sending `ack` to `client_id` and, after
+/// it, receiving an orderly DISCONNECT from that same client.
+/// `ack` is the packet that closes the exchange, `PUBACK` for QoS 1 and
+/// `PUBCOMP` for QoS 2. Only the first DISCONNECT from `client_id` counts, and
+/// a client id that is a strict prefix of another does not match it.
+///
+/// Both wordings are pinned against a real broker by the
+/// `an_answer_after_the_stop_precedes_the_disconnect_*` cases in `brenn-mqtt`'s
+/// integration suite.
+pub fn log_records_disconnect_after(log: &str, client_id: &str, ack: &str) -> bool {
+    let answered = format!("Sending {ack} to {client_id} (");
+    let disconnected = format!("Received DISCONNECT from {client_id}");
+    let mut answer_seen = false;
+    for line in log.lines() {
+        if line.contains(&answered) {
+            answer_seen = true;
+        } else if line.ends_with(&disconnected) {
+            return answer_seen;
+        }
+    }
+    false
+}
+
 /// Whether `log` records the broker sending a PUBLISH on `topic` to
 /// `subscriber` — the MQTT client id of the session that should have received
 /// it, [`session_client_id`](super::client::session_client_id) for a brenn one.
@@ -808,9 +831,10 @@ fn read_tail_4k(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_lines, log_publishes_from, log_records_disconnect_before_reconnect,
-        log_records_publish_from, log_records_publish_to_subscriber, log_records_unsubscribe,
-        log_says_running, read_complete_log,
+        complete_lines, log_publishes_from, log_records_disconnect_after,
+        log_records_disconnect_before_reconnect, log_records_publish_from,
+        log_records_publish_to_subscriber, log_records_unsubscribe, log_says_running,
+        read_complete_log,
     };
 
     /// A broker's start-up in mosquitto's own shape, up to the line written once
@@ -937,6 +961,57 @@ mod tests {
     fn a_window_with_neither_packet_makes_no_claim() {
         assert!(!log_records_disconnect_before_reconnect(
             TRANSCRIPT, "brenn:ha"
+        ));
+    }
+
+    /// A clean stop in mosquitto's shape: a QoS 1 PUBLISH answered, then the
+    /// session's DISCONNECT, with another session's acknowledgement before it.
+    const ANSWERED_STOP: &str = "\
+1700000000: Sending PUBACK to brenn:hall (m1, rc0)
+1700000001: Received PUBLISH from brenn:ha (d0, q1, r0, m1, 'brenn/itest/t', ... (2 bytes))
+1700000001: Sending PUBACK to brenn:ha (m1, rc0)
+1700000001: Received DISCONNECT from brenn:ha
+1700000001: Client brenn:ha disconnected.
+";
+
+    #[test]
+    fn an_acknowledgement_before_the_disconnect_is_found() {
+        assert!(log_records_disconnect_after(
+            ANSWERED_STOP,
+            "brenn:ha",
+            "PUBACK"
+        ));
+    }
+
+    #[test]
+    fn a_disconnect_before_the_acknowledgement_is_not() {
+        let unanswered = "\
+1700000001: Received DISCONNECT from brenn:ha
+1700000002: Sending PUBACK to brenn:ha (m1, rc0)
+";
+        assert!(!log_records_disconnect_after(
+            unanswered, "brenn:ha", "PUBACK"
+        ));
+    }
+
+    #[test]
+    fn another_acknowledgement_or_another_client_is_not_the_answer() {
+        assert!(!log_records_disconnect_after(
+            ANSWERED_STOP,
+            "brenn:ha",
+            "PUBCOMP"
+        ));
+        // `brenn:hall`'s acknowledgement is the only one before this DISCONNECT.
+        let other_only = ANSWERED_STOP.replace("Sending PUBACK to brenn:ha (", "Sending X (");
+        assert!(!log_records_disconnect_after(
+            &other_only,
+            "brenn:ha",
+            "PUBACK"
+        ));
+        assert!(!log_records_disconnect_after(
+            ANSWERED_STOP,
+            "brenn:h",
+            "PUBACK"
         ));
     }
 

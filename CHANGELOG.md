@@ -30,6 +30,22 @@ All notable changes to Brenn are documented here.
   still alerts the operator whether or not the caller was told, since it means
   the app's topic ACL admits what the broker forbids. Components cannot name a
   `status_to` yet.
+- **New for operators: an MQTT session waits for its broker's answers when it
+  stops.** A server shutdown, a reload that changes a client and a reload that
+  removes one all stop the client's session the same way: nothing more is
+  handed to the broker, the messages already in flight are waited for and
+  reported as what they turn out to be, and only then is the DISCONNECT sent.
+  How long it waits is a new `mqtt_client` key, `stop_wait_secs` (default 60;
+  `0` does not wait); a message the broker has not answered by then is
+  `unknown`, `stopped`. A session with nothing in flight, or a broker that
+  answers, stops in milliseconds. A shutdown stops every session at once and
+  does not exit until each has finished and its statuses are committed, so a
+  `handed` with no outcome now means the server crashed or was killed. Keep
+  `stop_wait_secs` shorter than the service manager's stop timeout (systemd's
+  `TimeoutStopSec`, 90 s unless set), or a shutdown against a silent broker is
+  killed mid-wait. A reload that both removes and changes clients, against
+  brokers that do not answer, can wait up to two bounds (120 s at the
+  default); allow for that in anything that waits on a reload's outcome.
 - **Development:** `make check` no longer spends about eleven minutes on the
   `brenn-server` test suite. Three Gmail message-body tests searched for the
   largest body that fits one byte step at a time; they now bracket and bisect,

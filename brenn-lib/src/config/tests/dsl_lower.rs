@@ -62,7 +62,8 @@ use crate::messaging::remote::{RemoteConfigRaw, RemoteSubscribeAclRaw};
 use crate::mqtt::config::{
     AppMqttIngressSubscriptionRaw, MqttClientConfigRaw, default_backoff_initial,
     default_backoff_max, default_client_urgency, default_inbound_payload_cap,
-    default_outbound_payload_cap, default_subscription_qos, default_tls_version_min,
+    default_outbound_payload_cap, default_stop_wait, default_subscription_qos,
+    default_tls_version_min,
 };
 use crate::pwa_push::config::PwaPushGlobalConfig;
 use crate::webhook::config::{
@@ -160,6 +161,7 @@ fn mqtt_client_at(slug: &str, url: &str) -> MqttClientConfigRaw {
         qos: default_subscription_qos(),
         urgency: default_client_urgency(),
         session_expiry_secs: 0,
+        stop_wait_secs: default_stop_wait(),
     }
 }
 
@@ -2484,6 +2486,7 @@ mqtt_client broker {
     reconnect_backoff_initial_secs = 2;
     reconnect_backoff_max_secs = 120;
     session_expiry_secs = 300;
+    stop_wait_secs = 15;
     qos = 2;
     urgency = high;
 }
@@ -2505,10 +2508,39 @@ mqtt_client broker {
                 qos: 2,
                 urgency: Urgency::High,
                 session_expiry_secs: 300,
+                stop_wait_secs: 15,
             }],
             ..Default::default()
         },
     );
+}
+
+/// `stop_wait_secs` is a `u32` count of seconds: zero lowers, and a negative,
+/// non-integer or over-range value is refused at the token that wrote it.
+#[test]
+fn an_mqtt_clients_stop_wait_is_a_u32_count() {
+    let zero = lower_document(
+        "mqtt_client broker { url = \"mqtts://broker.example.com:8883\"; stop_wait_secs = 0; }",
+    )
+    .expect("zero is a valid stop wait");
+    assert_eq!(zero.mqtt_clients[0].stop_wait_secs, 0);
+
+    for (value, message) in [
+        ("-1", "`stop_wait_secs`: -1 is out of range for this key"),
+        (
+            "4294967296",
+            "`stop_wait_secs`: 4294967296 is out of range for this key",
+        ),
+        (
+            "\"60\"",
+            "`stop_wait_secs`: expected an integer, got a string",
+        ),
+    ] {
+        let diagnostic = refusal(&format!(
+            "mqtt_client broker {{ url = \"mqtts://broker.example.com:8883\"; stop_wait_secs = {value}; }}"
+        ));
+        assert_eq!(diagnostic.message, message, "stop_wait_secs = {value}");
+    }
 }
 
 /// The minimal mqtt client body: the broker url alone. Every other field is
@@ -2540,6 +2572,7 @@ mqtt_client broker {
                 qos: default_subscription_qos(),
                 urgency: default_client_urgency(),
                 session_expiry_secs: 0,
+                stop_wait_secs: default_stop_wait(),
             }],
             ..Default::default()
         },

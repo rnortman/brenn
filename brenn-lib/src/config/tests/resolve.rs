@@ -1035,6 +1035,7 @@ fn ingress_test_broker(slug: &str) -> crate::mqtt::config::MqttClientConfigRaw {
         qos: 1,
         urgency: crate::messaging::Urgency::Normal,
         session_expiry_secs: 0,
+        stop_wait_secs: 0,
     }
 }
 

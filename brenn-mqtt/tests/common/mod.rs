@@ -19,8 +19,8 @@ pub mod router;
 
 pub use brenn_mqtt::test_support::broker::{
     AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, log_records_disconnect,
-    log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
-    log_records_unsubscribe,
+    log_records_disconnect_after, log_records_disconnect_before_reconnect,
+    log_records_publish_to_subscriber, log_records_unsubscribe,
 };
 pub use brenn_mqtt::test_support::certs;
 pub use brenn_mqtt::test_support::client::{
@@ -141,6 +141,7 @@ pub fn test_client_config(
             qos: 1,
             urgency: Urgency::Normal,
             session_expiry_secs: 0,
+            stop_wait_secs: 10,
         },
         password: None,
         ca_cert_pem: Some(ca_pem),

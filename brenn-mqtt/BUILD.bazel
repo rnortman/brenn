@@ -23,10 +23,10 @@ rust_library(
     ],
 )
 
-# 142 tests, all in-process: payload classification, session bookkeeping under
+# 182 tests, all in-process: payload classification, session bookkeeping under
 # tokio's test runtime, and the egress reader against a broker scripted over an
 # in-memory stream. No broker
-# process is spawned here — that is `:mqtt_integration`. 0.65s locally against
+# process is spawned here — that is `:mqtt_integration`. 2s locally against
 # a 60s budget, so `small` holds with room on a cold 4-vCPU runner. The count is
 # `.bazel-bin/brenn-mqtt/brenn-mqtt_test --list`'s own total, which is what to
 # re-read rather than increment; the timing is the load-bearing half.

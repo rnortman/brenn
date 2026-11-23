@@ -12,8 +12,21 @@
 //! depend on the messaging crate; the implementation lives above both. A
 //! message may name a `status_to`; the reader then reports it handed before
 //! it advances over it, and reports each of its drops one by one, so that the
-//! bus side can tell its sender. Every awaited bus call moves the handle's
-//! progress counter, which the reader's join watches.
+//! bus side can tell its sender.
+//!
+//! At the session's stop, or at its own retire, the reader hands nothing
+//! more. A pass checks the stop before each message it would hand, so a stop
+//! that lands during a pass leaves the rest of its read on the channel; the
+//! one message already being handed then either reaches the client and is
+//! waited for, or finds the client cell emptied and is reported dropped. The
+//! reader waits up to the client's `stop_wait_secs` for the notices of what
+//! is in flight, reports each as what it resolved to and the rest unknown,
+//! and exits; the handle's reader-live watch goes `false` after its last
+//! report has committed. A retire that arrives while the reader is ending for
+//! the stop is still carried out: the channel is abandoned and its messages
+//! reported dropped for the removal. A reader started on a handle whose stop
+//! is already set hands nothing: it skips its first pass and its first wake is
+//! the stop.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -21,6 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -196,56 +210,14 @@ pub trait EgressBus: Send + Sync + 'static {
     async fn report(&self, report: EgressReport);
 }
 
-/// The reader's one way to its bus: each awaited call moves the handle's
-/// progress counter when it returns.
-struct CountedBus {
-    handle: Arc<MqttClientHandle>,
-    bus: Arc<dyn EgressBus>,
-}
-
-impl CountedBus {
-    fn progressed(&self) {
-        self.handle
-            .egress_reader_progress
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    async fn unhanded(&self, limit: usize) -> Vec<EgressItem> {
-        let items = self.bus.unhanded(limit).await;
-        self.progressed();
-        items
-    }
-
-    async fn advance(&self, seq: MessageSeq) {
-        self.bus.advance(seq).await;
-        self.progressed();
-    }
-
-    async fn abandon(&self) -> Abandoned {
-        let abandoned = self.bus.abandon().await;
-        self.progressed();
-        abandoned
-    }
-
-    async fn report(&self, report: EgressReport) {
-        self.bus.report(report).await;
-        self.progressed();
-    }
-
-    fn wakes(&self) -> watch::Receiver<u64> {
-        self.bus.wakes()
-    }
-}
-
 /// The reader recorded on a handle.
 pub(crate) enum ReaderSlot {
     /// No reader was ever started on this handle.
     Never,
     Running {
-        join: tokio::task::JoinHandle<()>,
         retire: oneshot::Sender<()>,
     },
-    /// The reader was retired or joined; none may start again.
+    /// The reader was retired; none may start again.
     Gone,
 }
 
@@ -269,28 +241,22 @@ pub fn start_egress_reader(handle: &Arc<MqttClientHandle>, bus: Arc<dyn EgressBu
         "start_egress_reader called twice for MQTT client {slug:?}",
     );
     let (retire_tx, retire_rx) = oneshot::channel();
-    let reader = Reader {
-        handle: Arc::clone(handle),
-        bus: CountedBus {
-            handle: Arc::clone(handle),
-            bus,
-        },
-        window,
-        held: BTreeMap::new(),
-        in_flight: BTreeMap::new(),
-        unread: true,
-        more: false,
-        again: false,
-    };
+    let reader = Reader::new(Arc::clone(handle), bus, window);
     let stop = handle.stop_tx.subscribe();
-    let join = tokio::spawn(brenn_lib::panic_util::abort_on_panic(
+    handle.egress_reader_live.send_replace(true);
+    let live = Arc::clone(handle);
+    // The task's end is not awaited through a join handle: every waiter reads
+    // the reader-live watch, which any number of them can share. A reader that
+    // ends any way but returning takes the process with it, so the watch is
+    // never left `true` by a dead task.
+    drop(tokio::spawn(brenn_lib::panic_util::abort_on_panic(
         "MQTT egress reader panicked",
-        reader.run(stop, retire_rx),
-    ));
-    *slot = ReaderSlot::Running {
-        join,
-        retire: retire_tx,
-    };
+        async move {
+            reader.run(stop, retire_rx).await;
+            live.egress_reader_live.send_replace(false);
+        },
+    )));
+    *slot = ReaderSlot::Running { retire: retire_tx };
 }
 
 type NoticeResult = Result<rumqttc::PublishResult, rumqttc::PublishNoticeError>;
@@ -317,6 +283,22 @@ struct Connection {
     receive_max: u16,
 }
 
+/// Why the reader is ending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Stop,
+    Retire,
+}
+
+impl Ending {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Retire => "retire",
+        }
+    }
+}
+
 /// What woke the reader.
 enum Wake {
     Stop,
@@ -329,7 +311,7 @@ enum Wake {
 
 struct Reader {
     handle: Arc<MqttClientHandle>,
-    bus: CountedBus,
+    bus: Arc<dyn EgressBus>,
     window: Option<usize>,
     /// Handed messages the library does not have, by channel order.
     held: BTreeMap<MessageSeq, Held>,
@@ -345,6 +327,19 @@ struct Reader {
 }
 
 impl Reader {
+    fn new(handle: Arc<MqttClientHandle>, bus: Arc<dyn EgressBus>, window: Option<usize>) -> Self {
+        Self {
+            handle,
+            bus,
+            window,
+            held: BTreeMap::new(),
+            in_flight: BTreeMap::new(),
+            unread: true,
+            more: false,
+            again: false,
+        }
+    }
+
     async fn run(mut self, mut stop: watch::Receiver<bool>, mut retire: oneshot::Receiver<()>) {
         let mut wakes = self.bus.wakes();
         wakes.borrow_and_update();
@@ -373,24 +368,13 @@ impl Reader {
                 () = std::future::ready(()), if again => Wake::Again,
             };
             match wake {
-                Wake::Stop => {
-                    self.report_stopped().await;
-                    return;
-                }
-                Wake::Retire => {
-                    self.report_stopped().await;
-                    let Abandoned { count, named } = self.bus.abandon().await;
-                    let named = named
-                        .into_iter()
-                        .map(|message| (message, Sent::Never))
-                        .collect();
-                    self.report_dropped(DropCause::ClientRemoved, count, named)
-                        .await;
-                    return;
-                }
+                Wake::Stop => return self.end(Ending::Stop, &mut retire).await,
+                Wake::Retire => return self.end(Ending::Retire, &mut retire).await,
                 Wake::Channel => self.unread = true,
                 Wake::Room | Wake::Again => {}
-                Wake::Notice(seq, result) => self.resolve(seq, result).await,
+                Wake::Notice(seq, result) => {
+                    self.resolve(seq, result).await;
+                }
             }
             self.pass().await;
         }
@@ -398,6 +382,11 @@ impl Reader {
 
     fn outstanding(&self) -> usize {
         self.held.len() + self.in_flight.len()
+    }
+
+    /// Whether the session's stop has been requested.
+    fn stopping(&self) -> bool {
+        *self.handle.stop_tx.borrow()
     }
 
     /// The most messages outstanding at once: the broker's Receive Maximum,
@@ -421,8 +410,9 @@ impl Reader {
 
     /// Hand off what may be handed off now.
     ///
-    /// The reader has no timer, so every way a pass ends with work pending
-    /// names the wake that brings the next pass:
+    /// A pass arms no timer — the only timer the reader ever holds is the
+    /// deadline of [`Self::settle`] — so every way a pass ends with work
+    /// pending names the wake that brings the next pass:
     ///
     /// - no client: the next connection's install;
     /// - a notice of an older connection unresolved, or the limit reached:
@@ -433,8 +423,14 @@ impl Reader {
     ///   connection's install;
     /// - a full read that left room (its messages expired, gone or rejected
     ///   as oversize): `again`.
+    ///
+    /// A pass checks the session's stop before it hands each message, held or
+    /// read, and returns at a stop with the rest unhanded.
     async fn pass(&mut self) {
         self.again = false;
+        if self.stopping() {
+            return;
+        }
         let Some(connection) = connection(&self.handle).await else {
             return;
         };
@@ -451,6 +447,10 @@ impl Reader {
         }
 
         while let Some((seq, Held { message, sent })) = self.held.pop_first() {
+            if self.stopping() {
+                self.held.insert(seq, Held { message, sent });
+                return;
+            }
             let Some(expiry) = expiry_interval(&message.publish.expires, Utc::now()) else {
                 self.bus
                     .report(EgressReport::Expired {
@@ -479,6 +479,10 @@ impl Reader {
             self.more = items.len() == want;
             let mut items = items.into_iter();
             while let Some(item) = items.next() {
+                if self.stopping() {
+                    self.more = true;
+                    return;
+                }
                 let message = match item {
                     EgressItem::PayloadGone { seq, meta } => {
                         self.bus.advance(seq).await;
@@ -626,22 +630,27 @@ impl Reader {
         }
     }
 
-    /// Settle the in-flight message at `seq` by its notice's result.
-    async fn resolve(&mut self, seq: MessageSeq, result: NoticeResult) {
+    /// Settle the in-flight message at `seq` by its notice's result. Returns
+    /// whether the broker answered it; `false` when its connection ended
+    /// first.
+    async fn resolve(&mut self, seq: MessageSeq, result: NoticeResult) -> bool {
         let InFlight {
             message, earlier, ..
         } = self
             .in_flight
             .remove(&seq)
             .unwrap_or_else(|| panic!("a notice resolved for {seq:?}, which is not in flight"));
-        let report = match notice_outcome(result) {
-            NoticeOutcome::Delivered => EgressReport::Delivered(EgressMeta::of(&message)),
-            NoticeOutcome::Rejected { reason, code } => EgressReport::Rejected {
-                message: EgressMeta::of(&message),
-                reason,
-                code: Some(code),
-                earlier,
-            },
+        let (report, answered) = match notice_outcome(result) {
+            NoticeOutcome::Delivered => (EgressReport::Delivered(EgressMeta::of(&message)), true),
+            NoticeOutcome::Rejected { reason, code } => (
+                EgressReport::Rejected {
+                    message: EgressMeta::of(&message),
+                    reason,
+                    code: Some(code),
+                    earlier,
+                },
+                true,
+            ),
             NoticeOutcome::ConnectionEnded if message.publish.qos == 1 => {
                 self.held.insert(
                     seq,
@@ -650,14 +659,112 @@ impl Reader {
                         sent: Sent::Possibly,
                     },
                 );
-                return;
+                return false;
             }
-            NoticeOutcome::ConnectionEnded => EgressReport::Unknown {
-                message: EgressMeta::of(&message),
-                cause: UnknownCause::ConnectionLost,
-            },
+            NoticeOutcome::ConnectionEnded => (
+                EgressReport::Unknown {
+                    message: EgressMeta::of(&message),
+                    cause: UnknownCause::ConnectionLost,
+                },
+                false,
+            ),
         };
         self.bus.report(report).await;
+        answered
+    }
+
+    /// The reader's last act before it exits: settle, report what is still
+    /// outstanding, and on a retire move the position past everything left on
+    /// the channel and report it dropped. Logs one line as it begins and one
+    /// when its last report has been made, so a stop that hangs in a bus call
+    /// leaves a begin line with no end naming the client.
+    ///
+    /// Ending for the stop, it then closes `retire`: a retire sent before the
+    /// close is carried out here, and one sent after it fails, so a retire is
+    /// never left unread.
+    async fn end(&mut self, ending: Ending, retire: &mut oneshot::Receiver<()>) {
+        let handle = Arc::clone(&self.handle);
+        let client = handle.config.identity.slug.as_str();
+        tracing::info!(
+            client,
+            ending = ending.as_str(),
+            bound_secs = handle.stop_wait().as_secs(),
+            in_flight = self.in_flight.len(),
+            held = self.held.len(),
+            "MQTT egress reader ending: waiting for what is in flight, then reporting",
+        );
+        self.settle(ending).await;
+        self.report_stopped().await;
+        let retired = match ending {
+            Ending::Retire => true,
+            Ending::Stop => {
+                retire.close();
+                retire.try_recv().is_ok()
+            }
+        };
+        if retired {
+            let Abandoned { count, named } = self.bus.abandon().await;
+            let named = named
+                .into_iter()
+                .map(|message| (message, Sent::Never))
+                .collect();
+            self.report_dropped(DropCause::ClientRemoved, count, named)
+                .await;
+        }
+        tracing::info!(
+            client,
+            ending = ending.as_str(),
+            retired,
+            "MQTT egress reader ended: every outcome reported",
+        );
+    }
+
+    /// Wait, up to the client's stop bound, for the notices of what is in
+    /// flight, and report each as it resolves. Hands nothing: messages still
+    /// on the channel stay there, and held messages stay held.
+    ///
+    /// Ends when nothing is in flight, when the deadline passes, or when the
+    /// connection ends, which resolves every remaining notice. The select
+    /// prefers the notices, so a notice already resolved is read even with a
+    /// bound of zero or a deadline passed during a report.
+    ///
+    /// Logs and returns what the wait did; `None`, logging nothing, when
+    /// nothing was in flight.
+    async fn settle(&mut self, ending: Ending) -> Option<SettleSummary> {
+        let began = self.in_flight.len();
+        if began == 0 {
+            return None;
+        }
+        let bound = self.handle.stop_wait();
+        let start = tokio::time::Instant::now();
+        let deadline = tokio::time::sleep_until(start + bound);
+        tokio::pin!(deadline);
+        let mut answered = 0usize;
+        let mut connection_ended = 0usize;
+        while !self.in_flight.is_empty() {
+            tokio::select! {
+                biased;
+                (seq, result) = next_notice(&mut self.in_flight) => {
+                    if self.resolve(seq, result).await {
+                        answered += 1;
+                    } else {
+                        connection_ended += 1;
+                    }
+                }
+                () = &mut deadline => break,
+            }
+        }
+        let summary = SettleSummary {
+            ending,
+            bound,
+            waited: start.elapsed(),
+            began,
+            answered,
+            connection_ended,
+            left: self.in_flight.len(),
+        };
+        summary.log(&self.handle.config.identity.slug);
+        Some(summary)
     }
 
     /// Report what the reader still has as it exits: in flight is unknown,
@@ -718,6 +825,62 @@ impl Reader {
                     sent,
                 })
                 .await;
+        }
+    }
+}
+
+/// What one [`Reader::settle`] that began with messages in flight did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettleSummary {
+    ending: Ending,
+    bound: Duration,
+    waited: Duration,
+    /// Messages in flight when the wait began.
+    began: usize,
+    /// Messages the broker answered during the wait, delivered or rejected.
+    answered: usize,
+    /// Messages whose connection ended during the wait before the broker
+    /// answered them; their outcome is not known.
+    connection_ended: usize,
+    /// Messages still in flight when the wait ended, reported unknown.
+    left: usize,
+}
+
+impl SettleSummary {
+    /// Messages in flight at the start whose outcome the wait did not learn.
+    fn unknown(&self) -> usize {
+        self.connection_ended + self.left
+    }
+
+    /// One line: `warn` when any message's outcome is not known, `info` when
+    /// the broker answered every one.
+    fn log(&self, client: &str) {
+        let bound_secs = self.bound.as_secs();
+        let waited_ms = u64::try_from(self.waited.as_millis()).unwrap_or(u64::MAX);
+        if self.unknown() > 0 {
+            tracing::warn!(
+                client,
+                ending = self.ending.as_str(),
+                bound_secs,
+                waited_ms,
+                in_flight = self.began,
+                answered = self.answered,
+                unknown = self.unknown(),
+                connection_ended = self.connection_ended,
+                unanswered_at_bound = self.left,
+                "MQTT session ending: the broker did not answer every message in flight, because \
+                 its connection ended or the stop bound passed; their outcomes are not known",
+            );
+        } else {
+            tracing::info!(
+                client,
+                ending = self.ending.as_str(),
+                bound_secs,
+                waited_ms,
+                in_flight = self.began,
+                answered = self.answered,
+                "MQTT session ending: the broker answered every message in flight",
+            );
         }
     }
 }

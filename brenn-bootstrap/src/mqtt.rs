@@ -149,6 +149,11 @@ pub(crate) async fn start_mqtt_egress(
     notify: Arc<tokio::sync::Notify>,
 ) -> Arc<MqttEgressHub> {
     let hub = MqttEgressHub::new(messenger, alerts);
+    // TODO(mqtt-egress-removed-client-rows): a client deleted from the
+    // configuration while the server was down is not in this list, so no
+    // reader is started for its channel; the messages it holds unread are
+    // never reported `dropped`, `removed`, and the boot cursor reconcile
+    // deletes the position that says which they are.
     for slug in service.client_slugs() {
         let handle = service
             .get_client(&slug)

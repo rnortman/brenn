@@ -5,6 +5,8 @@
 //! brenn sent that does not depend on a subscriber being connected at the
 //! instant it was sent.
 
+mod stop;
+
 use std::time::Duration;
 
 use rumqttc::mqttbytes::QoS;
@@ -852,8 +854,9 @@ async fn a_broker_refusal_of_a_components_publish_names_the_component() {
 /// The status channel every `status_to` case names.
 const STATUS: &str = "brenn:status";
 
-/// The one client `ha` at `port`, retrying every second and backing off at
-/// most `backoff_max` seconds; the status channel [`STATUS`] when `status` is
+/// The one client `ha` at `port`, retrying every second, backing off at most
+/// `backoff_max` seconds, and waiting a second for the broker at a stop, since
+/// some cases stop it with the broker frozen; the status channel [`STATUS`] when `status` is
 /// given, with `status` as extra lines of its block (a `send_rate`, or empty);
 /// and the sender agent, which may publish to `ha`'s topics under
 /// [`TOPIC_PREFIX`], to [`BROKER_REFUSED_TOPIC`], and to the status channel
@@ -869,21 +872,10 @@ fn status_document(
     } else {
         ""
     };
-    let channel = status.map_or_else(String::new, |extra| {
-        format!(
-            "channel status at \"{STATUS}\" {{\n    push_depth = 1;\n    retain_depth = 64;\n    \
-             standing_retain_depth = 64;\n{extra}}}\n"
-        )
-    });
+    let client = client_block("ha", port, ca_file, backoff_max, 1);
+    let channel = status.map_or_else(String::new, status_channel);
     document(&format!(
-        r#"mqtt_client ha {{
-    url = "mqtts://127.0.0.1:{port}";
-    ca_file = "{ca}";
-    qos = 1;
-    reconnect_backoff_initial_secs = 1;
-    reconnect_backoff_max_secs = {backoff_max};
-}}
-
+        r#"{client}
 {channel}
 agent Sender() {{
     working_dir = ".";
@@ -894,8 +886,34 @@ agent Sender() {{
 
 new {SENDER}: Sender();
 "#,
-        ca = ca_file.display(),
     ))
+}
+
+/// The `mqtt_client` block for `slug` at `port` with QoS 1, retrying every
+/// second, backing off at most `backoff_max` seconds and waiting
+/// `stop_wait_secs` for the broker at a stop.
+fn client_block(
+    slug: &str,
+    port: u16,
+    ca_file: &std::path::Path,
+    backoff_max: u32,
+    stop_wait_secs: u32,
+) -> String {
+    format!(
+        "mqtt_client {slug} {{\n    url = \"mqtts://127.0.0.1:{port}\";\n    \
+         ca_file = \"{ca}\";\n    qos = 1;\n    reconnect_backoff_initial_secs = 1;\n    \
+         reconnect_backoff_max_secs = {backoff_max};\n    \
+         stop_wait_secs = {stop_wait_secs};\n}}\n",
+        ca = ca_file.display(),
+    )
+}
+
+/// The status channel [`STATUS`], with `extra` as extra lines of its block.
+fn status_channel(extra: &str) -> String {
+    format!(
+        "channel status at \"{STATUS}\" {{\n    push_depth = 1;\n    retain_depth = 64;\n    \
+         standing_retain_depth = 64;\n{extra}}}\n"
+    )
 }
 
 /// [`options`] at QoS 1 with a minute's lifetime, naming `status_to`.

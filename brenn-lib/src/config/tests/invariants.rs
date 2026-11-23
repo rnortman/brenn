@@ -120,6 +120,7 @@ fn default_functions_return_the_values_they_are_relied_on_for() {
     assert_eq!(crate::mqtt::config::default_backoff_initial(), 1);
     assert_eq!(crate::mqtt::config::default_backoff_max(), 60);
     assert_eq!(crate::mqtt::config::default_subscription_qos(), 1);
+    assert_eq!(crate::mqtt::config::default_stop_wait(), 60);
     // Webhook endpoints
     assert_eq!(
         crate::webhook::config::default_transport_ceiling(),

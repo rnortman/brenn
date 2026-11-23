@@ -76,6 +76,10 @@ pub struct MqttClientConfigRaw {
     /// session. `0` (default) = ephemeral: the broker discards session state on
     /// disconnect.
     pub session_expiry_secs: u32,
+    /// The longest a stop of this client's session waits for the broker: for
+    /// the outcomes of messages in flight, then for the socket to take the
+    /// DISCONNECT. A maximum, not a wait. Default: 60.
+    pub stop_wait_secs: u32,
 }
 
 #[cfg(any(test, feature = "testutils"))]
@@ -100,6 +104,7 @@ impl MqttClientConfigRaw {
             qos: default_subscription_qos(),
             urgency: default_client_urgency(),
             session_expiry_secs: 0,
+            stop_wait_secs: default_stop_wait(),
         }
     }
 }
@@ -125,6 +130,10 @@ pub(crate) fn default_backoff_initial() -> u32 {
 }
 
 pub(crate) fn default_backoff_max() -> u32 {
+    60
+}
+
+pub(crate) fn default_stop_wait() -> u32 {
     60
 }
 
@@ -225,6 +234,8 @@ pub struct MqttClientIdentity {
     pub urgency: Urgency,
     /// Broker-side session expiry in seconds for the single shared session.
     pub session_expiry_secs: u32,
+    /// The longest a stop of this session waits for the broker, in seconds.
+    pub stop_wait_secs: u32,
 }
 
 /// Resolved `[[mqtt_client]]` entry, with secrets loaded and fields validated.
@@ -550,6 +561,7 @@ pub fn resolve_client_identities(
                 qos: raw.qos,
                 urgency: raw.urgency,
                 session_expiry_secs: raw.session_expiry_secs,
+                stop_wait_secs: raw.stop_wait_secs,
             },
         );
     }
@@ -861,6 +873,7 @@ mod tests {
             qos: default_subscription_qos(),
             urgency: Urgency::Normal,
             session_expiry_secs: 0,
+            stop_wait_secs: default_stop_wait(),
         }
     }
 

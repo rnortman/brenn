@@ -142,6 +142,30 @@ impl<F: Future> Future for AbortOnPanic<F> {
     }
 }
 
+/// Await every task in `set` and return their outputs in completion order.
+///
+/// A task that panicked re-raises its own payload here, so the caller dies with
+/// the original message and location. A task that ended any other way — tokio
+/// cancelled it, which only an abort or the runtime's teardown does — panics
+/// naming `what`: nothing in the set is aborted, so a cancelled task means the
+/// caller's assumption about its tasks is wrong.
+pub async fn join_set_reraising<T: 'static>(
+    mut set: tokio::task::JoinSet<T>,
+    what: &str,
+) -> Vec<T> {
+    let mut outputs = Vec::with_capacity(set.len());
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(output) => outputs.push(output),
+            Err(e) => match e.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(e) => panic!("{what}: a task ended without finishing: {e}"),
+            },
+        }
+    }
+    outputs
+}
+
 /// The text of a panic payload, if it carries any.
 ///
 /// `String` is what a formatted `panic!("…{x}")` produces and `&'static str`
@@ -201,6 +225,44 @@ mod tests {
     fn suppression_ends_with_the_call() {
         let _ = catch_quietly(|| panic!("quiet"));
         assert!(!SUPPRESS_HOOK.with(Cell::get));
+    }
+
+    #[tokio::test]
+    async fn a_join_set_returns_every_output() {
+        let mut set = tokio::task::JoinSet::new();
+        for n in 0..3u32 {
+            set.spawn(async move { n });
+        }
+        let mut outputs = join_set_reraising(set, "test").await;
+        outputs.sort_unstable();
+        assert_eq!(outputs, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_joined_panic_is_reraised_with_its_own_payload() {
+        let mut set = tokio::task::JoinSet::<()>::new();
+        // `resume_unwind` runs no panic hook, so the test prints nothing.
+        set.spawn(async { std::panic::resume_unwind(Box::new("task's own")) });
+        let payload = tokio::spawn(join_set_reraising(set, "test"))
+            .await
+            .unwrap_err()
+            .into_panic();
+        assert_eq!(panic_message(&*payload), Some("task's own"));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_task_panics_naming_the_set() {
+        let mut set = tokio::task::JoinSet::<()>::new();
+        set.spawn(std::future::pending());
+        set.abort_all();
+        let payload = tokio::spawn(join_set_reraising(set, "the sessions"))
+            .await
+            .unwrap_err()
+            .into_panic();
+        assert!(
+            panic_message(&*payload)
+                .is_some_and(|m| m.starts_with("the sessions: a task ended without finishing")),
+        );
     }
 
     // The counter tests compare two readings: libtest may reuse a thread, so

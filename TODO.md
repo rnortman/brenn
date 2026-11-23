@@ -492,6 +492,48 @@ position skips whatever the channel still retains and logs the count. Done =
 removed channels are reaped under the general policy, or this channel family
 is reaped at removal.
 
+A removed client's channel can also hold messages its reader never read
+that name a `status_to`, with nobody left to report them. A removal carried
+out while the reader is running tells each of them `dropped`, `removed`;
+on two paths nothing does, and the sender learns that its message was not
+sent only by its lifetime passing with no `handed`, and never for a message
+sent with `lifetime_s` `"forever"`. One is a reload that
+removes the client while the server is shutting down, when the reader has
+already ended for the session's stop and the retire has nothing to carry it
+out (`MqttClientHandle::retire_egress_reader`, `brenn-mqtt/src/state.rs`,
+which logs a `warn`). The other is a client deleted from the configuration
+while the server is down: its channel is not in the directory at boot and
+no reader is started for it. On both, the reader's position is deleted —
+by `MqttEgressHub::close` in the reload commit, by the boot cursor
+reconcile (`brenn-messaging/src/reconcile.rs`) after a restart — and the
+position is the only record of which retained messages were unread: a
+message before it was handed and has had its statuses. The report is
+therefore made while the position exists, or the position is kept until
+it is made. The reader is the only reporter of egress outcomes and has
+exited on both paths, so whatever reports here acts on a removed client's
+channel after the task that served it is gone. On the reload path the
+channel is still in the live directory, the position still exists and the
+hub still holds the client when the retire finds the reader ended:
+`retire_egress_readers` resolves the channel and calls `close` only after
+every retire returns, so the unread messages and their `status_to` can be
+read there (`ClientEgress::skip_unhanded`) and told through the hub before
+`close`. On the restart path the channel has left the directory the hub
+reads through and the boot cursor reconcile deletes the position, so the
+report has to come from where the reaping lives. A client added again under the same slug skips
+these messages and logs only their count (`MqttEgressHub::open`,
+`brenn-server/src/mqtt_egress.rs`).
+
+Reaping the rows without reporting does not close this entry. Done also
+requires that every unread message naming a `status_to` on a removed
+client's channel is told `dropped`, `removed` before its rows or the
+reader's position go, on both paths, with a test for each. Code sites:
+on the reload path, `retire_egress_readers` in
+`brenn-bootstrap/src/reload/commit.rs` and `retire_egress_reader` in
+`brenn-mqtt/src/state.rs`; on the restart path, `start_mqtt_egress` in
+`brenn-bootstrap/src/mqtt.rs`, which starts readers for declared clients
+only; and `MqttEgressHub::open` in `brenn-server/src/mqtt_egress.rs`,
+where a client added again passes the messages either path left.
+
 ## `mqtt-publish-acl-ops-config`
 
 Per-topic MQTT publish ACLs exist (`acl publish [topic_filter …]`), but
@@ -829,13 +871,13 @@ about 45 ms from click to delivery report on every one of 100 samples, against
 about 25 ms for a 1,048,576-byte row; the browser state chains on the same page
 take 2-6 ms. The cause is not established. About 40 ms on small frames only has
 the shape of Nagle's algorithm meeting a delayed acknowledgement, and the
-server's listener (`axum::serve` in `brenn-bootstrap/src/lib.rs`) does not set
+server's listener (`axum::serve` in `brenn-bootstrap/src/shutdown.rs`) does not set
 `TCP_NODELAY`. Done when the extra latency is located (which hop: the page's
 send, the server's write of the `Deliver`, or a kernel flush timer) and either
 removed or explained in the timings document. Changing the server's socket
 options affects every HTTP and websocket route and wants a ruling. Code site
 (`TODO(surface-small-row-delivery-latency)`): `axum::serve` in
-`brenn-bootstrap/src/lib.rs`.
+`brenn-bootstrap/src/shutdown.rs`.
 
 ## `efficiency-surface-type-check-recompiles-every-kind-every-scan`
 
@@ -4921,7 +4963,7 @@ A declared `mqtt_client` that nothing is bound through holds a broker session,
 and no runtime surface reports it. The channel-listing enrichment
 (`enrich_mqtt_listing`, `brenn-server/src/messaging_intercept.rs`) decorates
 `mqtt:` channel entries with per-client health, and an unbound client has no
-entry; `MqttService::client_slugs` has no non-test caller. So a placeholder
+entry. So a placeholder
 broker whose credentials are wrong looks exactly like a healthy one that nobody
 uses: the only trace is the supervisor's own log line.
 
@@ -5120,32 +5162,34 @@ things a deferral was.
 
 A stop that lands while broker-to-client bytes are unread — SUBACKs for
 SUBSCRIBEs just sent, a retained delivery, ordinary inbound traffic — can
-lose its DISCONNECT at the broker. The supervisor's stop path queues the
-graceful DISCONNECT, rumqttc writes it and returns `RequestsDone`, and the
-`EventLoop` is dropped, which closes the socket with data still in its
-receive buffer; the kernel then sends RST instead of FIN, and the broker
-discards what it had not yet read, the DISCONNECT among it, and records the
-session as ended abnormally (mosquitto 2.1.2 logs "disconnected due to out
-of memory"). Consequences: a configured Last Will is published on a graceful
-stop or reload; the reload handover is ordered by the reset rather than by
-the orderly DISCONNECT `register_and_spawn`'s doc describes. The SUBSCRIBE
-brenn sends is untracked, and rumqttc's disconnect barrier
-(`outbound_requests_drained`) waits only on requests it tracks, so the
-barrier does not wait for those SUBACKs; and nothing after `RequestsDone`
-lets the client read the socket to EOF before closing. Candidate fixes, each a design decision: read
-to EOF after DISCONNECT (a rumqttc change or fork — third-party); tracked
-subscribes so the barrier waits for SUBACKs (closes the SUBACK window only,
-and moves pkid attribution onto the notices); a pre-DISCONNECT poll until
-`pending_subscribes` and `inflight_subscribes` are empty (same partial
-coverage, and spends the drain cap before DISCONNECT is queued on a broker
-that stops answering). Done when
-`stop_right_after_a_large_connect_returns_within_the_drain_cap` asserts
-`log_records_disconnect` again with no SUBACK barrier before the stop, 10/10
-under the gate.
+lose its DISCONNECT at the broker. The supervisor's stop path requests the
+DISCONNECT with `try_disconnect_now`, rumqttc writes it at the next poll and
+returns `RequestsDone`, and the `EventLoop` is dropped, which closes the
+socket with data still in its receive buffer; the kernel then sends RST
+instead of FIN, and the broker discards what it had not yet read, the
+DISCONNECT among it, and records the session as ended abnormally (mosquitto
+2.1.2 logs "disconnected due to out of memory"). Consequences: a configured
+Last Will is published on a graceful stop or reload; the reload handover is
+ordered by the reset rather than by the orderly DISCONNECT
+`register_and_spawn`'s doc describes. The stop services the connection only
+while an egress reader is settling its in-flight messages, so a session with
+nothing in flight goes straight to the DISCONNECT with whatever the broker
+has just sent — SUBACKs among it — unread; and nothing after `RequestsDone`
+lets the client read the socket to EOF before closing. Candidate fixes, each
+a design decision: read to EOF after DISCONNECT (a rumqttc change or fork —
+third-party); tracked subscribes so a barrier waits for SUBACKs (closes the
+SUBACK window only, moves pkid attribution onto the notices, and needs
+rumqttc's barrier call `try_disconnect` back on the stop path, which waits
+without a deadline for every unacknowledged publish); a pre-DISCONNECT poll
+until `pending_subscribes` and `inflight_subscribes` are empty (same partial
+coverage, and spends the client's `stop_wait_secs` on a broker that stops
+answering). Done when `stop_right_after_a_large_connect_ends_the_session`
+asserts `log_records_disconnect` again with no SUBACK barrier before the
+stop, 10/10 under the gate.
 
 Code sites (`TODO(mqtt-disconnect-lost-to-reset)`): `brenn-mqtt/src/connection.rs`
-(the stop arm, after the DISCONNECT drain), `brenn-mqtt/tests/mqtt_integration.rs`
-(the case).
+(the stop arm, at the event loop's drop after the DISCONNECT),
+`brenn-mqtt/tests/mqtt_integration.rs` (the case).
 
 ## `retained-state-port-attribute`
 

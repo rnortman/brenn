@@ -42,5 +42,6 @@ pub fn test_client_identity(slug: &str) -> MqttClientIdentity {
         qos: 1,
         urgency: Urgency::Normal,
         session_expiry_secs: 0,
+        stop_wait_secs: 0,
     }
 }

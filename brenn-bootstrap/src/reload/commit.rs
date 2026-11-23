@@ -36,6 +36,7 @@ use uuid::Uuid;
 use brenn_lib::messaging::config::{Depth, DormantSubscription};
 use brenn_lib::messaging::{ChannelEntry, ParticipantId, SubscriberEntryKind, mqtt_egress_address};
 use brenn_lib::mqtt::config::MqttClientConfig;
+use brenn_lib::panic_util::join_set_reraising;
 use brenn_lib::wasm_package::Verified;
 use brenn_messaging::Messenger;
 use brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT;
@@ -681,21 +682,31 @@ async fn start_egress_readers(
 }
 
 /// Take each client this reload removes out of egress service while its
-/// channel is still in the directory: retire its reader (which reports what
-/// it held and what it abandons), remove the participant's subscriber entry,
-/// and drop the position. The session stops later, after `swap_agents`.
+/// channel is still in the directory: retire its reader (which waits up to the
+/// client's `stop_wait_secs` for the outcomes of what it has in flight, then
+/// reports what it held and what it abandons), remove the participant's
+/// subscriber entry, and drop the position. The session stops later, after
+/// `swap_agents`.
+///
+/// The retires run concurrently, so the step waits up to the largest
+/// `stop_wait_secs` among the removed clients, not their sum; the directory
+/// work follows, client by client. A panic in a retire is carried back out of
+/// the join.
 ///
 /// The channel row and what it retains stay, as for every durable channel
 /// that leaves the directory.
 async fn retire_egress_readers(env: &ReloadEnv, delta: &PlanDelta) {
     // TODO(mqtt-egress-removed-client-rows): nothing reaps a removed client's
-    // egress channel row or its retained messages.
+    // egress channel row or its retained messages, nor does anything report
+    // the unread messages of a removed client whose reader ended before the
+    // retire.
     // TODO(correctness-publish-during-egress-retirement-silently-lost): a
     // publish admitted for a removed client after its reader abandons, and
     // committed before or after `remove_channels`, is never published or
     // reported.
     let kind = SubscriberEntryKind::System(MQTT_OUTBOUND_COMPONENT.to_string());
     let live = env.messenger.directory();
+    let mut retires = tokio::task::JoinSet::new();
     for slug in &delta.mqtt_clients.removed {
         let handle = env.mqtt_service.get_client(slug).unwrap_or_else(|| {
             panic!(
@@ -703,7 +714,14 @@ async fn retire_egress_readers(env: &ReloadEnv, delta: &PlanDelta) {
                  for it — the delta was computed against the registry, so this is a host bug",
             )
         });
-        handle.retire_egress_reader().await;
+        retires.spawn(async move { handle.retire_egress_reader().await });
+    }
+    join_set_reraising(
+        retires,
+        "reload commit: retiring removed mqtt egress readers",
+    )
+    .await;
+    for slug in &delta.mqtt_clients.removed {
         let address = mqtt_egress_address(slug);
         let channel = live.resolve(&address).unwrap_or_else(|| {
             panic!(
@@ -1023,15 +1041,18 @@ fn what_moved(old: &MqttClientConfig, new: &MqttClientConfig) -> &'static str {
 /// A removed client's session lingers at the broker until its session expiry
 /// elapses, exactly as it would after a fresh boot of the new document.
 ///
-/// One task per client, all in flight together: every join here is bounded by
-/// the supervisor's own DISCONNECT drain timeout but not fast, and only the
-/// stop-then-spawn pair *within* one client is ordered — distinct clients share
-/// nothing. Serially, a document retiring or re-credentialling K clients
-/// against a broker slow to close would stretch this step, and the whole commit
-/// with it, to K drains, with no `mqtt:` route installed and no status
-/// published until it finished. Concurrently the step is bounded by one drain
-/// whatever K is. A panic in any of them is carried back out of the join, so a
-/// commit-step assertion still takes the process down with its own payload.
+/// One task per client, all in flight together: a changed client's stop waits
+/// up to its `stop_wait_secs` for the outcomes of what its reader has in
+/// flight and for its DISCONNECT, and only the stop-then-spawn pair *within*
+/// one client is ordered — distinct clients share nothing. Serially, a
+/// document re-credentialling K clients against brokers not answering would
+/// stretch this step, and the whole commit with it, to K bounds, with no
+/// `mqtt:` route installed and no status published until it finished.
+/// Concurrently the step is bounded by the largest `stop_wait_secs` among the
+/// clients it stops. A removed client's reader was retired earlier in the
+/// commit, so its stop here only writes its DISCONNECT. A panic in any of them
+/// is carried back out of the join, so a commit-step assertion still takes the
+/// process down with its own payload.
 async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanDelta) {
     let router: Arc<dyn brenn_mqtt::MqttEventRouter> = env.mqtt_event_router.clone();
     let mut sessions = tokio::task::JoinSet::new();
@@ -1077,14 +1098,11 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
             info!(client = %slug, "reload: mqtt client supervisor stopped");
         });
     }
-    while let Some(joined) = sessions.join_next().await {
-        if let Err(e) = joined {
-            if e.is_panic() {
-                std::panic::resume_unwind(e.into_panic());
-            }
-            panic!("reload commit: an mqtt client session task ended unexpectedly: {e}");
-        }
-    }
+    join_set_reraising(
+        sessions,
+        "reload commit: restarting and stopping mqtt sessions",
+    )
+    .await;
 }
 
 /// The outgoing MQTT step, between the descriptions and the channel removals.

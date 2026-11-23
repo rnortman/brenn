@@ -1297,6 +1297,7 @@ vocabulary! {
         opt reconnect_backoff_initial_secs: V,
         opt reconnect_backoff_max_secs: V,
         opt session_expiry_secs: V,
+        opt stop_wait_secs: V,
         opt qos: V,
         opt urgency: Word,
     }

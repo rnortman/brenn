@@ -157,7 +157,7 @@ impl ActiveBridges {
     /// flag handles the event-loop-side Warning alert separately; this
     /// method's job is only the reader-side suppression.
     ///
-    /// Called from `shutdown_signal` on SIGTERM/SIGINT. Safe to call even if
+    /// Called from `serve_until_shutdown` on SIGTERM/SIGINT. Safe to call even if
     /// some bridges have already had `kill_session` invoked — `mark_shutting_down`
     /// is idempotent (flips a flag that's checked on EOF; no-op if already set).
     pub async fn mark_all_sessions_shutting_down(&self) {
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_all_sessions_shutting_down_flips_each_session_flag() {
-        // Simulates what shutdown_signal does on SIGTERM: walk the registry
+        // Simulates what serve_until_shutdown does on SIGTERM: walk the registry
         // and mark each live CcSession. Verifies every session's per-session
         // `shutting_down` flag flipped so its reader task's EOF branch stays
         // quiet.

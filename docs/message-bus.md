@@ -1769,8 +1769,8 @@ the message's `status_to` and was not a broker's rejection:
 | delivered | the broker acknowledged it (QoS 1, 2), or it was written (QoS 0); logged at `debug` and counted, no alert |
 | rejected | the broker refused it with a reason code, or its packet is over the broker's Maximum Packet Size |
 | expired | its lifetime passed before the reader handed it over, or before it handed over again a message it held for resubmission |
-| unknown | it was in flight when the connection was lost (QoS 0, 2) or when the session stopped |
-| dropped | the session stopped, or its client was removed, with messages the reader held or still owed; reported as a count, and one by one for those naming a `status_to` |
+| unknown | it was in flight when the connection was lost (QoS 0, 2), or the session stopped and the broker did not answer within the client's `stop_wait_secs` |
+| dropped | the session stopped, or its client was removed, with messages the reader held or still owed; reported as a count, and one by one for those naming a `status_to`. Nothing is handed or resent once a stop begins |
 
 A broker's rejection is always alerted, whether or not its sender was told:
 it means Brenn's per-topic ACL admits a topic the broker's configuration
@@ -1801,9 +1801,27 @@ newer, so a subscriber may see it twice. A QoS 0 or QoS 2 message in flight at
 a loss is reported unknown and not resent. The reader hands nothing new until
 every message of the lost connection is resolved. When a client's
 configuration changes, its session is stopped and replaced: what was in
-flight is reported unknown, and what the reader held for resubmission is
-dropped and counted, not handed to the successor. The successor's reader
-resumes from the same cursor.
+flight is waited for, up to the client's `stop_wait_secs`, and reported as
+what it turned out to be; only what the broker had not answered within it is
+reported unknown. What the reader held for resubmission is dropped and
+counted, not handed to the successor. The successor's reader resumes from the
+same cursor.
+
+**Stopping.** A session stops for a server shutdown, a configuration change
+or its client's removal. From the moment the stop is requested the reader
+hands nothing: what it has not read stays on the channel, ahead of the
+position. The one message it may be in the middle of handing as the stop
+lands is either taken by the client, and waited for like the rest, or finds
+the session already letting go of its connection and is reported `dropped`,
+`stopped`. It waits for the broker's answers to what is already in flight, and
+reports each as it comes, while the connection is serviced as usual —
+acknowledgements read, inbound messages routed, keep-alive kept. The wait ends
+when nothing is in flight, when the connection ends, or after the client's
+`stop_wait_secs` (60 by default), whichever is first; what is still
+unanswered then is reported unknown. Only after the reader's last report has
+committed is the DISCONNECT sent. A stop with nothing in flight does not
+wait. A server shutdown stops every session at once and does not exit until
+each has finished.
 
 **Overflow.** The egress channel is a window like any other: an outage longer
 than the window drops the oldest. Window overflow is the bus's to report, not
@@ -1833,10 +1851,20 @@ the channel held for the reader when it was retired is abandoned and reported
 dropped with the count, each message naming a `status_to` told `dropped`,
 `removed` there, and the position and subscriber entry are removed with
 the channel. A reload that removes or changes a client waits for that
-client's reader to finish the pass it is in and for its statuses to commit,
-however many: it gives up, and the server panics, only when the reader
-completes no bus call for 20 seconds. An `MqttSend` committed after that is lost unreported
-(Admission, above). The removed
+client's stop (Stopping, above): the removed clients' readers are retired
+together, each waiting up to its client's `stop_wait_secs`, and then the
+changed clients' sessions are stopped together, under the same rule. A reload
+that both removes and changes clients against brokers that do not answer can
+therefore wait up to two bounds. A removal that races a server shutdown is
+still carried out if the client's reader is waiting out the stop when the
+retire comes; if the reader has already finished, what the channel still
+holds is not reported dropped (`TODO(mqtt-egress-removed-client-rows)`), and
+a `warn` line names the client. A client deleted from the configuration
+while the server is down is not reported either: no reader is started for it
+at the next start, and what its channel holds is told nothing
+(`TODO(mqtt-egress-removed-client-rows)`). An
+`MqttSend` admitted for a removed client after its reader is retired is lost
+unreported (Admission, above). The removed
 channel's stored row and retained messages stay in the database
 (`TODO(mqtt-egress-removed-client-rows)`). One that changes a client keeps the
 channel and the cursor and starts a reader on the successor session.
@@ -1899,8 +1927,8 @@ the rest.
 | `unknown` | `connection_lost` | may have been sent: in flight when the connection was lost (QoS 0, 2), and not sent again |
 | `unknown` | `lifetime_ended` | may have been sent: the library accepted it, its connection ended before the broker answered (QoS 1), and its lifetime passed while it waited to be sent again |
 | `unknown` | `resend_refused` | may have been sent: the library accepted it, its connection ended before the broker answered (QoS 1), and when it was sent again the broker refused it (`reason_code` is the broker's) or its packet was over the new connection's Maximum Packet Size (no `reason_code`); the broker's reason string goes to the operator's log, not into the status |
-| `unknown` | `stopped` | may have been sent: in flight, or accepted and waiting to be sent again, when the session stopped or its client began to be removed |
-| `dropped` | `stopped` | never sent: the library never accepted it, and the session stopped or its client began to be removed while the reader held it |
+| `unknown` | `stopped` | may have been sent: in flight when the session stopped or its client began to be removed, and the broker did not answer within the client's `stop_wait_secs`; or, at QoS 1, accepted and waiting to be sent again, because its connection ended first, and not sent again |
+| `dropped` | `stopped` | never sent: the library never accepted it, and the session stopped or its client began to be removed while the reader held it; it is not handed during the stop |
 | `dropped` | `removed` | never sent: not yet read when its client was removed |
 | `dropped` | `left_retention` | its payload left the blob store before it was handed over |
 
@@ -1925,7 +1953,9 @@ the rest.
 - `delivered` at QoS 0 says the message was written to the connection, not
   that the broker took it. A sender that needs the broker's answer publishes
   at QoS 1 or 2.
-- `handed` with no outcome after a server restart means nobody knows.
+- `handed` with no outcome after a server restart means the server did not
+  stop cleanly — it crashed or was killed — and nobody knows. A clean stop
+  commits an outcome for every `handed` before the process exits.
 - No `handed` by the end of the lifetime means the message was not sent —
   except when the `handed` status itself could not be published, in which
   case the message may have been sent and the operator, not the sender,
@@ -1935,7 +1965,7 @@ the rest.
   refused.
 - A crash between the `handed` status and the cursor sends the message after
   restart with a second `handed`.
-- Four silences. A message the egress channel's window dropped before the
+- Silences. A message the egress channel's window dropped before the
   reader reached it gets no status: the store reports overflow as a count. A
   message in flight when the server crashed has a `handed` and never an
   outcome. A message committed in the moment its client is being removed gets
@@ -1943,8 +1973,14 @@ the rest.
   And nothing is published while the client has no connection: `expired`
   comes when a connection next lets the reader reach the message — hours
   later if the client is down that long, never if it stays down or the window
-  drops the message first. The same holds after a clean shutdown, which joins
-  no reader: a status that had not committed is not published.
+  drops the message first. What a removed client's channel still holds
+  unread is told nothing when a reload removes the client during a server
+  shutdown after its reader has finished the stop, or when the client is
+  deleted from the configuration while the server is down (Reload, above;
+  `TODO(mqtt-egress-removed-client-rows)`); a message sent with `lifetime_s`
+  `"forever"` then has no end of lifetime to infer from. Apart from that
+  removal, a clean shutdown is not a silence: it waits for every session's
+  reader and commits every status before the process exits.
 
 **When a status is not published.** A status is published at report time on
 the sender's authority as it stands then: the app named in the stored sender
