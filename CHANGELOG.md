@@ -4,6 +4,8 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+## [0.39.0] — 2026-11-24
+
 - **New for component authors: a component can state a lifetime, ask for
   delivery statuses and name a reply topic on an MQTT publish.**
   `brenn:processor/mqtt@0.1.0` gains a function, `mqtt-publish-tracked`, beside
