@@ -333,6 +333,7 @@ async fn an_unclean_restart_tells_the_sender_before_anything_new_is_handed() {
 /// and tells nobody.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clean_restart_tells_the_sender_nothing_more() {
+    // TODO(mqtt-egress-clean-restart-test-flaky): once failed under full `make check`; where it failed was not captured.
     broker_gate!();
 
     let harness = BrokerHarness::start();

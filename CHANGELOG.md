@@ -4,6 +4,13 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Behaviour change:** the `MqttSend` tool and an automation's `mqtt_publish`
+  action now publish a number or boolean `body` as its JSON text (`42`,
+  `true`). Before, both were refused, with advice to send the value as a
+  string, which could lead an agent round in circles. A null `body` is still
+  refused; the error now says to send the text `null` as base64
+  (`bnVsbA==`) in `body_base64`. Very large or very precise numbers may lose
+  digits before Brenn sees them; send those as a string. No upgrade step.
 - **New for component authors: a component can state a lifetime, ask for
   delivery statuses and name a reply topic on an MQTT publish.**
   `brenn:processor/mqtt@0.1.0` gains a function, `mqtt-publish-tracked`, beside

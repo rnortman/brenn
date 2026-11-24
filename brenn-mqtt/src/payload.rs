@@ -73,7 +73,7 @@ pub struct OutboundPayload {
 /// The one inline payload argument an `MqttSend` call gives.
 #[derive(Debug, Clone, Copy)]
 pub enum OutboundArg<'a> {
-    /// `body`: a string, an object or an array.
+    /// `body`: a string, a number, a boolean, an object or an array.
     Body(&'a Value),
     /// `body_base64`: the base64 text of the bytes to publish.
     Base64(&'a Value),
@@ -83,12 +83,12 @@ pub enum OutboundArg<'a> {
 /// `OutboundPayload`.
 ///
 /// - `body` as a string → its UTF-8 bytes, verbatim.
-/// - `body` as an object or array → its JSON text from `serde_json::to_vec`:
-///   compact, with no promise about key order or number spelling. An object
-///   with a top-level `binary_base64` key is refused whatever else it holds,
-///   so a caller of the retired binary object form never publishes base64
-///   text as JSON.
-/// - `body` as a number, boolean or null → refused.
+/// - `body` as an object, array, number or boolean → its JSON text from
+///   `serde_json::to_vec`: compact, with no promise about key order or number
+///   spelling. An object with a top-level `binary_base64` key is refused
+///   whatever else it holds, so a caller of the retired binary object form
+///   never publishes base64 text as JSON.
+/// - `body` as null → refused.
 /// - `body_base64` → the decoded bytes.
 ///
 /// `content_type`, when given, must be a string the bus's content-type rule
@@ -103,10 +103,10 @@ pub fn decode_outbound(
         OutboundArg::Body(Value::Object(map)) if map.contains_key("binary_base64") => {
             return Err(MqttError::RetiredBinaryBody);
         }
-        OutboundArg::Body(value @ (Value::Object(_) | Value::Array(_))) => {
-            serde_json::to_vec(value).expect("a serde_json::Value serializes")
-        }
-        OutboundArg::Body(_) => return Err(MqttError::BadBodyShape),
+        OutboundArg::Body(Value::Null) => return Err(MqttError::NullBody),
+        OutboundArg::Body(
+            value @ (Value::Object(_) | Value::Array(_) | Value::Number(_) | Value::Bool(_)),
+        ) => serde_json::to_vec(value).expect("a serde_json::Value serializes"),
         OutboundArg::Base64(Value::String(b64)) => {
             Base64::decode_vec(b64).map_err(|e| MqttError::BadBase64 {
                 detail: e.to_string(),
@@ -238,14 +238,29 @@ mod tests {
     }
 
     #[test]
-    fn scalar_bodies_are_refused() {
-        for value in [json!(null), json!(42), json!(1.5), json!(true)] {
-            assert_eq!(
-                body(&value).unwrap_err(),
-                MqttError::BadBodyShape,
-                "{value}"
-            );
+    fn number_and_boolean_bodies_publish_their_json_text() {
+        for (value, text) in [
+            (json!(42), "42"),
+            (json!(-7), "-7"),
+            (json!(1.5), "1.5"),
+            (json!(true), "true"),
+            (json!(false), "false"),
+        ] {
+            let out = body(&value).unwrap();
+            assert_eq!(out.bytes, text.as_bytes(), "{value}");
+            assert!(out.content_type.is_none(), "{value}");
         }
+        let parsed: Value = serde_json::from_str("1.50").unwrap();
+        assert_eq!(body(&parsed).unwrap().bytes, b"1.5");
+    }
+
+    #[test]
+    fn a_null_body_is_refused() {
+        let err = body(&json!(null)).unwrap_err();
+        assert_eq!(err, MqttError::NullBody);
+        assert!(err.to_string().contains("`bnVsbA==`"), "{err}");
+        let out = decode_outbound(OutboundArg::Base64(&json!("bnVsbA==")), None).unwrap();
+        assert_eq!(out.bytes, b"null");
     }
 
     #[test]
@@ -302,6 +317,11 @@ mod tests {
         .unwrap();
         assert_eq!(out.bytes, br#"{"on":true}"#);
         assert_eq!(out.content_type.as_deref(), Some("application/json"));
+
+        let out =
+            decode_outbound(OutboundArg::Body(&json!(7)), Some(&json!("text/plain"))).unwrap();
+        assert_eq!(out.bytes, b"7");
+        assert_eq!(out.content_type.as_deref(), Some("text/plain"));
     }
 
     #[test]

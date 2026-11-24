@@ -93,6 +93,33 @@ fn an_mqtt_publish_action_parses_every_field() {
 }
 
 #[test]
+fn a_number_or_boolean_body_parses_to_its_json_text_and_null_is_refused() {
+    for (body, text) in [(json!(42), "42"), (json!(false), "false")] {
+        let Action::MqttPublish(action) =
+            parse_action(&json!({ "action": mqtt(json!({ "body": body.clone() })) })).unwrap()
+        else {
+            panic!("{body}: an mqtt_publish action expected");
+        };
+        assert_eq!(
+            action.payload,
+            MqttActionPayload::from_bytes(text.as_bytes().to_vec()),
+            "{body}"
+        );
+    }
+    let mut null_body = mqtt(json!({}));
+    null_body["body"] = serde_json::Value::Null;
+    assert_eq!(
+        action_err(null_body),
+        "action: `body` is null: an argument that is not used is left out, not given as \
+         null. To publish the text `null`, give its base64, `bnVsbA==`, in `body_base64`"
+    );
+    assert_eq!(
+        action_err(send(json!({ "body": 42 }))),
+        "action.body must be a string for send_message"
+    );
+}
+
+#[test]
 fn an_mqtt_publish_action_refuses_what_does_not_apply() {
     assert_eq!(
         action_err(mqtt(json!({ "lifetime_s": null }))),
@@ -304,6 +331,7 @@ async fn a_listed_action_given_back_to_edit_stores_the_same_action() {
         }),
         json!({ "body": "ON", "qos": 2, "lifetime_s": 1 }),
         json!({ "body": "", "lifetime_s": 4294967295_u64 }),
+        json!({ "body": 42, "lifetime_s": 300 }),
         json!({ "body": null, "body_base64": "/wA=", "lifetime_s": 300 }),
         json!({ "body": null, "body_base64": "T04=", "lifetime_s": 300 }),
     ] {

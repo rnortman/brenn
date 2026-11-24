@@ -14,8 +14,8 @@ pub enum MqttError {
     WildcardNotAllowed { address: String },
     /// `body_base64` is not a string, or not valid base64.
     BadBase64 { detail: String },
-    /// `body` is a number, boolean or null.
-    BadBodyShape,
+    /// `body` is JSON null.
+    NullBody,
     /// `content_type` is not a string, or is a string the bus's content-type
     /// rule refuses.
     BadBodyContentType { detail: String },
@@ -44,11 +44,12 @@ impl fmt::Display for MqttError {
             MqttError::BadBase64 { detail } => {
                 write!(f, "invalid `body_base64` argument: {detail}")
             }
-            MqttError::BadBodyShape => {
+            MqttError::NullBody => {
                 write!(
                     f,
-                    "invalid `body` argument: must be a string, an object or an array; a number, \
-                     boolean or null is given as its JSON text in a string",
+                    "`body` is null: an argument that is not used is left out, not given as \
+                     null. To publish the text `null`, give its base64, `bnVsbA==`, in \
+                     `body_base64`",
                 )
             }
             MqttError::BadBodyContentType { detail } => {

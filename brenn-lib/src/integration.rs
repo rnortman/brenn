@@ -1443,8 +1443,9 @@ fn automation_virtual_tools(mqtt: bool) -> Vec<VirtualToolDef> {
             "`action`, kind `mqtt_publish`:\n",
             "  - `kind`: \"mqtt_publish\"\n",
             "  - `to`: `mqtt:<client>:<topic>`.\n",
-            "  - exactly one of `body` (text, or a JSON object or array published as its ",
-            "JSON text) and `body_base64` (base64 of the exact bytes). The payload is fixed ",
+            "  - exactly one of `body` (text, or a JSON object, array, number or boolean ",
+            "published as its JSON text) and `body_base64` (base64 of the exact bytes). The ",
+            "payload is fixed ",
             "when the job is created or edited.\n",
             "  - `content_type`: optional MQTT Content Type.\n",
             "  - `qos`: 0, 1 or 2 (default 1). `retain`: boolean (default false).\n",
@@ -1483,7 +1484,7 @@ fn automation_virtual_tools(mqtt: bool) -> Vec<VirtualToolDef> {
             "properties": {
                 "kind": { "type": "string", "enum": ["send_message", "mqtt_publish"] },
                 "to": { "type": "string", "description": "send_message: brenn: channel address. mqtt_publish: mqtt:<client>:<topic>." },
-                "body": { "type": ["string", "object", "array"], "description": "send_message: message body (markdown), a string. mqtt_publish: a string, or a JSON object or array published as its JSON text." },
+                "body": { "type": ["string", "number", "boolean", "object", "array"], "description": "send_message: message body (markdown), a string and nothing else. mqtt_publish: a string, or a JSON object, array, number or boolean published as its JSON text." },
                 "body_base64": { "type": "string", "description": "mqtt_publish, instead of body: base64 of the exact bytes to publish." },
                 "content_type": { "type": "string", "description": "mqtt_publish: optional MQTT Content Type." },
                 "qos": { "type": "integer", "enum": [0, 1, 2], "description": "mqtt_publish: QoS level (default 1)." },
@@ -1644,9 +1645,12 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 "Example: `mqtt:homeassistant:home/sensor/temperature`.\n\n",
                 "Give the payload in exactly one of three arguments. `body` as a string ",
                 "publishes the text, its UTF-8 bytes. JSON is given as `body`, as a value (an ",
-                "object or an array) or as text, and is published as JSON; a value is published ",
-                "as a serialization of it, not your spelling of it. A number, boolean or null is ",
-                "given as its JSON text in a string. When the exact bytes matter, `body_base64` ",
+                "object, an array, a number or a boolean) or as text, and is published as JSON; ",
+                "a value is published as a serialization of it, not your spelling of it: the ",
+                "number `1.50` is published as `1.5`, and a number with many digits can lose ",
+                "some of them. A null `body` is refused: leave out ",
+                "an argument you do not use; to publish the text `null`, give its base64, ",
+                "`bnVsbA==`, in `body_base64`. When the exact bytes matter, `body_base64` ",
                 "carries them unchanged: the base64 of bytes you compose yourself, published ",
                 "decoded. `content_type` with `body` or `body_base64` is sent as the MQTT ",
                 "Content Type; none is sent otherwise. `attachment` as ",
@@ -1738,8 +1742,8 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                         "description": "MQTT address: mqtt:<client>:<topic>"
                     },
                     "body": {
-                        "type": ["string", "object", "array"],
-                        "description": "Text (published as its UTF-8 bytes) or JSON (an object or array, published as JSON text)"
+                        "type": ["string", "number", "boolean", "object", "array"],
+                        "description": "Text (published as its UTF-8 bytes) or JSON (an object, array, number or boolean, published as JSON text)"
                     },
                     "body_base64": {
                         "type": "string",
@@ -3102,9 +3106,14 @@ mod tests {
             "spends no budget",
             "`acl publish` entries admit",
             "a refusal names the topic",
+            "a number or a boolean",
+            "A null `body` is refused",
+            "`bnVsbA==`",
+            "a number with many digits can lose some of them",
         ] {
             assert!(def.description.contains(phrase), "{phrase}");
         }
+        assert!(!def.description.contains("JSON text in a string"));
     }
 
     /// `status_to` is an optional string argument, and the description states
@@ -3173,7 +3182,7 @@ mod tests {
         let props = &def.input_schema["properties"];
         assert_eq!(
             props["body"]["type"],
-            serde_json::json!(["string", "object", "array"])
+            serde_json::json!(["string", "number", "boolean", "object", "array"])
         );
         assert_eq!(props["body_base64"]["type"], "string");
         assert_eq!(props["content_type"]["type"], "string");
@@ -3200,22 +3209,15 @@ mod tests {
     }
 
     #[test]
-    fn mqtt_send_admission_refuses_a_scalar_body_and_a_non_string_body_base64() {
+    fn mqtt_send_admission_takes_every_body_type_but_null() {
         let def = mqtt_send_def();
         let check = |args: serde_json::Value| {
             crate::tool_input::validate_tool_input("MqttSend", &def.input_schema, &args)
         };
-        for body in [
-            serde_json::json!(42),
-            serde_json::json!(1.5),
-            serde_json::json!(true),
-            serde_json::Value::Null,
-        ] {
-            let err =
-                check(serde_json::json!({ "to": "mqtt:c:t", "lifetime_s": 60, "body": body }))
-                    .expect_err("a scalar body is refused");
-            assert!(err.contains("'body'"), "{err}");
-        }
+        assert_eq!(
+            check(serde_json::json!({ "to": "mqtt:c:t", "lifetime_s": 60, "body": null })),
+            Err("argument 'body' must be string|number|boolean|object|array, got null".to_string())
+        );
         for b64 in [serde_json::json!(7), serde_json::json!({ "x": "AAEC" })] {
             let err = check(
                 serde_json::json!({ "to": "mqtt:c:t", "lifetime_s": 60, "body_base64": b64 }),
@@ -3224,6 +3226,9 @@ mod tests {
             assert!(err.contains("'body_base64'"), "{err}");
         }
         for body in [
+            serde_json::json!(42),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
             serde_json::json!("on"),
             serde_json::json!({ "action": "turn_on" }),
             serde_json::json!([1, 2]),
@@ -3232,7 +3237,8 @@ mod tests {
                 check(
                     serde_json::json!({ "to": "mqtt:c:t", "lifetime_s": "forever", "body": body, "content_type": "application/json" })
                 ),
-                Ok(())
+                Ok(()),
+                "{body}"
             );
         }
     }
@@ -3427,7 +3433,7 @@ mod tests {
         assert_eq!(action["required"], serde_json::json!(["kind", "to"]));
         assert_eq!(
             action["properties"]["body"]["type"],
-            serde_json::json!(["string", "object", "array"])
+            serde_json::json!(["string", "number", "boolean", "object", "array"])
         );
     }
 

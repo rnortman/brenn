@@ -371,6 +371,20 @@ async fn an_object_or_array_body_commits_json_text_of_the_same_value() {
 }
 
 #[tokio::test]
+async fn a_number_or_boolean_body_commits_its_json_text() {
+    let bridge = bridge_with_bound(1024).await;
+    for (value, text) in [
+        (json!(42), "42"),
+        (json!(1.5), "1.5"),
+        (json!(true), "true"),
+    ] {
+        let row = commit(&bridge, json!({ "body": value.clone() })).await;
+        assert_eq!(row.body.as_bytes(), text.as_bytes(), "{value}");
+        assert_eq!(transport(&row).content_type, None, "{value}");
+    }
+}
+
+#[tokio::test]
 async fn a_body_takes_a_content_type() {
     let bridge = bridge_with_bound(1024).await;
     let row = commit(

@@ -252,8 +252,10 @@ mod tests {
 
     #[test]
     fn each_payload_form_parses() {
-        let cases: [(serde_json::Value, &[u8], Option<&str>); 4] = [
+        let cases: [(serde_json::Value, &[u8], Option<&str>); 6] = [
             (json!({ "body": "on" }), b"on", None),
+            (json!({ "body": 42 }), b"42", None),
+            (json!({ "body": true }), b"true", None),
             (
                 json!({ "body": { "state": "ON" }, "content_type": "application/json" }),
                 br#"{"state":"ON"}"#,
@@ -307,10 +309,18 @@ mod tests {
         assert!(
             refusal(json!({ "body": null, "attachment": 3 })).starts_with("`attachment` must be "),
         );
+        let mut null_body = args(json!({}));
+        null_body["body"] = serde_json::Value::Null;
         assert_eq!(
-            refusal(json!({ "body": 5 })),
-            "invalid `body` argument: must be a string, an object or an array; a number, \
-             boolean or null is given as its JSON text in a string"
+            parse(&null_body).expect_err("refused"),
+            "`body` is null: an argument that is not used is left out, not given as null. To \
+             publish the text `null`, give its base64, `bnVsbA==`, in `body_base64`"
+        );
+        null_body["body_base64"] = json!("AA==");
+        assert_eq!(
+            parse(&null_body).expect_err("refused"),
+            "more than one payload argument is given: give exactly one of `body`, \
+             `body_base64` and `attachment`"
         );
         let bad_base64 = refusal(json!({ "body": null, "body_base64": "!!" }));
         assert!(

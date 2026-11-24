@@ -1731,16 +1731,20 @@ A call gives its payload in exactly one of three arguments, `body`,
 | Form | Arguments | Bytes published | MQTT 5 Content Type |
 |---|---|---|---|
 | text | `body`: a string | the string's UTF-8 bytes, verbatim | `content_type`, if given |
-| JSON | `body`: an object or an array | the value's JSON text | `content_type`, if given |
+| JSON | `body`: an object, an array, a number or a boolean | the value's JSON text | `content_type`, if given |
 | base64 | `body_base64`: a string | the decoded bytes | `content_type`, if given |
 | attachment | `attachment`: `{"message_id": …, "name": …}` | the blob's bytes | the blob's recorded content type |
 
 Text is published as given. A JSON value is published as its serialization
 (`serde_json`, compact), with no promise about key order or number spelling;
 neither form adds a Content Type, so the same JSON given as text and as a
-value differs at most in its spelling. A number, boolean or null `body` is refused at
-admission: its JSON text, as a string, says the same thing without being
-re-spelled. An object `body` with a top-level `binary_base64` key is refused
+value differs at most in its spelling. A number is published in `serde_json`'s
+spelling of the value Brenn received: `1.50` is published as `1.5`, and a
+number with many digits can lose some of them, on the way to Brenn or in
+Brenn's own parse, which holds at most a 64-bit integer or an `f64`;
+`body_base64` is the form for exact bytes. A null `body` is refused: an
+argument that is not used is left out, and the text `null` is published by
+giving its base64, `bnVsbA==`, in `body_base64`. An object `body` with a top-level `binary_base64` key is refused
 whatever else it holds, naming `body_base64`, so a caller of the retired
 binary object form never sends base64 text to a device as JSON; a JSON
 payload that itself has such a key is given as its text in `body_base64`.
@@ -1908,8 +1912,8 @@ session.
 **A recurring automation's publish.** An automation job (`AutoCreate`,
 `AutoEdit`) can fire an `mqtt_publish` action: a `to` of the form
 `mqtt:<client>:<topic>`, a payload fixed when the job is created or edited —
-text, a JSON object or array stored as its JSON text, or bytes given as
-base64; never an attachment, since a job that fires for months would have
+text, a JSON object, array, number or boolean stored as its JSON text, or
+bytes given as base64; never an attachment, since a job that fires for months would have
 to hold a blob — and `MqttSend`'s `content_type`, `qos`, `retain`,
 `lifetime_s`, `status_to` and `reply_to`. Its arguments are read by the same parser as
 `MqttSend`'s; `deliver_after` is refused by name, since the job's trigger is

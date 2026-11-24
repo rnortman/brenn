@@ -660,6 +660,32 @@ pub(super) mod tests {
         ));
     }
 
+    /// `MqttSend` admits a number or boolean `body` from either origin and
+    /// refuses a null one with the schema's type list.
+    #[tokio::test]
+    async fn mqtt_send_admits_a_number_or_boolean_body_and_refuses_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = full_catalog_bridge(dir.path(), None).await;
+        let input = |body: serde_json::Value| json!({ "to": "mqtt:home:cam/snapshot", "lifetime_s": 60, "body": body });
+        for origin in [CallOrigin::Hook, CallOrigin::Socket] {
+            for body in [json!(42), json!(1.5), json!(true)] {
+                assert_eq!(
+                    admit_tool_call(&bridge, origin, "MqttSend", &input(body.clone())),
+                    Ok(()),
+                    "{origin:?} {body}"
+                );
+            }
+            assert_eq!(
+                admit_tool_call(&bridge, origin, "MqttSend", &input(serde_json::Value::Null)),
+                Err(ExecuteError::InvalidArgs(
+                    "argument 'body' must be string|number|boolean|object|array, got null"
+                        .to_string()
+                )),
+                "{origin:?}"
+            );
+        }
+    }
+
     /// Every command has an executor: `dispatch` itself, below admission,
     /// answers each `Available` name. `{}` is refused by each family's own
     /// parsing or is a read, so the probe has no effects. The bridge has no

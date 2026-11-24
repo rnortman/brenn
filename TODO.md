@@ -32,29 +32,33 @@ or this is closed as not wanted.
 `make check`, a pre-commit run of a change that touches no egress or alert
 code (the automation `mqtt_publish` action): two "status not published"
 alerts had been raised where the test asserts exactly one, both send-rate
-refusals of a delivery status. It passed three of three reruns. The cause
-is not established. The test gives its status channel a send rate that
-admits one status and makes two publishes that name it, so several
-statuses are refused by design — the second publish's `handed`, and every
-later status of both — and what the test pins is that they raise one
-alert: the one that opens the reader's "status not published" episode
-(`brenn-server/src/mqtt_egress.rs`, `open_or_withhold`), the rest being
-withheld. One reading from the source, not run: the reader's `Drained`
-report closes that episode (`close_episodes`), so if the reader runs dry
-between two refused statuses, the next refusal opens a second episode with
-its own alert, and the test, which polls until it sees any such alert and
-then asserts the count, sees two when both land before its first look. On
-that reading the second alert is the server doing what its episode rule
-says and the test asserts something the rule does not promise. Not
-excluded: that the server raises a duplicate or miscounted alert for one
-refused status. This is the alerting of the MQTT outgoing path; an
-operator alert raised twice for one failure, or a test that cannot tell,
-are both defects, and `make check` is the pre-commit gate, where a test
-that fails at random teaches retry-until-green. Done = the cause is
-established, and either the test is made deterministic (if the second
-alert is legitimate behaviour the test failed to pin down) or the
-duplicate alert is fixed in the server, with the test passing reliably
-under the full `make check`; a retry is not a fix. Code site
+refusals of a delivery status. It passed three of three reruns. It failed
+once more in one of five reruns of the broker suite during a later change
+that also touches no egress or alert code (an MQTT publish taking a number
+or boolean `body`), with the machine's load average around 16; what that
+failure observed was not captured. The cause is not established. The test
+gives its status channel a send rate that admits one status and makes two
+publishes that name it, so several statuses are refused by design — the
+second publish's `handed`, and every later status of both — and what the
+test pins is that they raise one alert: the one that opens the reader's
+"status not published" episode (`brenn-server/src/mqtt_egress.rs`,
+`open_or_withhold`), the rest being withheld. One reading from the
+source, not run: the reader's `Drained` report closes that episode
+(`close_episodes`), so if the reader runs dry between two refused
+statuses, the next refusal opens a second episode with its own alert, and
+the test, which polls until it sees any such alert and then asserts the
+count, sees two when both land before its first look. On that reading the
+second alert is the server doing what its episode rule says and the test
+asserts something the rule does not promise. Not excluded: that the
+server raises a duplicate or miscounted alert for one refused status.
+This is the alerting of the MQTT outgoing path; an operator alert raised
+twice for one failure, or a test that cannot tell, are both defects, and
+`make check` is the pre-commit gate, where a test that fails at random
+teaches retry-until-green. Done = the cause is established, and either
+the test is made deterministic (if the second alert is legitimate
+behaviour the test failed to pin down) or the duplicate alert is fixed in
+the server, with the test passing reliably under the full `make check`;
+a retry is not a fix. Code site
 (`TODO(mqtt-refused-status-alert-test-sees-two-alerts)`): the alert-count
 assertion in the test.
 
@@ -631,6 +635,36 @@ and Correlation Data reach the subscriber on the bus envelope or its
 transport metadata, with a test of a round trip; or this is closed as
 not wanted, on the ground that payload-level correlation is what the
 brokers' peers in use do.
+
+## `mqtt-egress-clean-restart-test-flaky`
+
+`egress::connection_state::a_clean_restart_tells_the_sender_nothing_more`
+in `brenn-bootstrap`
+(`src/reload/mqtt_broker_tests/egress/connection_state.rs`) failed once
+under the full `make check`, a pre-commit run with the machine's load
+average around 16, on a change that touches no egress code (an MQTT
+publish taking a number or boolean `body`). The failing assertion and
+its message were not captured: it is not known where the test failed
+or what value was observed. The failure can be anywhere in the test:
+in the first process's boot, publish and stop, which run in the helper
+`first_process` that the unclean-restart test also calls, in the second
+process's boot and its reads of the connection state and the status
+channel, or in the final assertions. Five reruns of the broker suite
+did not fail on it, and the retried `make check` passed. The cause is
+not established, and it is not known whether the test or the code it
+runs is at fault. The test is there to show that a process stopped
+through the shutdown with a publish in flight tells its sender
+`unknown` with cause `stopped`, and that the next process on the same
+database reads the previous session as ended clean and tells the
+sender nothing more. It is not known whether this shares a cause with
+`mqtt-egress-shutdown-answers-test-flaky`, which is another test with a
+known symptom; neither has been read for one. `make check` is the
+pre-commit gate, and a test that fails at random teaches
+retry-until-green. Done = the cause is found, and either the code is
+fixed or the test is made deterministic, passing reliably under the
+full `make check`; a retry is not a fix. Code site
+(`TODO(mqtt-egress-clean-restart-test-flaky)`): the head of the test
+body, since the place of the failure is not known.
 
 ## `mqtt-egress-operator-text-unsent-of-possibly-sent`
 
