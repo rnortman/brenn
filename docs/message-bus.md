@@ -1501,6 +1501,58 @@ other shape by name. A 0.1.0 component cannot bind a raw channel: boot and
 reload refuse it, as on any `non_text` channel (§2.1). The size cap applies to
 a raw body (§2.1.2).
 
+**Which channels an inbound MQTT message reaches.** Each `mqtt:` filter a
+client holds is asserted at the broker as its own subscription, with an MQTT 5
+Subscription Identifier derived from the filter string, the same in every
+process. An inbound message is published once into the
+channel of each subscription the broker names on it, provided that channel's
+filter covers the message's topic, and into no other channel. A copy naming a
+subscription the process no longer holds, or one whose filter does not cover
+the topic, is dropped with a `warn`; the identifier never places a message in a
+channel whose filter does not match it.
+
+- *Overlapping filters.* A client holding `a/#` and `a/b` receives a publish to
+  `a/b` once in each of the two channels — the broker sends one copy per
+  subscription, and each copy reaches its own subscription's channel — unless
+  the two filters share an identifier (below).
+- *Two filters with one identifier.* The identifier is a 28-bit function of the
+  filter string, so two different filters on one client can have the same one
+  — about one chance in 268 million for a given pair. The broker's copies for
+  the two are then indistinguishable, and a message both filters cover is
+  delivered twice into each of their channels, as on a broker without
+  Subscription Identifiers. A message only one of them covers is routed
+  exactly. A `warn` names the pair when the second is subscribed. The same
+  holds when one of the pair is a filter this process no longer holds and a
+  resumed broker session still does: the held filter's channel receives that
+  filter's copy as a second row.
+- *Across a restart.* With a non-zero `session_expiry_secs` the broker keeps
+  the session while Brenn is down and delivers what it queued when Brenn
+  returns. Each queued message reaches the channel of the filter it was queued
+  for, if this process holds that filter; one queued for a filter no longer
+  held is dropped with a `warn`.
+- *Retained replay.* The retained messages the broker sends for a new
+  subscription reach that subscription's channel only; a wider channel the
+  client already holds does not receive them. A second subscriber joining a
+  filter already held makes the broker replay into the shared channel again,
+  and every reconnect replays the retained messages of every filter into its
+  own channel again; both add rows that repeat earlier ones.
+- *A broker without Subscription Identifiers.* When the broker's CONNACK says
+  it does not support them, SUBSCRIBEs carry none and messages are routed by
+  topic into every covering channel; overlapping filters then deliver a message
+  once per covering filter into each. A `warn` says so once per connection.
+- *What bounds what a new subscriber sees.* The channel's retain depth (100 by
+  default for an `mqtt:` channel, §2.7's table); a subscription asking for a
+  deeper `retain_depth` than the channel's standing depth is refused; and a
+  read's own `limit`.
+- *When the replay is there.* `MessageSubscribe` answering `"subscribed"` means
+  the subscription is recorded and the SUBSCRIBE has been sent to the broker —
+  not that the broker has answered or that any retained message has arrived.
+  The replay arrives afterwards, one message at a time: one on an exact topic
+  within moments, many under a wildcard over a time that grows with their
+  number, and nothing marks the last one. A read made at once may return none
+  or part of it. A subscription with `push_depth` above 0 is told as messages
+  arrive.
+
 **MQTT on a raw channel.** The body's content type is the publisher's MQTT 5
 Content-Type property when the broker delivered one. A payload with none takes
 the channel's `untyped_content_type`, when the tuning block states it; without
@@ -1517,7 +1569,8 @@ filter is split across two channels.
 
 Each payload is judged per channel. A bad one is dropped for that channel —
 one `warn` naming client, topic, channel, size and reason, nothing stored, no
-substitute type — and is still published on any other channel it matches:
+substitute type — and is still published on any other channel the message is
+routed to:
 
 | Input | Outcome |
 |---|---|

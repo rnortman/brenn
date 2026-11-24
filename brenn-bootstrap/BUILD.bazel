@@ -196,12 +196,12 @@ rust_test(
 # `//bazel/tools:mosquitto`, and dropping it or the `data` entry fails every
 # case at spawn with a message naming this target.
 #
-# Every case spawns a broker of its own. The binary's 32 cases finish in 6.4s
+# Every case spawns a broker of its own. The binary's 33 cases finish in 6.4s
 # locally, the brokers running concurrently; the longest cases are the egress
 # ones that freeze their broker across a reload or a shutdown, the longest of
 # them for six seconds.
 # `medium` (300s): at the repo's one measured local-to-CD-runner factor for a
-# suite of this shape, ~21x (see the wiring suite above), that is ~110s on a
+# suite of this shape, ~21x (see the wiring suite above), that is ~135s on a
 # loaded capacity-1 runner, past the small budget (60s) and well inside the
 # medium one. The budget is sized for the readiness and connect waits on that
 # runner, not the assertions. Re-measure both numbers when the suite grows

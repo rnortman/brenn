@@ -55,3 +55,24 @@ pub fn register_test_client(
         stop_tx,
     ));
 }
+
+/// Run the `mqtt:` runtime subscribe the `MessageSubscribe` tool runs — the
+/// ACL gate, the configured-client guard, the durable row, the route and the
+/// broker SUBSCRIBE, in that order — over a messenger, MQTT service and
+/// router the caller booted, and return the status word the tool would
+/// answer. Panics if the subscribe is refused.
+pub async fn subscribe_dynamic(
+    messenger: &brenn_messaging::Messenger,
+    mqtt_svc: &brenn_mqtt::MqttService,
+    router: &crate::mqtt_router::MqttEventRouterImpl,
+    app_slug: &str,
+    address: &str,
+    params: brenn_messaging::subscribe::DynamicSubscribeParams,
+) -> &'static str {
+    crate::mqtt_subscribe::activate_dynamic_subscribe(
+        messenger, mqtt_svc, router, app_slug, address, params,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("subscribe_dynamic: {app_slug:?} on {address:?} refused: {e}"))
+    .status_str()
+}

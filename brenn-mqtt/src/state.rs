@@ -8,12 +8,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 
 use brenn_lib::mqtt::config::MqttClientConfig;
+use brenn_lib::mqtt::subscription_identifier;
+use brenn_lib::mqtt::topic_filter::covers;
 
 use crate::reader::ReaderSlot;
 
@@ -200,20 +202,227 @@ pub const DEFAULT_RECEIVE_MAXIMUM: u16 = u16::MAX;
 
 /// One entry in a client's deduplicated ingress subscription set: a topic filter
 /// to SUBSCRIBE to, the QoS to request, and the MQTT 5 Subscription Identifier
-/// assigned to it.
+/// it is subscribed with.
 ///
-/// `sub_id` exists only to keep the SUBSCRIBE call well-formed; the ingress path
-/// does not route by it (the router matches the actual inbound topic against
-/// channel filters).
+/// The identifier is derived from the filter string
+/// ([`subscription_identifier`]), so every process gives a filter the same one.
+/// The broker returns it on each copy of a PUBLISH it sends for the
+/// subscription, and the inbound path resolves it back to this entry's filter
+/// and routes the copy to that filter's channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngressSubscription {
     /// The MQTT topic filter to subscribe to.
     pub topic_filter: String,
-    /// QoS requested from the broker (the client's `[[mqtt_client]].qos`; the
-    /// `.max()` fold is a no-op since there is exactly one QoS per client).
+    /// QoS requested from the broker: the client's `qos` for a filter a static
+    /// binding holds, otherwise the QoS stored on the first dynamic row of the
+    /// filter's channel. The QoS other dynamic subscribers asked for is not
+    /// consulted (`TODO(mqtt-dynamic-subscribe-qos-not-honoured)`).
     pub qos: u8,
-    /// Stable 1-based MQTT 5 Subscription Identifier.
+    /// [`subscription_identifier`] of `topic_filter`.
     pub sub_id: u32,
+}
+
+impl IngressSubscription {
+    /// The entry for `topic_filter` at `qos`, with the filter's derived
+    /// identifier.
+    pub fn new(topic_filter: impl Into<String>, qos: u8) -> Self {
+        let topic_filter = topic_filter.into();
+        let sub_id = subscription_identifier(&topic_filter);
+        Self {
+            topic_filter,
+            qos,
+            sub_id,
+        }
+    }
+}
+
+/// A client's ingress subscriptions, each held under the identifier derived
+/// from its filter.
+///
+/// A filter has the same identifier in every process and on every handle, so a
+/// copy a resumed broker session queued under an earlier process resolves to
+/// the filter it was queued for. Two different filters can share an
+/// identifier: both are held and both are subscribed with it, and
+/// [`Self::filters_for`] gives a copy carrying it to those of them whose filter
+/// covers its topic. A message both cover therefore reaches each of the two
+/// channels twice, which is what routing by topic gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressSubscriptionSet {
+    entries: Vec<IngressSubscription>,
+}
+
+/// What [`IngressSubscriptionSet::filters_for`] resolved a PUBLISH's
+/// identifiers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIdentifiers {
+    /// The filters the identifiers resolved to, each filter once, in the
+    /// order the packet named the identifiers.
+    pub filters: Vec<String>,
+    /// The identifiers no entry holds, in packet order.
+    pub unknown: Vec<usize>,
+}
+
+impl IngressSubscriptionSet {
+    /// A set holding `entries`.
+    ///
+    /// # Panics
+    ///
+    /// If two entries share a filter, or an entry's identifier is not
+    /// [`subscription_identifier`] of its filter; either is a host bug.
+    /// Different filters sharing an identifier are accepted.
+    pub fn new(entries: Vec<IngressSubscription>) -> Self {
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.sub_id,
+                subscription_identifier(&entry.topic_filter),
+                "subscription {:?} carries an identifier not derived from its filter",
+                entry.topic_filter,
+            );
+            for other in &entries[..i] {
+                assert_ne!(
+                    other.topic_filter, entry.topic_filter,
+                    "filter {:?} appears twice in one subscription set",
+                    entry.topic_filter,
+                );
+            }
+        }
+        Self { entries }
+    }
+
+    /// The entry for `topic_filter`, adding one with the filter's derived
+    /// identifier if the set does not hold the filter.
+    ///
+    /// # Panics
+    ///
+    /// If the filter is held at a different QoS. The subscribe path refuses a
+    /// re-subscribe with differing parameters for the same app only; a
+    /// different subscriber of the filter asking another QoS reaches this panic
+    /// (`TODO(mqtt-dynamic-subscribe-qos-not-honoured)`). A QoS change goes
+    /// through [`Self::set_qos`].
+    pub fn add(&mut self, topic_filter: String, qos: u8) -> IngressSubscription {
+        if let Some(existing) = self.get(&topic_filter) {
+            assert_eq!(
+                existing.qos, qos,
+                "add_subscription: qos {qos} for existing filter {:?} differs from stored qos {} \
+                 — the subscribe path must reject a differing-params re-subscribe before reaching \
+                 add_subscription (host bug)",
+                existing.topic_filter, existing.qos,
+            );
+            return existing.clone();
+        }
+        let entry = IngressSubscription::new(topic_filter, qos);
+        self.entries.push(entry.clone());
+        entry
+    }
+
+    /// Remove the entry for `topic_filter`, returning whether one was held.
+    pub fn remove(&mut self, topic_filter: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.topic_filter != topic_filter);
+        self.entries.len() != before
+    }
+
+    /// Set the QoS of the entry for `topic_filter`, keeping its identifier, and
+    /// return it with `true`. A filter the set does not hold is added as
+    /// [`Self::add`] adds it, and the flag is `false`.
+    pub fn set_qos(&mut self, topic_filter: &str, qos: u8) -> (IngressSubscription, bool) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.topic_filter == topic_filter)
+        {
+            entry.qos = qos;
+            return (entry.clone(), true);
+        }
+        (self.add(topic_filter.to_string(), qos), false)
+    }
+
+    /// The other held filters whose identifier equals `topic_filter`'s.
+    pub fn sharing_identifier(&self, topic_filter: &str) -> Vec<String> {
+        let id = subscription_identifier(topic_filter);
+        self.entries
+            .iter()
+            .filter(|e| e.sub_id == id && e.topic_filter != topic_filter)
+            .map(|e| e.topic_filter.clone())
+            .collect()
+    }
+
+    /// Resolve the Subscription Identifiers a PUBLISH on `topic` carried to
+    /// the filters of the entries holding them.
+    ///
+    /// An identifier one entry holds resolves to that entry's filter. One that
+    /// several entries share resolves to those of them whose filter covers
+    /// `topic`, or to all of them when none does, so the router's cover check
+    /// reports the copy as it does for a single holder.
+    pub fn filters_for(&self, ids: &[usize], topic: &str) -> ResolvedIdentifiers {
+        let mut resolved = ResolvedIdentifiers {
+            filters: Vec::new(),
+            unknown: Vec::new(),
+        };
+        for &id in ids {
+            let holders: Vec<&IngressSubscription> = self
+                .entries
+                .iter()
+                .filter(|e| e.sub_id as usize == id)
+                .collect();
+            if holders.is_empty() {
+                if !resolved.unknown.contains(&id) {
+                    resolved.unknown.push(id);
+                }
+                continue;
+            }
+            let covering: Vec<&IngressSubscription> = holders
+                .iter()
+                .copied()
+                .filter(|e| covers(&e.topic_filter, topic))
+                .collect();
+            let chosen = if covering.is_empty() {
+                holders
+            } else {
+                covering
+            };
+            for entry in chosen {
+                if !resolved.filters.contains(&entry.topic_filter) {
+                    resolved.filters.push(entry.topic_filter.clone());
+                }
+            }
+        }
+        resolved
+    }
+
+    /// The entry for `topic_filter`, if held.
+    pub fn get(&self, topic_filter: &str) -> Option<&IngressSubscription> {
+        self.entries.iter().find(|e| e.topic_filter == topic_filter)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, IngressSubscription> {
+        self.entries.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn to_vec(&self) -> Vec<IngressSubscription> {
+        self.entries.clone()
+    }
+}
+
+/// Log that `entry` and the held filter `other` share a Subscription
+/// Identifier, so the broker's copies for the two cannot be told apart.
+fn warn_shared_identifier(client: &str, entry: &IngressSubscription, other: &str) {
+    tracing::warn!(
+        client,
+        filter = %entry.topic_filter,
+        other_filter = %other,
+        sub_id = entry.sub_id,
+        "two MQTT topic filters share a Subscription Identifier; a message matching both is \
+         delivered twice into each of their two channels"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -235,9 +444,10 @@ pub struct MqttClientHandle {
     pub config: Arc<MqttClientConfig>,
 
     /// The deduplicated union subscription set for this client — the
-    /// reconnect-survival set the supervisor re-asserts on every connect.
-    /// Runtime-mutable: a dynamic `mqtt:` subscribe pushes a new entry here.
-    pub subscriptions: RwLock<Vec<IngressSubscription>>,
+    /// reconnect-survival set the supervisor re-asserts on every connect, and
+    /// the table the inbound path resolves Subscription Identifiers against.
+    /// Runtime-mutable: a dynamic `mqtt:` subscribe adds an entry here.
+    pub subscriptions: RwLock<IngressSubscriptionSet>,
 
     /// Live supervisor state (shared with the supervisor task via `Arc`).
     pub supervisor_state: RwLock<SupervisorState>,
@@ -258,6 +468,20 @@ pub struct MqttClientHandle {
     /// whose client [`Self::client`] holds, [`DEFAULT_RECEIVE_MAXIMUM`] when it
     /// stated none. Written and read only under the `client` lock.
     pub(crate) broker_receive_max: AtomicU16,
+
+    /// Whether the broker said, in the CONNACK of the connection whose client
+    /// [`Self::client`] holds, that it supports Subscription Identifiers.
+    /// Written only by the supervisor, under the `client` lock. Another task
+    /// reads it only under that lock, so a SUBSCRIBE carries an identifier only
+    /// on a connection whose broker accepts one; the supervisor, its writer,
+    /// reads it on the inbound path without the lock.
+    pub(crate) broker_sub_ids_available: AtomicBool,
+
+    /// Whether the inbound path has logged, on the current connection, a
+    /// PUBLISH that carried no Subscription Identifier from a broker that
+    /// supports them. Cleared when a connection is installed. Written and read
+    /// only by the supervisor task, so it takes no lock.
+    pub(crate) missing_identifier_warned: AtomicBool,
 
     /// Counts the connections installed on this handle; the current one's
     /// number. Written and read only under the `client` lock, so a submitter
@@ -356,9 +580,17 @@ impl MqttClientHandle {
         subscriptions: Vec<IngressSubscription>,
         stop_tx: tokio::sync::watch::Sender<bool>,
     ) -> Arc<Self> {
+        let set = IngressSubscriptionSet::new(subscriptions);
+        for (i, entry) in set.iter().enumerate() {
+            for other in set.iter().take(i) {
+                if other.sub_id == entry.sub_id {
+                    warn_shared_identifier(&config.identity.slug, entry, &other.topic_filter);
+                }
+            }
+        }
         Arc::new(Self {
             config,
-            subscriptions: RwLock::new(subscriptions),
+            subscriptions: RwLock::new(set),
             supervisor_state: RwLock::new(SupervisorState::Disconnected {
                 last_error: None,
                 next_attempt_at: Instant::now(),
@@ -366,6 +598,8 @@ impl MqttClientHandle {
             client: Mutex::new(None),
             broker_max_packet_size: AtomicU32::new(0),
             broker_receive_max: AtomicU16::new(DEFAULT_RECEIVE_MAXIMUM),
+            broker_sub_ids_available: AtomicBool::new(true),
+            missing_identifier_warned: AtomicBool::new(false),
             connection_epoch: AtomicU64::new(0),
             egress_wake: Notify::new(),
             pending_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -397,34 +631,17 @@ impl MqttClientHandle {
     /// present, returning the `IngressSubscription` to assert (a fresh entry, or the
     /// existing one if the filter is already subscribed).
     ///
-    /// The `sub_id` of a new entry is `max(existing sub_ids) + 1` so it stays unique
-    /// within the client's set. If the filter already exists, its existing entry is
-    /// returned unchanged and the set is not grown (idempotent). Does not touch the
-    /// broker — the caller issues the SUBSCRIBE on the live client.
+    /// A new entry takes the identifier derived from its filter. If the filter
+    /// already exists, its existing entry is returned unchanged and the set is
+    /// not grown (idempotent). Does not touch the broker — the caller issues the
+    /// SUBSCRIBE on the live client.
     pub async fn add_subscription(&self, topic_filter: String, qos: u8) -> IngressSubscription {
-        let mut subs = self.subscriptions.write().await;
-        if let Some(existing) = subs.iter().find(|s| s.topic_filter == topic_filter) {
-            // The higher-level subscribe path forbids re-subscribe-with-different-
-            // params, so by the time a re-subscribe for an existing filter reaches
-            // here the QoS must match the stored entry. A mismatch means a caller
-            // bypassed that guard — a host bug, not bad input — so assert loudly
-            // rather than silently keeping the old QoS.
-            assert_eq!(
-                existing.qos, qos,
-                "add_subscription: qos {qos} for existing filter {:?} differs from stored qos {} \
-                 — the subscribe path must reject a differing-params re-subscribe before reaching \
-                 add_subscription (host bug)",
-                existing.topic_filter, existing.qos,
-            );
-            return existing.clone();
+        let mut set = self.subscriptions.write().await;
+        let held = set.get(&topic_filter).is_some();
+        let entry = set.add(topic_filter, qos);
+        if !held {
+            self.warn_if_shared(&set, &entry);
         }
-        let next_id = subs.iter().map(|s| s.sub_id).max().unwrap_or(0) + 1;
-        let entry = IngressSubscription {
-            topic_filter,
-            qos,
-            sub_id: next_id,
-        };
-        subs.push(entry.clone());
         entry
     }
 
@@ -435,14 +652,40 @@ impl MqttClientHandle {
     /// was present: a filter being taken down is not a filter granted on this
     /// session, and no caller has to remember the pairing.
     pub async fn remove_subscription(&self, topic_filter: &str) -> bool {
-        let removed = {
-            let mut subs = self.subscriptions.write().await;
-            let before = subs.len();
-            subs.retain(|s| s.topic_filter != topic_filter);
-            subs.len() != before
-        };
+        let removed = self.subscriptions.write().await.remove(topic_filter);
         self.forget_outcome(topic_filter).await;
         removed
+    }
+
+    /// Set the QoS of the subscription for `topic_filter`, keeping its
+    /// identifier, and return the entry with `true`; a filter the set does not
+    /// hold is added and the flag is `false`. Does not touch the broker.
+    ///
+    /// The broker's answer for the filter is forgotten, so that "granted" again
+    /// means the SUBSCRIBE at the entry's current QoS was answered.
+    pub async fn set_subscription_qos(
+        &self,
+        topic_filter: &str,
+        qos: u8,
+    ) -> (IngressSubscription, bool) {
+        let placed = {
+            let mut set = self.subscriptions.write().await;
+            let placed = set.set_qos(topic_filter, qos);
+            if !placed.1 {
+                self.warn_if_shared(&set, &placed.0);
+            }
+            placed
+        };
+        self.forget_outcome(topic_filter).await;
+        placed
+    }
+
+    /// Log at `warn` when `entry`, just placed in `set`, shares its identifier
+    /// with another held filter.
+    fn warn_if_shared(&self, set: &IngressSubscriptionSet, entry: &IngressSubscription) {
+        for other in set.sharing_identifier(&entry.topic_filter) {
+            warn_shared_identifier(&self.config.identity.slug, entry, &other);
+        }
     }
 
     /// Record the broker's answer for `topic_filter` on the current session.
@@ -451,10 +694,7 @@ impl MqttClientHandle {
     /// and a SUBACK can cross, and an answer for a filter this process has taken
     /// down would outlive every reader's meaning of it.
     async fn record_outcome(&self, topic_filter: &str, outcome: SubAckOutcome) {
-        let held = {
-            let subs = self.subscriptions.read().await;
-            subs.iter().any(|s| s.topic_filter == topic_filter)
-        };
+        let held = self.subscriptions.read().await.get(topic_filter).is_some();
         if !held {
             return;
         }
@@ -707,13 +947,193 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_subscription_appends_with_next_sub_id() {
+    async fn add_subscription_appends_with_the_filters_identifier() {
         let handle = make_handle("broker");
         let added = handle.add_subscription("sensors/#".into(), 0).await;
         assert_eq!(added.topic_filter, "sensors/#");
-        assert_eq!(added.sub_id, 1);
+        assert_eq!(added.sub_id, subscription_identifier("sensors/#"));
         let added2 = handle.add_subscription("home/#".into(), 0).await;
-        assert_eq!(added2.sub_id, 2, "new sub_id must be max existing + 1");
+        assert_eq!(added2.sub_id, subscription_identifier("home/#"));
+        assert_eq!(handle.subscriptions.read().await.len(), 2);
+    }
+
+    fn entry(topic_filter: &str, qos: u8) -> IngressSubscription {
+        IngressSubscription::new(topic_filter, qos)
+    }
+
+    fn id(topic_filter: &str) -> usize {
+        subscription_identifier(topic_filter) as usize
+    }
+
+    /// Two filters with one identifier, found by search; the collision tests
+    /// assert they collide before relying on it.
+    const COLLIDING: (&str, &str) = ("k/+/84471", "k/282/+");
+
+    #[test]
+    fn a_filter_takes_its_derived_identifier_whatever_else_was_added() {
+        let mut set = IngressSubscriptionSet::new(vec![]);
+        assert_eq!(
+            set.add("a/#".into(), 1).sub_id,
+            subscription_identifier("a/#")
+        );
+        assert_eq!(
+            set.add("a/b".into(), 1).sub_id,
+            subscription_identifier("a/b")
+        );
+        assert!(set.remove("a/b"));
+        assert!(!set.remove("a/b"));
+        assert_eq!(
+            set.add("a/c".into(), 1).sub_id,
+            subscription_identifier("a/c")
+        );
+        assert_eq!(
+            set.add("a/b".into(), 1).sub_id,
+            subscription_identifier("a/b"),
+            "a filter added back takes the identifier it had",
+        );
+
+        let mut reordered = IngressSubscriptionSet::new(vec![]);
+        for filter in ["a/c", "a/b", "a/#"] {
+            reordered.add(filter.into(), 1);
+        }
+        for filter in ["a/#", "a/b", "a/c"] {
+            assert_eq!(
+                reordered.get(filter).map(|e| e.sub_id),
+                set.get(filter).map(|e| e.sub_id),
+                "{filter} has one identifier whatever order the set was built in",
+            );
+        }
+    }
+
+    #[test]
+    fn a_clone_equals_the_original() {
+        let mut set = IngressSubscriptionSet::new(vec![entry("a/#", 0)]);
+        set.add("a/b".into(), 0);
+        assert_eq!(set.clone(), set);
+    }
+
+    #[test]
+    fn filters_for_resolves_known_identifiers_and_reports_unknown_ones() {
+        let set = IngressSubscriptionSet::new(vec![entry("a/#", 1), entry("a/b", 1)]);
+        let unknown = [9_usize, 10];
+        for u in unknown {
+            assert!(u != id("a/#") && u != id("a/b"));
+        }
+        let resolved = |ids: &[usize]| set.filters_for(ids, "a/b");
+        assert_eq!(
+            resolved(&[id("a/b")]),
+            ResolvedIdentifiers {
+                filters: vec!["a/b".into()],
+                unknown: vec![],
+            },
+        );
+        assert_eq!(
+            resolved(&[id("a/b"), id("a/#")]),
+            ResolvedIdentifiers {
+                filters: vec!["a/b".into(), "a/#".into()],
+                unknown: vec![],
+            },
+            "packet order is kept",
+        );
+        assert_eq!(
+            resolved(&[id("a/#"), 9, id("a/b")]),
+            ResolvedIdentifiers {
+                filters: vec!["a/#".into(), "a/b".into()],
+                unknown: vec![9],
+            },
+        );
+        assert_eq!(
+            resolved(&[9, 10]),
+            ResolvedIdentifiers {
+                filters: vec![],
+                unknown: vec![9, 10],
+            },
+        );
+        assert_eq!(
+            resolved(&[id("a/b"), id("a/b")]),
+            ResolvedIdentifiers {
+                filters: vec!["a/b".into()],
+                unknown: vec![],
+            },
+            "a repeated identifier yields its filter once",
+        );
+    }
+
+    #[test]
+    fn two_filters_sharing_an_identifier_are_both_held_and_resolved_by_cover() {
+        let (wide, narrow) = COLLIDING;
+        assert_eq!(
+            subscription_identifier(wide),
+            subscription_identifier(narrow),
+            "the fixture pair must collide",
+        );
+        let shared = id(wide);
+
+        let set = IngressSubscriptionSet::new(vec![entry(wide, 1), entry(narrow, 1)]);
+        assert_eq!(set.len(), 2);
+        let mut added = IngressSubscriptionSet::new(vec![entry(wide, 1)]);
+        added.add(narrow.into(), 1);
+        assert_eq!(added.len(), 2);
+        assert_eq!(added.sharing_identifier(narrow), vec![wide.to_string()]);
+        assert_eq!(added.sharing_identifier(wide), vec![narrow.to_string()]);
+        assert!(added.sharing_identifier("a/b").is_empty());
+
+        let filters = |topic: &str| set.filters_for(&[shared], topic).filters;
+        assert_eq!(
+            filters("k/282/84471"),
+            vec![wide.to_string(), narrow.to_string()],
+            "a topic both cover resolves to both",
+        );
+        assert_eq!(
+            filters("k/282/1"),
+            vec![narrow.to_string()],
+            "a topic one covers resolves to that one",
+        );
+        assert_eq!(
+            filters("x/y"),
+            vec![wide.to_string(), narrow.to_string()],
+            "a topic neither covers resolves to both, for the router's cover check",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "appears twice")]
+    fn new_panics_on_a_duplicate_filter() {
+        IngressSubscriptionSet::new(vec![entry("a/#", 0), entry("a/#", 1)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not derived from its filter")]
+    fn new_panics_on_an_identifier_not_derived_from_its_filter() {
+        IngressSubscriptionSet::new(vec![IngressSubscription {
+            topic_filter: "a/#".into(),
+            qos: 0,
+            sub_id: 1,
+        }]);
+    }
+
+    /// `set_qos` on a held filter keeps its identifier; on an absent filter it
+    /// adds an entry with the filter's identifier.
+    #[test]
+    fn set_qos_keeps_the_identifier_of_a_held_filter() {
+        let mut set = IngressSubscriptionSet::new(vec![entry("a/#", 0)]);
+        assert_eq!(set.set_qos("a/#", 2), (entry("a/#", 2), true));
+        assert_eq!(set.get("a/#"), Some(&entry("a/#", 2)));
+        assert_eq!(set.set_qos("b/#", 1), (entry("b/#", 1), false));
+        assert_eq!(set.len(), 2);
+    }
+
+    /// The handle's QoS change forgets the broker's recorded answer, so a grant
+    /// is again the answer to the SUBSCRIBE at the current QoS.
+    #[tokio::test]
+    async fn set_subscription_qos_forgets_the_recorded_answer() {
+        let handle = make_handle("broker");
+        handle.add_subscription("a/#".into(), 0).await;
+        handle.record_grant("a/#").await;
+        let (sub, held) = handle.set_subscription_qos("a/#", 1).await;
+        assert!(held);
+        assert_eq!(sub, entry("a/#", 1));
+        assert!(!handle.is_granted("a/#").await);
     }
 
     #[tokio::test]
@@ -721,7 +1141,7 @@ mod tests {
         let handle = make_handle("broker");
         handle.add_subscription("home/+/state".into(), 1).await;
         let added = handle.add_subscription("home/+/state".into(), 1).await;
-        assert_eq!(added.sub_id, 1);
+        assert_eq!(added, entry("home/+/state", 1));
         assert_eq!(handle.subscriptions.read().await.len(), 1);
     }
 

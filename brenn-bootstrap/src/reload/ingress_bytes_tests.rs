@@ -17,7 +17,7 @@ use brenn_lib::config::PACKAGED;
 use brenn_lib::messaging::Urgency;
 use brenn_messaging::format::ConversationEnvelopes;
 use brenn_messaging::query::MessageQuery;
-use brenn_mqtt::{InboundPayload, MqttEventRouter};
+use brenn_mqtt::{InboundPayload, InboundRouting, MqttEventRouter};
 use brenn_server::mqtt_router::{IngressRoute, MqttEventRouterImpl};
 use brenn_server::webhook_router::WebhookEventRouterImpl;
 use chrono::{DateTime, Utc};
@@ -238,6 +238,7 @@ async fn a_typed_binary_payload_reaches_a_component_byte_exact_on_a_raw_channel(
             "cam/front",
             InboundPayload::new(NOT_UTF8.to_vec(), Some("image/jpeg".to_string())),
             1,
+            InboundRouting::ByTopic,
         )
         .await;
     let to = Utc::now();
@@ -291,6 +292,7 @@ async fn an_untyped_binary_payload_takes_the_channels_declared_type_or_is_droppe
                 topic,
                 InboundPayload::new(NOT_UTF8.to_vec(), None),
                 1,
+                InboundRouting::ByTopic,
             )
             .await;
     }
@@ -311,6 +313,7 @@ async fn an_untyped_binary_payload_takes_the_channels_declared_type_or_is_droppe
             "raw/front",
             InboundPayload::new(b"ok".to_vec(), Some("text/plain".to_string())),
             1,
+            InboundRouting::ByTopic,
         )
         .await;
     let entries = reported(&mut booted, "brenn:report-raw", RAW, 1).await;
@@ -338,6 +341,7 @@ async fn a_wrapped_channel_is_read_through_mqtt_body_and_refuses_the_transport_a
             "plain/front",
             InboundPayload::new(b"21.5".to_vec(), None),
             1,
+            InboundRouting::ByTopic,
         )
         .await;
 

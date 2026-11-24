@@ -100,7 +100,10 @@ struct BrennPendingListResponse<'a> {
 /// `"subscribed_client_failed"`, or `"already_subscribed"`) so the LLM gets an
 /// honest live-vs-deferred-vs-hopeless-vs-noop signal — the third means the
 /// subscription persisted but its broker session has stopped retrying, so
-/// nothing arrives until an operator fixes it. `note` carries a channel-class
+/// nothing arrives until an operator fixes it. `"subscribed"` on an `mqtt:`
+/// address means the SUBSCRIBE was handed to the broker connection, not that
+/// the broker answered or that any retained message is in the channel yet.
+/// `note` carries a channel-class
 /// caveat when there is one; omitted otherwise.
 #[derive(Serialize)]
 struct MessageSubscribeOk<'a> {

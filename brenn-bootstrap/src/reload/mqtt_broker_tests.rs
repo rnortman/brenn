@@ -25,7 +25,7 @@ use std::sync::Arc;
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::state::ConnectorHealthLabel;
 use brenn_mqtt::test_support::{
-    AUTH_CREDENTIALS, BrokerHarness, ROTATED_CREDENTIALS, await_puback, certs,
+    AUTH_CREDENTIALS, BrokerHarness, ROTATED_CREDENTIALS, await_puback, certs, connection_epoch,
     direct_publisher_acked, direct_publisher_acked_as, log_records_disconnect,
     log_records_publish_to_subscriber, log_records_unsubscribe, session_client_id,
 };
@@ -34,9 +34,9 @@ use rumqttc::mqttbytes::QoS;
 use super::driver::TriggerSource;
 use super::driver::tests::{
     BootFixture, Booted, READER, Tree, bodies_on, boot_with, conversation_of, cursor_of, document,
-    document_push_subscribing_acl, document_subscribing_acl, dynamic_rows, egress_entry_noise,
-    insert_dynamic_mqtt_row, install_package, live_entry_of_reader, seat_user, staged_module,
-    staged_module_opt,
+    document_push_subscribing_acl, document_subscribing_acl, document_with_agent, dynamic_rows,
+    egress_entry_noise, insert_dynamic_mqtt_row, install_package, live_entry_of_reader, seat_user,
+    staged_module, staged_module_opt,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -1673,6 +1673,499 @@ async fn a_client_whose_new_credentials_are_wrong_reaches_failed_after_an_applie
     assert!(
         booted.messenger.directory().resolve(&address).is_some(),
         "the ingress channel is the document's whatever the broker thinks of the credentials",
+    );
+
+    booted.stop_mqtt();
+}
+
+// ── which channels an inbound message reaches ──────────────────────────────
+
+/// The `topic` field of each ingress envelope in `bodies`, in order.
+fn topics_of(bodies: &[String]) -> Vec<String> {
+    bodies
+        .iter()
+        .map(|body| {
+            let envelope: serde_json::Value =
+                serde_json::from_str(body).expect("the ingress envelope is JSON");
+            envelope["topic"]
+                .as_str()
+                .expect("the envelope names its topic")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Poll until `address` holds at least `wanted` rows, and answer with their
+/// bodies. The timeout diagnostic names the client's connection epoch and
+/// health, because a reconnect is what a count-claiming case cannot survive.
+async fn rows_until(booted: &Booted, address: &str, wanted: usize, what: &str) -> Vec<String> {
+    let (service, _) = booted.mqtt.clone();
+    let messenger = &booted.messenger;
+    brenn_mqtt::test_support::poll_until(
+        BROKER_WAIT_SECS,
+        || async {
+            let bodies = bodies_on(messenger, address).await;
+            (bodies.len() >= wanted).then_some(bodies)
+        },
+        || async {
+            let held = bodies_on(messenger, address).await.len();
+            let epoch = connection_epoch(&service, CLIENT).await;
+            let (label, error) = service.ingress_health(CLIENT).await;
+            format!(
+                "{what}: {address} holds {held} of {wanted} rows (connection epoch {epoch}, \
+                 health {label:?} {error:?})"
+            )
+        },
+    )
+    .await
+}
+
+/// A message on a topic two filters of one client cover is one row in each
+/// filter's channel — not one row per covering filter in each.
+///
+/// The broker sends this session one copy per matching subscription, each
+/// carrying that subscription's identifier, and each copy goes to its own
+/// subscription's channel only. The barrier is covered by the wide filter
+/// alone, and the broker writes one session's copies in order, so once the
+/// barrier is in the wide channel both copies of the first message have been
+/// routed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_filters_put_one_row_in_each_channel() {
+    broker_gate!();
+
+    let wide = format!("{TOPIC_PREFIX}/ov/#");
+    let narrow = format!("{TOPIC_PREFIX}/ov/b");
+    let barrier = format!("{TOPIC_PREFIX}/ov/end");
+    let wide_address = format!("mqtt:{CLIENT}:{wide}");
+    let narrow_address = format!("mqtt:{CLIENT}:{narrow}");
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let components = tempfile::tempdir().expect("a components root");
+
+    let (_tree, mut booted) =
+        boot_connected(&harness, &ca_file, components.path(), &[&wide, &narrow]).await;
+    let (service, _router) = booted.mqtt.clone();
+    for filter in [&wide, &narrow] {
+        brenn_mqtt::test_support::wait_for_filter_acked(
+            &service,
+            CLIENT,
+            filter,
+            BROKER_WAIT_SECS,
+            &format!("the broker never granted {filter}"),
+        )
+        .await;
+    }
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    publisher
+        .publish(narrow.clone(), QoS::AtLeastOnce, false, b"once".to_vec())
+        .await
+        .expect("the broker took the publish");
+    await_puback(&mut acks, "the overlapped topic's publish").await;
+    publisher
+        .publish(barrier.clone(), QoS::AtLeastOnce, false, b"end".to_vec())
+        .await
+        .expect("the broker took the barrier");
+    await_puback(&mut acks, "the barrier's publish").await;
+    note_if_filter_lost(&service, CLIENT, &wide).await;
+
+    let wide_bodies = booted.bodies_until(&wide_address, 2).await;
+    assert_eq!(
+        topics_of(&wide_bodies),
+        vec![narrow.clone(), barrier.clone()],
+        "the wide channel holds the message once and the barrier once: {wide_bodies:?}",
+    );
+    let narrow_bodies = bodies_on(&booted.messenger, &narrow_address).await;
+    assert_eq!(
+        topics_of(&narrow_bodies),
+        vec![narrow.clone()],
+        "the narrow channel holds the message once: {narrow_bodies:?}",
+    );
+
+    booted.stop_mqtt();
+}
+
+/// How many retained messages the burst case stores before brenn subscribes.
+const BURST: usize = 150;
+
+/// The broker declaration with the reader agent holding `wide` pull-only as a
+/// static subscription, and granted what a runtime `mqtt:` subscribe under it
+/// needs: the `dynamic_subscribe` grant beside `subscribe`, and a `topic_filter`
+/// clause covering every filter `wide` covers.
+fn document_dynamic_under(port: u16, ca_file: &std::path::Path, wide: &str) -> String {
+    let address = format!("mqtt:{CLIENT}:{wide}");
+    document_with_agent(
+        &client_block(port, ca_file),
+        &format!(
+            r#"
+agent Reader() {{
+    working_dir = ".";
+    grants = [subscribe, publish, dynamic_subscribe];
+    send_budget = 1000000;
+    acl subscribe [exact reload_outcomes, prefix "brenn:surface.", prefix "ephemeral:surface.", topic_filter "{address}"];
+    acl publish [exact reload_requests, exact work];
+    subscribe "{address}" {{ push_depth = 0; retain_depth = 4; }}
+}}
+
+new some-reader: Reader();
+"#
+        ),
+    )
+}
+
+/// A runtime subscribe to a narrower filter receives every retained message the
+/// broker holds under it, each exactly once, and none of them reaches the wider
+/// channel the same client already holds.
+///
+/// 150 retained messages are stored before brenn connects; the wide filter is
+/// a static binding, the narrow one is added the way `MessageSubscribe` adds
+/// it. `"subscribed"` is answered before the replay is in the channel, so the
+/// case records how many rows were there at the return and how long the rest
+/// took, and prints both.
+///
+/// A reconnect is not tolerated: every reconnect asserts every held filter
+/// again, the broker replays each one's retained messages into its channel a
+/// second time, and the exact counts below stop being a statement about
+/// routing. The epoch assertion comes first and says so.
+///
+/// TODO(mqtt-retained-replay-shortfall-cause-unconfirmed): what produced the
+/// reported shortfall of retained values on a new subscription is not
+/// established; this case shows none on brenn's inbound path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_narrow_subscription_receives_every_retained_message_once() {
+    broker_gate!();
+
+    let wide = format!("{TOPIC_PREFIX}/burst/#");
+    let narrow = format!("{TOPIC_PREFIX}/burst/light/+/state");
+    let barrier = format!("{TOPIC_PREFIX}/burst/light/end/state");
+    let wide_address = format!("mqtt:{CLIENT}:{wide}");
+    let narrow_address = format!("mqtt:{CLIENT}:{narrow}");
+    let retained: Vec<String> = (0..BURST)
+        .map(|i| format!("{TOPIC_PREFIX}/burst/light/{i}/state"))
+        .collect();
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    for (i, topic) in retained.iter().enumerate() {
+        publisher
+            .publish(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                true,
+                format!("value-{i}").into_bytes(),
+            )
+            .await
+            .expect("the broker took the retained publish");
+        await_puback(&mut acks, "a retained publish").await;
+    }
+
+    let tree = Tree::holding(&document_dynamic_under(harness.port, &ca_file, &wide));
+    let booted = boot_live(&tree, None).await;
+    let (service, router) = booted.mqtt.clone();
+    rows_until(
+        &booted,
+        &wide_address,
+        BURST,
+        "the wide filter's retained replay",
+    )
+    .await;
+
+    let status = brenn_server::test_support::mqtt::subscribe_dynamic(
+        &booted.messenger,
+        &service,
+        &router,
+        READER,
+        &narrow_address,
+        brenn_messaging::subscribe::DynamicSubscribeParams {
+            push_depth: brenn_lib::messaging::config::Depth::Bounded(0),
+            retain_depth: brenn_lib::messaging::config::Depth::Bounded(4),
+            noise: None,
+            wake_min: None,
+            qos: None,
+        },
+    )
+    .await;
+    let returned = std::time::Instant::now();
+    let rows_at_return = bodies_on(&booted.messenger, &narrow_address).await.len();
+    let (label, error) = service.ingress_health(CLIENT).await;
+    assert_eq!(
+        status,
+        "subscribed",
+        "the session was not live when the narrow filter was added (health {label:?} {error:?}, \
+         connection epoch {})",
+        connection_epoch(&service, CLIENT).await,
+    );
+
+    rows_until(
+        &booted,
+        &narrow_address,
+        BURST,
+        "the narrow filter's retained replay",
+    )
+    .await;
+    let replay_time = returned.elapsed();
+    eprintln!(
+        "retained burst: {rows_at_return} of {BURST} rows in the narrow channel when the \
+         subscribe returned; the {BURST}th arrived {replay_time:?} after the return",
+    );
+
+    publisher
+        .publish(barrier.clone(), QoS::AtLeastOnce, false, b"end".to_vec())
+        .await
+        .expect("the broker took the barrier");
+    await_puback(&mut acks, "the barrier's publish").await;
+    let wide_bodies = rows_until(&booted, &wide_address, BURST + 1, "the barrier, wide").await;
+    let narrow_bodies =
+        rows_until(&booted, &narrow_address, BURST + 1, "the barrier, narrow").await;
+
+    assert_eq!(
+        connection_epoch(&service, CLIENT).await,
+        1,
+        "the session reconnected during the case; each reconnect replays every filter's retained \
+         messages into its channel again, so the counts below are not this case's claim on this \
+         run",
+    );
+
+    let mut expected: Vec<String> = retained.clone();
+    expected.push(barrier.clone());
+    expected.sort();
+    let mut narrow_topics = topics_of(&narrow_bodies);
+    narrow_topics.sort();
+    assert_eq!(
+        narrow_topics, expected,
+        "the narrow channel holds each retained topic exactly once, and the barrier",
+    );
+    let mut wide_topics = topics_of(&wide_bodies);
+    wide_topics.sort();
+    assert_eq!(
+        wide_topics, expected,
+        "the wide channel holds its own replay and the barrier, and none of the copies the broker \
+         sent for the narrow subscription",
+    );
+
+    assert!(
+        !harness
+            .log()
+            .contains("Outgoing messages are being dropped"),
+        "the broker dropped messages for a client, so a shortfall is the harness's limits: {}",
+        harness.log(),
+    );
+
+    booted.stop_mqtt();
+}
+
+// ── a resumed session and a reload's QoS move, at the broker ───────────────
+
+/// A message the broker queued for a filter while Brenn was stopped reaches
+/// that filter's channel in the next process, whatever order that process
+/// built its subscription set in.
+///
+/// The client keeps its session across the stop (`session_expiry_secs`), so
+/// the broker queues the down-time message under the identifier the first
+/// process subscribed `rs/#` with and delivers it on reconnect, before it reads
+/// the second process's SUBSCRIBEs. The second process binds `rs/b` before
+/// `rs/#`; a rule that numbered filters in the order a process meets them would
+/// give `rs/b` the number `rs/#` had, and the message would land in the `rs/b`
+/// channel and not in the `rs/#` one. The case proves the session was resumed
+/// by itself: without it the down-time message never arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_sessions_backlog_reaches_the_channel_it_was_queued_for() {
+    broker_gate!();
+
+    let wide = format!("{TOPIC_PREFIX}/rs/#");
+    let narrow = format!("{TOPIC_PREFIX}/rs/b");
+    let barrier = format!("{TOPIC_PREFIX}/rs/end");
+    let wide_address = format!("mqtt:{CLIENT}:{wide}");
+    let narrow_address = format!("mqtt:{CLIENT}:{narrow}");
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let block = format!(
+        r#"mqtt_client ha {{
+    url = "mqtts://127.0.0.1:{port}";
+    ca_file = "{ca}";
+    qos = 1;
+    session_expiry_secs = 60;
+}}
+"#,
+        port = harness.port,
+        ca = ca_file.display(),
+    );
+
+    let first_components = tempfile::tempdir().expect("a components root");
+    let first_tree = Tree::holding(&document_over_a_declared_client(&block, &[&wide]));
+    let first = boot_connected_on(&first_tree, first_components.path()).await;
+    let (first_service, _) = first.mqtt.clone();
+    brenn_mqtt::test_support::wait_for_filter_acked(
+        &first_service,
+        CLIENT,
+        &wide,
+        BROKER_WAIT_SECS,
+        &format!("the first process's {wide} was never granted"),
+    )
+    .await;
+    let since_first = harness.log_len();
+    super::mqtt_egress_tests::shut_down(first).await;
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    publisher
+        .publish(narrow.clone(), QoS::AtLeastOnce, false, b"down".to_vec())
+        .await
+        .expect("the broker took the down-time publish");
+    await_puback(&mut acks, "the down-time publish").await;
+
+    let second_components = tempfile::tempdir().expect("a components root");
+    let second_tree = Tree::holding(&document_over_a_declared_client(&block, &[&narrow, &wide]));
+    let second = boot_connected_on(&second_tree, second_components.path()).await;
+    let (service, _) = second.mqtt.clone();
+    for filter in [&narrow, &wide] {
+        brenn_mqtt::test_support::wait_for_filter_acked(
+            &service,
+            CLIENT,
+            filter,
+            BROKER_WAIT_SECS,
+            &format!("the second process's {filter} was never granted"),
+        )
+        .await;
+    }
+    publisher
+        .publish(barrier.clone(), QoS::AtLeastOnce, false, b"end".to_vec())
+        .await
+        .expect("the broker took the barrier");
+    await_puback(&mut acks, "the barrier's publish").await;
+    note_if_filter_lost(&service, CLIENT, &wide).await;
+
+    let wide_bodies = rows_until(&second, &wide_address, 2, "the resumed backlog").await;
+    let session_id = session_client_id(CLIENT);
+    let window = harness.log()[since_first..].to_string();
+    assert!(
+        brenn_mqtt::test_support::log_records_disconnect_before_reconnect(&window, &session_id),
+        "the second process connected under {session_id} before the first one's DISCONNECT, so \
+         the broker took the session over and the counts below are not this case's claim: \
+         {window}",
+    );
+    assert_eq!(
+        topics_of(&wide_bodies),
+        vec![narrow.clone(), barrier.clone()],
+        "the wide channel holds the down-time message once and the barrier once: {wide_bodies:?}",
+    );
+    let narrow_bodies = bodies_on(&second.messenger, &narrow_address).await;
+    assert!(
+        narrow_bodies.is_empty(),
+        "the down-time message was queued for the wide filter only: {narrow_bodies:?}",
+    );
+
+    second.stop_mqtt();
+}
+
+/// The document of [`a_reloads_qos_move_sends_no_unsubscribe`]: the consumer
+/// bound to `topic`, on a client at `qos`.
+fn bound_at_qos(port: u16, ca_file: &std::path::Path, topic: &str, qos: u8) -> String {
+    let block = format!(
+        r#"mqtt_client ha {{
+    url = "mqtts://127.0.0.1:{port}";
+    ca_file = "{ca}";
+    qos = {qos};
+}}
+"#,
+        ca = ca_file.display(),
+    );
+    document_over_a_declared_client(&block, &[topic])
+}
+
+/// A reload that moves a held filter's QoS sends the broker a SUBSCRIBE at the
+/// new QoS and no UNSUBSCRIBE.
+///
+/// A static binding's QoS is its client's, so the move is an edit to the
+/// client's `qos`, which also restarts the client. The reload's outgoing step,
+/// where a remove-and-add would withdraw the filter, runs before the restart,
+/// on the predecessor's connection; the broker logs an UNSUBSCRIBE sent there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reloads_qos_move_sends_no_unsubscribe() {
+    broker_gate!();
+
+    let topic = format!("{TOPIC_PREFIX}/qos-move");
+    let address = format!("mqtt:{CLIENT}:{topic}");
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let components = tempfile::tempdir().expect("a components root");
+
+    let tree = Tree::holding(&bound_at_qos(harness.port, &ca_file, &topic, 0));
+    let mut booted = boot_connected_on(&tree, components.path()).await;
+    let (service, _router) = booted.mqtt.clone();
+    assert_eq!(service.ingress_filter_qos(CLIENT, &topic).await, Some(0));
+    brenn_mqtt::test_support::wait_for_filter_acked(
+        &service,
+        CLIENT,
+        &topic,
+        BROKER_WAIT_SECS,
+        &format!("the broker never granted {topic}"),
+    )
+    .await;
+
+    let before_reload = harness.log_len();
+    tree.write(&bound_at_qos(harness.port, &ca_file, &topic, 1));
+    install_package(components.path(), &staged_module(&tree));
+    booted.driver.reload(TriggerSource::Signal).await;
+
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_changed, vec![CLIENT.to_string()]);
+    assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+    assert!(
+        status.delta.mqtt_unsubscribed.is_empty(),
+        "a qos move is not a withdrawal: {:?}",
+        status.delta.mqtt_unsubscribed,
+    );
+    assert_no_failed_filters(&status);
+
+    brenn_mqtt::test_support::wait_for_filter_acked(
+        &service,
+        CLIENT,
+        &topic,
+        BROKER_WAIT_SECS,
+        &format!("the successor's {topic} was never granted at the new qos"),
+    )
+    .await;
+    assert_eq!(service.ingress_filter_qos(CLIENT, &topic).await, Some(1));
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    publisher
+        .publish(topic.clone(), QoS::AtLeastOnce, false, b"moved".to_vec())
+        .await
+        .expect("the broker took the publish");
+    await_puback(&mut acks, "the moved topic's publish").await;
+    let session_id = session_client_id(CLIENT);
+    let window = harness
+        .wait_for_log(
+            before_reload,
+            BROKER_WAIT_SECS,
+            &format!("the broker never recorded sending {topic} to {session_id}"),
+            |log| log_records_publish_to_subscriber(log, &session_id, &topic),
+        )
+        .await;
+    assert!(
+        !log_records_unsubscribe(&window, &session_id, &topic),
+        "the reload's qos move sent an UNSUBSCRIBE for {topic}: {window}",
+    );
+
+    let bodies = booted.bodies_until(&address, 1).await;
+    assert_eq!(
+        topics_of(&bodies),
+        vec![topic.clone()],
+        "the channel holds the message once: {bodies:?}",
     );
 
     booted.stop_mqtt();

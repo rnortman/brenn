@@ -18,11 +18,14 @@
 //!   publish to an MQTT topic is admitted against.
 //! - `topic_filter` — `covers`, the one MQTT filter-against-filter match, `$` first-level rule
 //!   included; decides the subscribe ACL, the publish ACL and inbound routing.
+//! - `subscription_id` — `subscription_identifier`, the MQTT 5 Subscription Identifier a
+//!   filter is subscribed with, derived from the filter string.
 
 pub mod address;
 pub mod config;
 pub mod error;
 pub mod outbound;
+pub mod subscription_id;
 #[cfg(any(test, feature = "testutils"))]
 pub mod test_support;
 pub mod topic_filter;
@@ -30,3 +33,4 @@ pub mod topic_filter;
 pub use address::{MqttAddress, parse_mqtt_address, parse_topic_filter, parse_topic_name};
 pub use error::MqttError;
 pub use outbound::{MqttClientDirectory, MqttLifetime, MqttPublishOptions};
+pub use subscription_id::{MAX_SUBSCRIPTION_IDENTIFIER, subscription_identifier};

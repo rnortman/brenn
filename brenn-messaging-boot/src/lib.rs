@@ -1532,14 +1532,19 @@ pub async fn commit_messaging(
         // NOT one of those static channels needs its broker SUBSCRIBE + route
         // rebuilt; collect a descriptor per such channel (deduped by channel_uuid,
         // since two apps can dynamically subscribe to one filter — one channel,
-        // one SUBSCRIBE/route). Each row's stored `qos` is the SUBSCRIBE QoS it
-        // chose; `urgency` is filled by the caller from the client config.
+        // one SUBSCRIBE/route). A descriptor's QoS is the stored `qos` of the one
+        // row kept for its channel — the first in load order — and only where no
+        // static binding holds the channel; every other row's stored `qos` is not
+        // read. `urgency` is filled by the caller from the client config.
         let static_mqtt_uuids: std::collections::HashSet<uuid::Uuid> = mqtt_ingress_channels
             .iter()
             .map(|c| c.channel_uuid)
             .collect();
         let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
         for row in &merge_outcome.kept {
+            // TODO(mqtt-dynamic-subscribe-qos-not-honoured): the row's stored QoS
+            // is dropped here when a static binding holds the channel, and for
+            // every row after the first on a channel.
             if static_mqtt_uuids.contains(&row.channel_uuid) || !seen.insert(row.channel_uuid) {
                 continue;
             }

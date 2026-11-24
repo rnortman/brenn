@@ -299,7 +299,7 @@ async fn install_unpolled(
     receive_max: Option<u16>,
 ) -> rumqttc::EventLoop {
     let (client, eventloop) = unpolled_client(capacity);
-    install_connection(handle, client, max_packet_size, receive_max).await;
+    install_connection(handle, client, max_packet_size, receive_max, true).await;
     eventloop
 }
 
@@ -572,7 +572,7 @@ async fn connect_fake(
     answer: Answer,
 ) -> FakeBroker {
     let (client, mut eventloop, broker) = fake_connection(answer, None).await;
-    install_connection(handle, client, None, receive_max).await;
+    install_connection(handle, client, None, receive_max, true).await;
     let polled = Arc::clone(handle);
     tokio::spawn(async move {
         while let Ok(event) = eventloop.poll().await {
@@ -595,6 +595,7 @@ impl crate::service::MqttEventRouter for NoRoutes {
         _topic: &str,
         _payload: crate::payload::InboundPayload,
         _qos: u8,
+        _routing: crate::service::InboundRouting,
     ) {
         panic!("the in-process broker sends no inbound publish");
     }
@@ -624,7 +625,7 @@ async fn supervise(
     mut eventloop: rumqttc::EventLoop,
     receive_max: Option<u16>,
 ) {
-    install_connection(handle, client.clone(), None, receive_max).await;
+    install_connection(handle, client.clone(), None, receive_max, true).await;
     let supervised = Arc::clone(handle);
     let mut stop = handle.stop_tx.subscribe();
     let join = tokio::spawn(async move {

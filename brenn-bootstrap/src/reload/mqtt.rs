@@ -106,10 +106,18 @@ pub(crate) struct FilterMove {
 
 /// What moves on one client's broker session.
 ///
-/// `resubscribe` is a qos move on a filter both unions hold:
-/// `add_subscription` asserts qos equality for a filter already in the set, so
-/// the only way to raise or lower one is to take it out and put it back. It is
-/// therefore in both the outgoing and the incoming step, in that order.
+/// `resubscribe` is a qos move on a filter both unions hold: one SUBSCRIBE at
+/// the new qos, sent in the incoming step, for a filter the session keeps
+/// holding under the Subscription Identifier it already has. MQTT 5 has the
+/// broker replace its subscription in place, so the filter is in neither
+/// [`Self::leaving`] nor [`Self::joining`] and no copy the broker sends for it
+/// meanwhile goes unrouted.
+///
+/// A static filter's QoS is its client's, so an edit to the client's `qos`
+/// moves it, and that edit also restarts the client. A filter held only by
+/// dynamic rows takes the first row's QoS, so revoking that row while another
+/// at a different QoS remains moves it with no restart. A dynamic row beside a
+/// static binding never moves it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MqttClientDelta {
     pub client: String,
@@ -123,14 +131,15 @@ impl MqttClientDelta {
         self.subscribe.is_empty() && self.unsubscribe.is_empty() && self.resubscribe.is_empty()
     }
 
-    /// The filters the outgoing step issues an UNSUBSCRIBE for, in that order.
+    /// The filters the outgoing step issues an UNSUBSCRIBE for.
     pub(crate) fn leaving(&self) -> impl Iterator<Item = &FilterMove> {
-        self.unsubscribe.iter().chain(self.resubscribe.iter())
+        self.unsubscribe.iter()
     }
 
-    /// The filters the incoming step issues a SUBSCRIBE for, in that order.
+    /// The filters the incoming step adds to the session with a SUBSCRIBE.
+    /// The incoming step re-subscribes [`Self::resubscribe`] after these.
     pub(crate) fn joining(&self) -> impl Iterator<Item = &FilterMove> {
-        self.subscribe.iter().chain(self.resubscribe.iter())
+        self.subscribe.iter()
     }
 }
 
@@ -162,13 +171,15 @@ impl MqttDelta {
             && self.routes_removed.is_empty()
     }
 
-    /// Every filter the incoming step subscribes, as the status body names it.
+    /// Every filter the incoming step subscribes, as the status body names it:
+    /// the filters joining the session, then those re-subscribed at a new qos.
     pub fn subscribed(&self) -> Vec<String> {
         self.clients
             .iter()
             .flat_map(|client| {
                 client
                     .joining()
+                    .chain(client.resubscribe.iter())
                     .map(|filter| address_of(&client.client, &filter.topic_filter))
             })
             .collect()
@@ -475,11 +486,11 @@ mod tests {
         assert_eq!(delta.routes_removed.len(), 1);
     }
 
-    /// The union takes the max qos across a client's channels, so a raise on
-    /// one of two channels sharing a client's filter is a re-SUBSCRIBE: the
-    /// filter leaves the set and rejoins it at the new qos.
+    /// One filter whose qos differs between the two sides is a re-SUBSCRIBE
+    /// in place: the filter neither leaves the session nor joins it, and the
+    /// status body names it as subscribed only.
     #[test]
-    fn a_qos_move_is_an_unsubscribe_then_a_subscribe() {
+    fn a_qos_move_is_a_subscribe_in_place() {
         let before = ingress("chef", "a/b", 0);
         let after = ingress("chef", "a/b", 2);
         let delta = mqtt_delta(
@@ -493,15 +504,10 @@ mod tests {
         assert!(delta.clients[0].subscribe.is_empty());
         assert!(delta.clients[0].unsubscribe.is_empty());
         assert_eq!(filters(&delta.clients[0].resubscribe), vec![("a/b", 2)]);
-        // The order the two commit steps take it in: out first, then in.
-        assert_eq!(
-            filters(&delta.clients[0].leaving().cloned().collect::<Vec<_>>()),
-            vec![("a/b", 2)]
-        );
-        assert_eq!(
-            filters(&delta.clients[0].joining().cloned().collect::<Vec<_>>()),
-            vec![("a/b", 2)]
-        );
+        assert_eq!(delta.clients[0].leaving().count(), 0);
+        assert_eq!(delta.clients[0].joining().count(), 0);
+        assert_eq!(delta.subscribed(), vec!["mqtt:chef:a/b".to_string()]);
+        assert!(delta.unsubscribed().is_empty());
         assert!(delta.routes_added.is_empty());
         assert!(delta.routes_removed.is_empty());
     }

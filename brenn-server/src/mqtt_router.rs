@@ -14,12 +14,15 @@
 //! construction, before any supervisor can deliver an inbound message.
 //!
 //! Routing: the router owns the ingress routing table (built from the distinct
-//! ingress channels at `set_state` time). On each inbound message it matches the
-//! **actual** published topic against every channel's topic filter for that
-//! client (standard MQTT `+`/`#` matching) and fans out one channel publish per
-//! match. The supervisor only subscribes to filters that back a channel, so an
-//! inbound topic matching no channel is a benign overlap (logged and dropped, not
-//! panicked — untrusted broker input must not crash the host).
+//! ingress channels at `set_state` time), keyed by client and topic filter. The
+//! supervisor resolves each inbound copy's Subscription Identifiers to the
+//! filters the broker sent it for, and the router publishes the message once
+//! into the channel of each of those filters on that client, after checking that
+//! the channel's filter covers the **actual** published topic (standard MQTT
+//! `+`/`#` matching). Only a copy that names no subscription is routed by topic
+//! alone, into every channel on the client whose filter covers it. A copy that
+//! reaches no channel is logged and dropped, not panicked — untrusted broker
+//! input must not crash the host.
 
 use std::sync::RwLock;
 
@@ -33,16 +36,18 @@ use brenn_lib::mqtt::address::topic_name_has_wildcard;
 use brenn_lib::mqtt::topic_filter;
 use brenn_messaging::IngressMessage;
 use brenn_mqtt::payload::{InboundClass, InboundPayload, classify_inbound};
-use brenn_mqtt::service::MqttEventRouter;
+use brenn_mqtt::service::{InboundRouting, MqttEventRouter};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::state::AppState;
 
 /// One resolved ingress route. Built from a `ResolvedMqttIngressChannel` at
-/// `set_state` time. The router matches inbound `(client_slug, topic)` against
-/// the `(client_slug, topic_filter)` of each route and, on a match, publishes an
-/// `MqttEnvelope` to the route's `mqtt:<client>:<topic>` channel with `urgency`.
+/// `set_state` time. An inbound copy selects the route whose
+/// `(client_slug, topic_filter)` is a subscription the broker sent it for — or,
+/// when it names none, every route on its client whose filter covers its topic —
+/// and the router publishes it to the route's `mqtt:<client>:<topic>` channel
+/// with `urgency`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngressRoute {
     /// Client this channel subscribes on (the ACL/provenance boundary).
@@ -121,7 +126,9 @@ impl MqttEventRouterImpl {
 
     /// Add an ingress route at runtime. A dynamic `mqtt:` subscribe to a new
     /// topic filter needs a matching `IngressRoute` so `deliver_inbound` routes
-    /// the broker's deliveries to the new channel.
+    /// the copies the broker sends for that filter's subscription to the new
+    /// channel. The route is added before the SUBSCRIBE is sent, so it is in the
+    /// table before the broker can answer.
     ///
     /// **Idempotent on `channel_uuid`** (correctness-1): a route is added only if
     /// no route for that channel already exists; a second subscriber joining an
@@ -176,7 +183,7 @@ impl MqttEventRouterImpl {
     /// Remove the ingress route for `channel_uuid` at runtime. A dynamic `mqtt:`
     /// unsubscribe that removes the last subscriber on a filter drops the matching
     /// `IngressRoute` so the broker's deliveries on that filter — should any still
-    /// arrive before the UNSUBSCRIBE takes effect — no longer route to the
+    /// arrive before the UNSUBSCRIBE takes effect — no longer reach the
     /// now-unsubscribed channel.
     ///
     /// `channel_uuid` is the route's stable identity (one route per distinct
@@ -210,6 +217,7 @@ impl MqttEventRouter for MqttEventRouterImpl {
         topic: &str,
         payload: InboundPayload,
         qos: u8,
+        routing: InboundRouting,
     ) {
         // Use `get()` rather than `expect()` so a fast-broker startup race (broker
         // connects and delivers a retained message before AppState is wired in) drops
@@ -242,38 +250,76 @@ impl MqttEventRouter for MqttEventRouterImpl {
             return;
         }
 
-        // Find every channel on this client whose topic filter covers the actual
-        // published topic. Clone the matched routes out of the read-lock so the
-        // lock is released before the publish loop below `.await`s (a std
+        // Clone the selected routes out of the read-lock so the lock is
+        // released before the publish loop below `.await`s (a std
         // `RwLockReadGuard` is not `Send`, and routes are small and rarely added).
         let matches: Vec<IngressRoute> = {
             let routes = router_state
                 .routes
                 .read()
                 .expect("mqtt router routes lock poisoned");
-            routes
-                .iter()
-                // TODO(mqtt-shared-subscription-filters-unrouted): a `$share/<group>/…`
-                // route filter never covers a delivered topic, so its messages drop.
-                .filter(|r| {
-                    r.client_slug == client_slug && topic_filter::covers(&r.topic_filter, topic)
-                })
-                .cloned()
-                .collect()
+            match &routing {
+                InboundRouting::ByTopic => {
+                    let matches: Vec<IngressRoute> = routes
+                        .iter()
+                        .filter(|r| {
+                            r.client_slug == client_slug
+                                && topic_filter::covers(&r.topic_filter, topic)
+                        })
+                        .cloned()
+                        .collect();
+                    if matches.is_empty() {
+                        // Untrusted broker input must not crash the host: log
+                        // and drop, do not panic.
+                        tracing::warn!(
+                            client = client_slug,
+                            topic,
+                            "mqtt_router: inbound topic carrying no Subscription Identifier \
+                             matched no channel on this client — dropping."
+                        );
+                    }
+                    matches
+                }
+                InboundRouting::BySubscription(filters) => filters
+                    .iter()
+                    .filter_map(|filter| {
+                        // One route at most: a route is one per channel, and the
+                        // channel's identity is the address `mqtt:<client>:<filter>`.
+                        let Some(route) = routes
+                            .iter()
+                            .find(|r| r.client_slug == client_slug && &r.topic_filter == filter)
+                        else {
+                            tracing::warn!(
+                                client = client_slug,
+                                topic,
+                                filter = %filter,
+                                "mqtt_router: inbound copy sent for a subscription with no \
+                                 channel — dropped for that subscription."
+                            );
+                            return None;
+                        };
+                        // The identifier selects among channels and never
+                        // overrides the topic check.
+                        // TODO(mqtt-shared-subscription-filters-unrouted): a
+                        // `$share/<group>/…` filter never covers a delivered topic,
+                        // by this rule or by topic, so its messages drop here.
+                        if !topic_filter::covers(&route.topic_filter, topic) {
+                            tracing::warn!(
+                                client = client_slug,
+                                topic,
+                                filter = %filter,
+                                "mqtt_router: the broker sent a topic under a subscription \
+                                 whose filter does not cover it — dropped for that subscription."
+                            );
+                            return None;
+                        }
+                        Some(route.clone())
+                    })
+                    .collect(),
+            }
         };
 
         if matches.is_empty() {
-            // The supervisor only subscribes to filters that back a channel, so an
-            // unmatched topic indicates overlapping broker-side state. Untrusted
-            // broker input must not crash the host (CLAUDE.md attacker-input vs
-            // host-bug distinction): log and drop, do not panic.
-            tracing::warn!(
-                client = client_slug,
-                topic,
-                "mqtt_router: inbound topic matched no channel on this client — dropping. \
-                 The ingress supervisor should only subscribe to filters that back a channel; \
-                 an unmatched delivery indicates overlapping broker-side subscription state."
-            );
             return;
         }
 
@@ -513,7 +559,7 @@ mod tests {
     use brenn_messaging::config::{Depth, Sink};
     use brenn_messaging_store::db::upsert_channels;
     use brenn_mqtt::payload::InboundPayload;
-    use brenn_mqtt::service::MqttEventRouter;
+    use brenn_mqtt::service::{InboundRouting, MqttEventRouter};
     use indexmap::IndexMap;
 
     use super::*;
@@ -691,6 +737,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("22.5", None),
                 1,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -753,6 +800,7 @@ mod tests {
                     Some("application/octet-stream".to_string()),
                 ),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -812,6 +860,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("22.5", None),
                 1,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -864,6 +913,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("22.5", None),
                 1,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -913,6 +963,7 @@ mod tests {
                     "home/kitchen/state",
                     InboundPayload::new(reading.to_string(), None),
                     1,
+                    InboundRouting::ByTopic,
                 )
                 .await;
         }
@@ -945,10 +996,11 @@ mod tests {
         );
     }
 
-    /// One inbound topic matching two distinct-channel filters on the same client
-    /// fans out to both channels: two stored messages, one per channel.
+    /// A copy that names no subscription is routed by topic: one inbound topic
+    /// matching two distinct-channel filters on the same client reaches both
+    /// channels, one stored message each.
     #[tokio::test]
-    async fn deliver_inbound_fans_out_to_all_matching_channels() {
+    async fn a_copy_with_no_identifier_reaches_every_covering_channel() {
         let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
         // Two distinct channels on client `b1`, both matching "home/kitchen/state".
         let addr_a = "mqtt:b1:home/+/state";
@@ -976,6 +1028,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("x", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -1007,6 +1060,141 @@ mod tests {
         assert!(channel_uuids.contains(&uuid_b));
     }
 
+    // --- Routing by subscription ---
+
+    /// A router over channels `mqtt:c1:a/#` and `mqtt:c1:a/b`, with a route for
+    /// each, plus a route and channel for `a/b` on another client `c2`.
+    fn overlap_router() -> (MqttEventRouterImpl, brenn_db::Db) {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        state.messenger = Some(messenger_with_channels(
+            db.clone(),
+            vec![
+                mqtt_channel_entry("mqtt:c1:a/#", None),
+                mqtt_channel_entry("mqtt:c1:a/b", None),
+                mqtt_channel_entry("mqtt:c2:a/b", None),
+            ],
+            None,
+        ));
+        let router = MqttEventRouterImpl::new();
+        router.set_state(
+            state,
+            vec![
+                route("c1", "a/#", Urgency::Normal),
+                route("c1", "a/b", Urgency::Normal),
+                route("c2", "a/b", Urgency::Normal),
+            ],
+        );
+        (router, db)
+    }
+
+    /// Rows stored in each of `mqtt:c1:a/#`, `mqtt:c1:a/b` and `mqtt:c2:a/b`.
+    async fn overlap_rows(db: &brenn_db::Db) -> [i64; 3] {
+        let conn = db.lock().await;
+        ["mqtt:c1:a/#", "mqtt:c1:a/b", "mqtt:c2:a/b"].map(|address| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM messaging_messages WHERE channel_uuid = ?1",
+                [mqtt_channel_uuid_from_address(address).as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .expect("count")
+        })
+    }
+
+    async fn deliver_on_c1(router: &MqttEventRouterImpl, topic: &str, filters: &[&str]) {
+        router
+            .deliver_inbound(
+                "c1",
+                topic,
+                InboundPayload::new("x", None),
+                1,
+                InboundRouting::BySubscription(filters.iter().map(|f| f.to_string()).collect()),
+            )
+            .await;
+    }
+
+    /// A broker that sends one copy per subscription: each copy reaches its
+    /// own subscription's channel only, so each channel holds the message once.
+    #[tokio::test]
+    async fn one_copy_per_subscription_lands_once_in_each_channel() {
+        let (router, db) = overlap_router();
+        deliver_on_c1(&router, "a/b", &["a/#"]).await;
+        deliver_on_c1(&router, "a/b", &["a/b"]).await;
+        assert_eq!(overlap_rows(&db).await, [1, 1, 0]);
+    }
+
+    /// A broker that sends one copy naming both subscriptions: the copy lands
+    /// once in each.
+    #[tokio::test]
+    async fn one_copy_naming_several_subscriptions_lands_once_in_each() {
+        let (router, db) = overlap_router();
+        deliver_on_c1(&router, "a/b", &["a/#", "a/b"]).await;
+        assert_eq!(overlap_rows(&db).await, [1, 1, 0]);
+    }
+
+    /// A subscription with no route on this client stores nothing anywhere —
+    /// not even in a covering channel the copy was not sent for.
+    #[tokio::test]
+    async fn a_subscription_with_no_channel_stores_nothing() {
+        let (router, db) = overlap_router();
+        deliver_on_c1(&router, "a/c", &["a/c"]).await;
+        assert_eq!(overlap_rows(&db).await, [0, 0, 0]);
+    }
+
+    /// The identifier never overrides the topic check: a subscription whose
+    /// filter does not cover the topic is skipped, and the others on the same
+    /// copy are still served.
+    #[tokio::test]
+    async fn a_subscription_whose_filter_does_not_cover_the_topic_is_skipped() {
+        let (router, db) = overlap_router();
+        deliver_on_c1(&router, "x/y", &["a/#"]).await;
+        assert_eq!(overlap_rows(&db).await, [0, 0, 0]);
+        deliver_on_c1(&router, "a/c", &["a/b", "a/#"]).await;
+        assert_eq!(overlap_rows(&db).await, [1, 0, 0]);
+    }
+
+    /// The by-topic rule is kept for a copy naming no subscription.
+    #[tokio::test]
+    async fn a_copy_naming_no_subscription_reaches_every_covering_channel_on_its_client() {
+        let (router, db) = overlap_router();
+        router
+            .deliver_inbound(
+                "c1",
+                "a/b",
+                InboundPayload::new("x", None),
+                1,
+                InboundRouting::ByTopic,
+            )
+            .await;
+        assert_eq!(overlap_rows(&db).await, [1, 1, 0]);
+    }
+
+    /// A subscription whose route has gone stores nothing in either channel.
+    #[tokio::test]
+    async fn a_subscription_whose_route_was_removed_stores_nothing() {
+        let (router, db) = overlap_router();
+        assert!(router.remove_route(mqtt_channel_uuid_from_address("mqtt:c1:a/b")));
+        deliver_on_c1(&router, "a/b", &["a/b"]).await;
+        assert_eq!(overlap_rows(&db).await, [0, 0, 0]);
+    }
+
+    /// Another client's route for the same filter is never selected.
+    #[tokio::test]
+    async fn another_clients_route_for_the_same_filter_is_not_selected() {
+        let (router, db) = overlap_router();
+        deliver_on_c1(&router, "a/b", &["a/b"]).await;
+        assert_eq!(overlap_rows(&db).await, [0, 1, 0]);
+        router
+            .deliver_inbound(
+                "c2",
+                "a/b",
+                InboundPayload::new("x", None),
+                1,
+                InboundRouting::BySubscription(vec!["a/b".to_string()]),
+            )
+            .await;
+        assert_eq!(overlap_rows(&db).await, [0, 1, 1]);
+    }
+
     /// Inbound topic matching no bridge logs and drops without panic — and without
     /// storing any row.
     #[tokio::test]
@@ -1030,6 +1218,7 @@ mod tests {
                 "home/kitchen/state/extra",
                 InboundPayload::new("x", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -1069,7 +1258,13 @@ mod tests {
 
         for topic in ["home/+", "home/#"] {
             router
-                .deliver_inbound("homeassistant", topic, InboundPayload::new("x", None), 0)
+                .deliver_inbound(
+                    "homeassistant",
+                    topic,
+                    InboundPayload::new("x", None),
+                    0,
+                    InboundRouting::ByTopic,
+                )
                 .await;
         }
         assert_eq!(count().await, 0, "a wildcard topic must store no row");
@@ -1080,6 +1275,7 @@ mod tests {
                 "home/kitchen",
                 InboundPayload::new("x", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
         assert_eq!(
@@ -1112,6 +1308,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("x", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -1153,6 +1350,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("pre", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
         let pre_count: i64 = {
@@ -1170,6 +1368,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("post", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
         let post_count: i64 = {
@@ -1215,6 +1414,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("x", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
         let count: i64 = {
@@ -1265,6 +1465,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("pre", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
         let pre: i64 = {
@@ -1282,6 +1483,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("post", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
         let post: i64 = {
@@ -1318,6 +1520,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("x", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -1357,6 +1560,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("22.5", None),
                 1,
+                InboundRouting::ByTopic,
             )
             .await;
 
@@ -1451,6 +1655,7 @@ mod tests {
                 "cam/front",
                 InboundPayload::new(bytes.to_vec(), content_type.map(str::to_owned)),
                 1,
+                InboundRouting::ByTopic,
             )
             .await;
     }

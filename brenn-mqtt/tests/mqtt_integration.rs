@@ -12,13 +12,14 @@ use std::time::Duration;
 
 use brenn_envelope::{MqttExpiry, MqttPublishTransport};
 use brenn_lib::mqtt::config::TlsVersionMin;
+use brenn_lib::mqtt::subscription_identifier;
 use brenn_messaging_store::store::MessageSeq;
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::reader::{
     EgressBus, EgressItem, EgressMessage, EgressReport, Sent, UnknownCause, start_egress_reader,
 };
-use brenn_mqtt::service::MqttEventRouter;
+use brenn_mqtt::service::{InboundRouting, MqttEventRouter};
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
 use brenn_mqtt::state::IngressSubscription;
@@ -606,6 +607,177 @@ async fn ingress_unsubscribe_filter_live_stops_delivery() {
     }
 }
 
+/// **Overlapping filters: each copy is attributed to the subscription it was
+/// sent for.** One client holds `…/overlap/#` (identifier 1) and `…/overlap/b`
+/// (identifier 2); a publish to `…/overlap/b` comes back as one copy per
+/// subscription, each resolved through the client's table to its own filter. A
+/// broker that sent one copy carrying both identifiers would produce one
+/// delivery naming both filters and fail here by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_filters_attribute_each_copy_to_its_subscription() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let wide = "brenn/itest/overlap/#";
+    let narrow = "brenn/itest/overlap/b";
+    let end = "brenn/itest/overlap/end";
+
+    let SpawnedClient {
+        svc,
+        client_slug,
+        handle,
+        mut rx,
+    } = spawn_client(
+        "overlap",
+        &harness,
+        ca.clone(),
+        vec![(wide.to_string(), 1), (narrow.to_string(), 1)],
+    )
+    .await;
+    for filter in [wide, narrow] {
+        wait_for_filter_acked(&svc, &client_slug, filter, 5, "overlap filter granted").await;
+    }
+    {
+        let set = handle.subscriptions.read().await;
+        assert_eq!(
+            set.get(wide).map(|s| s.sub_id),
+            Some(subscription_identifier(wide))
+        );
+        assert_eq!(
+            set.get(narrow).map(|s| s.sub_id),
+            Some(subscription_identifier(narrow))
+        );
+    }
+    let by = |filter: &str| InboundRouting::BySubscription(vec![filter.to_string()]);
+
+    let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca.clone()).await;
+    for (topic, body) in [(narrow, "first"), (end, "barrier-1")] {
+        pubc.publish(
+            topic.to_string(),
+            QoS::AtLeastOnce,
+            false,
+            body.as_bytes().to_vec(),
+        )
+        .await
+        .expect("publish failed");
+        await_puback(&mut ack_rx, body).await;
+    }
+
+    // Before the barrier: two copies of the first message, one per subscription.
+    let mut routings = Vec::new();
+    for what in ["first copy", "second copy"] {
+        let msg = recv_delivery(&mut rx, what).await;
+        assert_eq!(msg.topic, narrow, "{what}: {msg:?}");
+        assert!(msg.payload == InboundPayload::new("first", None), "{msg:?}");
+        routings.push(msg.routing);
+    }
+    assert!(
+        routings.contains(&by(wide)) && routings.contains(&by(narrow)),
+        "one copy per subscription, each naming only its own: {routings:?}",
+    );
+    let barrier = recv_delivery(&mut rx, "barrier-1").await;
+    assert_eq!(barrier.topic, end);
+    assert_eq!(
+        barrier.routing,
+        by(wide),
+        "the barrier is covered by `#` only"
+    );
+
+    // After the narrow filter is withdrawn the overlap delivers once, under `#`.
+    assert_eq!(
+        svc.unsubscribe_filter(&client_slug, narrow).await,
+        Some(IngressUnsubscribeOutcome::UnsubscribedLive),
+    );
+    for (topic, body) in [(narrow, "second"), (end, "barrier-2")] {
+        pubc.publish(
+            topic.to_string(),
+            QoS::AtLeastOnce,
+            false,
+            body.as_bytes().to_vec(),
+        )
+        .await
+        .expect("publish failed");
+        await_puback(&mut ack_rx, body).await;
+    }
+    let msg = recv_delivery(&mut rx, "second").await;
+    assert!(
+        msg.payload == InboundPayload::new("second", None),
+        "{msg:?}"
+    );
+    assert_eq!(msg.routing, by(wide));
+    let barrier = recv_delivery(&mut rx, "barrier-2").await;
+    assert!(
+        barrier.payload == InboundPayload::new("barrier-2", None),
+        "nothing between the second message and its barrier: {barrier:?}",
+    );
+}
+
+/// **A QoS move is one SUBSCRIBE in place.** A held filter re-subscribed at a
+/// new QoS keeps its identifier, the broker replaces its subscription without
+/// an UNSUBSCRIBE, and the next copy arrives at the new QoS attributed to the
+/// same filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_qos_move_resubscribes_in_place() {
+    broker_gate!();
+
+    let harness = BrokerHarness::start();
+    let ca = certs::ca_pem_bytes();
+    let filter = "brenn/itest/qosmove/#";
+    let topic = "brenn/itest/qosmove/a";
+
+    let SpawnedClient {
+        svc,
+        client_slug,
+        handle,
+        mut rx,
+    } = spawn_client(
+        "qosmove",
+        &harness,
+        ca.clone(),
+        vec![(filter.to_string(), 0)],
+    )
+    .await;
+    wait_for_filter_acked(&svc, &client_slug, filter, 5, "qosmove filter granted at 0").await;
+
+    assert_eq!(
+        svc.resubscribe_filter(&client_slug, filter.to_string(), 1)
+            .await,
+        Some(IngressSubscribeOutcome::SubscribedLive),
+    );
+    wait_for_filter_acked(&svc, &client_slug, filter, 5, "qosmove filter granted at 1").await;
+    {
+        let set = handle.subscriptions.read().await;
+        let entry = set.get(filter).expect("filter held");
+        assert_eq!(*entry, IngressSubscription::new(filter, 1));
+        assert_eq!(set.len(), 1);
+    }
+
+    let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca.clone()).await;
+    pubc.publish(
+        topic.to_string(),
+        QoS::AtLeastOnce,
+        false,
+        b"moved".to_vec(),
+    )
+    .await
+    .expect("publish failed");
+    await_puback(&mut ack_rx, "moved").await;
+
+    let msg = recv_delivery(&mut rx, "moved").await;
+    assert!(msg.payload == InboundPayload::new("moved", None), "{msg:?}");
+    assert_eq!(msg.qos, 1, "delivered at the new QoS: {msg:?}");
+    assert_eq!(
+        msg.routing,
+        InboundRouting::BySubscription(vec![filter.to_string()]),
+    );
+    assert!(
+        !log_records_unsubscribe(&harness.log(), &session_client_id(&client_slug), filter),
+        "a QoS move sends no UNSUBSCRIBE:\n{}",
+        harness.log_tail(),
+    );
+}
+
 /// **The broker-log matchers, read against a real broker's wording.**
 ///
 /// The unit cases beside `log_records_unsubscribe` and
@@ -945,6 +1117,7 @@ impl MqttEventRouter for PanicOnceRouter {
         _topic: &str,
         payload: InboundPayload,
         _qos: u8,
+        _routing: InboundRouting,
     ) {
         if payload.bytes.as_ref() == b"panic"
             && !self
@@ -1001,11 +1174,7 @@ async fn a_message_on_a_panicked_bodys_connection_is_delivered() {
     let handle = register_and_spawn(
         &svc,
         config,
-        ArrivingFilters::Declared(vec![IngressSubscription {
-            topic_filter: trigger_topic.to_string(),
-            qos: 1,
-            sub_id: 1,
-        }]),
+        ArrivingFilters::Declared(vec![IngressSubscription::new(trigger_topic, 1)]),
         router,
     )
     .await;

@@ -200,6 +200,7 @@ async fn the_shutdown_waits_for_every_sessions_answers_before_it_returns() {
         .expect("the serve task");
 
     for id in &sent {
+        // TODO(mqtt-egress-shutdown-answers-test-flaky): once failed here on a broker-suite run, [Handed, Dropped { cause: Stopped }].
         assert_eq!(
             told(&booted, *id).await,
             vec![DeliveryKind::Handed, DeliveryKind::Delivered],

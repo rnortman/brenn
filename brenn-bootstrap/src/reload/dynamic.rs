@@ -469,6 +469,11 @@ pub(crate) fn dynamic_ingress(
     let mut out = Vec::new();
     for row in rows {
         let channel_uuid = &row.channel_uuid;
+        // TODO(mqtt-dynamic-subscribe-qos-not-honoured): the row's stored QoS
+        // is dropped here when a static binding holds the channel (`exclude`),
+        // and for every row after the first on a channel. The boot fold in
+        // `commit_messaging` skips the same rows, but a revived row comes after
+        // the rows already folded here, so the two can keep different firsts.
         if exclude.contains(channel_uuid) || !seen.insert(*channel_uuid) {
             continue;
         }

@@ -9,6 +9,7 @@
 //! `AppState` + `ActiveBridges`.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use tokio::sync::RwLock;
@@ -29,6 +30,17 @@ use brenn_lib::panic_util::join_set_reraising;
 // MqttEventRouter trait
 // ---------------------------------------------------------------------------
 
+/// Which channels an inbound PUBLISH is for, as the supervisor resolved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundRouting {
+    /// The PUBLISH carried no Subscription Identifier: route by topic into
+    /// every channel on the client whose filter covers it.
+    ByTopic,
+    /// The PUBLISH carried identifiers. These are the topic filters of the
+    /// subscriptions it was sent for, each once; never empty.
+    BySubscription(Vec<String>),
+}
+
 /// Inbound delivery surface implemented by the binary crate.
 ///
 /// `MqttService` lives in `brenn-lib` and must not depend on binary-crate types.
@@ -36,23 +48,27 @@ use brenn_lib::panic_util::join_set_reraising;
 /// implements this trait; the connection supervisor calls into it via
 /// `Arc<dyn MqttEventRouter>`.
 ///
-/// Bridge model: the router owns the bridge routing table and performs
-/// topic-filter matching itself. It needs only the **client** the message arrived
-/// on (the ACL/provenance boundary), the **actual** published `topic`, the
-/// decoded `payload`, and the delivery `qos`.
+/// Bridge model: the router owns the bridge routing table. It needs the
+/// **client** the message arrived on (the ACL/provenance boundary), the
+/// **actual** published `topic`, the decoded `payload`, the delivery `qos`,
+/// and the subscriptions the broker sent the copy for.
 #[async_trait::async_trait]
 pub trait MqttEventRouter: Send + Sync + 'static {
     /// Deliver an inbound MQTT message arriving on `client_slug`.
     ///
-    /// The router matches `topic` against every bridge's topic filter for this
-    /// client and fans out one typed `mqtt:` channel publish per match. `qos` is
-    /// the QoS at which the broker actually delivered this PUBLISH.
+    /// With [`InboundRouting::BySubscription`] the router publishes the
+    /// message once into the channel of each named filter on this client whose
+    /// filter covers `topic`, and into no other channel. With
+    /// [`InboundRouting::ByTopic`] it publishes into every channel on this
+    /// client whose filter covers `topic`. `qos` is the QoS at which the broker
+    /// actually delivered this PUBLISH.
     async fn deliver_inbound(
         &self,
         client_slug: &str,
         topic: &str,
         payload: InboundPayload,
         qos: u8,
+        routing: InboundRouting,
     );
 }
 
@@ -382,9 +398,7 @@ impl MqttService {
     pub async fn ingress_filter_qos(&self, client_slug: &str, topic_filter: &str) -> Option<u8> {
         let handle = self.get_client(client_slug)?;
         let subs = handle.subscriptions.read().await;
-        subs.iter()
-            .find(|s| s.topic_filter == topic_filter)
-            .map(|s| s.qos)
+        subs.get(topic_filter).map(|s| s.qos)
     }
 
     /// Whether the broker has granted `topic_filter` on `client_slug`'s current
@@ -436,8 +450,7 @@ impl MqttService {
             .subscriptions
             .read()
             .await
-            .iter()
-            .find(|s| s.topic_filter == topic_filter)
+            .get(topic_filter)
             .map(|s| s.qos);
         let (label, last_error) = handle.health_snapshot().await;
         (qos, label, last_error)
@@ -489,16 +502,72 @@ impl MqttService {
         topic_filter: String,
         qos: u8,
     ) -> Option<IngressSubscribeOutcome> {
+        self.assert_filter(client_slug, topic_filter, qos, SetOperation::Add)
+            .await
+    }
+
+    /// Set the QoS of `topic_filter` on `client_slug`'s reconnect-survival set,
+    /// keeping its Subscription Identifier, and issue the broker SUBSCRIBE at
+    /// the new QoS now if the client is live. MQTT 5 has the broker replace its
+    /// subscription for the filter in place, so no UNSUBSCRIBE is sent and the
+    /// copies the broker sends under the identifier keep resolving to the
+    /// filter throughout.
+    ///
+    /// Answers as [`Self::subscribe_filter`] does, and retargets across a
+    /// restart the same way. A filter the set does not hold is added, with a
+    /// `warn`: the caller believed the session held it.
+    pub async fn resubscribe_filter(
+        &self,
+        client_slug: &str,
+        topic_filter: String,
+        qos: u8,
+    ) -> Option<IngressSubscribeOutcome> {
+        self.assert_filter(client_slug, topic_filter, qos, SetOperation::SetQos)
+            .await
+    }
+
+    /// The body of [`Self::subscribe_filter`] and [`Self::resubscribe_filter`],
+    /// which differ only in how the set takes the filter.
+    async fn assert_filter(
+        &self,
+        client_slug: &str,
+        topic_filter: String,
+        qos: u8,
+        operation: SetOperation,
+    ) -> Option<IngressSubscribeOutcome> {
         let mut attempts = 0;
         let (handle, sub) = loop {
             let handle = self.get_client(client_slug)?;
-            let sub = handle.add_subscription(topic_filter.clone(), qos).await;
+            let sub = match operation {
+                SetOperation::Add => handle.add_subscription(topic_filter.clone(), qos).await,
+                SetOperation::SetQos => {
+                    let (sub, held) = handle.set_subscription_qos(&topic_filter, qos).await;
+                    if !held {
+                        tracing::warn!(
+                            client = client_slug,
+                            topic_filter,
+                            qos,
+                            "resubscribe_filter: filter absent from the reconnect set that \
+                             the caller expected to hold it; added with a new identifier"
+                        );
+                    }
+                    sub
+                }
+            };
             if self.still_registered(client_slug, &handle) {
                 break (handle, sub);
             }
             attempts = retarget_on_swap(client_slug, attempts);
         };
-        let client = handle.client.lock().await.clone();
+        // The identifier flag is read in the same lock section as the client,
+        // so the SUBSCRIBE is shaped for the connection it goes out on.
+        let (client, with_identifier) = {
+            let guard = handle.client.lock().await;
+            (
+                guard.clone(),
+                handle.broker_sub_ids_available.load(Ordering::Relaxed),
+            )
+        };
         let outcome = match client {
             None => match &*handle.supervisor_state.read().await {
                 SupervisorState::Failed { reason } => {
@@ -516,7 +585,7 @@ impl MqttService {
                     .deferred_subscribes
                     .lock()
                     .expect(DEFERRED_SUBSCRIBES_POISONED);
-                match try_assert_ingress_subscription(&handle, &client, &sub) {
+                match try_assert_ingress_subscription(&handle, &client, &sub, with_identifier) {
                     Ok(SubscribeSend::Sent) => IngressSubscribeOutcome::SubscribedLive,
                     Ok(SubscribeSend::ChannelFull) => {
                         deferred.push_back(sub);
@@ -583,6 +652,16 @@ impl MqttService {
     // (`SupervisorState`-based) and the `MessageChannelList` enrichment.
 }
 
+/// How [`MqttService::assert_filter`] puts a filter into a client's set.
+#[derive(Clone, Copy)]
+enum SetOperation {
+    /// [`MqttClientHandle::add_subscription`]: a held filter is returned as is.
+    Add,
+    /// [`MqttClientHandle::set_subscription_qos`]: a held filter takes the new
+    /// QoS and keeps its identifier.
+    SetQos,
+}
+
 /// The library's QoS for an MQTT QoS number; `None` above 2.
 pub(crate) fn qos_of(qos: u8) -> Option<rumqttc::mqttbytes::QoS> {
     match qos {
@@ -619,6 +698,7 @@ impl Default for MqttService {
 mod tests {
     use super::*;
     use crate::connection::unpolled_client;
+    use crate::state::IngressSubscription;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn make_handle(client: &str) -> Arc<MqttClientHandle> {
@@ -961,6 +1041,205 @@ mod tests {
         assert_eq!(
             svc.ingress_filter_qos("home", "sensors/+/temp").await,
             Some(2)
+        );
+    }
+
+    /// The entry for `topic_filter` on `client_slug`'s registered handle.
+    async fn entry(
+        svc: &MqttService,
+        client_slug: &str,
+        topic_filter: &str,
+    ) -> IngressSubscription {
+        svc.get_client(client_slug)
+            .expect("client registered")
+            .subscriptions
+            .read()
+            .await
+            .get(topic_filter)
+            .cloned()
+            .expect("filter held")
+    }
+
+    /// A QoS move on a live client goes out as a SUBSCRIBE now, the entry keeps
+    /// its identifier at the new QoS, and the grant recorded for the old QoS is
+    /// no longer reported.
+    #[tokio::test]
+    async fn resubscribe_filter_live_client_keeps_the_identifier() {
+        let svc = MqttService::new();
+        let handle = make_handle("home");
+        let (client, _eventloop) = live_client();
+        *handle.client.lock().await = Some(client);
+        svc.add_client(handle.clone());
+        svc.subscribe_filter("home", "sensors/a".to_string(), 0)
+            .await;
+        svc.subscribe_filter("home", "sensors/#".to_string(), 0)
+            .await;
+        handle.record_grant("sensors/#").await;
+        let before = entry(&svc, "home", "sensors/#").await;
+
+        let outcome = svc
+            .resubscribe_filter("home", "sensors/#".to_string(), 1)
+            .await;
+        assert_eq!(outcome, Some(IngressSubscribeOutcome::SubscribedLive));
+        let after = entry(&svc, "home", "sensors/#").await;
+        assert_eq!(after.sub_id, before.sub_id);
+        assert_eq!(after.qos, 1);
+        assert_eq!(handle.subscriptions.read().await.len(), 2);
+        assert_eq!(
+            svc.subscription_acked("home", "sensors/#").await,
+            Some(false),
+            "the grant was for the SUBSCRIBE at the old QoS",
+        );
+    }
+
+    /// A client connected to an in-process broker that answers the CONNECT and
+    /// then reads every packet without answering it; each SUBSCRIBE it reads
+    /// arrives on the receiver. Its event loop is polled from a spawned task.
+    async fn subscribe_capturing_client() -> (
+        rumqttc::AsyncClient,
+        tokio::sync::mpsc::UnboundedReceiver<rumqttc::Subscribe>,
+    ) {
+        use bytes::BytesMut;
+        use rumqttc::{AsyncClient, ConnAck, ConnectReturnCode, Event, MqttOptions, Packet};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_end, mut broker_end) = tokio::io::duplex(1 << 16);
+        let client_end = Arc::new(std::sync::Mutex::new(Some(client_end)));
+        let mut opts = MqttOptions::new("test-service", ("127.0.0.1", 1));
+        opts.set_socket_connector(move |_host, _network| {
+            let stream = client_end.lock().unwrap().take();
+            async move {
+                stream.ok_or_else(|| std::io::Error::other("the in-process broker accepts once"))
+            }
+        });
+        let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
+        let (subscribes_tx, subscribes_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = BytesMut::new();
+            loop {
+                match Packet::read(&mut buf, None) {
+                    Ok(Packet::Connect(..)) => {
+                        let connack = ConnAck {
+                            session_present: false,
+                            code: ConnectReturnCode::Success,
+                            properties: None,
+                        };
+                        let mut out = BytesMut::new();
+                        connack.write(&mut out).unwrap();
+                        broker_end.write_all(&out).await.unwrap();
+                    }
+                    Ok(Packet::Subscribe(subscribe)) => {
+                        if subscribes_tx.send(subscribe).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {
+                        if broker_end.read_buf(&mut buf).await.unwrap() == 0 {
+                            return;
+                        }
+                    }
+                    Err(e) => panic!("the in-process broker could not read a packet: {e:?}"),
+                }
+            }
+        });
+        loop {
+            if let Event::Incoming(Packet::ConnAck(_)) = eventloop.poll().await.unwrap() {
+                break;
+            }
+        }
+        tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
+        (client, subscribes_rx)
+    }
+
+    /// The SUBSCRIBE that a live subscribe and a live QoS move put on the wire
+    /// carries the filter's identifier when the installed connection's broker
+    /// supports Subscription Identifiers, and none when it does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_subscribes_carry_the_identifier_only_where_the_broker_supports_it() {
+        for available in [true, false] {
+            let svc = MqttService::new();
+            let handle = make_handle("home");
+            let (client, mut subscribes) = subscribe_capturing_client().await;
+            crate::connection::install_connection(&handle, client, None, None, available).await;
+            svc.add_client(handle.clone());
+
+            assert_eq!(
+                svc.subscribe_filter("home", "sensors/#".to_string(), 0)
+                    .await,
+                Some(IngressSubscribeOutcome::SubscribedLive),
+            );
+            let sub_id = entry(&svc, "home", "sensors/#").await.sub_id as usize;
+            let expected_id = available.then_some(sub_id);
+            let sent = subscribes
+                .recv()
+                .await
+                .expect("the broker read the SUBSCRIBE");
+            assert_eq!(sent.filters.len(), 1);
+            assert_eq!(sent.filters[0].path, "sensors/#");
+            assert_eq!(
+                sent.properties.and_then(|p| p.id),
+                expected_id,
+                "subscribe_filter with identifiers available: {available}",
+            );
+
+            assert_eq!(
+                svc.resubscribe_filter("home", "sensors/#".to_string(), 1)
+                    .await,
+                Some(IngressSubscribeOutcome::SubscribedLive),
+            );
+            let sent = subscribes
+                .recv()
+                .await
+                .expect("the broker read the SUBSCRIBE");
+            assert_eq!(sent.filters.len(), 1);
+            assert_eq!(sent.filters[0].path, "sensors/#");
+            assert_eq!(sent.filters[0].qos, rumqttc::QoS::AtLeastOnce);
+            assert_eq!(
+                sent.properties.and_then(|p| p.id),
+                expected_id,
+                "resubscribe_filter with identifiers available: {available}",
+            );
+        }
+    }
+
+    /// With no connection the move is deferred to the reconnect, which asserts
+    /// the entry at its new QoS.
+    #[tokio::test]
+    async fn resubscribe_filter_disconnected_defers_and_sets_the_qos() {
+        let svc = MqttService::new();
+        svc.add_client(make_handle("home"));
+        svc.subscribe_filter("home", "sensors/#".to_string(), 0)
+            .await;
+        let before = entry(&svc, "home", "sensors/#").await;
+
+        let outcome = svc
+            .resubscribe_filter("home", "sensors/#".to_string(), 2)
+            .await;
+        assert_eq!(outcome, Some(IngressSubscribeOutcome::DeferredDisconnected));
+        let after = entry(&svc, "home", "sensors/#").await;
+        assert_eq!((after.sub_id, after.qos), (before.sub_id, 2));
+    }
+
+    /// A filter the set does not hold is added with the identifier derived from
+    /// it.
+    #[tokio::test]
+    async fn resubscribe_filter_adds_an_absent_filter() {
+        let svc = MqttService::new();
+        svc.add_client(make_handle("home"));
+        svc.subscribe_filter("home", "sensors/a".to_string(), 0)
+            .await;
+
+        let outcome = svc
+            .resubscribe_filter("home", "sensors/#".to_string(), 1)
+            .await;
+        assert_eq!(outcome, Some(IngressSubscribeOutcome::DeferredDisconnected));
+        let added = entry(&svc, "home", "sensors/#").await;
+        assert_eq!(added, IngressSubscription::new("sensors/#", 1));
+        assert!(
+            svc.resubscribe_filter("nonesuch", "sensors/#".to_string(), 1)
+                .await
+                .is_none()
         );
     }
 

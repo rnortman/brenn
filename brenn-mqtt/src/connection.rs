@@ -20,7 +20,7 @@ use rumqttc::{
 use rustls_pki_types::pem::PemObject as _;
 
 use crate::payload::InboundPayload;
-use crate::service::{MqttEventRouter, MqttService, qos_of};
+use crate::service::{InboundRouting, MqttEventRouter, MqttService, qos_of};
 use crate::state::{
     DEFAULT_RECEIVE_MAXIMUM, DEFERRED_SUBSCRIBES_POISONED, IngressSubscription, MqttClientHandle,
     PENDING_SUBSCRIBES_POISONED, SupervisorState,
@@ -43,10 +43,15 @@ const UNATTRIBUTED_FILTER: &str = "<unknown>";
 /// Collapse one client's ingress channels into the deduplicated set of
 /// `(topic_filter, qos)` subscriptions.
 ///
-/// Distinct filter *strings* on one client yield distinct SUBSCRIBEs (each its
-/// own `sub_id`). Each distinct filter is assigned a sequential `sub_id` (1, 2,
-/// …) in first-seen order. `channels` may include channels for other clients;
-/// only those whose `client_slug == client_slug` are considered.
+/// Distinct filter *strings* on one client yield distinct SUBSCRIBEs, each with
+/// the identifier derived from its filter ([`IngressSubscription::new`]), at the
+/// largest QoS among the channels given for it. Entries are in first-seen order.
+/// The callers give at most one channel per filter — a dynamic row under a
+/// static binding and every dynamic row after the first on a channel are left
+/// out before the union — so this is not the largest QoS any subscriber asked
+/// for (`TODO(mqtt-dynamic-subscribe-qos-not-honoured)`).
+/// `channels` may include channels for other clients; only those whose
+/// `client_slug == client_slug` are considered.
 pub fn union_subscriptions(
     client_slug: &str,
     channels: &[ResolvedMqttIngressChannel],
@@ -59,12 +64,7 @@ pub fn union_subscriptions(
         if let Some(existing) = subs.iter_mut().find(|s| s.topic_filter == channel.topic) {
             existing.qos = existing.qos.max(channel.qos);
         } else {
-            let sub_id = subs.len() as u32 + 1;
-            subs.push(IngressSubscription {
-                topic_filter: channel.topic.clone(),
-                qos: channel.qos,
-                sub_id,
-            });
+            subs.push(IngressSubscription::new(channel.topic.clone(), channel.qos));
         }
     }
     subs
@@ -72,9 +72,14 @@ pub fn union_subscriptions(
 
 /// The `Filter` and properties of the broker SUBSCRIBE for one ingress
 /// subscription: the `OnEverySubscribe` retain rule, so the broker re-delivers
-/// the current retained message on every (re)subscribe, and the subscription's
-/// MQTT 5 Subscription Identifier.
-fn subscribe_request(sub: &IngressSubscription) -> (Filter, SubscribeProperties) {
+/// the current retained message on every (re)subscribe, and — when
+/// `with_identifier`, which is whether the connection's broker supports
+/// Subscription Identifiers — the subscription's MQTT 5 Subscription
+/// Identifier.
+fn subscribe_request(
+    sub: &IngressSubscription,
+    with_identifier: bool,
+) -> (Filter, SubscribeProperties) {
     let rumq_qos = qos_of(sub.qos).unwrap_or_else(|| {
         panic!(
             "subscription {:?} with QoS {}, which config validation refuses",
@@ -89,7 +94,7 @@ fn subscribe_request(sub: &IngressSubscription) -> (Filter, SubscribeProperties)
         retain_forward_rule: RetainForwardRule::OnEverySubscribe,
     };
     let props = SubscribeProperties {
-        id: Some(sub.sub_id as usize),
+        id: with_identifier.then_some(sub.sub_id as usize),
         user_properties: vec![],
     };
     (filter, props)
@@ -126,17 +131,21 @@ pub enum SubscribeSend {
 /// FIFO: rumqttc reports it with the same error as a full channel, and a
 /// retry loop must not mistake it for one.
 ///
+/// `with_identifier` is whether the connection `client` belongs to accepts a
+/// Subscription Identifier; see [`subscribe_request`].
+///
 /// Returns `Err(message)` for a send that failed for any other reason; there is
 /// no SUBACK wait.
 pub fn try_assert_ingress_subscription(
     handle: &MqttClientHandle,
     client: &AsyncClient,
     sub: &IngressSubscription,
+    with_identifier: bool,
 ) -> Result<SubscribeSend, String> {
     if !rumqttc::mqttbytes::valid_filter(&sub.topic_filter) {
         return Err(format!("invalid topic filter {:?}", sub.topic_filter));
     }
-    let (filter, props) = subscribe_request(sub);
+    let (filter, props) = subscribe_request(sub, with_identifier);
     let mut pending = handle
         .pending_subscribes
         .lock()
@@ -465,9 +474,7 @@ pub enum ArrivingFilters<'a> {
 ///   successor's write guard is taken before the join and held across it: every
 ///   filter edit that reaches this slug during the handover — whether it
 ///   resolved the successor directly or was re-aimed at it — therefore applies
-///   on top of the inherited set rather than being discarded by it, and
-///   `add_subscription`'s id numbering stays monotone because no edit can
-///   precede the inherit. A read of the successor's set blocks for the
+///   on top of the inherited set rather than being discarded by it. A read of the successor's set blocks for the
 ///   predecessor's stop, which the client's `stop_wait_secs` bounds.
 /// - **Record the join handle.** `MqttClientHandle::stop_and_join` panics
 ///   without one, so a session that is brought up any other way cannot be
@@ -530,9 +537,24 @@ async fn stop_requested(stop_rx: &mut tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-/// What a CONNACK says that the session keeps: Session Present, and the
-/// broker's Maximum Packet Size and Receive Maximum, each if it sent one.
-type ConnackFacts = (bool, Option<u32>, Option<u16>);
+/// What a CONNACK says that the session keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnackFacts {
+    session_present: bool,
+    /// The broker's Maximum Packet Size, if it sent one.
+    max_packet_size: Option<u32>,
+    /// The broker's Receive Maximum, if it sent one.
+    receive_max: Option<u16>,
+    /// Whether the broker supports Subscription Identifiers.
+    sub_ids_available: bool,
+}
+
+/// Whether a CONNACK's properties say the broker supports Subscription
+/// Identifiers: `false` only when the property is present with value 0, since
+/// MQTT 5.0 section 3.2.2.3.12 reads an absent property as "supported".
+fn sub_ids_available(props: Option<&rumqttc::ConnAckProperties>) -> bool {
+    props.and_then(|p| p.subscription_identifiers_available) != Some(0)
+}
 
 /// The actual supervisor body, wrapped by the watchdog in
 /// `spawn_client_supervisor`.
@@ -606,9 +628,12 @@ async fn supervisor_body(
                         Err(e) => break Some(Err(e)),
                         Ok(Event::Incoming(Incoming::ConnAck(ack))) => {
                             let props = ack.properties.as_ref();
-                            let max_packet_size = props.and_then(|p| p.max_packet_size);
-                            let receive_max = props.and_then(|p| p.receive_max);
-                            break Some(Ok((ack.session_present, max_packet_size, receive_max)));
+                            break Some(Ok(ConnackFacts {
+                                session_present: ack.session_present,
+                                max_packet_size: props.and_then(|p| p.max_packet_size),
+                                receive_max: props.and_then(|p| p.receive_max),
+                                sub_ids_available: sub_ids_available(props),
+                            }));
                         }
                         Ok(_) => continue,
                     }
@@ -616,7 +641,7 @@ async fn supervisor_body(
             }
         };
 
-        let (session_present, broker_max_packet_size, broker_receive_max) = match connack {
+        let facts = match connack {
             None => {
                 // Clean stop during connect handshake; no client installed yet.
                 if terminal_reason.is_none() {
@@ -711,8 +736,9 @@ async fn supervisor_body(
         install_connection(
             &handle,
             client.clone(),
-            broker_max_packet_size,
-            broker_receive_max,
+            facts.max_packet_size,
+            facts.receive_max,
+            facts.sub_ids_available,
         )
         .await;
         {
@@ -724,9 +750,18 @@ async fn supervisor_body(
         tracing::info!(
             client = %client_slug,
             broker = %broker.identity.slug,
-            session_present,
+            session_present = facts.session_present,
             "connected to broker",
         );
+        if !facts.sub_ids_available {
+            tracing::warn!(
+                client = %client_slug,
+                broker = %broker.identity.slug,
+                "the broker does not support Subscription Identifiers: inbound messages on this \
+                 client are routed by topic, and overlapping filters on it deliver a message once \
+                 per covering filter into each covering channel",
+            );
+        }
 
         // Re-assert all union subscriptions (static config union plus any
         // runtime-added dynamic `mqtt:` subscriptions) from inside the main
@@ -734,7 +769,7 @@ async fn supervisor_body(
         // poll, the rest after the poll frees room. Snapshot under a brief
         // read-lock.
         let mut unasserted: std::collections::VecDeque<IngressSubscription> =
-            handle.subscriptions.read().await.clone().into();
+            handle.subscriptions.read().await.to_vec().into();
         let reassert_count = unasserted.len();
         let mut reasserted_logged = reassert_count == 0;
         let mut reassert_failed = 0usize;
@@ -753,7 +788,12 @@ async fn supervisor_body(
             // full channel is non-empty, so the poll below takes a request off
             // it (or fails and ends the connection) and this loop resumes.
             while let Some(sub) = unasserted.front() {
-                match try_assert_ingress_subscription(&handle, &client, sub) {
+                match try_assert_ingress_subscription(
+                    &handle,
+                    &client,
+                    sub,
+                    facts.sub_ids_available,
+                ) {
                     Ok(SubscribeSend::Sent) => {
                         unasserted.pop_front();
                     }
@@ -1130,8 +1170,12 @@ async fn handle_event(
         // SECURITY: inbound payloads are untrusted. Any MQTT client with write
         // access to a subscribed topic can inject arbitrary text into the LLM
         // context (prompt injection). Broker ACLs must restrict topic write access
-        // to authorised publishers only. Every PUBLISH is handed to the router,
-        // which matches the actual topic against bridge filters for this client.
+        // to authorised publishers only. The PUBLISH's Subscription Identifiers
+        // are resolved against this client's set to the filters the broker sent
+        // the copy for, and the router publishes into those filters' channels
+        // only, each after checking that its filter covers the topic. A copy
+        // whose identifiers name no subscription this client holds is dropped
+        // here. A copy with no identifier is routed by topic.
         Event::Incoming(Incoming::Publish(p)) => {
             let topic_str = String::from_utf8_lossy(&p.topic).into_owned();
 
@@ -1151,10 +1195,24 @@ async fn handle_event(
                 QoS::ExactlyOnce => 2,
             };
 
+            let identifiers: &[usize] = p
+                .properties
+                .as_ref()
+                .map_or(&[], |pp| pp.subscription_identifiers.as_slice());
+            let Some(routing) = inbound_routing(handle, &topic_str, identifiers).await else {
+                return;
+            };
+
             let inbound_payload = InboundPayload::new(p.payload, content_type);
 
             router
-                .deliver_inbound(client_slug, &topic_str, inbound_payload, delivery_qos)
+                .deliver_inbound(
+                    client_slug,
+                    &topic_str,
+                    inbound_payload,
+                    delivery_qos,
+                    routing,
+                )
                 .await;
         }
 
@@ -1244,6 +1302,56 @@ async fn handle_event(
     }
 }
 
+/// How an inbound PUBLISH to `topic` carrying `identifiers` is routed, or
+/// `None` when it is dropped because none of its identifiers names a
+/// subscription this client holds.
+async fn inbound_routing(
+    handle: &MqttClientHandle,
+    topic: &str,
+    identifiers: &[usize],
+) -> Option<InboundRouting> {
+    let client_slug = handle.config.identity.slug.as_str();
+    if identifiers.is_empty() {
+        // No `client` lock: this runs on the supervisor task, which is the only
+        // writer of both flags (`install_connection`) and never installs a
+        // connection while handling a packet, so they are this connection's.
+        let first_on_connection = handle.broker_sub_ids_available.load(Ordering::Relaxed)
+            && !handle
+                .missing_identifier_warned
+                .swap(true, Ordering::Relaxed);
+        if first_on_connection {
+            tracing::warn!(
+                client = %client_slug,
+                topic = %topic,
+                "a broker that supports Subscription Identifiers sent a PUBLISH without one: \
+                 messages on this connection are routed by topic, and overlapping filters may \
+                 deliver more than once",
+            );
+        }
+        return Some(InboundRouting::ByTopic);
+    }
+    let resolved = handle
+        .subscriptions
+        .read()
+        .await
+        .filters_for(identifiers, topic);
+    for id in &resolved.unknown {
+        tracing::warn!(
+            client = %client_slug,
+            topic = %topic,
+            subscription_identifier = id,
+            "inbound PUBLISH names a Subscription Identifier no subscription on this client \
+             holds: the copy was sent for a filter this process does not hold, or was queued by \
+             the broker under an identifier an earlier Brenn version assigned — not routed for \
+             that identifier",
+        );
+    }
+    if resolved.filters.is_empty() {
+        return None;
+    }
+    Some(InboundRouting::BySubscription(resolved.filters))
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -1260,16 +1368,18 @@ pub(crate) fn unpolled_client(capacity: usize) -> (AsyncClient, rumqttc::EventLo
 /// Make `client` the session's current client.
 ///
 /// Under the `client` guard, in order: the broker's Maximum Packet Size
-/// (`None`: none advertised, stored as `0`) and Receive Maximum (`None`:
-/// [`DEFAULT_RECEIVE_MAXIMUM`]) are stored, the connection epoch is
-/// incremented, and the client becomes visible. A submitter that takes the
-/// guard therefore reads the facts of the connection whose client it took.
-/// The egress wake is notified last.
+/// (`None`: none advertised, stored as `0`), Receive Maximum (`None`:
+/// [`DEFAULT_RECEIVE_MAXIMUM`]) and whether it supports Subscription
+/// Identifiers are stored, the missing-identifier warning is re-armed, the
+/// connection epoch is incremented, and the client becomes visible. A
+/// submitter that takes the guard therefore reads the facts of the connection
+/// whose client it took. The egress wake is notified last.
 pub(crate) async fn install_connection(
     handle: &MqttClientHandle,
     client: AsyncClient,
     broker_max_packet_size: Option<u32>,
     broker_receive_max: Option<u16>,
+    broker_sub_ids_available: bool,
 ) {
     {
         let mut client_guard = handle.client.lock().await;
@@ -1280,6 +1390,12 @@ pub(crate) async fn install_connection(
             broker_receive_max.unwrap_or(DEFAULT_RECEIVE_MAXIMUM),
             Ordering::Relaxed,
         );
+        handle
+            .broker_sub_ids_available
+            .store(broker_sub_ids_available, Ordering::Relaxed);
+        handle
+            .missing_identifier_warned
+            .store(false, Ordering::Relaxed);
         handle.connection_epoch.fetch_add(1, Ordering::Relaxed);
         *client_guard = Some(client);
     }
@@ -1291,6 +1407,7 @@ mod tests {
     use super::*;
     use crate::state::SubAckOutcome;
     use brenn_lib::messaging::Urgency;
+    use brenn_lib::mqtt::subscription_identifier;
 
     fn channel(client: &str, topic: &str, qos: u8) -> ResolvedMqttIngressChannel {
         let address = brenn_lib::mqtt::config::parsed_address_canonical(client, topic);
@@ -1313,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn union_assigns_sequential_sub_ids_in_first_seen_order() {
+    fn union_gives_each_filter_its_derived_identifier() {
         let channels = vec![
             channel("broker", "home/+/state", 1),
             channel("broker", "sensors/#", 0),
@@ -1325,12 +1442,12 @@ mod tests {
                 IngressSubscription {
                     topic_filter: "home/+/state".into(),
                     qos: 1,
-                    sub_id: 1,
+                    sub_id: subscription_identifier("home/+/state"),
                 },
                 IngressSubscription {
                     topic_filter: "sensors/#".into(),
                     qos: 0,
-                    sub_id: 2,
+                    sub_id: subscription_identifier("sensors/#"),
                 },
             ]
         );
@@ -1344,8 +1461,7 @@ mod tests {
         ];
         let subs = union_subscriptions("broker", &channels);
         assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].qos, 2);
-        assert_eq!(subs[0].sub_id, 1);
+        assert_eq!(subs[0], IngressSubscription::new("home/+/state", 2));
     }
 
     #[test]
@@ -1378,7 +1494,37 @@ mod tests {
             _topic: &str,
             _payload: crate::payload::InboundPayload,
             _qos: u8,
+            _routing: InboundRouting,
         ) {
+        }
+    }
+
+    /// A router that keeps each call's topic and routing.
+    #[derive(Default)]
+    struct RecordingRouter {
+        calls: std::sync::Mutex<Vec<(String, InboundRouting)>>,
+    }
+
+    impl RecordingRouter {
+        fn take(&self) -> Vec<(String, InboundRouting)> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MqttEventRouter for RecordingRouter {
+        async fn deliver_inbound(
+            &self,
+            _client_slug: &str,
+            topic: &str,
+            _payload: crate::payload::InboundPayload,
+            _qos: u8,
+            routing: InboundRouting,
+        ) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((topic.to_string(), routing));
         }
     }
 
@@ -1493,17 +1639,12 @@ mod tests {
                 .any(|sub| sub.topic_filter == "attic/+"),
             "the edit resolved the successor, not the predecessor — the interleaving under test",
         );
-        let ids: Vec<u32> = successor
-            .subscriptions
-            .read()
-            .await
-            .iter()
-            .map(|sub| sub.sub_id)
-            .collect();
+        let mut expected = old.subscriptions.read().await.to_vec();
+        expected.push(IngressSubscription::new("attic/+", 1));
         assert_eq!(
-            ids.len(),
-            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
-            "no edit precedes the inherit, so the ids stay distinct: {ids:?}",
+            successor.subscriptions.read().await.to_vec(),
+            expected,
+            "the successor holds the predecessor's entries and the mid-handover edit",
         );
         successor.stop_and_join().await;
     }
@@ -1582,15 +1723,16 @@ mod tests {
             "the late edit landed on the predecessor, which is the interleaving under test: an \
              edit that started after the swap would not be on this set at all",
         );
+        assert_eq!(
+            *successor.subscriptions.read().await,
+            *old.subscriptions.read().await,
+            "the successor's set is the predecessor's",
+        );
         successor.stop_and_join().await;
     }
 
-    fn sub(topic_filter: &str, sub_id: u32) -> IngressSubscription {
-        IngressSubscription {
-            topic_filter: topic_filter.to_string(),
-            qos: 1,
-            sub_id,
-        }
+    fn sub(topic_filter: &str) -> IngressSubscription {
+        IngressSubscription::new(topic_filter, 1)
     }
 
     /// The supervisor's SUBSCRIBE send returns at once on a full request
@@ -1602,7 +1744,7 @@ mod tests {
         let (client, _eventloop) = unpolled_client(1);
 
         assert_eq!(
-            try_assert_ingress_subscription(&handle, &client, &sub("home/a", 1)),
+            try_assert_ingress_subscription(&handle, &client, &sub("home/a"), true),
             Ok(SubscribeSend::Sent),
         );
         assert_eq!(
@@ -1617,7 +1759,7 @@ mod tests {
         );
 
         assert_eq!(
-            try_assert_ingress_subscription(&handle, &client, &sub("home/b", 2)),
+            try_assert_ingress_subscription(&handle, &client, &sub("home/b"), true),
             Ok(SubscribeSend::ChannelFull),
         );
         assert_eq!(
@@ -1640,7 +1782,7 @@ mod tests {
         let handle = test_handle();
         let (client, _eventloop) = unpolled_client(4);
 
-        let result = try_assert_ingress_subscription(&handle, &client, &sub("a/#/b", 1));
+        let result = try_assert_ingress_subscription(&handle, &client, &sub("a/#/b"), true);
         assert!(
             matches!(result, Err(ref e) if e.contains("a/#/b")),
             "{result:?}"
@@ -1911,7 +2053,7 @@ mod tests {
         assert_eq!(handle.connection_epoch.load(Ordering::Relaxed), 0);
 
         let (client, _eventloop) = unpolled_client(4);
-        install_connection(&handle, client, Some(4096), Some(10)).await;
+        install_connection(&handle, client, Some(4096), Some(10), true).await;
         assert!(handle.client.lock().await.is_some());
         assert_eq!(handle.broker_max_packet_size.load(Ordering::Relaxed), 4096);
         assert_eq!(handle.broker_receive_max.load(Ordering::Relaxed), 10);
@@ -1921,13 +2063,253 @@ mod tests {
             .expect("install leaves a wake");
 
         let (client, _eventloop2) = unpolled_client(4);
-        install_connection(&handle, client, None, None).await;
+        install_connection(&handle, client, None, None, false).await;
         assert_eq!(handle.broker_max_packet_size.load(Ordering::Relaxed), 0);
         assert_eq!(
             handle.broker_receive_max.load(Ordering::Relaxed),
             DEFAULT_RECEIVE_MAXIMUM
         );
         assert_eq!(handle.connection_epoch.load(Ordering::Relaxed), 2);
+        assert!(!handle.broker_sub_ids_available.load(Ordering::Relaxed));
+    }
+
+    // --- Subscription Identifiers: SUBSCRIBE, CONNACK and the inbound arm ---
+
+    #[test]
+    fn subscribe_request_carries_the_identifier_only_when_asked() {
+        let (filter, props) = subscribe_request(&sub("home/a"), true);
+        assert_eq!(filter.path, "home/a");
+        assert_eq!(props.id, Some(subscription_identifier("home/a") as usize));
+        let (_, props) = subscribe_request(&sub("home/a"), false);
+        assert_eq!(props.id, None);
+    }
+
+    #[test]
+    fn the_connack_says_identifiers_are_unavailable_only_with_a_zero() {
+        let props = |available: Option<u8>| rumqttc::ConnAckProperties {
+            session_expiry_interval: None,
+            receive_max: None,
+            max_qos: None,
+            retain_available: None,
+            max_packet_size: None,
+            assigned_client_identifier: None,
+            topic_alias_max: None,
+            reason_string: None,
+            user_properties: Vec::new(),
+            wildcard_subscription_available: None,
+            subscription_identifiers_available: available,
+            shared_subscription_available: None,
+            server_keep_alive: None,
+            response_information: None,
+            server_reference: None,
+            authentication_method: None,
+            authentication_data: None,
+        };
+        assert!(!sub_ids_available(Some(&props(Some(0)))));
+        assert!(sub_ids_available(Some(&props(Some(1)))));
+        assert!(sub_ids_available(Some(&props(None))));
+        assert!(sub_ids_available(None));
+    }
+
+    /// The identifier `topic_filter` is subscribed with, as a PUBLISH carries
+    /// it.
+    fn id(topic_filter: &str) -> usize {
+        subscription_identifier(topic_filter) as usize
+    }
+
+    /// An identifier none of `a/#`, `a/b` and `a/c` has.
+    const UNKNOWN: usize = 9;
+
+    /// A handle holding `a/#` and `a/b`, with a connection installed whose
+    /// broker does or does not support Subscription Identifiers.
+    async fn routing_handle(
+        sub_ids_available: bool,
+    ) -> (Arc<MqttClientHandle>, rumqttc::EventLoop) {
+        for filter in ["a/#", "a/b", "a/c"] {
+            assert_ne!(id(filter), UNKNOWN);
+        }
+        let handle = test_handle();
+        handle.add_subscription("a/#".into(), 1).await;
+        handle.add_subscription("a/b".into(), 1).await;
+        let (client, eventloop) = unpolled_client(4);
+        install_connection(&handle, client, None, None, sub_ids_available).await;
+        (handle, eventloop)
+    }
+
+    /// Hand the arm a PUBLISH to `topic` with `properties`.
+    async fn inbound(
+        handle: &Arc<MqttClientHandle>,
+        router: &Arc<RecordingRouter>,
+        topic: &str,
+        properties: Option<rumqttc::PublishProperties>,
+    ) {
+        let mut publish = rumqttc::Publish::new(topic, QoS::AtLeastOnce, "v", properties);
+        publish.pkid = 1;
+        let router: Arc<dyn MqttEventRouter> = router.clone();
+        handle_event(Event::Incoming(Incoming::Publish(publish)), handle, &router).await;
+    }
+
+    /// Hand the arm a PUBLISH to `a/b` carrying `ids`.
+    async fn inbound_ids(
+        handle: &Arc<MqttClientHandle>,
+        router: &Arc<RecordingRouter>,
+        ids: &[usize],
+    ) {
+        let properties = rumqttc::PublishProperties {
+            subscription_identifiers: ids.to_vec(),
+            ..Default::default()
+        };
+        inbound(handle, router, "a/b", Some(properties)).await;
+    }
+
+    fn by_subscription(filters: &[&str]) -> Vec<(String, InboundRouting)> {
+        vec![(
+            "a/b".to_string(),
+            InboundRouting::BySubscription(filters.iter().map(|f| f.to_string()).collect()),
+        )]
+    }
+
+    /// A PUBLISH with no identifier is routed by topic, and the first one on a
+    /// connection whose broker supports identifiers arms the warning once.
+    #[tokio::test]
+    async fn a_publish_with_no_identifier_is_routed_by_topic() {
+        let (handle, _eventloop) = routing_handle(true).await;
+        let router = Arc::new(RecordingRouter::default());
+        let by_topic = || vec![("a/b".to_string(), InboundRouting::ByTopic)];
+
+        assert!(!handle.missing_identifier_warned.load(Ordering::Relaxed));
+        inbound(&handle, &router, "a/b", None).await;
+        assert_eq!(router.take(), by_topic());
+        assert!(handle.missing_identifier_warned.load(Ordering::Relaxed));
+
+        inbound(
+            &handle,
+            &router,
+            "a/b",
+            Some(rumqttc::PublishProperties::default()),
+        )
+        .await;
+        assert_eq!(router.take(), by_topic());
+        assert!(handle.missing_identifier_warned.load(Ordering::Relaxed));
+
+        let (client, _eventloop2) = unpolled_client(4);
+        install_connection(&handle, client, None, None, true).await;
+        assert!(
+            !handle.missing_identifier_warned.load(Ordering::Relaxed),
+            "a new connection re-arms the warning",
+        );
+    }
+
+    /// From a broker that does not support identifiers, a PUBLISH without one
+    /// is what is expected: routed by topic, and no warning armed.
+    #[tokio::test]
+    async fn a_broker_without_identifiers_routes_by_topic_without_warning() {
+        let (handle, _eventloop) = routing_handle(false).await;
+        let router = Arc::new(RecordingRouter::default());
+        inbound(&handle, &router, "a/b", None).await;
+        inbound(
+            &handle,
+            &router,
+            "a/b",
+            Some(rumqttc::PublishProperties::default()),
+        )
+        .await;
+        assert_eq!(
+            router.take(),
+            vec![
+                ("a/b".to_string(), InboundRouting::ByTopic),
+                ("a/b".to_string(), InboundRouting::ByTopic),
+            ],
+        );
+        assert!(!handle.missing_identifier_warned.load(Ordering::Relaxed));
+    }
+
+    /// Identifiers resolve to the filters they are derived from; unknown ones
+    /// are left out, and a packet naming only unknown ones never reaches the
+    /// router.
+    #[tokio::test]
+    async fn identifiers_resolve_to_their_filters() {
+        let (handle, _eventloop) = routing_handle(true).await;
+        let router = Arc::new(RecordingRouter::default());
+
+        inbound_ids(&handle, &router, &[id("a/b")]).await;
+        assert_eq!(router.take(), by_subscription(&["a/b"]));
+
+        inbound_ids(&handle, &router, &[id("a/#"), id("a/b")]).await;
+        assert_eq!(router.take(), by_subscription(&["a/#", "a/b"]));
+
+        inbound_ids(&handle, &router, &[id("a/b"), UNKNOWN]).await;
+        assert_eq!(router.take(), by_subscription(&["a/b"]));
+
+        inbound_ids(&handle, &router, &[UNKNOWN]).await;
+        assert_eq!(router.take(), vec![]);
+        assert!(
+            !handle.missing_identifier_warned.load(Ordering::Relaxed),
+            "a packet that carried identifiers is not a missing-identifier packet",
+        );
+    }
+
+    /// A removed filter's identifier resolves to nothing while the filter is
+    /// not held, another filter's add does not take it, and the filter added
+    /// back resolves under it again.
+    #[tokio::test]
+    async fn a_removed_filters_identifier_is_dropped_until_the_filter_is_held_again() {
+        let (handle, _eventloop) = routing_handle(true).await;
+        let router = Arc::new(RecordingRouter::default());
+
+        assert!(handle.remove_subscription("a/b").await);
+        inbound_ids(&handle, &router, &[id("a/b")]).await;
+        assert_eq!(router.take(), vec![]);
+
+        handle.add_subscription("a/c".into(), 1).await;
+        inbound_ids(&handle, &router, &[id("a/b")]).await;
+        assert_eq!(router.take(), vec![]);
+        inbound_ids(&handle, &router, &[id("a/c")]).await;
+        assert_eq!(router.take(), by_subscription(&["a/c"]));
+
+        handle.add_subscription("a/b".into(), 1).await;
+        inbound_ids(&handle, &router, &[id("a/b")]).await;
+        assert_eq!(router.take(), by_subscription(&["a/b"]));
+    }
+
+    /// A copy carrying an identifier two held filters share goes to both when
+    /// both cover its topic, in one call.
+    #[tokio::test]
+    async fn a_shared_identifier_resolves_to_every_holder_covering_the_topic() {
+        let (wide, narrow) = ("k/+/84471", "k/282/+");
+        assert_eq!(id(wide), id(narrow), "the fixture pair must collide");
+        let handle = test_handle();
+        handle.add_subscription(wide.into(), 1).await;
+        handle.add_subscription(narrow.into(), 1).await;
+        let (client, _eventloop) = unpolled_client(4);
+        install_connection(&handle, client, None, None, true).await;
+        let router = Arc::new(RecordingRouter::default());
+
+        let properties = rumqttc::PublishProperties {
+            subscription_identifiers: vec![id(wide)],
+            ..Default::default()
+        };
+        inbound(&handle, &router, "k/282/84471", Some(properties)).await;
+        assert_eq!(
+            router.take(),
+            vec![(
+                "k/282/84471".to_string(),
+                InboundRouting::BySubscription(vec![wide.to_string(), narrow.to_string()]),
+            )],
+        );
+    }
+
+    /// A QoS change keeps the filter's identifier, so copies under it still
+    /// resolve.
+    #[tokio::test]
+    async fn a_qos_move_keeps_routing_by_the_same_identifier() {
+        let (handle, _eventloop) = routing_handle(true).await;
+        let router = Arc::new(RecordingRouter::default());
+        let (moved, held) = handle.set_subscription_qos("a/b", 2).await;
+        assert!(held);
+        assert_eq!(moved.sub_id, subscription_identifier("a/b"));
+        inbound_ids(&handle, &router, &[id("a/b")]).await;
+        assert_eq!(router.take(), by_subscription(&["a/b"]));
     }
 
     /// Every outgoing event wakes the egress side: the event loop emits one

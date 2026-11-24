@@ -77,6 +77,17 @@ pub(crate) struct MqttCommitReport {
     pub(crate) failed: Vec<String>,
 }
 
+impl MqttCommitReport {
+    /// File `address` under the list `report` names, if any.
+    fn record(&mut self, report: SubscribeReport, address: String) {
+        match report {
+            SubscribeReport::AtBroker => {}
+            SubscribeReport::Deferred => self.deferred.push(address),
+            SubscribeReport::Failed => self.failed.push(address),
+        }
+    }
+}
+
 /// The two halves of the walk prepare could not measure: what the broker did
 /// with each moved filter, and which condemned sessions died at the swap.
 #[derive(Debug, Default)]
@@ -1104,8 +1115,15 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
 
 /// The outgoing MQTT step, between the descriptions and the channel removals.
 ///
-/// UNSUBSCRIBE before the route goes, so a publish already in flight finds its
-/// route; one that arrives after the route is gone is a benign zero-match drop.
+/// UNSUBSCRIBE before the route goes. On a broker that returns Subscription
+/// Identifiers, a copy already in flight for a withdrawn filter is dropped
+/// whether or not the route is still there: its identifier left the client's
+/// set with the filter. On a broker that does not, such a copy is routed by
+/// topic and finds its route; one that arrives after the route is gone is a
+/// benign zero-match drop.
+///
+/// A qos move is not a withdrawal: [`mqtt_incoming`] re-subscribes the filter
+/// in place.
 ///
 /// Returns the filters the broker did not take now, for the status body.
 async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
@@ -1143,7 +1161,10 @@ async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
 /// The incoming MQTT step, after the channels are in the directory.
 ///
 /// Route before SUBSCRIBE, so the first matching publish after the SUBACK has
-/// somewhere to go.
+/// somewhere to go. A qos move is one SUBSCRIBE at the new qos for a filter the
+/// session holds, keeping its Subscription Identifier; it runs after the
+/// client restarts, so on a client this reload restarts the successor has
+/// inherited the entry before its qos is set.
 async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
     for route in &delta.mqtt.routes_added {
         let address = route.channel_address.clone();
@@ -1159,23 +1180,24 @@ async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
         info!(address = %address, "reload: mqtt route added");
     }
     let mut report = MqttCommitReport::default();
+    let service = &env.mqtt_service;
     for client in &delta.mqtt.clients {
-        for filter in client.joining() {
+        let joining = client.joining().map(|filter| (filter, false));
+        let moving = client.resubscribe.iter().map(|filter| (filter, true));
+        for (filter, in_place) in joining.chain(moving) {
             let address = address_of(&client.client, &filter.topic_filter);
-            let service = &env.mqtt_service;
-            let outcome = session_or_bug(
+            let topic_filter = filter.topic_filter.clone();
+            let outcome = if in_place {
                 service
-                    .subscribe_filter(&client.client, filter.topic_filter.clone(), filter.qos)
-                    .await,
-                &client.client,
-                &address,
-                "subscribed",
-            );
-            match record_subscribe(&outcome, &address) {
-                SubscribeReport::AtBroker => {}
-                SubscribeReport::Deferred => report.deferred.push(address),
-                SubscribeReport::Failed => report.failed.push(address),
-            }
+                    .resubscribe_filter(&client.client, topic_filter, filter.qos)
+                    .await
+            } else {
+                service
+                    .subscribe_filter(&client.client, topic_filter, filter.qos)
+                    .await
+            };
+            let outcome = session_or_bug(outcome, &client.client, &address, "subscribed");
+            report.record(record_subscribe(&outcome, &address), address);
         }
     }
     report

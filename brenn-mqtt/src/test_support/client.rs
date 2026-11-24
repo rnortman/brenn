@@ -100,6 +100,21 @@ pub async fn wait_for_filter_acked(
     .await
 }
 
+/// The number of connections installed on `client_slug`'s session so far: 1
+/// after the first connect, and one more for every reconnect. Read under the
+/// `client` lock, the rule the counter is written under.
+///
+/// # Panics
+///
+/// If `client_slug` is not a registered client.
+pub async fn connection_epoch(svc: &MqttService, client_slug: &str) -> u64 {
+    let handle = svc.get_client(client_slug).unwrap_or_else(|| {
+        panic!("connection_epoch: no session registered for client {client_slug:?}")
+    });
+    let _guard = handle.client.lock().await;
+    handle.connection_epoch.load(Ordering::Relaxed)
+}
+
 /// A raw rumqttc client plus a receiver that yields one item per PubAck.
 ///
 /// The connection is established (ConnAck received) before this returns, so a

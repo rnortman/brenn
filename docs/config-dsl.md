@@ -3118,6 +3118,9 @@ Three further refusals come from the wiring rather than from a section:
   broker could not be told about now — the client is disconnected, or its event
   loop is dying — is in `mqtt_deferred`: it is in the reconnect-survival set and
   the supervisor asserts it on the next connect, so the reload still applied.
+  A held filter whose QoS moved is subscribed again in place at the new QoS,
+  with no UNSUBSCRIBE, and is in `mqtt_subscribed` and not in
+  `mqtt_unsubscribed`.
   One whose client's supervisor has *stopped* retrying — an authoritative
   failure such as bad credentials or a rejected TLS chain — is in `mqtt_failed`
   instead: the reload applied and the filter is registered, but no reconnect is

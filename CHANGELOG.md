@@ -4,6 +4,28 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Fixed:** a client holding overlapping MQTT subscription filters (`a/#` and
+  `a/b`) received each message on the overlap once per covering filter in each
+  covering channel. It now receives it once in each: every message is routed
+  by the MQTT 5 Subscription Identifier the broker returns on it. The
+  exception is two filters that share a Subscription Identifier, which is
+  rare; see "Which channels an inbound MQTT message reaches" in
+  `docs/message-bus.md`.
+- **BREAKING for operators with a non-zero `session_expiry_secs`:** on the
+  first start of this version, messages the broker queued for the client while
+  the previous version was stopped are dropped, each with a `warn` naming the
+  Subscription Identifier it carried. Later restarts deliver queued messages
+  to the channel of the filter each was queued for. A deployment with the
+  default `session_expiry_secs = 0` is not affected.
+- **Behaviour change:** the retained messages a broker replays for a new MQTT
+  subscription, and for each filter on reconnect, reach that subscription's
+  channel only — a wider channel on the same client no longer receives them.
+  A subscriber that relied on the wider channel refreshing that way subscribes
+  to the narrower filter itself.
+- **Fixed:** a reload that changed the QoS of a held MQTT filter unsubscribed
+  it and subscribed it again several commit steps later, and the broker sent
+  nothing published on it in between. The reload now sends one SUBSCRIBE at
+  the new QoS, and the filter is reported in `mqtt_subscribed` only.
 - **BREAKING for operators:** an MQTT subscribe ACL entry whose filter starts
   with `#` or `+` no longer covers a subscription whose first level starts
   with `$` (`$SYS/…`, `$share/…`), matching what publish entries already do.
@@ -16,8 +38,11 @@ All notable changes to Brenn are documented here.
   dynamic subscribe is refused as not permitted. On a client with a non-zero
   `session_expiry_secs`, the broker can resume its session with the dormant
   subscription's filter still in place and keep sending on it: each such
-  message is dropped with a `warn` line "inbound topic matched no channel",
-  until the broker's session for the client ends or a covering entry is added.
+  message is dropped with a `warn` naming the Subscription Identifier it
+  carried, unless a filter the client holds shares that identifier and covers
+  the topic, in which case that filter's channel receives the message a second
+  time (rare; `docs/message-bus.md`, the same passage); this lasts until the
+  broker's session for the client ends or a covering entry is added.
 - **New: an MQTT publish can name a reply topic.** `MqttSend` and an
   automation's `mqtt_publish` action take an optional `reply_to`, written
   `mqtt:<client>:<topic>`, which is sent to the broker as the MQTT 5 Response

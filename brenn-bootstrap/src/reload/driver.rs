@@ -1779,6 +1779,7 @@ pub(crate) mod tests {
 
     use brenn_lib::config::{BrennConfig, PACKAGED, PACKAGED_MODULE};
     use brenn_lib::messaging::SubscriberEntryKind;
+    use brenn_lib::mqtt::subscription_identifier;
     use brenn_messaging::config_reload::{RELOAD_ADDRESS, STATUS_ADDRESS};
     use brenn_messaging::query::MessageQuery;
     use brenn_obs::alerting::make_capturing_alerter_with_severity;
@@ -1963,7 +1964,7 @@ new some-reader: Reader();
 
     /// The channel floor every fixture stands on, `agent` between it and
     /// `extra`.
-    fn document_with_agent(extra: &str, agent: &str) -> String {
+    pub(crate) fn document_with_agent(extra: &str, agent: &str) -> String {
         format!(
             r#"
 channel index at "brenn:surface.index" {{
@@ -3711,6 +3712,15 @@ new sifter: Demo {{
         clients: &[(&str, u16, Option<&std::path::Path>)],
         bindings: &[(&str, &str)],
     ) -> String {
+        document_with_clients_at_qos(clients, bindings, 1)
+    }
+
+    /// [`document_with_clients`] with every client declared at `qos`.
+    pub(crate) fn document_with_clients_at_qos(
+        clients: &[(&str, u16, Option<&std::path::Path>)],
+        bindings: &[(&str, &str)],
+        qos: u8,
+    ) -> String {
         let blocks: String = clients
             .iter()
             .map(|(slug, port, password)| {
@@ -3719,7 +3729,7 @@ new sifter: Demo {{
                 });
                 format!(
                     "mqtt_client {slug} {{\n    url = \"mqtts://127.0.0.1:{port}\";\n\
-                     {credential}    qos = 1;\n}}\n\n"
+                     {credential}    qos = {qos};\n}}\n\n"
                 )
             })
             .collect();
@@ -3946,6 +3956,83 @@ new sifter: Demo {{
             "a carried filter is not a move: {:?}",
             status.delta.mqtt_subscribed,
         );
+        booted.stop_mqtt();
+    }
+
+    /// A reload that moves a held filter's qos re-subscribes it: the entry
+    /// keeps its Subscription Identifier and its route, and the status
+    /// body names it as subscribed and not as unsubscribed. The client's `qos`
+    /// is part of its identity, so the same reload restarts the client and the
+    /// successor inherits the entry before its qos is set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_qos_move_keeps_the_filters_identifier_and_route() {
+        const TOPIC: &str = "home/state";
+        let address = format!("mqtt:ha:{TOPIC}");
+        let clients = [("ha", 8883u16, None)];
+        let tree = Tree::holding(&document_with_clients_at_qos(&clients, &[("ha", TOPIC)], 0));
+        let components = tempfile::tempdir().expect("a components root");
+        install_package(components.path(), &staged_module(&tree));
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        let (service, router) = booted.mqtt.clone();
+        assert_eq!(service.ingress_filter_qos("ha", TOPIC).await, Some(0));
+        let sub_id_before = service
+            .get_client("ha")
+            .expect("a declared client")
+            .subscriptions
+            .read()
+            .await
+            .get(TOPIC)
+            .expect("the bound filter is held")
+            .sub_id;
+        let routes_before = router.route_uuids();
+
+        tree.write(&document_with_clients_at_qos(&clients, &[("ha", TOPIC)], 1));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_changed, vec!["ha".to_string()]);
+        assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+        assert!(
+            status.delta.mqtt_unsubscribed.is_empty(),
+            "a qos move is not a withdrawal: {:?}",
+            status.delta.mqtt_unsubscribed,
+        );
+        assert_eq!(
+            service.ingress_filter_qos("ha", TOPIC).await,
+            Some(1),
+            "the successor holds the filter at the new qos",
+        );
+        {
+            let handle = service.get_client("ha").expect("the slug is never absent");
+            let set = handle.subscriptions.read().await;
+            assert_eq!(set.len(), 1, "{:?}", set.to_vec());
+            let sub_id_after = set.get(TOPIC).expect("the filter is held").sub_id;
+            assert_eq!(
+                (sub_id_after, sub_id_before),
+                (
+                    subscription_identifier(TOPIC),
+                    subscription_identifier(TOPIC)
+                ),
+                "the filter is held under the identifier derived from it, before and after",
+            );
+        }
+        let uuid = booted
+            .messenger
+            .directory()
+            .resolve(&address)
+            .expect("the entry is in the directory")
+            .uuid;
+        assert_eq!(router.route_uuids(), routes_before);
+        assert_eq!(router.route_uuids(), vec![uuid]);
         booted.stop_mqtt();
     }
 

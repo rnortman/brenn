@@ -586,6 +586,78 @@ transport metadata, with a test of a round trip; or this is closed as
 not wanted, on the ground that payload-level correlation is what the
 brokers' peers in use do.
 
+## `mqtt-dynamic-subscribe-qos-not-honoured`
+
+A dynamic `mqtt:` subscription stores the QoS its app asked for —
+`MessageSubscribe`'s `qos`, or the client's `qos` at the time when the
+app gave none — and the broker holds a filter at one QoS. Nothing
+decides that QoS when the subscribers of one filter disagree, and three
+things follow. (1) Under a static binding the row's QoS is never read:
+the boot fold of dynamic MQTT ingress in `commit_messaging`
+(`brenn-messaging-boot/src/lib.rs`, the `static_mqtt_uuids` skip) leaves
+out every dynamic row whose channel a static binding holds, a reload
+does the same (`dynamic_ingress`, `brenn-bootstrap/src/reload/dynamic.rs`,
+its `exclude` set), and the filter is subscribed at the client's `qos`.
+(2) Between dynamic rows of several apps on one channel the first row's
+QoS is used and the others' are never read, larger or smaller: both
+folds keep one row per channel uuid (`seen.insert`). Which row is first
+is the store's load order (`load_dynamic_subscriptions`, today by app
+slug), not the order of subscribing and not something the other
+subscribers control; a reload also puts a row it revives after the rows
+already folded (`dynamic_ingress_sides`,
+`brenn-bootstrap/src/reload/delta.rs`), so a reload and the next boot
+can take different rows as first. `union_subscriptions`
+(`brenn-mqtt/src/connection.rs`) takes the largest QoS among the rows it
+is given for a filter, and is never given two. (3) A `MessageSubscribe`
+whose QoS differs from the one the filter is already held at — by a
+static binding of another subscriber or by another app's dynamic
+subscription — writes the durable row, the directory subscriber and the
+inbound route and then panics on the equality assertion in
+`IngressSubscriptionSet::add` (`brenn-mqtt/src/state.rs`), reached from
+`activate_dynamic_subscribe` (`brenn-server/src/mqtt_subscribe.rs`); the
+only refusal before it is for the same app re-subscribing with different
+parameters. The differing QoS can be the defaulted one: an app that
+gives no `qos` panics whenever the filter is held at a QoS other than
+the client's current `qos`, because an earlier subscriber passed one
+explicitly or because the client's `qos` was edited after the filter was
+taken (the restarted client inherits its predecessor's set unchanged).
+The panic ends the task the call ran on — the conversation's event loop,
+which the watchdog then resets, or one tool-socket connection, which
+nothing supervises and whose conversation keeps running — the app gets
+no answer, and what was written stays, so from the next reload or start
+the row falls under (1) or (2); under (2), where it is the first row,
+its QoS becomes the filter's for every other subscriber, and a reload,
+whose baseline is rebuilt from the stored rows rather than read from the
+session, can then compute no move while the session holds another QoS.
+Rows that disagree also arise with no panic: a row stored at the
+client's `qos` keeps that value when the client's `qos` is edited later.
+Consequence: an app's requested QoS is ignored with no error and no log
+line, in either direction, and the QoS in force can be one another app
+chose. Once one app subscribes a filter with an explicit QoS other than
+the client's, or the operator edits the client's `qos`, every other
+app's plain default subscribe to that filter panics, at that app's cost
+and not the cost of whoever set it up: its conversation's event loop and
+the operator a panic page and a wedged-bridge page, or, from the tool
+socket, one connection task and one page, each attempt leaving another
+disagreeing row.
+Done when a filter is subscribed at the largest QoS any live subscriber
+of it asked for, static or dynamic, a reload or a runtime subscribe that
+changes that largest value re-subscribes in place, and no subscribe
+panics on a QoS another subscriber chose — or the subscribe call
+refuses, with an error the app reads, a QoS it will not honour, and no
+stored row carries a QoS that is not in force. Which of the two is
+open. Either way the `qos` text of `MessageSubscribe`
+(`brenn-lib/src/integration.rs`) says what an app gets.
+
+Code site (`TODO(mqtt-dynamic-subscribe-qos-not-honoured)`):
+`brenn-messaging-boot/src/lib.rs`, where the boot fold skips the dynamic
+row; `brenn-bootstrap/src/reload/dynamic.rs`, where the reload fold
+`dynamic_ingress` skips it; and `brenn-server/src/mqtt_subscribe.rs`, at
+the `subscribe_filter` call in `activate_dynamic_subscribe`. The two
+folds apply one rule and must agree. The doc comments in
+`brenn-mqtt/src/state.rs` and `brenn-mqtt/src/connection.rs` that carry
+the slug state the current rule and change with it.
+
 ## `mqtt-egress-operator-text-unsent-of-possibly-sent`
 
 The MQTT egress hub (`brenn-server/src/mqtt_egress.rs`) tells the
@@ -648,6 +720,30 @@ whatever is still parked and logs the count beside the retained messages
 it skips; those are not reported either. Done for this half includes the
 parked rows.
 
+## `mqtt-egress-shutdown-answers-test-flaky`
+
+`the_shutdown_waits_for_every_sessions_answers_before_it_returns` in
+`brenn-bootstrap` (`src/reload/mqtt_broker_tests/egress/stop.rs`) failed
+once on a run of the broker suite, on a change that touches no egress
+code (deriving each MQTT Subscription Identifier from its filter
+string): one sender had been told `[Handed, Dropped { cause: Stopped }]`
+where the test asserts `[Handed, Delivered]` for both. It passed on
+every later run. The cause is not established, and it is not known
+whether the test or the shutdown is at fault. The test freezes its
+broker with a publish in flight on each of two clients, signals
+shutdown, thaws the broker inside the bound and asserts that both
+senders were told `handed` then `delivered` before the shutdown
+returned. The observed value says one sender was told its publish was
+dropped because the session stopped, after being told it was handed
+over; if the shutdown is at fault, that is a sender told the wrong
+outcome. Neither the test's timing nor the shutdown path has been read
+for a cause. `make check` is the pre-commit gate, and a test that fails
+there at random teaches retry-until-green. Done = the cause is found,
+and either the shutdown is fixed or the test is made deterministic,
+passing reliably under the full `make check`; a retry is not a fix.
+Code site (`TODO(mqtt-egress-shutdown-answers-test-flaky)`): the outcome
+assertion in the test.
+
 ## `mqtt-publish-acl-ops-config`
 
 Per-topic MQTT publish ACLs exist (`acl publish [topic_filter …]`), but
@@ -688,6 +784,41 @@ build it; whether the client library ever surfaces this outside a session
 mismatch is part of the finding out. Done = a QoS 2 message whose PUBREC
 succeeded is never reported to the operator or to a `status_to` as
 rejected.
+
+## `mqtt-retained-replay-shortfall-cause-unconfirmed`
+
+A personal-assistant app reported that a new subscription to a wildcard filter
+under a wider one it already held showed about 28 retained light states where
+many more exist, while exact-topic subscriptions returned each value at once.
+Brenn's inbound path was read end to end and has no queue, cap, rate limit or
+dedupe that drops a message, and a test delivers a retained burst of 150
+messages — larger than a channel window — whole, to a narrower subscription
+added under a wider one, each exactly once, with none of the narrow
+subscription's copies reaching the wider channel. Which of three things
+produced the report is not confirmed, because the evidence is outside this
+repository. (1) A read made while the replay was still arriving:
+`MessageSubscribe` answers `"subscribed"` without waiting for SUBACK or for
+any delivery, the replay then arrives one message at a time, and a read in
+that time returns the part that has arrived; in the test against a local
+broker, 0 of 150 rows were present when the subscribe returned and the last
+arrived about 105–130 ms later. This fits the report, exact-topic values
+arriving "at once" included, and needs no fault anywhere; until the routing
+change that added the test, the tool's own description told an app to read
+straight after subscribing, and it now says the replay arrives afterwards.
+(2) The app's read being bounded by the channel's retain depth (100 by
+default) and the `limit` it passed. (3) The production broker: mosquitto drops
+outgoing messages for a client over `max_queued_messages` beyond
+`max_inflight_messages`, logging "Outgoing messages are being dropped for
+client" once and telling the client nothing. Done when the report has been
+repeated with the time of the read and the depths recorded, reading again
+after the replay has had time to arrive: if the later read is whole, the
+report is closed as (1) or (2), and nothing on the broker host needs checking;
+only if it is still short are the broker's log and configuration checked and
+the cause fixed where it lives.
+
+Code site (`TODO(mqtt-retained-replay-shortfall-cause-unconfirmed)`):
+`brenn-bootstrap/src/reload/mqtt_broker_tests.rs`, at
+`a_new_narrow_subscription_receives_every_retained_message_once`.
 
 ## `mqtt-stack-history-rewrite-before-push`
 
@@ -3195,9 +3326,8 @@ wildcard placement, and is covered by an ACL entry that spells
 handed to the broker as written, and inbound routing compares the route's
 filter with the delivered topic level by level, so the literal first level
 `$share` never equals the first level of a delivered topic and every
-message on such a subscription is logged as matching no channel and
-dropped. Done when either a `$share/…` filter is refused where filters are
-validated, with a reason that says shared subscriptions are unsupported,
+message on such a subscription is logged and dropped. Done when either a
+`$share/…` filter is refused where filters are validated, with a reason that says shared subscriptions are unsupported,
 or shared subscriptions are supported end to end: the ACL decided on the
 inner filter, the route matched on the inner filter, and a test delivers a
 message through one.
@@ -5250,13 +5380,23 @@ persistent (`clean_start(false)` with a session expiry, `connection.rs`), so the
 broker resumes it with its filter set intact.
 
 Consequence: the broker keeps publishing every message matching that filter for
-as long as the session lives, and brenn's router discards them, having no route.
-Not a leak, and bounded by the topic's traffic — unbounded wasted ingress on a
-`#`-shaped filter. The reload's status body is the second half: it reports the
-address in `mqtt_deferred`, which reads as "converged, just not yet", and the
-filter is in fact still at the broker. Both callers are affected — reload's
-ingress walk (`brenn-bootstrap/src/reload/commit.rs`, `record_unsubscribe`) and
-the runtime `MessageUnsubscribe` (`brenn-server/src/mqtt_subscribe.rs`).
+as long as the session lives, and brenn discards them: each copy carries the
+withdrawn filter's Subscription Identifier, which the client's subscription
+set no longer holds. Not a leak, and bounded by the topic's traffic —
+unbounded wasted ingress on a `#`-shaped filter. The reload's status body is
+the second half: it reports the address in `mqtt_deferred`, which reads as
+"converged, just not yet", and the filter is in fact still at the broker. Both
+callers are affected — reload's ingress walk
+(`brenn-bootstrap/src/reload/commit.rs`, `record_unsubscribe`) and the runtime
+`MessageUnsubscribe` (`brenn-server/src/mqtt_subscribe.rs`).
+
+Since inbound routing follows the Subscription Identifier, and a filter's
+identifier is derived from its filter string, a copy the broker sends for a
+filter this process does not hold carries an identifier the client's
+subscription set does not hold and is dropped with a `warn`. The one
+exception is a leftover filter that shares its identifier with a held
+filter covering the topic (`docs/message-bus.md`, "Two filters with one
+identifier"): that channel receives the message a second time.
 
 Doing it is a supervisor contract, which is why this is an entry and not a
 patch: the handle needs a pending-withdrawals set — filters removed from

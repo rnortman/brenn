@@ -170,8 +170,8 @@ pub struct StatusDelta {
     /// `channels_changed`.
     pub channels_described: Vec<String>,
     /// `mqtt:<client>:<filter>` for every broker subscription this reload
-    /// asserted. A filter whose qos moved is here and in `mqtt_unsubscribed`
-    /// both: raising a qos is taking the filter out and putting it back.
+    /// asserted. A filter whose qos moved is here and not in
+    /// `mqtt_unsubscribed`: it is subscribed again in place at the new qos.
     pub mqtt_subscribed: Vec<String>,
     /// `mqtt:<client>:<filter>` for every broker subscription this reload
     /// withdrew.

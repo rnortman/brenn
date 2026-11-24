@@ -717,11 +717,9 @@ async fn dynamic_subs(messenger: &Messenger) -> Vec<String> {
 /// empty lists, which is what a document naming no client leaves behind on both
 /// sides.
 ///
-/// `sub_id` is deliberately not rendered: it is a per-session counter handed out
-/// in subscription order, so the process that subscribed one filter at boot and
-/// one at reload holds different numbers from the one that subscribed both at
-/// boot, for the same set of filters. The filter and its qos are the whole of
-/// what the broker was told.
+/// `sub_id` is not rendered: it is a function of the filter string and adds
+/// nothing to it. The filter and its qos are the whole of what the broker was
+/// told.
 async fn mqtt_ingress(
     booted: &Booted,
     entries: &[Arc<brenn_lib::messaging::ChannelEntry>],

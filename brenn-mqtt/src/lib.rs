@@ -44,6 +44,10 @@ pub use reader::{
     start_egress_reader,
 };
 pub use service::{
-    IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter, MqttService,
+    InboundRouting, IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter,
+    MqttService,
 };
-pub use state::{ConnectorHealthLabel, IngressSubscription, MqttClientHandle, SubAckOutcome};
+pub use state::{
+    ConnectorHealthLabel, IngressSubscription, IngressSubscriptionSet, MqttClientHandle,
+    ResolvedIdentifiers, SubAckOutcome,
+};

@@ -61,8 +61,10 @@ pub enum SubscribeActivation {
     /// `brenn:`/`webhook:`/`ephemeral:`/`local:` subscribe — no broker
     /// activation; the registration + directory write is the whole operation.
     LocalOnly,
-    /// `mqtt:` subscribe; the client was live and the broker SUBSCRIBE went out
-    /// now (delivery — including any retained message — starts immediately).
+    /// `mqtt:` subscribe; the client was live and the SUBSCRIBE has been handed
+    /// to the broker connection. No SUBACK has been awaited. The broker's
+    /// retained replay, if any, arrives afterwards one message at a time, and
+    /// none of it need be in the channel when the call returns.
     MqttLive,
     /// `mqtt:` subscribe; the client is currently disconnected but still
     /// retrying. The subscription is durable and the route is added; the broker
@@ -158,15 +160,6 @@ impl From<RuntimeSubscribeError> for SubscribeActivateError {
     }
 }
 
-/// Create a dynamic subscription for `app_slug` on `address` and activate the
-/// transport. The single runtime subscribe entry point
-/// the `MessageSubscribe` tool calls.
-///
-/// `brenn:`/`webhook:` are pure lib-core operations (no activation).
-/// `mqtt:` runs the configured-client guard + qos-default resolution **before**
-/// the lib core (so nothing is persisted for an unconfigured client), then adds
-/// the router `IngressRoute` and issues the broker SUBSCRIBE after the core
-/// persists the durable state.
 /// Fetch the resolved [`AppPolicy`] for a *live* app slug, panicking if absent.
 ///
 /// The `MessageSubscribe` tool is only offered to apps that resolved a config, so
@@ -184,6 +177,15 @@ fn app_policy(
     })
 }
 
+/// Create a dynamic subscription for `app_slug` on `address` and activate the
+/// transport. The single runtime subscribe entry point
+/// the `MessageSubscribe` tool calls.
+///
+/// `brenn:`/`webhook:` are pure lib-core operations (no activation).
+/// `mqtt:` runs the configured-client guard + qos-default resolution **before**
+/// the lib core (so nothing is persisted for an unconfigured client), then adds
+/// the router `IngressRoute` and issues the broker SUBSCRIBE after the core
+/// persists the durable state.
 pub async fn subscribe_dynamic_activated(
     bridge: &ActiveBridge,
     app_slug: &str,
@@ -195,7 +197,27 @@ pub async fn subscribe_dynamic_activated(
         // Messenger at this point is a host wiring bug, not bad input.
         panic!("subscribe_dynamic_activated: Messenger required but absent on ActiveBridge")
     });
+    activate_dynamic_subscribe(
+        messenger,
+        bridge.mqtt_service(),
+        bridge.mqtt_event_router(),
+        app_slug,
+        address,
+        params,
+    )
+    .await
+}
 
+/// [`subscribe_dynamic_activated`] over the three parts of the bridge it uses:
+/// the messenger, the MQTT service and the inbound router.
+pub(crate) async fn activate_dynamic_subscribe(
+    messenger: &brenn_messaging::Messenger,
+    mqtt_svc: &brenn_mqtt::MqttService,
+    router: &crate::mqtt_router::MqttEventRouterImpl,
+    app_slug: &str,
+    address: &str,
+    params: DynamicSubscribeParams,
+) -> Result<SubscribeActivation, SubscribeActivateError> {
     let is_mqtt = matches!(ChannelScheme::of(address), Some(ChannelScheme::Mqtt));
     if !is_mqtt {
         // --- Phase 1: per-app dynamic-subscribe ACL (non-mqtt schemes) ---
@@ -248,10 +270,8 @@ pub async fn subscribe_dynamic_activated(
     }
 
     // --- mqtt: activation ---
-
-    // The service always exists; the per-client guard below is what refuses an
-    // address on a client no `[[mqtt_client]]` declares.
-    let mqtt_svc = bridge.mqtt_service();
+    // The per-client guard below is what refuses an address on a client no
+    // `[[mqtt_client]]` declares.
 
     // Parse the mqtt: address once. Both the configured-client guard and the
     // Phase-1 ACL gate need fields off the same parse (`client` and `topic`),
@@ -369,7 +389,6 @@ pub async fn subscribe_dynamic_activated(
             client: parsed.client.clone(),
         });
     };
-    let router = bridge.mqtt_event_router();
     router.add_route(IngressRoute {
         client_slug: parsed.client.clone(),
         topic_filter: parsed.topic.clone(),
@@ -391,6 +410,9 @@ pub async fn subscribe_dynamic_activated(
     // client's session having been stopped, not an inconsistency. The route
     // installed a moment ago comes back out — it maps to a filter no session
     // will ever assert — and the durable row is left dormant.
+    // TODO(mqtt-dynamic-subscribe-qos-not-honoured): a QoS that differs from
+    // the one the filter is held at panics inside this call, after the row and
+    // the route were written.
     let Some(outcome) = mqtt_svc
         .subscribe_filter(&parsed.client, parsed.topic.clone(), qos)
         .await
@@ -562,9 +584,10 @@ pub async fn unsubscribe_dynamic_activated(
     // Last subscriber removed: drop the route and issue the broker UNSUBSCRIBE.
     let mqtt_svc = bridge.mqtt_service();
 
-    // Drop the router IngressRoute for this channel so any in-flight broker
-    // delivery on the filter (before the UNSUBSCRIBE takes effect) no longer
-    // routes to the now-unsubscribed channel.
+    // Drop the router IngressRoute for this channel so a broker delivery on
+    // the filter that arrives before the UNSUBSCRIBE takes effect no longer
+    // reaches the now-unsubscribed channel, including a copy routed by topic
+    // from a broker that returns no Subscription Identifiers.
     let router = bridge.mqtt_event_router();
     router.remove_route(channel_uuid);
 
@@ -613,7 +636,7 @@ mod tests {
     use brenn_lib::messaging::config::Depth;
     use brenn_messaging_store::db::load_dynamic_subscriptions;
     use brenn_mqtt::payload::InboundPayload;
-    use brenn_mqtt::service::MqttEventRouter;
+    use brenn_mqtt::service::{InboundRouting, MqttEventRouter};
 
     use crate::active_bridge::ActiveBridge;
 
@@ -784,6 +807,7 @@ mod tests {
                 "sensors/kitchen/temp",
                 InboundPayload::new("22.5", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
         let stored: i64 = {
@@ -796,6 +820,94 @@ mod tests {
             .expect("count")
         };
         assert_eq!(stored, 1, "runtime-added route must route the delivery");
+    }
+
+    /// The `topic` of each ingress envelope `MessageChannelGet` would answer for
+    /// `address` with `limit`, newest first.
+    async fn read_topics(bridge: &ActiveBridge, address: &str, limit: u32) -> Vec<String> {
+        let envelopes = bridge
+            .messenger()
+            .unwrap()
+            .query(&brenn_messaging::query::MessageQuery {
+                channel: address.to_string(),
+                limit,
+                before: None,
+                after: None,
+                sender: None,
+                search: None,
+                calling_app_slug: "testapp".to_string(),
+            })
+            .await
+            .expect("the subscriber may read its channel");
+        envelopes
+            .iter()
+            .map(|envelope| {
+                let text = envelope
+                    .body
+                    .as_text()
+                    .expect("an ingress envelope is text");
+                let wrapper: serde_json::Value =
+                    serde_json::from_str(text).expect("the ingress envelope is JSON");
+                wrapper["topic"]
+                    .as_str()
+                    .expect("the envelope names its topic")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A read made while a wildcard subscription's retained replay is still
+    /// arriving returns what has arrived and nothing else; a read after the
+    /// replay returns the newest `min(limit, retain_depth)`.
+    ///
+    /// The test is the inbound path: it delivers the broker's copies itself, and
+    /// the supervisor awaits each delivery before it reads the next packet, so
+    /// a read between two calls here is a read between two packets.
+    #[tokio::test]
+    async fn a_read_part_way_through_a_replay_returns_what_has_arrived() {
+        let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
+        let filter = "sensors/+/temp";
+        let addr = format!("mqtt:home:{filter}");
+        let topics: Vec<String> = (0..150).map(|i| format!("sensors/{i}/temp")).collect();
+        // The newest `n` of the first `delivered` topics, newest first.
+        let newest = |delivered: usize, n: usize| -> Vec<String> {
+            topics[..delivered].iter().rev().take(n).cloned().collect()
+        };
+
+        let params = DynamicSubscribeParams {
+            retain_depth: Depth::Bounded(100),
+            ..pull_only(None)
+        };
+        subscribe_dynamic_activated(&bridge, "testapp", &addr, params)
+            .await
+            .expect("mqtt subscribe activates");
+        assert!(read_topics(&bridge, &addr, 500).await.is_empty());
+
+        let router = bridge.mqtt_event_router().clone();
+        let deliver = |topic: String| {
+            let router = router.clone();
+            async move {
+                router
+                    .deliver_inbound(
+                        "home",
+                        &topic,
+                        InboundPayload::new("v", None),
+                        1,
+                        InboundRouting::BySubscription(vec![filter.to_string()]),
+                    )
+                    .await;
+            }
+        };
+        for topic in &topics[..40] {
+            deliver(topic.clone()).await;
+        }
+        assert_eq!(read_topics(&bridge, &addr, 500).await, newest(40, 40));
+
+        for topic in &topics[40..] {
+            deliver(topic.clone()).await;
+        }
+        assert_eq!(read_topics(&bridge, &addr, 500).await, newest(150, 100));
+        assert_eq!(read_topics(&bridge, &addr, 30).await, newest(150, 30));
     }
 
     /// The same subscribe against a client whose supervisor gave up: the two
@@ -840,6 +952,7 @@ mod tests {
                 "sensors/kitchen/temp",
                 InboundPayload::new("22.5", None),
                 0,
+                InboundRouting::ByTopic,
             )
             .await;
         let stored: i64 = {
@@ -888,6 +1001,19 @@ mod tests {
             deliver_and_count(&bridge, "home", "sensors/k/temp").await,
             1,
             "two subscribers on one filter must not double-store an inbound message"
+        );
+        // A copy the broker attributes to the filter's one subscription is one
+        // row too.
+        assert_eq!(
+            deliver_routed_and_count(
+                &bridge,
+                "home",
+                "sensors/k/temp",
+                InboundRouting::BySubscription(vec!["sensors/+/temp".to_string()]),
+            )
+            .await,
+            2,
+            "one attributed copy adds one row to the shared channel"
         );
     }
 
@@ -1428,9 +1554,19 @@ mod tests {
     /// Count `mqtt:` rows stored via `deliver_inbound` on a topic, after the
     /// bridge's router. Used to prove a route is (or is no longer) live.
     async fn deliver_and_count(bridge: &ActiveBridge, client: &str, topic: &str) -> i64 {
+        deliver_routed_and_count(bridge, client, topic, InboundRouting::ByTopic).await
+    }
+
+    /// [`deliver_and_count`] for a copy carrying `routing`.
+    async fn deliver_routed_and_count(
+        bridge: &ActiveBridge,
+        client: &str,
+        topic: &str,
+        routing: InboundRouting,
+    ) -> i64 {
         let router = bridge.mqtt_event_router().clone();
         router
-            .deliver_inbound(client, topic, InboundPayload::new("v", None), 0)
+            .deliver_inbound(client, topic, InboundPayload::new("v", None), 0, routing)
             .await;
         let conn = bridge.messenger().unwrap().db().lock().await;
         conn.query_row(

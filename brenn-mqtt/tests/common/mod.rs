@@ -87,8 +87,8 @@ pub struct SpawnedClient {
 
 /// Build `MqttService` + `MqttClientHandle` + the unified supervisor for
 /// `test_name`, wiring a `CapturingRouter` for inbound deliveries. `static_subs`
-/// are the client's union subscription set (assigned 1-based `sub_id`s in order),
-/// re-asserted by the supervisor on connect.
+/// are the client's union subscription set (each with its filter's derived
+/// identifier), re-asserted by the supervisor on connect.
 ///
 /// Returns only after the session reaches `Connected` (poll every 25ms, cap 5s).
 /// Connected ≠ subscriptions live — callers confirm liveness via
@@ -216,12 +216,7 @@ pub async fn spawn_client_with_config(
 
     let subs: Vec<IngressSubscription> = static_subs
         .into_iter()
-        .enumerate()
-        .map(|(i, (topic_filter, qos))| IngressSubscription {
-            topic_filter,
-            qos,
-            sub_id: (i + 1) as u32,
-        })
+        .map(|(topic_filter, qos)| IngressSubscription::new(topic_filter, qos))
         .collect();
 
     let svc = MqttService::new();
