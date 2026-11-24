@@ -312,6 +312,30 @@ mod tests {
         }
     }
 
+    /// On the hook path, a `MessageSubscribe` that passes `qos` is answered by
+    /// admission ahead of every family handler, on any address, with the
+    /// refusal that names the key; nothing is written.
+    #[tokio::test]
+    async fn hook_message_subscribe_refuses_qos_before_the_handler() {
+        use brenn_render::tools::messaging::MCP_MESSAGE_SUBSCRIBE_TOOL;
+        for (address, filter) in execute::tests::QOS_SUBSCRIBES {
+            let bridge = super::super::ActiveBridge::test_new_for_mqtt_subscribe().await;
+            let req = post_req(
+                MCP_MESSAGE_SUBSCRIBE_TOOL,
+                execute::tests::subscribe_with_qos(address),
+                "tu_subscribe_qos",
+            );
+            let out = continue_output(handle_brenn_tools(&bridge, &req).await);
+            assert_eq!(out["error"], "invalid_args", "{address}: {out}");
+            let detail = out["detail"].as_str().expect("a detail string");
+            assert!(
+                detail.contains(execute::tests::QOS_REFUSAL),
+                "{address}: {detail}"
+            );
+            execute::tests::assert_subscribe_left_nothing(&bridge, address, filter).await;
+        }
+    }
+
     #[tokio::test]
     async fn post_tool_use_for_a_non_brenn_tool_is_not_admitted() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge().await;

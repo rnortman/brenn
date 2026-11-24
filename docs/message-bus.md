@@ -1459,6 +1459,16 @@ the channel's identity by construction, since a declaration derives its uuid
 from its address; a `uuid_pins` entry that moves it is refused, because the
 address still belongs to the stored row the dormant subscription names.
 
+**An `mqtt:` filter is subscribed at its client's QoS.** The broker
+subscription behind an `mqtt:<client>:<filter>` channel is made at that
+client's `[[mqtt_client]].qos`, and at nothing else. Every subscriber of the
+address — a `subscribe` line, a component binding, a runtime
+`MessageSubscribe` — shares that one broker subscription, and none of them can
+choose or change its QoS: `MessageSubscribe` takes no `qos`. A message arrives
+at the lower of the QoS it was published at and the QoS the broker granted,
+which is at most the client's. Editing the client's `qos` restarts the client,
+and its first connect subscribes every filter it holds again at the new QoS.
+
 ### 2.7.1 The two ingress shapes
 
 A `webhook:` or `mqtt:` channel takes what its transport receives in one of two

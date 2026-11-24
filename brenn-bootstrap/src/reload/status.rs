@@ -240,10 +240,7 @@ mod tests {
             mqtt: super::super::mqtt::MqttDelta {
                 clients: vec![super::super::mqtt::MqttClientDelta {
                     client: "chef".to_string(),
-                    subscribe: vec![super::super::mqtt::FilterMove {
-                        topic_filter: "a/b".to_string(),
-                        qos: 1,
-                    }],
+                    subscribe: vec!["a/b".to_string()],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -277,6 +274,7 @@ mod tests {
                 changed: vec![std::sync::Arc::new(
                     brenn_lib::mqtt::test_support::test_client_config("rotated"),
                 )],
+                qos_moved: Default::default(),
             },
             api_keys: super::super::api_keys::ApiKeyDelta {
                 added: vec!["maps".to_string()],

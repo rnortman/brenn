@@ -291,11 +291,6 @@ async fn build_messaging_derives_mqtt_channel_entry() {
     assert_eq!(ingress[0].channel_address, address);
     assert_eq!(ingress[0].client_slug, "homeassistant");
     assert_eq!(ingress[0].topic, "home/+/state");
-    assert_eq!(
-        ingress[0].qos,
-        minimal_mqtt_client("homeassistant").qos,
-        "the fact carries the broker's own SUBSCRIBE qos"
-    );
 
     // Ingress channels alone bring the service up.
     let messenger = result
@@ -379,12 +374,12 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
         };
         brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
         conn.execute(
-                "INSERT INTO messaging_dynamic_subscriptions \
-                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-                 VALUES (?1, 'graf', '0', '5', 'silent', 'normal', 1, '2026-06-20T00:00:00Z')",
-                rusqlite::params![channel_uuid.as_bytes().to_vec()],
-            )
-            .expect("seed durable dynamic row");
+            "INSERT INTO messaging_dynamic_subscriptions \
+                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+                 VALUES (?1, 'graf', '0', '5', 'silent', 'normal', '2026-06-20T00:00:00Z')",
+            rusqlite::params![channel_uuid.as_bytes().to_vec()],
+        )
+        .expect("seed durable dynamic row");
     }
 
     // The dynamic row's app (`graf`) must carry a policy that authorizes
@@ -518,8 +513,8 @@ async fn build_messaging_keeps_a_dynamic_subscription_on_a_chat_channel() {
         brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&entry));
         conn.execute(
             "INSERT INTO messaging_dynamic_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-             VALUES (?1, ?2, '8', '0', 'silent', 'normal', NULL, '2026-06-20T00:00:00Z')",
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+             VALUES (?1, ?2, '8', '0', 'silent', 'normal', '2026-06-20T00:00:00Z')",
             rusqlite::params![record_uuid.as_bytes().to_vec(), peer],
         )
         .expect("seed the peer's cross-subscription");
@@ -649,8 +644,8 @@ async fn build_messaging_holds_a_dynamic_subscription_dormant_while_its_block_is
         let conn = db.lock().await;
         conn.execute(
             "INSERT INTO messaging_dynamic_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-             VALUES (?1, ?2, '2', '4', 'silent', 'normal', NULL, '2026-06-20T00:00:00Z')",
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+             VALUES (?1, ?2, '2', '4', 'silent', 'normal', '2026-06-20T00:00:00Z')",
             rusqlite::params![channel_uuid.as_bytes().to_vec(), app_slug],
         )
         .expect("seed the dynamic subscription");
@@ -769,8 +764,8 @@ async fn build_messaging_prunes_a_dynamic_subscription_when_the_channel_row_is_d
         let conn = db.lock().await;
         conn.execute(
             "INSERT INTO messaging_dynamic_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-             VALUES (?1, ?2, '2', '4', 'silent', 'normal', NULL, '2026-06-20T00:00:00Z')",
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+             VALUES (?1, ?2, '2', '4', 'silent', 'normal', '2026-06-20T00:00:00Z')",
             rusqlite::params![channel_uuid.as_bytes().to_vec(), app_slug],
         )
         .expect("seed the dynamic subscription");
@@ -941,12 +936,12 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
         };
         brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
         conn.execute(
-                "INSERT INTO messaging_dynamic_subscriptions \
-                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-                 VALUES (?1, 'graf', '0', '5', 'silent', 'normal', 1, '2026-06-20T00:00:00Z')",
-                rusqlite::params![channel_uuid.as_bytes().to_vec()],
-            )
-            .expect("seed durable dynamic row");
+            "INSERT INTO messaging_dynamic_subscriptions \
+                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+                 VALUES (?1, 'graf', '0', '5', 'silent', 'normal', '2026-06-20T00:00:00Z')",
+            rusqlite::params![channel_uuid.as_bytes().to_vec()],
+        )
+        .expect("seed durable dynamic row");
     }
 
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
@@ -4930,7 +4925,7 @@ fn ingress_identities(
     brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients)
 }
 
-/// An `[[app.mqtt_subscription]]` mints its channel, carrying the broker's qos.
+/// An `[[app.mqtt_subscription]]` mints its channel.
 #[test]
 fn an_app_subscription_mints_its_ingress_channel() {
     let config = ingress_document(
@@ -4942,7 +4937,6 @@ fn an_app_subscription_mints_its_ingress_channel() {
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].channel_address, "mqtt:ha:home/+/state");
     assert_eq!(channels[0].client_slug, "ha");
-    assert_eq!(channels[0].qos, 1, "qos from the broker");
 }
 
 /// A `[[wasm_consumer.subscription]]` naming an `mqtt:` address mints its
@@ -5453,8 +5447,8 @@ async fn rebuilt_mqtt_channel_holding_non_text(
         brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
         conn.execute(
             "INSERT INTO messaging_dynamic_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-             VALUES (?1, 'graf', '0', '4', 'silent', 'normal', 1, '2026-06-20T00:00:00Z')",
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+             VALUES (?1, 'graf', '0', '4', 'silent', 'normal', '2026-06-20T00:00:00Z')",
             rusqlite::params![channel_uuid.as_bytes().to_vec()],
         )
         .expect("seed durable dynamic row");

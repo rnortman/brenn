@@ -6474,7 +6474,6 @@ new router: Router { grants = []; subscribe_acls = []; io tick {} }
             retain_depth: retain,
             noise: NoiseLevel::Silent,
             wake_min: WakeMin::Normal,
-            qos: None,
             created_at: "2026-06-20T00:00:00Z".to_string(),
         }
     }

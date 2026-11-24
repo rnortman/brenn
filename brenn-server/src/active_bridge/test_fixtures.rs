@@ -972,16 +972,16 @@ impl ActiveBridge {
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         );
 
-        // MqttService with a registered ingress handle for `home`; the filter is
-        // subscribed at QoS 2 so the enrichment surfaces it. The handle's `client`
-        // cell is `None` (no live broker in a unit test) → health "disconnected".
+        // MqttService with a registered ingress handle for `home`, configured at
+        // QoS 2, holding the filter so the enrichment surfaces that QoS. The
+        // handle's `client` cell is `None` (no live broker in a unit test) →
+        // health "disconnected".
         let mqtt_service = brenn_mqtt::MqttService::new();
         let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
-        let config = Arc::new(crate::test_support::mqtt::test_client_config("home"));
-        let handle = brenn_mqtt::MqttClientHandle::new(config, vec![], stop_tx);
-        handle
-            .add_subscription("sensors/+/temp".to_string(), 2)
-            .await;
+        let mut config = crate::test_support::mqtt::test_client_config("home");
+        config.identity.qos = 2;
+        let handle = brenn_mqtt::MqttClientHandle::new(Arc::new(config), vec![], stop_tx);
+        handle.add_subscription("sensors/+/temp".to_string()).await;
         mqtt_service.add_client(handle);
 
         Self::inject_for_test_full(

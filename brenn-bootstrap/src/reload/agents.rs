@@ -401,7 +401,7 @@ mod tests {
                 directory: &brenn_lib::messaging::MessagingDirectory::with_entries(Vec::new()),
                 dynamic: &crate::reload::dynamic::DynamicSnapshot::default(),
                 mqtt_clients: &IndexMap::new(),
-                clients_stopping: &std::collections::BTreeSet::new(),
+                client_moves: &crate::reload::mqtt::MqttClientsDelta::default(),
             },
         )
     }

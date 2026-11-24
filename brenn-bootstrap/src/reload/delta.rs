@@ -78,16 +78,18 @@ pub(crate) struct LiveFacts<'a> {
     pub dynamic: &'a DynamicSnapshot,
     /// The **candidate's** declared MQTT clients — not the booted ones, which
     /// is where a dynamic `mqtt:` subscription's injection urgency comes from
-    /// (the row carries the qos and the address carries the filter, and neither
-    /// carries that). Reading the candidate's is what gives a carried-over row
+    /// (the address carries the filter, and the row does not carry that).
+    /// Reading the candidate's is what gives a carried-over row
     /// the urgency a fresh boot of the candidate would give it, and it is why a
     /// row can name a client this map does not hold.
     pub mqtt_clients: &'a IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
-    /// The slugs whose broker session this reload stops, from the client delta
-    /// the caller took off the live registry. A live fact by derivation: the
-    /// registry is this process's, not either plan's. The MQTT half reads it to
-    /// suppress filter moves on a client that is about to be disconnected.
-    pub clients_stopping: &'a BTreeSet<String>,
+    /// The client delta the caller took off the live registry. A live fact by
+    /// derivation: the registry is this process's, not either plan's. The MQTT
+    /// half reads its `removed` to suppress filter moves on a client that is
+    /// about to be disconnected, and its `qos_moved` to name every filter such
+    /// a client carries as re-subscribed: the client's restart subscribes each
+    /// of them again at the new `qos`.
+    pub client_moves: &'a MqttClientsDelta,
 }
 
 /// A channel entry that is in both plans under one uuid but is not the same
@@ -408,7 +410,7 @@ pub(crate) fn plan_delta(
     // the two plans' ingress lists and the two sides' dynamic subscriptions for
     // the broker set, which are three grains of the same move. A client the
     // candidate stops contributes no filter move at all, because its filters
-    // leave with its session — which is why the stopping set is a live fact
+    // leave with its session — which is why the client delta is a live fact
     // this pass reads rather than a peer half it assembles.
     let leaving: Vec<&ChannelEntry> = delta.leaving().map(Arc::as_ref).collect();
     let joining: Vec<&ChannelEntry> = delta.joining().map(Arc::as_ref).collect();
@@ -425,7 +427,7 @@ pub(crate) fn plan_delta(
         },
         &leaving,
         &joining,
-        live.clients_stopping,
+        live.client_moves,
     );
     delta
 }
@@ -501,14 +503,14 @@ fn dynamic_ingress_sides(
             &before,
             live.directory,
             live.mqtt_clients,
-            live.clients_stopping,
+            &live.client_moves.removed,
             &baseline_static,
         ),
         dynamic_ingress(
             &after,
             live.directory,
             live.mqtt_clients,
-            live.clients_stopping,
+            &live.client_moves.removed,
             &candidate_static,
         ),
     )
@@ -1085,7 +1087,12 @@ mod tests {
     static NO_CLIENTS: std::sync::LazyLock<
         IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
     > = std::sync::LazyLock::new(IndexMap::new);
-    static NO_CLIENTS_STOPPING: BTreeSet<String> = BTreeSet::new();
+    static NO_CLIENT_MOVES: MqttClientsDelta = MqttClientsDelta {
+        added: Vec::new(),
+        removed: BTreeSet::new(),
+        changed: Vec::new(),
+        qos_moved: BTreeSet::new(),
+    };
 
     /// The surface platform every plan here is compared under: the default
     /// `[surface_description]` prefix and no surface error channel.
@@ -1102,7 +1109,7 @@ mod tests {
             directory: &EMPTY_DIRECTORY,
             dynamic: &NO_DYNAMIC,
             mqtt_clients: &NO_CLIENTS,
-            clients_stopping: &NO_CLIENTS_STOPPING,
+            client_moves: &NO_CLIENT_MOVES,
         }
     }
 
@@ -1791,7 +1798,6 @@ mod tests {
             channel_address: ADDRESS.to_string(),
             client_slug: "ha".to_string(),
             topic: "home/state".to_string(),
-            qos: 1,
             urgency: brenn_lib::messaging::Urgency::Normal,
         }];
         let empty = HashMap::new();
@@ -1836,9 +1842,8 @@ mod tests {
     /// behind. A document that starts declaring a channel a dynamic subscribe
     /// already minted would reach `add_channel`'s address assert in commit,
     /// which is past the point where anything may decline — and on the `mqtt:`
-    /// side it is also what keeps `add_subscription`'s qos assert and
-    /// `add_route`'s idempotence assert unreachable from the walk, since
-    /// `mqtt_subscribe` mints exactly these entries.
+    /// side it is also what keeps `add_route`'s idempotence assert unreachable
+    /// from the walk, since `mqtt_subscribe` mints exactly these entries.
     #[test]
     fn minting_an_address_the_live_directory_already_holds_is_refused() {
         for address in ["brenn:work", "mqtt:ha:home/state"] {
@@ -1851,7 +1856,6 @@ mod tests {
                         channel_address: address.to_string(),
                         client_slug: "ha".to_string(),
                         topic: "home/state".to_string(),
-                        qos: 1,
                         urgency: brenn_lib::messaging::Urgency::Normal,
                     }]
                 }
@@ -2696,8 +2700,7 @@ mod tests {
     // this reload stands behind.
     // -----------------------------------------------------------------------
 
-    /// A durable `mqtt:` row as a dynamic subscribe leaves it, with the
-    /// SUBSCRIBE QoS the projection re-asserts the filter at.
+    /// A durable `mqtt:` row as a dynamic subscribe leaves it.
     fn mqtt_row(uuid: Uuid, slug: &str) -> brenn_lib::messaging::DynamicSubscriptionRow {
         brenn_lib::messaging::DynamicSubscriptionRow {
             channel_uuid: uuid,
@@ -2706,7 +2709,6 @@ mod tests {
             retain_depth: Depth::Bounded(1),
             noise: NoiseLevel::Metered,
             wake_min: brenn_lib::messaging::WakeMin::Never,
-            qos: Some(1),
             created_at: "2026-09-07T00:00:00Z".to_string(),
         }
     }
@@ -2783,7 +2785,7 @@ mod tests {
             directory: &directory,
             dynamic: &dynamic,
             mqtt_clients: &clients,
-            clients_stopping: &NO_CLIENTS_STOPPING,
+            client_moves: &NO_CLIENT_MOVES,
         };
         // Two plans that declare nothing: the filter under test is purely
         // dynamic, so it is in neither side's static ingress list.

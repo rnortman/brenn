@@ -27,16 +27,17 @@ use brenn_mqtt::state::ConnectorHealthLabel;
 use brenn_mqtt::test_support::{
     AUTH_CREDENTIALS, BrokerHarness, ROTATED_CREDENTIALS, await_puback, certs, connection_epoch,
     direct_publisher_acked, direct_publisher_acked_as, log_records_disconnect,
-    log_records_publish_to_subscriber, log_records_unsubscribe, session_client_id,
+    log_records_publish_to_subscriber, log_records_subscribe_at, log_records_unsubscribe,
+    session_client_id,
 };
 use rumqttc::mqttbytes::QoS;
 
 use super::driver::TriggerSource;
 use super::driver::tests::{
     BootFixture, Booted, READER, Tree, bodies_on, boot_with, conversation_of, cursor_of, document,
-    document_push_subscribing_acl, document_subscribing_acl, document_with_agent, dynamic_rows,
-    egress_entry_noise, insert_dynamic_mqtt_row, install_package, live_entry_of_reader, seat_user,
-    staged_module, staged_module_opt,
+    document_push_subscribing_acl, document_subscribing_acl, document_with_agent,
+    dynamic_reader_agent, dynamic_rows, egress_entry_noise, insert_dynamic_row, install_package,
+    live_entry_of_reader, runtime_subscribe, seat_user, staged_module, staged_module_opt,
 };
 use brenn_messaging::config_reload::Outcome;
 
@@ -50,11 +51,16 @@ const TOPIC_PREFIX: &str = "brenn/itest/reload";
 /// `url` or `qos` would restart the client's supervisor mid-case — a change
 /// these tests are not about, in the middle of the applied path they are.
 fn client_block(port: u16, ca_file: &std::path::Path) -> String {
+    client_block_at(port, ca_file, 1)
+}
+
+/// [`client_block`] at `qos`, for the cases about a `qos` edit.
+fn client_block_at(port: u16, ca_file: &std::path::Path, qos: u8) -> String {
     format!(
         r#"mqtt_client ha {{
     url = "mqtts://127.0.0.1:{port}";
     ca_file = "{ca}";
-    qos = 1;
+    qos = {qos};
 }}
 "#,
         ca = ca_file.display(),
@@ -989,9 +995,7 @@ async fn boot_over_a_dynamic_row(
         },
     )
     .await;
-    // QoS 1, the `qos` the document's client declares and the one a
-    // `MessageSubscribe` through it would have stored.
-    insert_dynamic_mqtt_row(&first, &address, false, 1).await;
+    insert_dynamic_row(&first, &address, false).await;
     drop(first);
 
     let tree = Tree::holding(document);
@@ -1799,19 +1803,10 @@ fn document_dynamic_under(port: u16, ca_file: &std::path::Path, wide: &str) -> S
     let address = format!("mqtt:{CLIENT}:{wide}");
     document_with_agent(
         &client_block(port, ca_file),
-        &format!(
-            r#"
-agent Reader() {{
-    working_dir = ".";
-    grants = [subscribe, publish, dynamic_subscribe];
-    send_budget = 1000000;
-    acl subscribe [exact reload_outcomes, prefix "brenn:surface.", prefix "ephemeral:surface.", topic_filter "{address}"];
-    acl publish [exact reload_requests, exact work];
-    subscribe "{address}" {{ push_depth = 0; retain_depth = 4; }}
-}}
-
-new some-reader: Reader();
-"#
+        &dynamic_reader_agent(
+            &address,
+            &format!("    subscribe \"{address}\" {{ push_depth = 0; retain_depth = 4; }}\n"),
+            &[READER],
         ),
     )
 }
@@ -1868,7 +1863,7 @@ async fn a_new_narrow_subscription_receives_every_retained_message_once() {
 
     let tree = Tree::holding(&document_dynamic_under(harness.port, &ca_file, &wide));
     let booted = boot_live(&tree, None).await;
-    let (service, router) = booted.mqtt.clone();
+    let (service, _) = booted.mqtt.clone();
     rows_until(
         &booted,
         &wide_address,
@@ -1877,21 +1872,7 @@ async fn a_new_narrow_subscription_receives_every_retained_message_once() {
     )
     .await;
 
-    let status = brenn_server::test_support::mqtt::subscribe_dynamic(
-        &booted.messenger,
-        &service,
-        &router,
-        READER,
-        &narrow_address,
-        brenn_messaging::subscribe::DynamicSubscribeParams {
-            push_depth: brenn_lib::messaging::config::Depth::Bounded(0),
-            retain_depth: brenn_lib::messaging::config::Depth::Bounded(4),
-            noise: None,
-            wake_min: None,
-            qos: None,
-        },
-    )
-    .await;
+    let status = runtime_subscribe(&booted, READER, &narrow_address).await;
     let returned = std::time::Instant::now();
     let rows_at_return = bodies_on(&booted.messenger, &narrow_address).await.len();
     let (label, error) = service.ingress_health(CLIENT).await;
@@ -2070,16 +2051,7 @@ async fn a_resumed_sessions_backlog_reaches_the_channel_it_was_queued_for() {
 /// The document of [`a_reloads_qos_move_sends_no_unsubscribe`]: the consumer
 /// bound to `topic`, on a client at `qos`.
 fn bound_at_qos(port: u16, ca_file: &std::path::Path, topic: &str, qos: u8) -> String {
-    let block = format!(
-        r#"mqtt_client ha {{
-    url = "mqtts://127.0.0.1:{port}";
-    ca_file = "{ca}";
-    qos = {qos};
-}}
-"#,
-        ca = ca_file.display(),
-    );
-    document_over_a_declared_client(&block, &[topic])
+    document_over_a_declared_client(&client_block_at(port, ca_file, qos), &[topic])
 }
 
 /// A reload that moves a held filter's QoS sends the broker a SUBSCRIBE at the
@@ -2114,6 +2086,12 @@ async fn a_reloads_qos_move_sends_no_unsubscribe() {
         &format!("the broker never granted {topic}"),
     )
     .await;
+    let session_id = session_client_id(CLIENT);
+    assert!(
+        log_records_subscribe_at(&harness.log(), &session_id, &topic, 0),
+        "boot subscribed {topic} at the client's qos 0: {}",
+        harness.log(),
+    );
 
     let before_reload = harness.log_len();
     tree.write(&bound_at_qos(harness.port, &ca_file, &topic, 1));
@@ -2140,6 +2118,16 @@ async fn a_reloads_qos_move_sends_no_unsubscribe() {
     )
     .await;
     assert_eq!(service.ingress_filter_qos(CLIENT, &topic).await, Some(1));
+    harness
+        .wait_for_log(
+            before_reload,
+            BROKER_WAIT_SECS,
+            &format!(
+                "the broker never recorded a SUBSCRIBE for {topic} at qos 1 from {session_id}"
+            ),
+            |log| log_records_subscribe_at(log, &session_id, &topic, 1),
+        )
+        .await;
 
     let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
     publisher
@@ -2147,7 +2135,6 @@ async fn a_reloads_qos_move_sends_no_unsubscribe() {
         .await
         .expect("the broker took the publish");
     await_puback(&mut acks, "the moved topic's publish").await;
-    let session_id = session_client_id(CLIENT);
     let window = harness
         .wait_for_log(
             before_reload,
@@ -2166,6 +2153,162 @@ async fn a_reloads_qos_move_sends_no_unsubscribe() {
         topics_of(&bodies),
         vec![topic.clone()],
         "the channel holds the message once: {bodies:?}",
+    );
+    assert_eq!(
+        qos_of(&bodies[0]),
+        1,
+        "delivered at the new qos: {bodies:?}"
+    );
+
+    booted.stop_mqtt();
+}
+
+/// The QoS the broker delivered an ingress envelope's message at.
+fn qos_of(body: &str) -> u64 {
+    let envelope: serde_json::Value =
+        serde_json::from_str(body).expect("the ingress envelope is JSON");
+    envelope["qos"]
+        .as_u64()
+        .expect("the envelope names its delivered qos")
+}
+
+/// The broker declaration at `qos` with two reader agents, each granted what a
+/// runtime `mqtt:` subscribe needs — `dynamic_subscribe` and a `topic_filter`
+/// clause covering `covered` — and no binding or static subscription on any
+/// `mqtt:` channel.
+fn document_dynamic_only(
+    port: u16,
+    ca_file: &std::path::Path,
+    covered: &str,
+    qos: u8,
+    second: &str,
+) -> String {
+    document_with_agent(
+        &client_block_at(port, ca_file, qos),
+        &dynamic_reader_agent(covered, "", &[READER, second]),
+    )
+}
+
+/// A reload that edits the client's `qos` moves a filter held only by a
+/// runtime subscription, at the broker: a SUBSCRIBE at the new QoS and no
+/// UNSUBSCRIBE, and a message published at QoS 1 is delivered at QoS 0 before
+/// and at QoS 1 after. A second app subscribing the same address afterwards
+/// sends the filter at the new QoS too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reloads_qos_move_resubscribes_a_dynamic_only_filter() {
+    broker_gate!();
+
+    const SECOND: &str = "second-reader";
+    let topic = format!("{TOPIC_PREFIX}/qos-dyn");
+    let address = format!("mqtt:{CLIENT}:{topic}");
+    let session_id = session_client_id(CLIENT);
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let components = tempfile::tempdir().expect("a components root");
+    let at = |qos| document_dynamic_only(harness.port, &ca_file, &address, qos, SECOND);
+
+    let tree = Tree::holding(&at(0));
+    let mut booted = boot_connected_on(&tree, components.path()).await;
+    let (service, _) = booted.mqtt.clone();
+    let status = runtime_subscribe(&booted, READER, &address).await;
+    assert_eq!(
+        status, "subscribed",
+        "the session was live for the runtime subscribe"
+    );
+    brenn_mqtt::test_support::wait_for_filter_acked(
+        &service,
+        CLIENT,
+        &topic,
+        BROKER_WAIT_SECS,
+        &format!("the broker never granted {topic}"),
+    )
+    .await;
+    assert!(
+        log_records_subscribe_at(&harness.log(), &session_id, &topic, 0),
+        "the runtime subscribe sent {topic} at the client's qos 0: {}",
+        harness.log(),
+    );
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    publisher
+        .publish(topic.clone(), QoS::AtLeastOnce, false, b"before".to_vec())
+        .await
+        .expect("the broker took the publish");
+    await_puback(&mut acks, "the publish before the reload").await;
+    let before = rows_until(&booted, &address, 1, "the message before the reload").await;
+    assert_eq!(
+        qos_of(&before[0]),
+        0,
+        "delivered at the old qos: {before:?}"
+    );
+
+    let before_reload = harness.log_len();
+    tree.write(&at(1));
+    booted.driver.reload(TriggerSource::Signal).await;
+
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_changed, vec![CLIENT.to_string()]);
+    assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+    assert!(
+        status.delta.mqtt_unsubscribed.is_empty(),
+        "a qos move is not a withdrawal: {:?}",
+        status.delta.mqtt_unsubscribed,
+    );
+    assert_no_failed_filters(&status);
+
+    brenn_mqtt::test_support::wait_for_filter_acked(
+        &service,
+        CLIENT,
+        &topic,
+        BROKER_WAIT_SECS,
+        &format!("the successor's {topic} was never granted"),
+    )
+    .await;
+    let window = harness
+        .wait_for_log(
+            before_reload,
+            BROKER_WAIT_SECS,
+            &format!(
+                "the broker never recorded a SUBSCRIBE for {topic} at qos 1 from {session_id}"
+            ),
+            |log| log_records_subscribe_at(log, &session_id, &topic, 1),
+        )
+        .await;
+    assert!(
+        !log_records_unsubscribe(&window, &session_id, &topic),
+        "the reload's qos move sent an UNSUBSCRIBE for {topic}: {window}",
+    );
+
+    publisher
+        .publish(topic.clone(), QoS::AtLeastOnce, false, b"after".to_vec())
+        .await
+        .expect("the broker took the publish");
+    await_puback(&mut acks, "the publish after the reload").await;
+    note_if_filter_lost(&service, CLIENT, &topic).await;
+    let after = rows_until(&booted, &address, 2, "the message after the reload").await;
+    assert_eq!(qos_of(&after[1]), 1, "delivered at the new qos: {after:?}");
+
+    let before_second = harness.log_len();
+    let status = runtime_subscribe(&booted, SECOND, &address).await;
+    assert_eq!(
+        status, "subscribed",
+        "the successor was live for the second app"
+    );
+    let window = harness
+        .wait_for_log(
+            before_second,
+            BROKER_WAIT_SECS,
+            &format!("the second app's subscribe sent no SUBSCRIBE for {topic} at qos 1"),
+            |log| log_records_subscribe_at(log, &session_id, &topic, 1),
+        )
+        .await;
+    assert!(
+        !log_records_subscribe_at(&window, &session_id, &topic, 0),
+        "a SUBSCRIBE after the qos edit went out at qos 0: {window}",
     );
 
     booted.stop_mqtt();

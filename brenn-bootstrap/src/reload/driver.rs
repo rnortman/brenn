@@ -709,7 +709,7 @@ impl ReloadDriver {
                 directory: self.env.messenger.directory(),
                 dynamic,
                 mqtt_clients: &client_identities,
-                clients_stopping: &mqtt_clients.removed,
+                client_moves: &mqtt_clients,
             },
             surface_platform,
         );
@@ -2406,9 +2406,14 @@ channel scratch at "ephemeral:scratch" {{
     /// read. What is spawned is a stand-in task that watches the same stop
     /// signal and exits when it is set, so a reload that stops or restarts one
     /// of these clients has a supervisor to join — which is what commit does.
+    ///
+    /// The filters and routes are boot's own [`crate::mqtt::boot_ingress`], so
+    /// a durable dynamic `mqtt:` row the boot merge kept is held and routed
+    /// here as boot holds and routes it.
     async fn mqtt_runtime(
         plan: &MessagingPlan,
         clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientConfig>,
+        dynamic_ingress: &[brenn_messaging_boot::DynamicMqttIngress],
         db: &brenn_db::Db,
     ) -> (
         Arc<brenn_mqtt::MqttService>,
@@ -2416,12 +2421,14 @@ channel scratch at "ephemeral:scratch" {{
     ) {
         use brenn_server::mqtt_router::IngressRoute;
 
+        let ingress =
+            crate::mqtt::boot_ingress(&plan.mqtt_ingress_channels, clients, dynamic_ingress);
         let service = brenn_mqtt::MqttService::new();
         for (slug, config) in clients {
             let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
             let handle = brenn_mqtt::MqttClientHandle::new(
                 Arc::new(config.clone()),
-                brenn_mqtt::union_subscriptions(slug, &plan.mqtt_ingress_channels),
+                brenn_mqtt::union_subscriptions(slug, &ingress),
                 stop_tx,
             );
             service.add_client(handle.clone());
@@ -2438,10 +2445,7 @@ channel scratch at "ephemeral:scratch" {{
         let router = Arc::new(brenn_server::mqtt_router::MqttEventRouterImpl::new());
         router.set_state(
             brenn_server::test_support::state::test_state(db),
-            plan.mqtt_ingress_channels
-                .iter()
-                .map(IngressRoute::from)
-                .collect(),
+            ingress.iter().map(IngressRoute::from).collect(),
         );
         (service, router)
     }
@@ -2464,30 +2468,11 @@ channel scratch at "ephemeral:scratch" {{
         Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
     ) {
         let clients = brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients);
-        // The supervisor's SUBSCRIBE union and the router's route table are
-        // built from the static ingress set alone, so a durable dynamic `mqtt:`
-        // row the boot merge kept is appended here, with `urgency` filled from
-        // the client the row was created against. Without it a dormant row
-        // revived by a reload would be the first filter this process ever
-        // asserted for its channel, and the case about revoking one would have
-        // nothing to revoke.
-        let mut ingress = plan.mqtt_ingress_channels.clone();
-        for kept in dynamic_ingress {
-            let client = clients.get(&kept.client_slug).unwrap_or_else(|| {
-                panic!(
-                    "the fixture document declares no client {:?} for the dynamic row on {:?}",
-                    kept.client_slug, kept.channel_address,
-                )
-            });
-            ingress.push(brenn_lib::mqtt::config::ResolvedMqttIngressChannel {
-                channel_address: kept.channel_address.clone(),
-                channel_uuid: kept.channel_uuid,
-                client_slug: kept.client_slug.clone(),
-                topic: kept.topic.clone(),
-                qos: kept.qos,
-                urgency: client.identity.urgency,
-            });
-        }
+        // Without the kept dynamic rows a dormant row revived by a reload would
+        // be the first filter this process ever asserted for its channel, and
+        // the case about revoking one would have nothing to revoke.
+        let ingress =
+            crate::mqtt::boot_ingress(&plan.mqtt_ingress_channels, &clients, dynamic_ingress);
         let result = crate::mqtt::start_mqtt(&ingress, &clients).await;
         // The state the router delivers through must carry the messenger this
         // process publishes with: an inbound packet reaches the bus through it,
@@ -2744,6 +2729,7 @@ channel scratch at "ephemeral:scratch" {{
             mqtt_runtime(
                 &plan,
                 &brenn_lib::mqtt::config::resolve_clients(&document.config.mqtt_clients),
+                &result.dynamic_mqtt_ingress,
                 &db,
             )
             .await
@@ -3721,6 +3707,57 @@ new sifter: Demo {{
         bindings: &[(&str, &str)],
         qos: u8,
     ) -> String {
+        document(&clients_and_bindings(clients, bindings, qos))
+    }
+
+    /// [`document_with_clients_at_qos`] for the one client `ha`, with the
+    /// reader agent declared once per slug in `readers`, each granted
+    /// `dynamic_subscribe` and a subscribe ACL whose `topic_filter` covers
+    /// `covered` — what a runtime `mqtt:` subscribe by each of them needs, and
+    /// what the boot merge needs to keep each one's durable row.
+    pub(crate) fn document_with_dynamic_readers(
+        bindings: &[&str],
+        qos: u8,
+        readers: &[&str],
+        covered: &str,
+    ) -> String {
+        let bindings: Vec<(&str, &str)> = bindings.iter().map(|topic| ("ha", *topic)).collect();
+        document_with_agent(
+            &clients_and_bindings(&[("ha", 8883, None)], &bindings, qos),
+            &dynamic_reader_agent(covered, "", readers),
+        )
+    }
+
+    /// The `Reader` agent granted what a runtime `mqtt:` subscribe needs —
+    /// `dynamic_subscribe` beside `subscribe`, and a `topic_filter` ACL clause
+    /// covering `covered` — with `statics` (static `subscribe` lines, or
+    /// nothing) in its body, and one instance per slug in `readers`.
+    pub(crate) fn dynamic_reader_agent(covered: &str, statics: &str, readers: &[&str]) -> String {
+        let instances: String = readers
+            .iter()
+            .map(|slug| format!("new {slug}: Reader();\n"))
+            .collect();
+        format!(
+            r#"
+agent Reader() {{
+    working_dir = ".";
+    grants = [subscribe, publish, dynamic_subscribe];
+    send_budget = 1000000;
+    acl subscribe [exact reload_outcomes, prefix "brenn:surface.", prefix "ephemeral:surface.", topic_filter "{covered}"];
+    acl publish [exact reload_requests, exact work];
+{statics}}}
+
+{instances}"#
+        )
+    }
+
+    /// The `mqtt_client` blocks and the bound consumer of
+    /// [`document_with_clients_at_qos`], without the agent.
+    fn clients_and_bindings(
+        clients: &[(&str, u16, Option<&std::path::Path>)],
+        bindings: &[(&str, &str)],
+        qos: u8,
+    ) -> String {
         let blocks: String = clients
             .iter()
             .map(|(slug, port, password)| {
@@ -3746,7 +3783,7 @@ new sifter: Demo {{
                 )
             })
             .collect();
-        document(&format!(
+        format!(
             r#"{blocks}channel sink at "brenn:sink" {{
     push_depth = 1;
     retain_depth = 4;
@@ -3763,7 +3800,7 @@ new sifter: Demo {{
 {wiring}    out digest -> sink;
 }}
 "#
-        ))
+        )
     }
 
     /// A `[[mqtt_client]]` the candidate declares and the process does not hold
@@ -3959,17 +3996,105 @@ new sifter: Demo {{
         booted.stop_mqtt();
     }
 
-    /// A reload that moves a held filter's qos re-subscribes it: the entry
-    /// keeps its Subscription Identifier and its route, and the status
-    /// body names it as subscribed and not as unsubscribed. The client's `qos`
-    /// is part of its identity, so the same reload restarts the client and the
-    /// successor inherits the entry before its qos is set.
+    /// A pull-only runtime subscribe's parameters.
+    fn pull_only_params() -> brenn_messaging::subscribe::DynamicSubscribeParams {
+        brenn_messaging::subscribe::DynamicSubscribeParams {
+            push_depth: brenn_lib::messaging::config::Depth::Bounded(0),
+            retain_depth: brenn_lib::messaging::config::Depth::Bounded(4),
+            noise: None,
+            wake_min: None,
+        }
+    }
+
+    /// Run `app`'s runtime `MessageSubscribe` on `address` against `booted`'s
+    /// messenger, MQTT service and router, and return the status word.
+    pub(crate) async fn runtime_subscribe(
+        booted: &Booted,
+        app: &str,
+        address: &str,
+    ) -> &'static str {
+        let (service, router) = booted.mqtt.clone();
+        brenn_server::test_support::mqtt::subscribe_dynamic(
+            &booted.messenger,
+            &service,
+            &router,
+            app,
+            address,
+            pull_only_params(),
+        )
+        .await
+    }
+
+    /// The directory uuid of `address`.
+    fn uuid_of(booted: &Booted, address: &str) -> uuid::Uuid {
+        booted
+            .messenger
+            .directory()
+            .resolve(address)
+            .unwrap_or_else(|| panic!("{address} is not in the directory"))
+            .uuid
+    }
+
+    /// Assert that client `ha`'s registered session holds exactly `topics`,
+    /// each once and under the identifier derived from it, that the session
+    /// is the one configured at `qos`, and that the route table holds exactly
+    /// one route per topic's `mqtt:ha:` channel. `when` names the moment in
+    /// the failure message.
+    ///
+    /// `ingress_filter_qos` answers the holding session's configured `qos`;
+    /// it says which session holds the filter, not what any SUBSCRIBE carried,
+    /// which the real-broker cases show.
+    async fn assert_ha_holds_once(booted: &Booted, topics: &[&str], qos: u8, when: &str) {
+        let (service, router) = booted.mqtt.clone();
+        {
+            let handle = service.get_client("ha").expect("a declared client");
+            assert_eq!(handle.config.identity.qos, qos, "{when}: the session's qos");
+            let set = handle.subscriptions.read().await;
+            let mut held: Vec<String> = set.to_vec().into_iter().map(|s| s.topic_filter).collect();
+            held.sort();
+            let mut wanted: Vec<String> = topics.iter().map(|t| t.to_string()).collect();
+            wanted.sort();
+            assert_eq!(held, wanted, "{when}: the filters held, each once");
+            for topic in topics {
+                assert_eq!(
+                    set.get(topic).expect("the filter is held").sub_id,
+                    subscription_identifier(topic),
+                    "{when}: {topic} is held under the identifier derived from it",
+                );
+            }
+        }
+        for topic in topics {
+            assert_eq!(
+                service.ingress_filter_qos("ha", topic).await,
+                Some(qos),
+                "{when}: {topic} is held by the session at qos {qos}",
+            );
+        }
+        let mut routes = router.route_uuids();
+        routes.sort();
+        let mut wanted: Vec<uuid::Uuid> = topics
+            .iter()
+            .map(|topic| uuid_of(booted, &format!("mqtt:ha:{topic}")))
+            .collect();
+        wanted.sort();
+        assert_eq!(routes, wanted, "{when}: one route per channel");
+    }
+
+    /// A reload that edits the client's `qos` re-subscribes every filter it
+    /// holds, a static binding's and one held only by a runtime subscription
+    /// alike: the edit restarts the client, the successor inherits each entry
+    /// with its Subscription Identifier and holds it at the new `qos`, the
+    /// routes stay, and the status body names both filters as subscribed and
+    /// neither as unsubscribed. No connected client here: what the
+    /// successor's connect sends is shown against the real broker.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_qos_move_keeps_the_filters_identifier_and_route() {
         const TOPIC: &str = "home/state";
+        const DYNAMIC: &str = "home/dynamic";
         let address = format!("mqtt:ha:{TOPIC}");
-        let clients = [("ha", 8883u16, None)];
-        let tree = Tree::holding(&document_with_clients_at_qos(&clients, &[("ha", TOPIC)], 0));
+        let dynamic_address = format!("mqtt:ha:{DYNAMIC}");
+        let at = |qos| document_with_dynamic_readers(&[TOPIC], qos, &[READER], "mqtt:ha:home/#");
+        let tree = Tree::holding(&at(0));
         let components = tempfile::tempdir().expect("a components root");
         install_package(components.path(), &staged_module(&tree));
         let mut booted = boot_with(
@@ -3980,59 +4105,147 @@ new sifter: Demo {{
             },
         )
         .await;
-        let (service, router) = booted.mqtt.clone();
-        assert_eq!(service.ingress_filter_qos("ha", TOPIC).await, Some(0));
-        let sub_id_before = service
-            .get_client("ha")
-            .expect("a declared client")
-            .subscriptions
-            .read()
-            .await
-            .get(TOPIC)
-            .expect("the bound filter is held")
-            .sub_id;
-        let routes_before = router.route_uuids();
+        assert_eq!(
+            runtime_subscribe(&booted, READER, &dynamic_address).await,
+            "subscribed_pending_reconnect",
+        );
+        assert_ha_holds_once(&booted, &[TOPIC, DYNAMIC], 0, "before the reload").await;
+        let routes_before = {
+            let mut routes = booted.mqtt.1.route_uuids();
+            routes.sort();
+            routes
+        };
 
-        tree.write(&document_with_clients_at_qos(&clients, &[("ha", TOPIC)], 1));
+        tree.write(&at(1));
         install_package(components.path(), &staged_module(&tree));
         booted.driver.reload(TriggerSource::Signal).await;
 
         let status = booted.last_status().await;
         assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
         assert_eq!(status.delta.mqtt_clients_changed, vec!["ha".to_string()]);
-        assert_eq!(status.delta.mqtt_subscribed, vec![address.clone()]);
+        let mut subscribed = status.delta.mqtt_subscribed.clone();
+        subscribed.sort();
+        let mut both = vec![address.clone(), dynamic_address.clone()];
+        both.sort();
+        assert_eq!(
+            subscribed, both,
+            "both filters are re-subscribed, whoever holds them"
+        );
         assert!(
             status.delta.mqtt_unsubscribed.is_empty(),
             "a qos move is not a withdrawal: {:?}",
             status.delta.mqtt_unsubscribed,
         );
-        assert_eq!(
-            service.ingress_filter_qos("ha", TOPIC).await,
-            Some(1),
-            "the successor holds the filter at the new qos",
-        );
-        {
-            let handle = service.get_client("ha").expect("the slug is never absent");
-            let set = handle.subscriptions.read().await;
-            assert_eq!(set.len(), 1, "{:?}", set.to_vec());
-            let sub_id_after = set.get(TOPIC).expect("the filter is held").sub_id;
+        assert_ha_holds_once(&booted, &[TOPIC, DYNAMIC], 1, "after the qos edit").await;
+        let mut routes_after = booted.mqtt.1.route_uuids();
+        routes_after.sort();
+        assert_eq!(routes_after, routes_before, "the routes stay");
+        booted.stop_mqtt();
+    }
+
+    /// Boot, reload and a runtime subscribe agree on which filters a client
+    /// holds and which session holds them, whatever order the rows load in.
+    ///
+    /// One filter has a static binding and two durable dynamic rows from two
+    /// apps; another has only the two rows. The rows are written by a first
+    /// process and read back by a second one booted over the same store. In
+    /// the second process each filter is held once, by the session configured
+    /// at the client's current `qos`, under the identifier derived from it,
+    /// with one route per channel — at boot, after a reload that leaves the
+    /// client alone, after one that edits its `qos`, and after a third app
+    /// subscribes both at runtime. No connected client here: what each
+    /// SUBSCRIBE carries is shown against the real broker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_reload_and_runtime_agree_on_who_holds_a_filter() {
+        const STATIC: &str = "home/state";
+        const DYNAMIC: &str = "home/dynamic";
+        const SECOND: &str = "second-reader";
+        const THIRD: &str = "third-reader";
+        let static_address = format!("mqtt:ha:{STATIC}");
+        let dynamic_address = format!("mqtt:ha:{DYNAMIC}");
+        let readers = [READER, SECOND, THIRD];
+        let at = |qos| document_with_dynamic_readers(&[STATIC], qos, &readers, "mqtt:ha:home/#");
+        let db = brenn_server::test_support::init_db_memory();
+        let components = tempfile::tempdir().expect("a components root");
+
+        let tree = Tree::holding(&at(0));
+        install_package(components.path(), &staged_module(&tree));
+        let first = boot_with(
+            &tree,
+            BootFixture {
+                db: Some(db.clone()),
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        for app in [SECOND, READER] {
+            for address in [&static_address, &dynamic_address] {
+                assert_eq!(
+                    runtime_subscribe(&first, app, address).await,
+                    "subscribed_pending_reconnect",
+                    "{app} on {address}",
+                );
+            }
+        }
+        first.stop_mqtt();
+        drop(first);
+
+        let mut booted = boot_with(
+            &tree,
+            BootFixture {
+                db: Some(db),
+                components_roots: vec![components.path().to_path_buf()],
+                ..BootFixture::default()
+            },
+        )
+        .await;
+        assert_eq!(dynamic_rows(&booted).await.len(), 4);
+        assert_ha_holds_once(&booted, &[STATIC, DYNAMIC], 0, "at boot").await;
+
+        // A reload that moves nothing on the client: one more channel.
+        tree.write(&at(0).replace(
+            "channel work at",
+            "channel spare at \"brenn:spare\" {\n    push_depth = 1;\n    retain_depth = 1;\n    standing_retain_depth = 1;\n}\n\nchannel work at",
+        ));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert!(status.delta.mqtt_clients_changed.is_empty());
+        assert!(status.delta.mqtt_subscribed.is_empty());
+        assert!(status.delta.mqtt_unsubscribed.is_empty());
+        assert_ha_holds_once(&booted, &[STATIC, DYNAMIC], 0, "after an unrelated reload").await;
+
+        tree.write(&at(1));
+        install_package(components.path(), &staged_module(&tree));
+        booted.driver.reload(TriggerSource::Signal).await;
+        let status = booted.last_status().await;
+        assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+        assert_eq!(status.delta.mqtt_clients_changed, vec!["ha".to_string()]);
+        let mut subscribed = status.delta.mqtt_subscribed.clone();
+        subscribed.sort();
+        let mut both = vec![static_address.clone(), dynamic_address.clone()];
+        both.sort();
+        assert_eq!(subscribed, both);
+        assert!(status.delta.mqtt_unsubscribed.is_empty());
+        assert_ha_holds_once(&booted, &[STATIC, DYNAMIC], 1, "after the qos edit").await;
+
+        for address in [&static_address, &dynamic_address] {
             assert_eq!(
-                (sub_id_after, sub_id_before),
-                (
-                    subscription_identifier(TOPIC),
-                    subscription_identifier(TOPIC)
-                ),
-                "the filter is held under the identifier derived from it, before and after",
+                runtime_subscribe(&booted, THIRD, address).await,
+                "subscribed_pending_reconnect",
+                "{THIRD} on {address}",
             );
         }
-        let uuid = booted
-            .messenger
-            .directory()
-            .resolve(&address)
-            .expect("the entry is in the directory")
-            .uuid;
-        assert_eq!(router.route_uuids(), routes_before);
-        assert_eq!(router.route_uuids(), vec![uuid]);
+        assert_eq!(dynamic_rows(&booted).await.len(), 6);
+        assert_ha_holds_once(
+            &booted,
+            &[STATIC, DYNAMIC],
+            1,
+            "after a third app's runtime subscribe",
+        )
+        .await;
         booted.stop_mqtt();
     }
 
@@ -4695,7 +4908,7 @@ new sifter: Demo {{
         .await;
         // Dormant: the row is stored and is not folded onto the entry, which is
         // where an ACL narrowed under a runtime `MessageSubscribe` leaves it.
-        insert_dynamic_mqtt_row(&booted, ADDRESS, false, 1).await;
+        insert_dynamic_row(&booted, ADDRESS, false).await;
 
         tree.write(&document_with_clients(&one, &[("ha", "home/state")]));
         install_package(components.path(), &staged_module(&tree));
@@ -4951,7 +5164,6 @@ new sifter: Demo {{
                     retain_depth: brenn_lib::messaging::config::Depth::Bounded(1),
                     noise: None,
                     wake_min: None,
-                    qos: Some(1),
                 },
             )
             .await
@@ -4961,7 +5173,6 @@ new sifter: Demo {{
             channel_address: address.clone(),
             client_slug: "ha".to_string(),
             topic: DYNAMIC.to_string(),
-            qos: 1,
             urgency: brenn_lib::messaging::Urgency::Normal,
         };
         assert!(
@@ -4969,7 +5180,7 @@ new sifter: Demo {{
             "the dynamic route is new to the table",
         );
         service
-            .subscribe_filter("ha", DYNAMIC.to_string(), 1)
+            .subscribe_filter("ha", DYNAMIC.to_string())
             .await
             .expect("the client has a session");
 
@@ -8664,7 +8875,6 @@ new sifter: Sifter {{
             address,
             folded,
             brenn_lib::messaging::config::Depth::Bounded(0),
-            None,
         )
         .await
     }
@@ -8677,25 +8887,6 @@ new sifter: Sifter {{
             address,
             true,
             brenn_lib::messaging::config::Depth::Bounded(1),
-            None,
-        )
-        .await
-    }
-
-    /// The same on an `mqtt:` channel: the row carries the SUBSCRIBE QoS.
-    /// Boot and reload both require it when re-asserting the broker filter.
-    pub(crate) async fn insert_dynamic_mqtt_row(
-        booted: &Booted,
-        address: &str,
-        folded: bool,
-        qos: u8,
-    ) -> uuid::Uuid {
-        insert_dynamic_row_at(
-            booted,
-            address,
-            folded,
-            brenn_lib::messaging::config::Depth::Bounded(0),
-            Some(qos),
         )
         .await
     }
@@ -8705,7 +8896,6 @@ new sifter: Sifter {{
         address: &str,
         folded: bool,
         push_depth: brenn_lib::messaging::config::Depth,
-        qos: Option<u8>,
     ) -> uuid::Uuid {
         let uuid = booted
             .messenger
@@ -8724,7 +8914,6 @@ new sifter: Sifter {{
                     retain_depth: brenn_lib::messaging::config::Depth::Bounded(2),
                     noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                     wake_min: brenn_lib::messaging::WakeMin::Never,
-                    qos,
                     created_at: "2026-09-07T00:00:00Z".to_string(),
                 },
             );
@@ -8811,7 +9000,6 @@ new sifter: Sifter {{
                     retain_depth: brenn_lib::messaging::config::Depth::Bounded(2),
                     noise: None,
                     wake_min: None,
-                    qos: None,
                 },
             )
             .await
@@ -8901,7 +9089,6 @@ new sifter: Sifter {{
                     retain_depth: brenn_lib::messaging::config::Depth::Bounded(2),
                     noise: None,
                     wake_min: None,
-                    qos: None,
                 },
             )
             .await

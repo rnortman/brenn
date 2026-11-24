@@ -17,7 +17,8 @@ pub mod poll;
 pub use broker::{
     AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, ROTATED_CREDENTIALS,
     log_publishes_from, log_records_disconnect, log_records_disconnect_before_reconnect,
-    log_records_publish_from, log_records_publish_to_subscriber, log_records_unsubscribe,
+    log_records_publish_from, log_records_publish_to_subscriber, log_records_subscribe_at,
+    log_records_unsubscribe,
 };
 pub use client::{
     await_puback, connection_epoch, direct_publisher_acked, direct_publisher_acked_as,

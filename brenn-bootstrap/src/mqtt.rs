@@ -17,6 +17,48 @@ pub(crate) struct MqttResult {
     pub(crate) event_router: Arc<MqttEventRouterImpl>,
 }
 
+/// The ingress set boot builds its sessions and route table from: `static_`,
+/// then one channel per durable dynamic `mqtt:` subscription the boot merge
+/// kept, with `urgency` filled from the client the row names (the same
+/// per-client constant a static channel on that client carries).
+///
+/// Without the appended channels a runtime-created `mqtt:` subscription to a
+/// filter no static channel declares would stop delivering after a restart:
+/// its SUBSCRIBE would not be re-asserted on connect and its deliveries would
+/// have no route.
+///
+/// A kept row whose client is no longer declared in `[[mqtt_client]]` is
+/// dropped with a warning: it was created against a configured client that the
+/// operator has since removed, which is durable user state that config has
+/// overridden, not a host bug. Its directory subscriber remains and nothing
+/// delivers to it.
+pub(crate) fn boot_ingress(
+    static_: &[ResolvedMqttIngressChannel],
+    clients: &IndexMap<String, MqttClientConfig>,
+    dynamic: &[brenn_messaging_boot::DynamicMqttIngress],
+) -> Vec<ResolvedMqttIngressChannel> {
+    let mut ingress = static_.to_vec();
+    for kept in dynamic {
+        let Some(client) = clients.get(&kept.client_slug) else {
+            tracing::warn!(
+                client = %kept.client_slug,
+                channel = %kept.channel_address,
+                "boot: dropping dynamic mqtt subscription whose client is no longer a \
+                 configured [[mqtt_client]] — not re-activating its broker SUBSCRIBE/route"
+            );
+            continue;
+        };
+        ingress.push(ResolvedMqttIngressChannel {
+            channel_address: kept.channel_address.clone(),
+            channel_uuid: kept.channel_uuid,
+            client_slug: kept.client_slug.clone(),
+            topic: kept.topic.clone(),
+            urgency: client.identity.urgency,
+        });
+    }
+    ingress
+}
+
 /// Build the MQTT service and spawn one unified supervisor per **declared**
 /// `[[mqtt_client]]`. Each session carries both the publish path and the
 /// ingress delivery + reconnect re-assert path.
@@ -206,7 +248,6 @@ mod tests {
             client_slug: client.to_string(),
             topic: topic.to_string(),
             urgency: Urgency::Normal,
-            qos: 1,
         }
     }
 

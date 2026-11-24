@@ -19,8 +19,9 @@
 //! transport-specific *broker activation* (the live MQTT SUBSCRIBE, the
 //! configured-client check, and the router `IngressRoute` add) is **not** done
 //! here — it is layered on top by the per-transport activation increment and
-//! the `MessageSubscribe` tool. The `qos` parameter is validated and persisted
-//! here (so the later activation step has it), but no broker call is made.
+//! the `MessageSubscribe` tool. No broker call is made here, and no QoS is
+//! taken or stored: an `mqtt:` filter is subscribed at its client's configured
+//! `qos`.
 //!
 //! Every failure path returns an error (never panics): a misconfigured dynamic
 //! subscribe is LLM/attacker-shaped tool input, not a host bug (CLAUDE.md
@@ -50,7 +51,7 @@ use brenn_lib::mqtt::address::{parse_mqtt_address, validate_topic_filter_str};
 /// makes the pull-vs-push and history-retention decisions explicitly on every
 /// call); they are passed verbatim with no inheritance. `noise` and
 /// `wake_min` remain `Option` and inherit from the channel/global rung when
-/// omitted. `qos` is MQTT-only.
+/// omitted.
 #[derive(Debug, Clone)]
 pub struct DynamicSubscribeParams {
     /// Required: 0 = pull-only (the `push_depth=0` ad-hoc-read trick), >0 = push.
@@ -59,10 +60,6 @@ pub struct DynamicSubscribeParams {
     pub retain_depth: Depth,
     pub noise: Option<NoiseLevel>,
     pub wake_min: Option<WakeMin>,
-    /// MQTT SUBSCRIBE QoS (0/1/2). Required-shape only for `mqtt:` addresses;
-    /// supplying it for `brenn:`/`webhook:` is an error (don't silently ignore a
-    /// caller mistake).
-    pub qos: Option<u8>,
 }
 
 /// Error from the runtime dynamic-subscribe core ([`Messenger::subscribe_dynamic`]).
@@ -77,8 +74,6 @@ pub enum RuntimeSubscribeError {
     /// is meaningless, so it is never auto-created. (For `mqtt:` an
     /// absent topic-filter channel is created rather than erroring.)
     UnknownChannel { address: String },
-    /// `qos` supplied for a non-MQTT (`brenn:`/`webhook:`) address.
-    QosOnNonMqtt { address: String },
     /// An `mqtt:` address with an invalid topic filter (wildcard placement, empty
     /// topic, etc.). Surfaced here because channel creation validates the filter
     /// before deriving the channel. Carries the parser's
@@ -132,11 +127,6 @@ impl std::fmt::Display for RuntimeSubscribeError {
                 f,
                 "unknown channel {address:?} — nothing publishes there; a dynamic \
                  subscription requires an existing channel"
-            ),
-            RuntimeSubscribeError::QosOnNonMqtt { address } => write!(
-                f,
-                "qos is only valid for mqtt: addresses; channel {address:?} is not MQTT — \
-                 omit qos"
             ),
             RuntimeSubscribeError::InvalidMqttFilter { address, detail } => {
                 write!(f, "invalid mqtt topic filter in {address:?}: {detail}")
@@ -282,20 +272,6 @@ pub struct UnsubscribeOutcome {
 }
 
 impl Messenger {
-    /// Create a dynamic subscription for `app_slug` on an **existing** channel.
-    ///
-    /// Steps: validate `qos` placement → resolve params (shared resolver) →
-    /// reject an already-present dynamic sub for this app → persist the durable
-    /// row → fold the subscriber into the directory.
-    ///
-    /// This does **not** perform transport activation (the MQTT broker SUBSCRIBE
-    /// and not-yet-existing-channel creation are the per-transport activation
-    /// increment's job). The persisted `qos` is carried for that step. Returns the
-    /// [`ResolvedSubscription`] so the caller (tool/activation layer) has the
-    /// concrete resolved params.
-    ///
-    /// Errors (never panics): unknown channel, `qos` on a non-MQTT address, an
-    /// existing dynamic sub for this app, or any resolver/invariant violation.
     /// Resolve the channel for `address`, creating it when the address is a
     /// not-yet-existing `mqtt:` topic filter.
     ///
@@ -374,6 +350,20 @@ impl Messenger {
             .expect("subscribe_dynamic: channel absent immediately after add_channel"))
     }
 
+    /// Create a dynamic subscription for `app_slug` on a channel, creating the
+    /// channel for a not-yet-existing `mqtt:` topic filter.
+    ///
+    /// Steps: resolve or create the channel → resolve params (shared resolver) →
+    /// reject an already-present dynamic sub for this app → persist the
+    /// registration → fold the subscriber into the directory.
+    ///
+    /// This does **not** perform transport activation (the MQTT broker SUBSCRIBE
+    /// is the activation layer's job, at the client's configured `qos`). Returns
+    /// the [`ResolvedSubscription`] so the caller (tool/activation layer) has the
+    /// concrete resolved params.
+    ///
+    /// Errors (never panics): unknown channel, an invalid `mqtt:` filter, an
+    /// existing subscription for this app, or any resolver/invariant violation.
     pub async fn subscribe_dynamic(
         &self,
         app_slug: &str,
@@ -387,16 +377,9 @@ impl Messenger {
         //    the loser would collide on the write.
         let _gate = self.dynamic_subscribe_gate.lock().await;
 
-        // 1. `qos` is MQTT-only — reject it on a non-MQTT address rather than
-        //    silently ignoring a caller mistake. Determine the transport from
-        //    the address prefix (not the directory entry, which may not exist
-        //    yet for a new `mqtt:` filter).
+        // 1. Determine the transport from the address prefix (not the directory
+        //    entry, which may not exist yet for a new `mqtt:` filter).
         let is_mqtt = matches!(ChannelScheme::of(address), Some(ChannelScheme::Mqtt));
-        if params.qos.is_some() && !is_mqtt {
-            return Err(RuntimeSubscribeError::QosOnNonMqtt {
-                address: address.to_string(),
-            });
-        }
 
         // 2. Resolve the target channel, creating it for a not-yet-existing
         //    `mqtt:` topic-filter address. `brenn:`/`webhook:` never auto-create:
@@ -407,7 +390,6 @@ impl Messenger {
         //     channel keeps its dynamic subscription as a row, a non-durable one
         //     keeps it in memory, where it expires with the data it names.
         let durable_channel = entry.capabilities().durable;
-        let qos = params.qos;
 
         // 3. Resolve the requested params via the shared resolver.
         //    Done *before* the re-subscribe identity check so an identical /
@@ -456,8 +438,7 @@ impl Messenger {
         //
         // Two facts classify the state: whether this app holds an `App(app_slug)`
         // directory subscriber, and whether a durable dynamic row exists for
-        // `(channel, app)`. Load the durable row once (it also carries the mqtt
-        // `qos` the directory entry lacks, needed for the identity comparison):
+        // `(channel, app)`:
         //   - directory subscriber, no durable row ⇒ a *static* (config-managed)
         //     sub — never shadow or mutate it.
         //   - no directory subscriber, durable row present ⇒ a *dormant* boot-merge
@@ -466,29 +447,27 @@ impl Messenger {
         //     (channel_uuid, app_slug) PK and panic; reject instead. The app must
         //     MessageUnsubscribe first, then re-subscribe.
         //   - directory subscriber + durable row ⇒ a live dynamic sub: identity-only
-        //     re-subscribe (identical resolved params incl. qos = idempotent
-        //     success; differing = error). Resolving in the core, where the resolver
+        //     re-subscribe (identical resolved params = idempotent success;
+        //     differing = error). Resolving in the core, where the resolver
         //     and the subscriber entry are both in hand, is the only place the
         //     comparison can be exact.
         //   - neither ⇒ a fresh subscribe (step 5).
         let existing_entry = entry.app_subscriber(app_slug);
-        // The registration record for this `(channel, app)`, if any, carrying the
-        // stored `qos` the directory entry lacks. Each class answers from its own
-        // authority: the durable table, or the in-memory non-durable registration
-        // set (which carries no `qos` — `qos` is mqtt-only and mqtt is durable).
-        let registration: Option<Option<u8>> = if durable_channel {
+        // Whether a registration record exists for this `(channel, app)`. Each
+        // class answers from its own authority: the durable table, or the
+        // in-memory non-durable registration set.
+        let registration = if durable_channel {
             let conn = self.db.lock().await;
-            super::db::load_dynamic_subscription_for(&conn, entry.uuid, app_slug).map(|row| row.qos)
+            super::db::load_dynamic_subscription_for(&conn, entry.uuid, app_slug).is_some()
         } else {
             self.nondurable_dynamic_sub_exists(&entry.uuid, app_slug)
-                .then_some(None)
         };
         // Static and dormant are checked BEFORE the cap: each is the more actionable
         // error (a static holder can never succeed by lowering its depth, so the cap
         // error would be a lie; a dormant holder must unsubscribe first regardless of
         // depth). The dormant reject re-establishes insert_dynamic_subscription's
         // "neither row pre-exists" guarantee for the step-5 INSERT.
-        match (existing_entry.is_some(), registration.is_some()) {
+        match (existing_entry.is_some(), registration) {
             (true, false) => {
                 return Err(RuntimeSubscribeError::StaticSubscriptionExists {
                     address: address.to_string(),
@@ -514,13 +493,13 @@ impl Messenger {
                 standing,
             });
         }
-        if let (Some(existing), Some(existing_qos)) = (existing_entry, registration) {
-            // Live dynamic re-subscribe: identity-only policy.
+        if let Some(existing) = existing_entry {
+            // Live dynamic re-subscribe (the match above leaves a directory
+            // subscriber here only with its registration): identity-only policy.
             let identical = existing.push_depth == resolved.push_depth
                 && existing.retain_depth == resolved.retain_depth
                 && existing.noise == resolved.noise
-                && existing.wake_min == Some(resolved.wake_min)
-                && existing_qos == qos;
+                && existing.wake_min == Some(resolved.wake_min);
             if identical {
                 return Ok(SubscribeOutcome::AlreadySubscribedIdentical(resolved));
             }
@@ -545,7 +524,6 @@ impl Messenger {
                 retain_depth: resolved.retain_depth,
                 noise: resolved.noise,
                 wake_min: resolved.wake_min,
-                qos,
                 created_at: format_ts_for_db(chrono::Utc::now()),
             };
             let conn = self.db.lock().await;
@@ -848,7 +826,6 @@ mod tests {
             retain_depth: Depth::Bounded(5),
             noise: None,
             wake_min: None,
-            qos: None,
         }
     }
 
@@ -875,20 +852,19 @@ mod tests {
         app
     }
 
-    fn pull_only(qos: Option<u8>) -> DynamicSubscribeParams {
+    fn pull_only() -> DynamicSubscribeParams {
         DynamicSubscribeParams {
             push_depth: Depth::Bounded(0),
             retain_depth: Depth::Bounded(5),
             noise: None,
             wake_min: None,
-            qos,
         }
     }
 
     /// Seed a durable dynamic-subscription row directly, with no directory
     /// subscriber folded — the shape of a boot-merge `revoked`/dormant row
-    /// (durable-only, invisible to `MessageSubscriptionList`). Pull-only, silent,
-    /// no qos: the fields the dormant/cap tests never vary; only `retain_depth`
+    /// (durable-only, invisible to `MessageSubscriptionList`). Pull-only and
+    /// silent: the fields the dormant/cap tests never vary; only `retain_depth`
     /// differs across callers.
     async fn seed_dynamic_row(
         m: &Messenger,
@@ -906,7 +882,6 @@ mod tests {
                 retain_depth,
                 noise: NoiseLevel::Silent,
                 wake_min: WakeMin::Normal,
-                qos: None,
                 created_at: brenn_db::format_ts_for_db(chrono::Utc::now()),
             },
         );
@@ -922,7 +897,7 @@ mod tests {
         let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
 
         let outcome = m
-            .subscribe_dynamic("graf", "ephemeral:chatter", pull_only(None))
+            .subscribe_dynamic("graf", "ephemeral:chatter", pull_only())
             .await
             .expect("a pull-only subscribe to a non-durable channel succeeds");
         assert!(outcome.is_created());
@@ -969,7 +944,7 @@ mod tests {
     async fn list_subscriptions_reports_a_nondurable_dynamic_subscription() {
         let ch = channel("ephemeral:chatter", ChannelScheme::Ephemeral);
         let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
-        m.subscribe_dynamic("graf", "ephemeral:chatter", pull_only(None))
+        m.subscribe_dynamic("graf", "ephemeral:chatter", pull_only())
             .await
             .expect("a pull-only subscribe to a non-durable channel succeeds");
 
@@ -1109,12 +1084,12 @@ mod tests {
     async fn resubscribe_nondurable_follows_the_identity_policy() {
         let ch = channel("ephemeral:chatter", ChannelScheme::Ephemeral);
         let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
-        m.subscribe_dynamic("graf", "ephemeral:chatter", pull_only(None))
+        m.subscribe_dynamic("graf", "ephemeral:chatter", pull_only())
             .await
             .expect("first subscribe succeeds");
 
         let outcome = m
-            .subscribe_dynamic("graf", "ephemeral:chatter", pull_only(None))
+            .subscribe_dynamic("graf", "ephemeral:chatter", pull_only())
             .await
             .expect("identical re-subscribe is a no-op success");
         assert!(matches!(
@@ -1127,7 +1102,6 @@ mod tests {
             retain_depth: Depth::Bounded(7),
             noise: None,
             wake_min: None,
-            qos: None,
         };
         let err = m
             .subscribe_dynamic("graf", "ephemeral:chatter", differing)
@@ -1148,7 +1122,7 @@ mod tests {
         let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
 
         let outcome = m
-            .subscribe_dynamic("graf", "heartbeat", pull_only(None))
+            .subscribe_dynamic("graf", "heartbeat", pull_only())
             .await
             .expect("subscribe succeeds");
         assert!(outcome.is_created());
@@ -1157,14 +1131,12 @@ mod tests {
         assert_eq!(resolved.push_depth, Depth::Bounded(0));
         assert_eq!(resolved.retain_depth, Depth::Bounded(5));
 
-        // Durable row persisted (no qos for brenn:).
         let rows = {
             let conn = m.db.lock().await;
             load_dynamic_subscriptions(&conn)
         };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].app_slug, "graf");
-        assert_eq!(rows[0].qos, None);
 
         // Directory now carries the App(graf) subscriber.
         let entry = m.directory.resolve("heartbeat").expect("channel present");
@@ -1177,50 +1149,15 @@ mod tests {
         );
     }
 
-    /// MQTT channel accepts a `qos`; it is persisted on the durable row.
-    #[tokio::test]
-    async fn subscribe_mqtt_channel_persists_qos() {
-        let ch = channel("mqtt:home:sensors/temp", ChannelScheme::Mqtt);
-        let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
-
-        m.subscribe_dynamic("graf", "mqtt:home:sensors/temp", pull_only(Some(1)))
-            .await
-            .expect("mqtt subscribe succeeds");
-
-        let rows = {
-            let conn = m.db.lock().await;
-            load_dynamic_subscriptions(&conn)
-        };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].qos, Some(1));
-    }
-
     /// Unknown channel → error, nothing persisted.
     #[tokio::test]
     async fn subscribe_unknown_channel_errors() {
         let m = messenger(vec![], &[("graf", false, &["u"])]).await;
         let err = m
-            .subscribe_dynamic("graf", "nope", pull_only(None))
+            .subscribe_dynamic("graf", "nope", pull_only())
             .await
             .unwrap_err();
         assert!(matches!(err, RuntimeSubscribeError::UnknownChannel { .. }));
-        let rows = {
-            let conn = m.db.lock().await;
-            load_dynamic_subscriptions(&conn)
-        };
-        assert!(rows.is_empty());
-    }
-
-    /// `qos` supplied for a non-MQTT (`brenn:`) channel → error, nothing persisted.
-    #[tokio::test]
-    async fn subscribe_qos_on_brenn_errors() {
-        let ch = channel("heartbeat", ChannelScheme::Brenn);
-        let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
-        let err = m
-            .subscribe_dynamic("graf", "heartbeat", pull_only(Some(0)))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RuntimeSubscribeError::QosOnNonMqtt { .. }));
         let rows = {
             let conn = m.db.lock().await;
             load_dynamic_subscriptions(&conn)
@@ -1239,7 +1176,6 @@ mod tests {
             retain_depth: Depth::Bounded(5),
             noise: None,
             wake_min: None,
-            qos: None,
         };
         let err = m
             .subscribe_dynamic("graf", "heartbeat", params)
@@ -1268,7 +1204,6 @@ mod tests {
             retain_depth: Depth::Bounded(5),
             noise: Some(NoiseLevel::Fatal),
             wake_min: None,
-            qos: None,
         };
         let err = m
             .subscribe_dynamic("graf", "heartbeat", fatal)
@@ -1290,7 +1225,6 @@ mod tests {
             retain_depth: Depth::Bounded(5),
             noise: Some(NoiseLevel::Alarm),
             wake_min: None,
-            qos: None,
         };
         m.subscribe_dynamic("graf", "heartbeat", alarm)
             .await
@@ -1304,12 +1238,12 @@ mod tests {
     async fn subscribe_resubscribe_identical_is_idempotent_noop() {
         let ch = channel("heartbeat", ChannelScheme::Brenn);
         let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
-        m.subscribe_dynamic("graf", "heartbeat", pull_only(None))
+        m.subscribe_dynamic("graf", "heartbeat", pull_only())
             .await
             .expect("first subscribe succeeds");
 
         let outcome = m
-            .subscribe_dynamic("graf", "heartbeat", pull_only(None))
+            .subscribe_dynamic("graf", "heartbeat", pull_only())
             .await
             .expect("identical re-subscribe is a no-op success");
         assert!(matches!(
@@ -1332,7 +1266,7 @@ mod tests {
     async fn subscribe_resubscribe_differs_errors() {
         let ch = channel("heartbeat", ChannelScheme::Brenn);
         let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
-        m.subscribe_dynamic("graf", "heartbeat", pull_only(None))
+        m.subscribe_dynamic("graf", "heartbeat", pull_only())
             .await
             .expect("first subscribe succeeds");
 
@@ -1344,7 +1278,6 @@ mod tests {
             retain_depth: Depth::Bounded(7),
             noise: None,
             wake_min: None,
-            qos: None,
         };
         let err = m
             .subscribe_dynamic("graf", "heartbeat", differing)
@@ -1381,7 +1314,7 @@ mod tests {
         let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
 
         let err = m
-            .subscribe_dynamic("graf", "heartbeat", pull_only(None))
+            .subscribe_dynamic("graf", "heartbeat", pull_only())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1402,7 +1335,6 @@ mod tests {
             retain_depth: retain,
             noise: None,
             wake_min: None,
-            qos: None,
         }
     }
 
@@ -1544,7 +1476,6 @@ mod tests {
                     retain_depth: Depth::Bounded(4),
                     noise: None,
                     wake_min: None,
-                    qos: None,
                 },
             )
             .await
@@ -1581,7 +1512,6 @@ mod tests {
                     retain_depth: Depth::Bounded(4),
                     noise: None,
                     wake_min: None,
-                    qos: None,
                 },
             )
             .await
@@ -1806,7 +1736,7 @@ mod tests {
 
     /// A new `mqtt:` topic-filter address whose channel does not yet exist is
     /// **created**: the channel becomes resolvable + listable,
-    /// the durable row persists with its `qos`, and the subscriber is folded in.
+    /// the durable row persists, and the subscriber is folded in.
     #[tokio::test]
     async fn subscribe_new_mqtt_filter_creates_channel() {
         // No channels seeded — the filter channel must be created on subscribe.
@@ -1814,7 +1744,7 @@ mod tests {
         let address = "mqtt:home:sensors/+/temp";
 
         let outcome = m
-            .subscribe_dynamic("graf", address, pull_only(Some(2)))
+            .subscribe_dynamic("graf", address, pull_only())
             .await
             .expect("new mqtt filter subscribe creates the channel and succeeds");
         assert!(outcome.is_created());
@@ -1830,7 +1760,6 @@ mod tests {
             m.directory.list().iter().any(|e| e.address == address),
             "created channel is listable"
         );
-        // Subscriber folded; durable row persisted with qos.
         assert!(
             entry
                 .subscribers
@@ -1842,7 +1771,7 @@ mod tests {
             load_dynamic_subscriptions(&conn)
         };
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].qos, Some(2));
+        assert_eq!(rows[0].app_slug, "graf");
         // Channel row was upserted into messaging_channels (count == 1).
         let channel_count: i64 = {
             let conn = m.db.lock().await;
@@ -1858,7 +1787,7 @@ mod tests {
     async fn subscribe_new_mqtt_invalid_filter_errors() {
         let m = messenger(vec![], &[("graf", false, &["u"])]).await;
         let err = m
-            .subscribe_dynamic("graf", "mqtt:home:a/#/b", pull_only(None))
+            .subscribe_dynamic("graf", "mqtt:home:a/#/b", pull_only())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1890,7 +1819,6 @@ mod tests {
             retain_depth: Depth::Bounded(5),
             noise: None,
             wake_min: None,
-            qos: None,
         };
         let outcome = m
             .subscribe_dynamic("graf", "heartbeat", params)
@@ -2221,10 +2149,10 @@ mod tests {
             &[("graf", false, &["u"]), ("pfin", false, &["u"])],
         )
         .await;
-        m.subscribe_dynamic("graf", "heartbeat", pull_only(None))
+        m.subscribe_dynamic("graf", "heartbeat", pull_only())
             .await
             .expect("graf subscribe");
-        m.subscribe_dynamic("pfin", "heartbeat", pull_only(None))
+        m.subscribe_dynamic("pfin", "heartbeat", pull_only())
             .await
             .expect("pfin subscribe");
 
@@ -2354,7 +2282,7 @@ mod tests {
         let m = messenger(vec![brenn_ch, mqtt_ch], &[("graf", false, &["u"])]).await;
 
         // Create the dynamic mqtt: subscription at runtime.
-        m.subscribe_dynamic("graf", "mqtt:home:sensors/temp", pull_only(Some(1)))
+        m.subscribe_dynamic("graf", "mqtt:home:sensors/temp", pull_only())
             .await
             .expect("mqtt subscribe succeeds");
 

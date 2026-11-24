@@ -680,8 +680,7 @@ impl WakeMin {
 
 /// One row of `messaging_dynamic_subscriptions`, decoded into typed values:
 /// the resolved subscription parameters (`channel_uuid`/`app_slug`/`push_depth`/
-/// `retain_depth`/`noise`/`wake_min`) plus the MQTT-only `qos` (`None` for
-/// `brenn:`/`webhook:`) and the `created_at` timestamp.
+/// `retain_depth`/`noise`/`wake_min`) and the `created_at` timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicSubscriptionRow {
     pub channel_uuid: Uuid,
@@ -690,8 +689,6 @@ pub struct DynamicSubscriptionRow {
     pub retain_depth: config::Depth,
     pub noise: config::NoiseLevel,
     pub wake_min: WakeMin,
-    /// MQTT SUBSCRIBE QoS (0/1/2). `None` for non-MQTT transports.
-    pub qos: Option<u8>,
     /// RFC3339 creation timestamp (DB wire form), as stored.
     pub created_at: String,
 }

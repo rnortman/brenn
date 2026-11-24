@@ -170,8 +170,10 @@ pub struct StatusDelta {
     /// `channels_changed`.
     pub channels_described: Vec<String>,
     /// `mqtt:<client>:<filter>` for every broker subscription this reload
-    /// asserted. A filter whose qos moved is here and not in
-    /// `mqtt_unsubscribed`: it is subscribed again in place at the new qos.
+    /// asserted. On a client whose `qos` this reload edits, every filter the
+    /// client holds before and after — static, component or dynamic — is here
+    /// and not in `mqtt_unsubscribed`: the restarted client subscribes it again
+    /// at the new `qos` on its first connect.
     pub mqtt_subscribed: Vec<String>,
     /// `mqtt:<client>:<filter>` for every broker subscription this reload
     /// withdrew.
@@ -229,8 +231,9 @@ pub struct StatusDelta {
     /// normally in `mqtt_deferred`, because its supervisor was spawned a few
     /// commit steps earlier and is usually still connecting — a broker that
     /// answers faster than those steps run puts the same filter in
-    /// `mqtt_subscribed` alone instead. A removed client's filters are in
-    /// neither move list: they left with the session.
+    /// `mqtt_subscribed` alone instead. Filters a restarted client carried are
+    /// in neither move list unless its `qos` moved. A removed client's filters
+    /// are in neither move list: they left with the session.
     pub mqtt_clients_added: Vec<String>,
     pub mqtt_clients_removed: Vec<String>,
     pub mqtt_clients_changed: Vec<String>,

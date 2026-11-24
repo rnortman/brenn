@@ -49,7 +49,7 @@ pub struct PlanInputs<'a> {
     /// single-writer sweep is skipped.
     pub apps: Option<&'a Arc<IndexMap<String, AppConfig>>>,
     /// The non-secret half of every `[[mqtt_client]]`, which is all the
-    /// derivation reads: membership, and each client's `qos`/`urgency`.
+    /// derivation reads: membership, and each client's `urgency`.
     pub mqtt_clients: &'a IndexMap<String, MqttClientIdentity>,
     /// The tool registry. `None` when the caller has not built one (a config
     /// check): the async tool substrate — request channels, result inboxes, the

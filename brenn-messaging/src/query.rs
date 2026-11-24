@@ -1220,7 +1220,6 @@ pub mod tests {
                     retain_depth: Depth::Bounded(2),
                     noise: None,
                     wake_min: None,
-                    qos: None,
                 },
             )
             .await
@@ -1269,7 +1268,6 @@ pub mod tests {
                     retain_depth: Depth::Bounded(2),
                     noise: None,
                     wake_min: None,
-                    qos: None,
                 },
             )
             .await
@@ -2089,7 +2087,6 @@ pub mod tests {
                 retain_depth: Depth::Bounded(2),
                 noise: None,
                 wake_min: None,
-                qos: None,
             },
         )
         .await

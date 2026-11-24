@@ -48,7 +48,8 @@ use brenn_wasm_dispatch::ConsumerHandle;
 use super::webhook::WebhookArrivals;
 
 use brenn_mqtt::{
-    ArrivingFilters, IngressSubscribeOutcome, IngressUnsubscribeOutcome, register_and_spawn,
+    ArrivingFilters, ConnectorHealthLabel, IngressSubscribeOutcome, IngressUnsubscribeOutcome,
+    register_and_spawn,
 };
 
 use brenn_lib::messaging::identity::AttachScope;
@@ -1122,20 +1123,18 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
 /// topic and finds its route; one that arrives after the route is gone is a
 /// benign zero-match drop.
 ///
-/// A qos move is not a withdrawal: [`mqtt_incoming`] re-subscribes the filter
-/// in place.
+/// A `qos` edit is not a withdrawal: the restarted client re-subscribes each
+/// filter in place.
 ///
 /// Returns the filters the broker did not take now, for the status body.
 async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
     let mut deferred = Vec::new();
     for client in &delta.mqtt.clients {
         for filter in client.leaving() {
-            let address = address_of(&client.client, &filter.topic_filter);
+            let address = address_of(&client.client, filter);
             let service = &env.mqtt_service;
             let outcome = session_or_bug(
-                service
-                    .unsubscribe_filter(&client.client, &filter.topic_filter)
-                    .await,
+                service.unsubscribe_filter(&client.client, filter).await,
                 &client.client,
                 &address,
                 "unsubscribed",
@@ -1161,10 +1160,11 @@ async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
 /// The incoming MQTT step, after the channels are in the directory.
 ///
 /// Route before SUBSCRIBE, so the first matching publish after the SUBACK has
-/// somewhere to go. A qos move is one SUBSCRIBE at the new qos for a filter the
-/// session holds, keeping its Subscription Identifier; it runs after the
-/// client restarts, so on a client this reload restarts the successor has
-/// inherited the entry before its qos is set.
+/// somewhere to go. A filter a `qos` edit re-subscribes is sent nothing here and
+/// its set is not touched: the edit restarted the client, and the successor's
+/// connect subscribes every filter it inherited at its own `qos`. The filter is
+/// reported from the successor's health, which this step reads after the
+/// restart.
 async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
     for route in &delta.mqtt.routes_added {
         let address = route.channel_address.clone();
@@ -1182,22 +1182,31 @@ async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
     let mut report = MqttCommitReport::default();
     let service = &env.mqtt_service;
     for client in &delta.mqtt.clients {
-        let joining = client.joining().map(|filter| (filter, false));
-        let moving = client.resubscribe.iter().map(|filter| (filter, true));
-        for (filter, in_place) in joining.chain(moving) {
-            let address = address_of(&client.client, &filter.topic_filter);
-            let topic_filter = filter.topic_filter.clone();
-            let outcome = if in_place {
+        for filter in client.joining() {
+            let address = address_of(&client.client, filter);
+            let outcome = session_or_bug(
                 service
-                    .resubscribe_filter(&client.client, topic_filter, filter.qos)
-                    .await
-            } else {
-                service
-                    .subscribe_filter(&client.client, topic_filter, filter.qos)
-                    .await
-            };
-            let outcome = session_or_bug(outcome, &client.client, &address, "subscribed");
+                    .subscribe_filter(&client.client, filter.clone())
+                    .await,
+                &client.client,
+                &address,
+                "subscribed",
+            );
             report.record(record_subscribe(&outcome, &address), address);
+        }
+        let Some(first) = client.resubscribe.first() else {
+            continue;
+        };
+        let session = session_or_bug(
+            service.get_client(&client.client),
+            &client.client,
+            &address_of(&client.client, first),
+            "subscribed",
+        );
+        let (health, _) = session.health_snapshot().await;
+        for filter in &client.resubscribe {
+            let address = address_of(&client.client, filter);
+            report.record(record_resubscribe(health, &address), address);
         }
     }
     report
@@ -1454,6 +1463,32 @@ fn record_subscribe(outcome: &IngressSubscribeOutcome, address: &str) -> Subscri
         IngressSubscribeOutcome::SendFailed(error) => {
             warn!(address = %address, %error, "reload: mqtt SUBSCRIBE send failed");
             SubscribeReport::Deferred
+        }
+    }
+}
+
+/// Where a filter a `qos` edit re-subscribes belongs in the status body, from
+/// the health of the restarted client whose connect subscribes it: connected,
+/// the connect has sent it or is sending it; disconnected, the next connect
+/// sends it; failed, nothing will until the client is fixed.
+fn record_resubscribe(health: ConnectorHealthLabel, address: &str) -> SubscribeReport {
+    match health {
+        ConnectorHealthLabel::Connected => {
+            info!(address = %address, "reload: mqtt filter re-subscribed by the client's connect");
+            SubscribeReport::AtBroker
+        }
+        ConnectorHealthLabel::Disconnected => {
+            info!(address = %address, "reload: mqtt filter re-subscribed on reconnect");
+            SubscribeReport::Deferred
+        }
+        ConnectorHealthLabel::Failed => {
+            warn!(
+                address = %address,
+                "reload: mqtt filter carried, but its client's session has failed \
+                 authoritatively; nothing will be subscribed until the client is fixed and \
+                 reloaded"
+            );
+            SubscribeReport::Failed
         }
     }
 }
@@ -2207,6 +2242,25 @@ mod tests {
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A filter a `qos` edit re-subscribes is reported from the restarted
+    /// client's health: deferred on a disconnected session, failed on a failed
+    /// one, and neither on a connected one.
+    #[test]
+    fn a_resubscribed_filter_lands_where_its_clients_health_puts_it() {
+        assert_eq!(
+            record_resubscribe(ConnectorHealthLabel::Connected, "mqtt:ha:a/b"),
+            SubscribeReport::AtBroker
+        );
+        assert_eq!(
+            record_resubscribe(ConnectorHealthLabel::Disconnected, "mqtt:ha:a/b"),
+            SubscribeReport::Deferred
+        );
+        assert_eq!(
+            record_resubscribe(ConnectorHealthLabel::Failed, "mqtt:ha:a/b"),
+            SubscribeReport::Failed
+        );
+    }
 
     /// Every SUBSCRIBE outcome is a success, and the status body sorts them
     /// three ways: at the broker, coming on a reconnect, and coming only after

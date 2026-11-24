@@ -743,10 +743,6 @@ pub struct DynamicMqttIngress {
     pub channel_uuid: uuid::Uuid,
     pub client_slug: String,
     pub topic: String,
-    /// The broker SUBSCRIBE QoS stored on the durable row at creation time (it was
-    /// defaulted to the client's `[[mqtt_client]].qos` when omitted). MQTT dynamic
-    /// rows always carry a `qos`; a missing one is a host bug.
-    pub qos: u8,
 }
 
 /// Outcome of building the messaging layer.
@@ -1019,7 +1015,8 @@ pub fn messaging_configured(config: &BrennConfig) -> bool {
 ///
 /// No conflict check is needed: `qos`/`urgency` are connection-level on
 /// `[[mqtt_client]]`, so the same `(client, topic)` across declarations always
-/// carries identical delivery intent.
+/// carries identical delivery intent. Every filter of a client is subscribed at
+/// the client's `qos`.
 pub(crate) fn derive_mqtt_ingress_channels(
     config: &BrennConfig,
     mqtt_clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity>,
@@ -1532,19 +1529,16 @@ pub async fn commit_messaging(
         // NOT one of those static channels needs its broker SUBSCRIBE + route
         // rebuilt; collect a descriptor per such channel (deduped by channel_uuid,
         // since two apps can dynamically subscribe to one filter — one channel,
-        // one SUBSCRIBE/route). A descriptor's QoS is the stored `qos` of the one
-        // row kept for its channel — the first in load order — and only where no
-        // static binding holds the channel; every other row's stored `qos` is not
-        // read. `urgency` is filled by the caller from the client config.
+        // one SUBSCRIBE/route). Every row of a channel agrees on whether a route
+        // and a filter exist, so which row is kept does not matter. The filter is
+        // subscribed at the client's `qos`; `urgency` is filled by the caller from
+        // the client config.
         let static_mqtt_uuids: std::collections::HashSet<uuid::Uuid> = mqtt_ingress_channels
             .iter()
             .map(|c| c.channel_uuid)
             .collect();
         let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
         for row in &merge_outcome.kept {
-            // TODO(mqtt-dynamic-subscribe-qos-not-honoured): the row's stored QoS
-            // is dropped here when a static binding holds the channel, and for
-            // every row after the first on a channel.
             if static_mqtt_uuids.contains(&row.channel_uuid) || !seen.insert(row.channel_uuid) {
                 continue;
             }
@@ -1564,19 +1558,11 @@ pub async fn commit_messaging(
                         entry.address
                     )
                 });
-            let qos = row.qos.unwrap_or_else(|| {
-                panic!(
-                    "build_messaging: dynamic mqtt subscription on {:?} has no stored qos — \
-                     mqtt dynamic rows always persist a qos (host bug)",
-                    entry.address
-                )
-            });
             dynamic_mqtt_ingress.push(DynamicMqttIngress {
                 channel_address: entry.address.clone(),
                 channel_uuid: row.channel_uuid,
                 client_slug: parsed.client,
                 topic: parsed.topic,
-                qos,
             });
         }
     }

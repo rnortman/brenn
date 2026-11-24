@@ -4073,7 +4073,6 @@ mod tests {
                         retain_depth: brenn_lib::messaging::config::Depth::Bounded(0),
                         noise: None,
                         wake_min: None,
-                        qos: None,
                     },
                 )
                 .await

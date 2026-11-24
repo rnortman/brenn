@@ -19,14 +19,11 @@
 //!    subscribe to a client with no running ingress supervisor is a tool error;
 //!    we never spawn supervisors at runtime. The guard runs first so the lib core
 //!    never creates a durable channel + row for an unconfigured client.
-//! 2. **`qos` default resolution**. An omitted `qos` for `mqtt:` defaults
-//!    to the client's `[[mqtt_client]].qos` (the same value a static subscription
-//!    on this client would use), resolved from the live ingress handle.
-//! 3. **Lib core** ([`Messenger::subscribe_dynamic`]): resolve +
+//! 2. **Lib core** ([`Messenger::subscribe_dynamic`]): resolve +
 //!    persist + create-channel-if-absent + directory fold.
-//! 4. **Router `IngressRoute` add**, stamped with the client's ingress
+//! 3. **Router `IngressRoute` add**, stamped with the client's ingress
 //!    `urgency`, so `deliver_inbound` routes matching topics to the new channel.
-//! 5. **Broker SUBSCRIBE + reconnect-set registration**, via
+//! 4. **Broker SUBSCRIBE + reconnect-set registration**, via
 //!    [`MqttService::subscribe_filter`] (live now if connected, deferred to next
 //!    reconnect if disconnected — both survive reconnect).
 //!
@@ -119,8 +116,7 @@ pub enum SubscribeActivateError {
     UnconfiguredMqttClient { client: String },
     /// The lib core (`Messenger::subscribe_dynamic`) rejected the subscribe —
     /// unknown `brenn:`/`webhook:` channel, invalid mqtt filter, a duplicate
-    /// dynamic sub for this app, `qos` on a non-mqtt address, or a
-    /// resolver/invariant violation. Carries the core's typed error.
+    /// dynamic sub for this app, or a resolver/invariant violation. Carries the core's typed error.
     Core(RuntimeSubscribeError),
     /// The app's resolved `AppPolicy` does not permit a dynamic subscribe to this
     /// address (any transport: `mqtt:`/`brenn:`/`webhook:`). Either the
@@ -182,8 +178,7 @@ fn app_policy(
 /// the `MessageSubscribe` tool calls.
 ///
 /// `brenn:`/`webhook:` are pure lib-core operations (no activation).
-/// `mqtt:` runs the configured-client guard + qos-default resolution **before**
-/// the lib core (so nothing is persisted for an unconfigured client), then adds
+/// `mqtt:` runs the configured-client guard **before** the lib core (so nothing is persisted for an unconfigured client), then adds
 /// the router `IngressRoute` and issues the broker SUBSCRIBE after the core
 /// persists the durable state.
 pub async fn subscribe_dynamic_activated(
@@ -319,26 +314,18 @@ pub(crate) async fn activate_dynamic_subscribe(
     // session. Checked before the core so no durable channel/row is created for an
     // unconfigured client. (If the address didn't parse, the core will reject it as
     // InvalidMqttFilter without creating anything.)
-    let mut params = params;
-    if let Some(client) = parsed_client {
-        if mqtt_svc.get_client(client).is_none() {
-            return Err(SubscribeActivateError::UnconfiguredMqttClient {
-                client: client.to_string(),
-            });
-        }
-        // qos default resolution: an omitted qos defaults to
-        // the client's [[mqtt_client]].qos — the same value a static subscription
-        // on this client uses. The client is configured (guard above), so
-        // ingress_qos is Some.
-        if params.qos.is_none() {
-            params.qos = mqtt_svc.ingress_qos(client).await;
-        }
+    if let Some(client) = parsed_client
+        && mqtt_svc.get_client(client).is_none()
+    {
+        return Err(SubscribeActivateError::UnconfiguredMqttClient {
+            client: client.to_string(),
+        });
     }
 
     // Lib core: resolve + persist durable row + mirror +
     // create-channel-if-absent + directory fold. Returns the subscribe outcome.
     let outcome = messenger
-        .subscribe_dynamic(app_slug, address, params.clone())
+        .subscribe_dynamic(app_slug, address, params)
         .await?;
     // Idempotent re-subscribe (identical params): nothing was
     // created and the subscription is already live — do NOT re-add the route or
@@ -397,24 +384,15 @@ pub(crate) async fn activate_dynamic_subscribe(
         urgency,
     });
 
-    // Broker SUBSCRIBE + reconnect-set registration. The
-    // resolved qos is concrete (defaulted above if omitted).
-    let qos = params.qos.unwrap_or_else(|| {
-        panic!(
-            "subscribe_dynamic_activated: qos unresolved for configured mqtt client {:?} \
-             (default resolution should have filled it)",
-            parsed.client
-        )
-    });
+    // Broker SUBSCRIBE + reconnect-set registration, at the client's `qos`:
+    // every subscriber of the filter shares one broker subscription.
+    //
     // Same window as the urgency read above, one await later: a `None` is the
     // client's session having been stopped, not an inconsistency. The route
     // installed a moment ago comes back out — it maps to a filter no session
     // will ever assert — and the durable row is left dormant.
-    // TODO(mqtt-dynamic-subscribe-qos-not-honoured): a QoS that differs from
-    // the one the filter is held at panics inside this call, after the row and
-    // the route were written.
     let Some(outcome) = mqtt_svc
-        .subscribe_filter(&parsed.client, parsed.topic.clone(), qos)
+        .subscribe_filter(&parsed.client, parsed.topic.clone())
         .await
     else {
         router.remove_route(channel_uuid);
@@ -640,14 +618,13 @@ mod tests {
 
     use crate::active_bridge::ActiveBridge;
 
-    /// Pull-only params (the `push_depth=0` trick), with an optional explicit qos.
-    fn pull_only(qos: Option<u8>) -> DynamicSubscribeParams {
+    /// Pull-only params (the `push_depth=0` trick).
+    fn pull_only() -> DynamicSubscribeParams {
         DynamicSubscribeParams {
             push_depth: Depth::Bounded(0),
             retain_depth: Depth::Bounded(5),
             noise: None,
             wake_min: None,
-            qos,
         }
     }
 
@@ -680,7 +657,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
         let addr = "brenn:test-channel";
 
-        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("brenn subscribe succeeds");
         assert_eq!(outcome, SubscribeActivation::LocalOnly);
@@ -688,7 +665,6 @@ mod tests {
         let rows = dynamic_rows(&bridge).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].app_slug, "testapp");
-        assert_eq!(rows[0].qos, None, "brenn: carries no qos");
         assert!(has_app_subscriber(&bridge, addr, "testapp"));
     }
 
@@ -707,7 +683,7 @@ mod tests {
             &bridge,
             "testapp",
             "mqtt:home:sensors/+/temp",
-            pull_only(None),
+            pull_only(),
         )
         .await
         .unwrap_err();
@@ -735,7 +711,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
         let addr = "mqtt:nope:sensors/x";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -758,16 +734,16 @@ mod tests {
     }
 
     /// A new `mqtt:` filter on the configured `home` client activates: the channel
-    /// is created, the subscriber folded, the durable row persisted with the
-    /// **defaulted** qos (client default 2, since omitted), and the router route is
-    /// added — proven end-to-end by a post-subscribe `deliver_inbound` storing a
-    /// row. The client cell is empty (no broker) → `MqttDeferredDisconnected`.
+    /// is created, the subscriber folded, the durable row persisted, the filter
+    /// held by the client's session, and the router route added — proven
+    /// end-to-end by a post-subscribe `deliver_inbound` storing a row. The client
+    /// cell is empty (no broker) → `MqttDeferredDisconnected`.
     #[tokio::test]
     async fn subscribe_new_mqtt_filter_activates() {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
         let addr = "mqtt:home:sensors/+/temp";
 
-        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("mqtt subscribe activates");
         assert_eq!(
@@ -788,13 +764,17 @@ mod tests {
         );
         assert!(has_app_subscriber(&bridge, addr, "testapp"));
 
-        // Durable row persisted with the defaulted qos (client default = 2).
+        // Durable row persisted, and the filter held by the client's session,
+        // whose configured qos is 2.
         let rows = dynamic_rows(&bridge).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].qos,
+            bridge
+                .mqtt_service()
+                .ingress_filter_qos("home", "sensors/+/temp")
+                .await,
             Some(2),
-            "omitted qos defaults to the client's [[mqtt_client]].qos"
+            "the session holds the filter"
         );
 
         // Route was added: a matching inbound delivery now routes to the channel
@@ -876,7 +856,7 @@ mod tests {
 
         let params = DynamicSubscribeParams {
             retain_depth: Depth::Bounded(100),
-            ..pull_only(None)
+            ..pull_only()
         };
         subscribe_dynamic_activated(&bridge, "testapp", &addr, params)
             .await
@@ -929,7 +909,7 @@ mod tests {
             reason: REASON.to_string(),
         };
 
-        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("a failed session is not a subscribe error");
         assert_eq!(
@@ -941,7 +921,6 @@ mod tests {
         assert!(has_app_subscriber(&bridge, addr, "testapp"));
         let rows = dynamic_rows(&bridge).await;
         assert_eq!(rows.len(), 1, "the subscription is durable all the same");
-        assert_eq!(rows[0].qos, Some(2), "omitted qos still defaults");
 
         // And the route: a process with working credentials asserts the filter
         // without the app re-subscribing, which needs the route to be there.
@@ -980,7 +959,7 @@ mod tests {
         let addr = "mqtt:home:sensors/+/temp";
 
         // App A subscribes: channel + route created.
-        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("first app subscribe");
         // App B subscribes to the SAME filter: core returns Created (per-app), the
@@ -988,12 +967,24 @@ mod tests {
         // is in the fixture's apps map with a policy granting DynamicSubscribe +
         // MqttSubscribe + an mqtt_subscribe matcher covering (client "home", filter
         // "sensors/#"), so the ACL gate admits its subscribe.
-        subscribe_dynamic_activated(&bridge, "otherapp", addr, pull_only(None))
+        subscribe_dynamic_activated(&bridge, "otherapp", addr, pull_only())
             .await
             .expect("second app subscribe on same filter");
 
-        // Both apps' durable rows exist (two subscribers on the channel).
+        // Both apps' durable rows exist (two subscribers on the channel), and
+        // the session holds the filter once.
         assert_eq!(dynamic_rows(&bridge).await.len(), 2);
+        assert_eq!(
+            bridge
+                .mqtt_service()
+                .get_client("home")
+                .expect("the configured client")
+                .subscriptions
+                .read()
+                .await
+                .len(),
+            1
+        );
 
         // One inbound delivery stores exactly ONE row (not two). A duplicate route
         // would double-store/double-deliver every message.
@@ -1017,22 +1008,81 @@ mod tests {
         );
     }
 
-    /// An explicit `qos` is persisted verbatim, overriding the client default.
+    /// Replace the registered `home` session with a successor configured at
+    /// `qos`, holding the predecessor's filters under the same identifiers —
+    /// what a reload that edits the client's `qos` leaves in the registry. The
+    /// fixture's predecessor is at qos 2.
+    async fn replace_home_at(bridge: &ActiveBridge, qos: u8) {
+        let service = bridge.mqtt_service();
+        let predecessor = service.get_client("home").expect("the configured client");
+        let inherited = predecessor.subscriptions.read().await.to_vec();
+        let mut config = (*predecessor.config).clone();
+        config.identity.qos = qos;
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        service.add_client(brenn_mqtt::MqttClientHandle::new(
+            std::sync::Arc::new(config),
+            inherited,
+            stop_tx,
+        ));
+    }
+
+    /// After the client is replaced by a successor at another `qos`, a
+    /// subscribe on a filter the predecessor held answers normally and leaves
+    /// the filter held once, by the successor: once for a filter a static
+    /// binding put in the session's set, once for one held only by an earlier
+    /// app's dynamic subscription. There is no connected client here, so the
+    /// `ingress_filter_qos` reads show which session holds the filter, not the
+    /// QoS any SUBSCRIBE carried.
     #[tokio::test]
-    async fn subscribe_mqtt_explicit_qos_overrides_default() {
+    async fn a_subscribe_after_the_clients_qos_moved_answers_normally() {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
-        let addr = "mqtt:home:sensors/explicit";
+        let static_filter = "sensors/static";
+        let dynamic_filter = "sensors/+/temp";
+        let service = bridge.mqtt_service();
+        service
+            .get_client("home")
+            .expect("the configured client")
+            .add_subscription(static_filter.to_string())
+            .await;
+        subscribe_dynamic_activated(
+            &bridge,
+            "testapp",
+            &format!("mqtt:home:{dynamic_filter}"),
+            pull_only(),
+        )
+        .await
+        .expect("the first app's subscribe");
 
-        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(Some(1)))
+        replace_home_at(&bridge, 0).await;
+
+        for filter in [static_filter, dynamic_filter] {
+            let outcome = subscribe_dynamic_activated(
+                &bridge,
+                "otherapp",
+                &format!("mqtt:home:{filter}"),
+                pull_only(),
+            )
             .await
-            .expect("mqtt subscribe with explicit qos");
-
-        let rows = dynamic_rows(&bridge).await;
-        assert_eq!(rows.len(), 1);
+            .expect("a subscribe on a filter the predecessor held");
+            assert_eq!(outcome, SubscribeActivation::MqttDeferredDisconnected);
+            assert_eq!(
+                service.ingress_filter_qos("home", filter).await,
+                Some(0),
+                "{filter} is held by the successor"
+            );
+        }
+        let held = service
+            .get_client("home")
+            .expect("the successor")
+            .subscriptions
+            .read()
+            .await
+            .len();
+        assert_eq!(held, 2, "each filter is held once");
         assert_eq!(
-            rows[0].qos,
-            Some(1),
-            "explicit qos overrides the client default (2)"
+            deliver_and_count(&bridge, "home", "sensors/k/temp").await,
+            1,
+            "the dynamic filter's channel has one route"
         );
     }
 
@@ -1048,7 +1098,7 @@ mod tests {
             ActiveBridge::test_new_for_mqtt_subscribe_with_policy(Default::default()).await;
         let addr = "mqtt:home:sensors/+/temp";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1081,7 +1131,7 @@ mod tests {
 
         // Broader request not covered by the narrow matcher ⇒ deny.
         let broader = "mqtt:home:sensors/#";
-        let err = subscribe_dynamic_activated(&bridge, "testapp", broader, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", broader, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1106,7 +1156,7 @@ mod tests {
         // The exact covered filter on the same client is admitted (proves the gate
         // is a real subset check, not a blanket deny).
         let covered = "mqtt:home:sensors/+/temp";
-        subscribe_dynamic_activated(&bridge, "testapp", covered, pull_only(None))
+        subscribe_dynamic_activated(&bridge, "testapp", covered, pull_only())
             .await
             .expect("covered filter is admitted");
         assert_eq!(dynamic_rows(&bridge).await.len(), 1);
@@ -1121,7 +1171,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
 
         let sys = "mqtt:home:$SYS/#";
-        let err = subscribe_dynamic_activated(&bridge, "testapp", sys, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", sys, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1141,7 +1191,7 @@ mod tests {
             "no channel created on a policy-denied `$` subscribe"
         );
 
-        subscribe_dynamic_activated(&bridge, "testapp", "mqtt:home:#", pull_only(None))
+        subscribe_dynamic_activated(&bridge, "testapp", "mqtt:home:#", pull_only())
             .await
             .expect("`#` under a `#` entry is admitted");
         assert_eq!(dynamic_rows(&bridge).await.len(), 1);
@@ -1169,7 +1219,7 @@ mod tests {
         // ran first this would be `UnconfiguredMqttClient`.
         let addr = "mqtt:other:sensors/+/temp";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1209,7 +1259,7 @@ mod tests {
         // `sensors/#/extra`: `#` is not terminal — invalid wildcard placement.
         let addr = "mqtt:home:sensors/#/extra";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert!(
@@ -1275,7 +1325,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
         let addr = "brenn:test-channel";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1308,7 +1358,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(deny_policy).await;
         let addr = "brenn:test-channel";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1332,7 +1382,7 @@ mod tests {
             vec![],
         );
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(allow_policy).await;
-        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("covered brenn: channel is admitted");
         assert_eq!(outcome, SubscribeActivation::LocalOnly);
@@ -1357,7 +1407,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
         let addr = "ephemeral:test-ring";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1383,7 +1433,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
         let addr = "ephemeral:test-ring";
 
-        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("a covered ephemeral: channel is admitted");
         assert_eq!(outcome, SubscribeActivation::LocalOnly);
@@ -1408,7 +1458,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
         let addr = "webhook:test-ep";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1443,7 +1493,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
         let addr = "brenn:test-channel";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1478,7 +1528,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
         let addr = "bogus-proto:whatever";
 
-        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .unwrap_err();
         assert!(
@@ -1502,10 +1552,9 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
 
         // Authorized endpoint: gate passes, core rejects the absent channel.
-        let err =
-            subscribe_dynamic_activated(&bridge, "testapp", "webhook:test-ep", pull_only(None))
-                .await
-                .unwrap_err();
+        let err = subscribe_dynamic_activated(&bridge, "testapp", "webhook:test-ep", pull_only())
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1517,7 +1566,7 @@ mod tests {
 
         // A different endpoint is not covered by the matcher ⇒ PolicyDenied.
         let other = "webhook:other-ep";
-        let err = subscribe_dynamic_activated(&bridge, "testapp", other, pull_only(None))
+        let err = subscribe_dynamic_activated(&bridge, "testapp", other, pull_only())
             .await
             .unwrap_err();
         assert_eq!(
@@ -1526,26 +1575,6 @@ mod tests {
                 address: other.to_string()
             }
         );
-        assert!(dynamic_rows(&bridge).await.is_empty());
-    }
-
-    /// `qos` supplied for a non-MQTT (`brenn:`) address is rejected by the lib
-    /// core, surfaced as `Core(QosOnNonMqtt)`; nothing persisted.
-    #[tokio::test]
-    async fn subscribe_qos_on_brenn_errors() {
-        let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
-        let err = subscribe_dynamic_activated(
-            &bridge,
-            "testapp",
-            "brenn:test-channel",
-            pull_only(Some(0)),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            SubscribeActivateError::Core(RuntimeSubscribeError::QosOnNonMqtt { .. })
-        ));
         assert!(dynamic_rows(&bridge).await.is_empty());
     }
 
@@ -1636,7 +1665,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
         let addr = "brenn:test-channel";
 
-        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("brenn subscribe");
         assert!(has_app_subscriber(&bridge, addr, "testapp"));
@@ -1681,7 +1710,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
         let addr = "mqtt:home:sensors/+/temp";
 
-        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("mqtt subscribe");
         // Route is live: a matching delivery stores a row.
@@ -1729,7 +1758,7 @@ mod tests {
         // subscriber back out, leaving the durable row → the dormant shape:
         // durable-only, unfolded, and never activated (no route).
         messenger
-            .subscribe_dynamic("testapp", addr, pull_only(None))
+            .subscribe_dynamic("testapp", addr, pull_only())
             .await
             .expect("core mqtt subscribe");
         let uuid = messenger.directory().resolve(addr).expect("channel").uuid;
@@ -1782,7 +1811,7 @@ mod tests {
         let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
         let addr = "mqtt:home:sensors/+/temp";
 
-        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+        subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await
             .expect("mqtt subscribe");
 

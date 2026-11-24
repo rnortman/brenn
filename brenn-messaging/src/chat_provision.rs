@@ -890,7 +890,6 @@ mod tests {
                 retain_depth: Depth::Bounded(4),
                 noise: crate::NoiseLevel::Silent,
                 wake_min: crate::WakeMin::Normal,
-                qos: None,
                 created_at: "2024-01-01T00:00:00Z".to_string(),
             },
         );

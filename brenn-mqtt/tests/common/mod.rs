@@ -20,7 +20,7 @@ pub mod router;
 pub use brenn_mqtt::test_support::broker::{
     AUTH_CREDENTIALS, BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, log_records_disconnect,
     log_records_disconnect_after, log_records_disconnect_before_reconnect,
-    log_records_publish_to_subscriber, log_records_unsubscribe,
+    log_records_publish_to_subscriber, log_records_subscribe_at, log_records_unsubscribe,
 };
 pub use brenn_mqtt::test_support::certs;
 pub use brenn_mqtt::test_support::client::{
@@ -86,7 +86,7 @@ pub struct SpawnedClient {
 }
 
 /// Build `MqttService` + `MqttClientHandle` + the unified supervisor for
-/// `test_name`, wiring a `CapturingRouter` for inbound deliveries. `static_subs`
+/// `test_name`, wiring a `CapturingRouter` for inbound deliveries. `static_filters`
 /// are the client's union subscription set (each with its filter's derived
 /// identifier), re-asserted by the supervisor on connect.
 ///
@@ -98,10 +98,16 @@ pub async fn spawn_client(
     test_name: &str,
     broker: &BrokerHarness,
     ca_pem: Vec<u8>,
-    static_subs: Vec<(String, u8)>,
+    static_filters: Vec<String>,
 ) -> SpawnedClient {
-    spawn_client_with_tls_version(test_name, broker, ca_pem, static_subs, TlsVersionMin::Tls12)
-        .await
+    spawn_client_with_tls_version(
+        test_name,
+        broker,
+        ca_pem,
+        static_filters,
+        TlsVersionMin::Tls12,
+    )
+    .await
 }
 
 /// Like [`spawn_client`] but negotiates TLS 1.3 only (`tls_version_min = Tls13`).
@@ -109,10 +115,16 @@ pub async fn spawn_client_tls13(
     test_name: &str,
     broker: &BrokerHarness,
     ca_pem: Vec<u8>,
-    static_subs: Vec<(String, u8)>,
+    static_filters: Vec<String>,
 ) -> SpawnedClient {
-    spawn_client_with_tls_version(test_name, broker, ca_pem, static_subs, TlsVersionMin::Tls13)
-        .await
+    spawn_client_with_tls_version(
+        test_name,
+        broker,
+        ca_pem,
+        static_filters,
+        TlsVersionMin::Tls13,
+    )
+    .await
 }
 
 /// The `MqttClientConfig` the harness spawner uses, returned as a bare struct so
@@ -181,7 +193,7 @@ async fn spawn_client_with_tls_version(
     test_name: &str,
     broker: &BrokerHarness,
     ca_pem: Vec<u8>,
-    static_subs: Vec<(String, u8)>,
+    static_filters: Vec<String>,
     tls_version_min: TlsVersionMin,
 ) -> SpawnedClient {
     let client_slug = format!("testbroker-{test_name}");
@@ -191,7 +203,7 @@ async fn spawn_client_with_tls_version(
         ca_pem,
         tls_version_min,
     ));
-    let spawned = spawn_client_with_config(config, static_subs).await;
+    let spawned = spawn_client_with_config(config, static_filters).await;
 
     wait_until_connected(
         || async { spawned.svc.ingress_health(&spawned.client_slug).await.0 },
@@ -210,13 +222,13 @@ async fn spawn_client_with_tls_version(
 /// client slug is taken from `config.slug`.
 pub async fn spawn_client_with_config(
     config: Arc<MqttClientConfig>,
-    static_subs: Vec<(String, u8)>,
+    static_filters: Vec<String>,
 ) -> SpawnedClient {
     let client_slug = config.identity.slug.clone();
 
-    let subs: Vec<IngressSubscription> = static_subs
+    let subs: Vec<IngressSubscription> = static_filters
         .into_iter()
-        .map(|(topic_filter, qos)| IngressSubscription::new(topic_filter, qos))
+        .map(IngressSubscription::new)
         .collect();
 
     let svc = MqttService::new();
@@ -417,7 +429,7 @@ pub async fn subscribe_live_confirmed(
     await_puback(ack_rx, "subscribe_live_confirmed: barrier").await;
 
     let outcome = svc
-        .subscribe_filter(client_slug, topic.to_string(), 1)
+        .subscribe_filter(client_slug, topic.to_string())
         .await
         .expect("subscribe_live_confirmed: no ingress supervisor for client");
 

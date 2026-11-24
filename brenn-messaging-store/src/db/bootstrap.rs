@@ -418,8 +418,8 @@ mod tests {
         for app in ["graf", "pfin"] {
             conn.execute(
                 "INSERT INTO messaging_dynamic_subscriptions \
-                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-                 VALUES (?1, ?2, '0', '1', 'silent', 'normal', NULL, '2026-06-20T00:00:00Z')",
+                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+                 VALUES (?1, ?2, '0', '1', 'silent', 'normal', '2026-06-20T00:00:00Z')",
                 rusqlite::params![uuid.as_bytes().to_vec(), app],
             )
             .expect("seed dynamic row");

@@ -40,18 +40,13 @@ const UNATTRIBUTED_FILTER: &str = "<unknown>";
 // Union subscription set
 // ---------------------------------------------------------------------------
 
-/// Collapse one client's ingress channels into the deduplicated set of
-/// `(topic_filter, qos)` subscriptions.
+/// Collapse one client's ingress channels into its deduplicated set of topic
+/// filters.
 ///
 /// Distinct filter *strings* on one client yield distinct SUBSCRIBEs, each with
-/// the identifier derived from its filter ([`IngressSubscription::new`]), at the
-/// largest QoS among the channels given for it. Entries are in first-seen order.
-/// The callers give at most one channel per filter — a dynamic row under a
-/// static binding and every dynamic row after the first on a channel are left
-/// out before the union — so this is not the largest QoS any subscriber asked
-/// for (`TODO(mqtt-dynamic-subscribe-qos-not-honoured)`).
-/// `channels` may include channels for other clients; only those whose
-/// `client_slug == client_slug` are considered.
+/// the identifier derived from its filter ([`IngressSubscription::new`]).
+/// Entries are in first-seen order. `channels` may include channels for other
+/// clients; only those whose `client_slug == client_slug` are considered.
 pub fn union_subscriptions(
     client_slug: &str,
     channels: &[ResolvedMqttIngressChannel],
@@ -61,29 +56,35 @@ pub fn union_subscriptions(
         if channel.client_slug != client_slug {
             continue;
         }
-        if let Some(existing) = subs.iter_mut().find(|s| s.topic_filter == channel.topic) {
-            existing.qos = existing.qos.max(channel.qos);
-        } else {
-            subs.push(IngressSubscription::new(channel.topic.clone(), channel.qos));
+        if !subs.iter().any(|s| s.topic_filter == channel.topic) {
+            subs.push(IngressSubscription::new(channel.topic.clone()));
         }
     }
     subs
 }
 
 /// The `Filter` and properties of the broker SUBSCRIBE for one ingress
-/// subscription: the `OnEverySubscribe` retain rule, so the broker re-delivers
-/// the current retained message on every (re)subscribe, and — when
+/// subscription at `qos`: the `OnEverySubscribe` retain rule, so the broker
+/// re-delivers the current retained message on every (re)subscribe, and — when
 /// `with_identifier`, which is whether the connection's broker supports
 /// Subscription Identifiers — the subscription's MQTT 5 Subscription
 /// Identifier.
+///
+/// # Panics
+///
+/// If `qos` is above 2, which config validation refuses for the client named
+/// by `client_slug`; reaching it is a host bug.
 fn subscribe_request(
+    client_slug: &str,
     sub: &IngressSubscription,
+    qos: u8,
     with_identifier: bool,
 ) -> (Filter, SubscribeProperties) {
-    let rumq_qos = qos_of(sub.qos).unwrap_or_else(|| {
+    let rumq_qos = qos_of(qos).unwrap_or_else(|| {
         panic!(
-            "subscription {:?} with QoS {}, which config validation refuses",
-            sub.topic_filter, sub.qos
+            "client {client_slug:?}: subscription {:?} with QoS {qos}, which config \
+             validation refuses",
+            sub.topic_filter
         )
     });
     let filter = Filter {
@@ -133,6 +134,8 @@ pub enum SubscribeSend {
 /// FIFO: rumqttc reports it with the same error as a full channel, and a
 /// retry loop must not mistake it for one.
 ///
+/// The SUBSCRIBE requests the `qos` of `handle`'s configuration: every filter
+/// of a client is subscribed at the QoS of the session it goes out on.
 /// `with_identifier` is whether the connection `client` belongs to accepts a
 /// Subscription Identifier; see [`subscribe_request`].
 ///
@@ -147,7 +150,12 @@ pub fn try_assert_ingress_subscription(
     if !rumqttc::mqttbytes::valid_filter(&sub.topic_filter) {
         return Err(format!("invalid topic filter {:?}", sub.topic_filter));
     }
-    let (filter, props) = subscribe_request(sub, with_identifier);
+    let (filter, props) = subscribe_request(
+        &handle.config.identity.slug,
+        sub,
+        handle.config.identity.qos,
+        with_identifier,
+    );
     let mut pending = handle
         .pending_subscribes
         .lock()
@@ -1414,7 +1422,7 @@ mod tests {
     use brenn_lib::messaging::Urgency;
     use brenn_lib::mqtt::subscription_identifier;
 
-    fn channel(client: &str, topic: &str, qos: u8) -> ResolvedMqttIngressChannel {
+    fn channel(client: &str, topic: &str) -> ResolvedMqttIngressChannel {
         let address = brenn_lib::mqtt::config::parsed_address_canonical(client, topic);
         ResolvedMqttIngressChannel {
             channel_uuid: brenn_lib::messaging::mqtt_channel_uuid_from_address(&address),
@@ -1422,7 +1430,6 @@ mod tests {
             client_slug: client.to_string(),
             topic: topic.to_string(),
             urgency: Urgency::Normal,
-            qos,
         }
     }
 
@@ -1430,15 +1437,15 @@ mod tests {
 
     #[test]
     fn union_empty_when_no_channels_for_client() {
-        let channels = vec![channel("other", "a/b", 1)];
+        let channels = vec![channel("other", "a/b")];
         assert!(union_subscriptions("target", &channels).is_empty());
     }
 
     #[test]
     fn union_gives_each_filter_its_derived_identifier() {
         let channels = vec![
-            channel("broker", "home/+/state", 1),
-            channel("broker", "sensors/#", 0),
+            channel("broker", "home/+/state"),
+            channel("broker", "sensors/#"),
         ];
         let subs = union_subscriptions("broker", &channels);
         assert_eq!(
@@ -1446,12 +1453,10 @@ mod tests {
             vec![
                 IngressSubscription {
                     topic_filter: "home/+/state".into(),
-                    qos: 1,
                     sub_id: subscription_identifier("home/+/state"),
                 },
                 IngressSubscription {
                     topic_filter: "sensors/#".into(),
-                    qos: 0,
                     sub_id: subscription_identifier("sensors/#"),
                 },
             ]
@@ -1459,22 +1464,28 @@ mod tests {
     }
 
     #[test]
-    fn union_dedups_shared_filter_at_max_qos() {
+    fn union_dedups_a_shared_filter_in_first_seen_order() {
         let channels = vec![
-            channel("broker", "home/+/state", 0),
-            channel("broker", "home/+/state", 2),
+            channel("broker", "home/+/state"),
+            channel("broker", "sensors/#"),
+            channel("broker", "home/+/state"),
         ];
         let subs = union_subscriptions("broker", &channels);
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0], IngressSubscription::new("home/+/state", 2));
+        assert_eq!(
+            subs,
+            vec![
+                IngressSubscription::new("home/+/state"),
+                IngressSubscription::new("sensors/#"),
+            ]
+        );
     }
 
     #[test]
     fn union_filters_out_other_clients() {
         let channels = vec![
-            channel("broker-a", "a/#", 1),
-            channel("broker-b", "b/#", 1),
-            channel("broker-a", "c/#", 1),
+            channel("broker-a", "a/#"),
+            channel("broker-b", "b/#"),
+            channel("broker-a", "c/#"),
         ];
         let subs = union_subscriptions("broker-a", &channels);
         assert_eq!(subs.len(), 2);
@@ -1582,7 +1593,7 @@ mod tests {
     async fn an_edit_reaching_the_successor_mid_handover_survives_the_inherit() {
         let service = MqttService::new();
         let old = test_handle();
-        old.add_subscription("home/state".to_string(), 1).await;
+        old.add_subscription("home/state".to_string()).await;
         old.set_supervisor(lingering_stand_in_supervisor(
             &old,
             Duration::from_millis(400),
@@ -1616,7 +1627,7 @@ mod tests {
             "the registry answers with the successor before the drain finishes, which is what              makes this window reachable",
         );
         let edit = service
-            .subscribe_filter("broker", "attic/+".to_string(), 1)
+            .subscribe_filter("broker", "attic/+".to_string())
             .await;
         assert!(edit.is_some(), "the slug is registered throughout");
 
@@ -1645,7 +1656,7 @@ mod tests {
             "the edit resolved the successor, not the predecessor — the interleaving under test",
         );
         let mut expected = old.subscriptions.read().await.to_vec();
-        expected.push(IngressSubscription::new("attic/+", 1));
+        expected.push(IngressSubscription::new("attic/+"));
         assert_eq!(
             successor.subscriptions.read().await.to_vec(),
             expected,
@@ -1670,7 +1681,7 @@ mod tests {
     async fn a_successor_inherits_a_filter_added_during_the_handover() {
         let service = MqttService::new();
         let old = test_handle();
-        old.add_subscription("home/state".to_string(), 1).await;
+        old.add_subscription("home/state".to_string()).await;
         old.set_supervisor(stand_in_supervisor(&old)).await;
         service.add_client(old.clone());
 
@@ -1679,7 +1690,7 @@ mod tests {
         let edit_service = service.clone();
         let edit = tokio::spawn(async move {
             edit_service
-                .subscribe_filter("broker", "attic/+".to_string(), 1)
+                .subscribe_filter("broker", "attic/+".to_string())
                 .await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1736,8 +1747,49 @@ mod tests {
         successor.stop_and_join().await;
     }
 
+    /// A successor configured at a different `qos` holds each inherited filter
+    /// under the same identifier, and answers its own `qos` for it: the set
+    /// carries filters only, so what the successor's connect asserts is at the
+    /// successor's configuration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_successor_at_another_qos_holds_the_inherited_filter_at_its_own() {
+        let service = MqttService::new();
+        let old = test_handle();
+        assert_eq!(old.config.identity.qos, 1);
+        old.add_subscription("home/state".to_string()).await;
+        old.set_supervisor(stand_in_supervisor(&old)).await;
+        service.add_client(old.clone());
+        assert_eq!(
+            service.ingress_filter_qos("broker", "home/state").await,
+            Some(1)
+        );
+
+        let mut config = brenn_lib::mqtt::test_support::test_client_config("broker");
+        config.identity.qos = 2;
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        let successor = register_and_spawn(
+            &service,
+            Arc::new(config),
+            ArrivingFilters::Successor(&old),
+            router,
+        )
+        .await;
+
+        assert_eq!(
+            successor.subscriptions.read().await.get("home/state"),
+            Some(&IngressSubscription::new("home/state")),
+            "the inherited filter keeps its identifier",
+        );
+        assert_eq!(
+            service.ingress_filter_qos("broker", "home/state").await,
+            Some(2),
+            "the reader follows the registered successor's configuration",
+        );
+        successor.stop_and_join().await;
+    }
+
     fn sub(topic_filter: &str) -> IngressSubscription {
-        IngressSubscription::new(topic_filter, 1)
+        IngressSubscription::new(topic_filter)
     }
 
     /// The supervisor's SUBSCRIBE send returns at once on a full request
@@ -1930,8 +1982,8 @@ mod tests {
     async fn suback_records_only_granted_filters() {
         let handle = test_handle();
         let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
-        handle.add_subscription("home/+/state".into(), 1).await;
-        handle.add_subscription("sensors/#".into(), 0).await;
+        handle.add_subscription("home/+/state".into()).await;
+        handle.add_subscription("sensors/#".into()).await;
 
         handle
             .pending_subscribes
@@ -1994,7 +2046,7 @@ mod tests {
     async fn suback_for_an_unsubscribed_filter_records_nothing() {
         let handle = test_handle();
         let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
-        handle.add_subscription("home/+/state".into(), 1).await;
+        handle.add_subscription("home/+/state".into()).await;
         handle
             .pending_subscribes
             .lock()
@@ -2022,7 +2074,7 @@ mod tests {
     async fn suback_with_several_return_codes_refuses_the_filter() {
         let handle = test_handle();
         let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
-        handle.add_subscription("home/+/state".into(), 1).await;
+        handle.add_subscription("home/+/state".into()).await;
         handle
             .pending_subscribes
             .lock()
@@ -2082,10 +2134,10 @@ mod tests {
 
     #[test]
     fn subscribe_request_carries_the_identifier_only_when_asked() {
-        let (filter, props) = subscribe_request(&sub("home/a"), true);
+        let (filter, props) = subscribe_request("broker", &sub("home/a"), 1, true);
         assert_eq!(filter.path, "home/a");
         assert_eq!(props.id, Some(subscription_identifier("home/a") as usize));
-        let (_, props) = subscribe_request(&sub("home/a"), false);
+        let (_, props) = subscribe_request("broker", &sub("home/a"), 1, false);
         assert_eq!(props.id, None);
     }
 
@@ -2134,8 +2186,8 @@ mod tests {
             assert_ne!(id(filter), UNKNOWN);
         }
         let handle = test_handle();
-        handle.add_subscription("a/#".into(), 1).await;
-        handle.add_subscription("a/b".into(), 1).await;
+        handle.add_subscription("a/#".into()).await;
+        handle.add_subscription("a/b".into()).await;
         let (client, eventloop) = unpolled_client(4);
         install_connection(&handle, client, None, None, sub_ids_available).await;
         (handle, eventloop)
@@ -2266,13 +2318,13 @@ mod tests {
         inbound_ids(&handle, &router, &[id("a/b")]).await;
         assert_eq!(router.take(), vec![]);
 
-        handle.add_subscription("a/c".into(), 1).await;
+        handle.add_subscription("a/c".into()).await;
         inbound_ids(&handle, &router, &[id("a/b")]).await;
         assert_eq!(router.take(), vec![]);
         inbound_ids(&handle, &router, &[id("a/c")]).await;
         assert_eq!(router.take(), by_subscription(&["a/c"]));
 
-        handle.add_subscription("a/b".into(), 1).await;
+        handle.add_subscription("a/b".into()).await;
         inbound_ids(&handle, &router, &[id("a/b")]).await;
         assert_eq!(router.take(), by_subscription(&["a/b"]));
     }
@@ -2284,8 +2336,8 @@ mod tests {
         let (wide, narrow) = ("k/+/84471", "k/282/+");
         assert_eq!(id(wide), id(narrow), "the fixture pair must collide");
         let handle = test_handle();
-        handle.add_subscription(wide.into(), 1).await;
-        handle.add_subscription(narrow.into(), 1).await;
+        handle.add_subscription(wide.into()).await;
+        handle.add_subscription(narrow.into()).await;
         let (client, _eventloop) = unpolled_client(4);
         install_connection(&handle, client, None, None, true).await;
         let router = Arc::new(RecordingRouter::default());
@@ -2302,19 +2354,6 @@ mod tests {
                 InboundRouting::BySubscription(vec![wide.to_string(), narrow.to_string()]),
             )],
         );
-    }
-
-    /// A QoS change keeps the filter's identifier, so copies under it still
-    /// resolve.
-    #[tokio::test]
-    async fn a_qos_move_keeps_routing_by_the_same_identifier() {
-        let (handle, _eventloop) = routing_handle(true).await;
-        let router = Arc::new(RecordingRouter::default());
-        let (moved, held) = handle.set_subscription_qos("a/b", 2).await;
-        assert!(held);
-        assert_eq!(moved.sub_id, subscription_identifier("a/b"));
-        inbound_ids(&handle, &router, &[id("a/b")]).await;
-        assert_eq!(router.take(), by_subscription(&["a/b"]));
     }
 
     /// Every outgoing event wakes the egress side: the event loop emits one

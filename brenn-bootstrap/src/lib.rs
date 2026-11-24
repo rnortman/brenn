@@ -755,7 +755,7 @@ pub async fn run_server(
     .await;
 
     let brenn_messaging_boot::PlanCarried {
-        mut mqtt_ingress_channels,
+        mqtt_ingress_channels,
         surface_error_advisory,
         planned_directory,
         tool_caller_grants: planned_tool_caller_grants,
@@ -766,48 +766,11 @@ pub async fn run_server(
     // the plan's, not the process's, for the same reason its directory is.
     let planned_mqtt_ingress_channels = mqtt_ingress_channels.clone();
 
-    // Boot re-activation of durable dynamic `mqtt:` subscriptions: the
-    // boot merge folded them into the directory, but the ingress supervisor's
-    // broker SUBSCRIBE union and the router's `IngressRoute` table (built below by
-    // `start_mqtt`/`wire_mqtt_state`) are derived only from the *static*
-    // `mqtt_ingress_channels`. Append a `ResolvedMqttIngressChannel` for each kept
-    // dynamic `mqtt:` sub whose filter has no static channel — filling `urgency`
-    // from the client's `[[mqtt_client]]` (the same per-client constant a static
-    // channel on this client carries) — so its SUBSCRIBE is re-asserted on connect
-    // and its deliveries route after restart. Without this a runtime-created
-    // `mqtt:` subscription to a never-statically-declared filter silently stops
-    // delivering after a restart.
-    {
-        use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
-        let dynamic = std::mem::take(&mut messaging_result.dynamic_mqtt_ingress);
-        for dyn_ch in dynamic {
-            match mqtt_clients.get(&dyn_ch.client_slug) {
-                Some(client) => {
-                    mqtt_ingress_channels.push(ResolvedMqttIngressChannel {
-                        channel_address: dyn_ch.channel_address,
-                        channel_uuid: dyn_ch.channel_uuid,
-                        client_slug: dyn_ch.client_slug,
-                        topic: dyn_ch.topic,
-                        qos: dyn_ch.qos,
-                        urgency: client.identity.urgency,
-                    });
-                }
-                None => {
-                    // The dynamic sub was created against a configured client, but the
-                    // client was removed from `[[mqtt_client]]` config between boots —
-                    // durable user state config has since overridden, not a host bug.
-                    // Drop it from re-activation with a warn (its directory subscriber
-                    // remains harmless; nothing will deliver to it).
-                    tracing::warn!(
-                        client = %dyn_ch.client_slug,
-                        channel = %dyn_ch.channel_address,
-                        "boot: dropping dynamic mqtt subscription whose client is no longer a \
-                         configured [[mqtt_client]] — not re-activating its broker SUBSCRIBE/route"
-                    );
-                }
-            }
-        }
-    }
+    let mqtt_ingress_channels = mqtt::boot_ingress(
+        &mqtt_ingress_channels,
+        &mqtt_clients,
+        &messaging_result.dynamic_mqtt_ingress,
+    );
 
     // Observability: log the boot-resolved surfaces and non-durable
     // channels. Skipped when empty so a config with no `[[surface]]` /

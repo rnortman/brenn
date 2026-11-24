@@ -4,6 +4,20 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Behaviour change: one QoS per MQTT topic filter, the client's.** An MQTT
+  filter is now always subscribed at its client's configured `qos`, whether a
+  config binding or an app's runtime `MessageSubscribe` subscribed it.
+  `MessageSubscribe` no longer takes a `qos` argument; a call that passes one
+  is refused as an unknown argument. This fixes a panic: subscribing to a
+  filter already held at a different QoS crashed the conversation (or tool
+  connection) after the subscription had been written.
+- **Upgrade note:** on first start, the QoS stored with each app's runtime
+  MQTT subscription is dropped. A filter that was held at a different QoS
+  than its client's is held at the client's from then on, so its messages
+  arrive at no higher QoS than that.
+- After a config reload that changes a client's `qos`, the `mqtt_subscribed`
+  status lists every filter of that client the reload carried, including
+  those held only by runtime subscriptions.
 - **Behaviour change:** recurring automation jobs now keep firing with nobody
   attending. Before, every fire used one unit of a conversation's send budget
   (the allowance that only a person's interaction refills), so a schedule

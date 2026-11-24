@@ -97,7 +97,6 @@ pub(crate) enum DynamicKey {
         retain_depth: brenn_lib::messaging::config::Depth,
         noise: brenn_lib::messaging::config::NoiseLevel,
         wake_min: brenn_lib::messaging::WakeMin,
-        qos: Option<u8>,
     },
     Nondurable(Uuid),
 }
@@ -110,7 +109,6 @@ impl DynamicKey {
             retain_depth: row.retain_depth,
             noise: row.noise,
             wake_min: row.wake_min,
-            qos: row.qos,
         }
     }
 
@@ -469,11 +467,9 @@ pub(crate) fn dynamic_ingress(
     let mut out = Vec::new();
     for row in rows {
         let channel_uuid = &row.channel_uuid;
-        // TODO(mqtt-dynamic-subscribe-qos-not-honoured): the row's stored QoS
-        // is dropped here when a static binding holds the channel (`exclude`),
-        // and for every row after the first on a channel. The boot fold in
-        // `commit_messaging` skips the same rows, but a revived row comes after
-        // the rows already folded here, so the two can keep different firsts.
+        // One descriptor per channel, none where a static binding holds it
+        // (`exclude`): every row of a channel agrees on whether a route and a
+        // filter exist, so which row is kept does not matter.
         if exclude.contains(channel_uuid) || !seen.insert(*channel_uuid) {
             continue;
         }
@@ -512,19 +508,11 @@ pub(crate) fn dynamic_ingress(
             }
             continue;
         };
-        let qos = row.qos.unwrap_or_else(|| {
-            panic!(
-                "reload: dynamic mqtt subscription on {:?} has no stored qos — mqtt dynamic rows \
-                 always persist one (host bug)",
-                entry.address
-            )
-        });
         out.push(brenn_lib::mqtt::config::ResolvedMqttIngressChannel {
             channel_uuid: *channel_uuid,
             channel_address: entry.address.clone(),
             client_slug: parsed.client,
             topic: parsed.topic,
-            qos,
             urgency: client.urgency,
         });
     }
@@ -583,7 +571,6 @@ mod tests {
             retain_depth,
             noise: NoiseLevel::Metered,
             wake_min: WakeMin::Never,
-            qos: None,
             created_at: "2026-09-07T00:00:00Z".to_string(),
         }
     }
@@ -1118,13 +1105,9 @@ mod tests {
         (MessagingDirectory::with_entries(entries), uuids)
     }
 
-    /// A durable row as a dynamic `mqtt:` subscribe leaves it: with the
-    /// SUBSCRIBE QoS the projection re-asserts the filter at.
+    /// A durable row as a dynamic `mqtt:` subscribe leaves it.
     fn mqtt_row(uuid: Uuid, slug: &str) -> DynamicSubscriptionRow {
-        DynamicSubscriptionRow {
-            qos: Some(1),
-            ..row(uuid, slug, Depth::Bounded(1))
-        }
+        row(uuid, slug, Depth::Bounded(1))
     }
 
     fn clients(slugs: &[&str]) -> IndexMap<String, brenn_lib::mqtt::config::MqttClientIdentity> {

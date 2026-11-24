@@ -664,8 +664,9 @@ fn messaging_virtual_tools(enabled: bool, mqtt: bool, has_shell: bool) -> Vec<Vi
                 "Optional: `noise` (\"silent\"|\"metered\"|\"alarm\"), `wake_min` (\"very-low\"|",
                 "\"low\"|\"normal\"|\"high\"|\"never\") — both inherit channel/global defaults when ",
                 "omitted, and may NOT be set on a `push_depth=0` (pull-only) subscription. ",
-                "`qos` (0/1/2) is MQTT-only (defaults to the client's configured QoS); ",
-                "supplying it for a non-`mqtt:` address is an error.\n\n",
+                "An `mqtt:` filter is subscribed at the QoS the operator configured for its ",
+                "client; a subscriber cannot choose it, and messages arrive at no higher QoS ",
+                "than that.\n\n",
                 "The `push_depth=0` trick (ad-hoc retained reads, replaces the removed ",
                 "MqttGetRetained): subscribe with `push_depth=0` then read with ",
                 "MessageChannelGet. For `mqtt:` the SUBSCRIBE makes the broker send the ",
@@ -715,8 +716,7 @@ fn messaging_virtual_tools(enabled: bool, mqtt: bool, has_shell: bool) -> Vec<Vi
                         ]
                     },
                     "noise": { "type": "string", "enum": ["silent", "metered", "alarm"], "description": "Optional; inherits when omitted; invalid on push_depth=0." },
-                    "wake_min": { "type": "string", "enum": ["very-low", "low", "normal", "high", "never"], "description": "Optional; inherits when omitted; invalid on push_depth=0." },
-                    "qos": { "type": "integer", "minimum": 0, "maximum": 2, "description": "MQTT only; ignored for other transports (error if supplied for non-mqtt:). Defaults to the client's configured QoS." }
+                    "wake_min": { "type": "string", "enum": ["very-low", "low", "normal", "high", "never"], "description": "Optional; inherits when omitted; invalid on push_depth=0." }
                 },
                 "required": ["address", "push_depth", "retain_depth"]
             }),
@@ -2354,6 +2354,8 @@ mod tests {
         assert!(subscribe_req.iter().any(|v| v == "address"));
         assert!(subscribe_req.iter().any(|v| v == "push_depth"));
         assert!(subscribe_req.iter().any(|v| v == "retain_depth"));
+        // The QoS of an `mqtt:` filter is its client's; a subscriber cannot pass one.
+        assert!(subscribe.input_schema["properties"].get("qos").is_none());
 
         let unsubscribe = tools
             .iter()

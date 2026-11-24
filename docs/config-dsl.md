@@ -3153,9 +3153,11 @@ Three further refusals come from the wiring rather than from a section:
   broker could not be told about now — the client is disconnected, or its event
   loop is dying — is in `mqtt_deferred`: it is in the reconnect-survival set and
   the supervisor asserts it on the next connect, so the reload still applied.
-  A held filter whose QoS moved is subscribed again in place at the new QoS,
-  with no UNSUBSCRIBE, and is in `mqtt_subscribed` and not in
-  `mqtt_unsubscribed`.
+  Editing a client's `qos` restarts the client, whose first connect subscribes
+  every filter it holds again at the new QoS, with no UNSUBSCRIBE: each of
+  those filters is in `mqtt_subscribed` and not in `mqtt_unsubscribed`,
+  whether a `subscribe` line, a component binding or only dynamic
+  subscriptions hold it.
   One whose client's supervisor has *stopped* retrying — an authoritative
   failure such as bad credentials or a rejected TLS chain — is in `mqtt_failed`
   instead: the reload applied and the filter is registered, but no reconnect is
@@ -3170,8 +3172,8 @@ Three further refusals come from the wiring rather than from a section:
   those steps, in which case the same filter is in `mqtt_subscribed` alone —
   both reports are true, and neither is an anomaly. Filters a
   restarted client *carried* — everything bound through it that the document did
-  not move — are in neither list; the client itself is named in
-  `mqtt_clients_changed`. A removed client's filters are in neither list either:
+  not move — are in neither list unless the client's `qos` moved; the client
+  itself is named in `mqtt_clients_changed`. A removed client's filters are in neither list either:
   they left with the session, and a session about to be stopped can make no
   UNSUBSCRIBE good.
   Every declared `mqtt_client` has a broker session from boot, and one a reload

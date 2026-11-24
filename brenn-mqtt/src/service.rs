@@ -391,14 +391,16 @@ impl MqttService {
         }
     }
 
-    /// The broker SUBSCRIBE QoS this client's session holds for `topic_filter`.
+    /// The broker SUBSCRIBE QoS this client's session holds `topic_filter` at:
+    /// the `qos` of the session's configuration, which every filter of the
+    /// session is subscribed at.
     ///
     /// Returns `None` if the client has no session or no subscription for that
     /// exact filter.
     pub async fn ingress_filter_qos(&self, client_slug: &str, topic_filter: &str) -> Option<u8> {
         let handle = self.get_client(client_slug)?;
         let subs = handle.subscriptions.read().await;
-        subs.get(topic_filter).map(|s| s.qos)
+        subs.get(topic_filter).map(|_| handle.config.identity.qos)
     }
 
     /// Whether the broker has granted `topic_filter` on `client_slug`'s current
@@ -433,7 +435,9 @@ impl MqttService {
     }
 
     /// Combined `(qos, health, last_error)` for one `mqtt:` channel's
-    /// `(client, topic_filter)`, resolving the handle **once**.
+    /// `(client, topic_filter)`, resolving the handle **once**. The QoS is the
+    /// session's configured `qos` when the session holds the filter, as in
+    /// [`Self::ingress_filter_qos`].
     pub async fn ingress_filter_status(
         &self,
         client_slug: &str,
@@ -451,7 +455,7 @@ impl MqttService {
             .read()
             .await
             .get(topic_filter)
-            .map(|s| s.qos);
+            .map(|_| handle.config.identity.qos);
         let (label, last_error) = handle.health_snapshot().await;
         (qos, label, last_error)
     }
@@ -465,15 +469,9 @@ impl MqttService {
             .map(|h| h.config.identity.urgency)
     }
 
-    /// The default broker SUBSCRIBE QoS for `client_slug`'s session.
-    ///
-    /// Returns `None` if the client has no session.
-    pub async fn ingress_qos(&self, client_slug: &str) -> Option<u8> {
-        self.get_client(client_slug).map(|h| h.config.identity.qos)
-    }
-
-    /// Register `topic_filter` (at `qos`) on `client_slug`'s reconnect-survival
-    /// set and issue the broker SUBSCRIBE now if the client is live.
+    /// Register `topic_filter` on `client_slug`'s reconnect-survival set and
+    /// issue the broker SUBSCRIBE now if the client is live, at the `qos` of the
+    /// session it goes out on.
     ///
     /// Returns `None` if `client_slug` has no registered session (an unconfigured
     /// MQTT client — the caller maps this to a tool error). This method does
@@ -500,60 +498,11 @@ impl MqttService {
         &self,
         client_slug: &str,
         topic_filter: String,
-        qos: u8,
-    ) -> Option<IngressSubscribeOutcome> {
-        self.assert_filter(client_slug, topic_filter, qos, SetOperation::Add)
-            .await
-    }
-
-    /// Set the QoS of `topic_filter` on `client_slug`'s reconnect-survival set,
-    /// keeping its Subscription Identifier, and issue the broker SUBSCRIBE at
-    /// the new QoS now if the client is live. MQTT 5 has the broker replace its
-    /// subscription for the filter in place, so no UNSUBSCRIBE is sent and the
-    /// copies the broker sends under the identifier keep resolving to the
-    /// filter throughout.
-    ///
-    /// Answers as [`Self::subscribe_filter`] does, and retargets across a
-    /// restart the same way. A filter the set does not hold is added, with a
-    /// `warn`: the caller believed the session held it.
-    pub async fn resubscribe_filter(
-        &self,
-        client_slug: &str,
-        topic_filter: String,
-        qos: u8,
-    ) -> Option<IngressSubscribeOutcome> {
-        self.assert_filter(client_slug, topic_filter, qos, SetOperation::SetQos)
-            .await
-    }
-
-    /// The body of [`Self::subscribe_filter`] and [`Self::resubscribe_filter`],
-    /// which differ only in how the set takes the filter.
-    async fn assert_filter(
-        &self,
-        client_slug: &str,
-        topic_filter: String,
-        qos: u8,
-        operation: SetOperation,
     ) -> Option<IngressSubscribeOutcome> {
         let mut attempts = 0;
         let (handle, sub) = loop {
             let handle = self.get_client(client_slug)?;
-            let sub = match operation {
-                SetOperation::Add => handle.add_subscription(topic_filter.clone(), qos).await,
-                SetOperation::SetQos => {
-                    let (sub, held) = handle.set_subscription_qos(&topic_filter, qos).await;
-                    if !held {
-                        tracing::warn!(
-                            client = client_slug,
-                            topic_filter,
-                            qos,
-                            "resubscribe_filter: filter absent from the reconnect set that \
-                             the caller expected to hold it; added with a new identifier"
-                        );
-                    }
-                    sub
-                }
-            };
+            let sub = handle.add_subscription(topic_filter.clone()).await;
             if self.still_registered(client_slug, &handle) {
                 break (handle, sub);
             }
@@ -652,16 +601,6 @@ impl MqttService {
     // (`SupervisorState`-based) and the `MessageChannelList` enrichment.
 }
 
-/// How [`MqttService::assert_filter`] puts a filter into a client's set.
-#[derive(Clone, Copy)]
-enum SetOperation {
-    /// [`MqttClientHandle::add_subscription`]: a held filter is returned as is.
-    Add,
-    /// [`MqttClientHandle::set_subscription_qos`]: a held filter takes the new
-    /// QoS and keeps its identifier.
-    SetQos,
-}
-
 /// The library's QoS for an MQTT QoS number; `None` above 2.
 pub(crate) fn qos_of(qos: u8) -> Option<rumqttc::mqttbytes::QoS> {
     match qos {
@@ -707,6 +646,14 @@ mod tests {
         MqttClientHandle::new(config, vec![], tx)
     }
 
+    /// A handle for `client` whose configuration's `qos` is `qos`.
+    fn make_handle_at(client: &str, qos: u8) -> Arc<MqttClientHandle> {
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let mut config = brenn_lib::mqtt::test_support::test_client_config(client);
+        config.identity.qos = qos;
+        MqttClientHandle::new(Arc::new(config), vec![], tx)
+    }
+
     /// An `AsyncClient` whose eventloop has been dropped: every request send fails
     /// with a closed-channel `ClientError`. Never connects to anything.
     fn dead_live_client() -> rumqttc::AsyncClient {
@@ -734,7 +681,7 @@ mod tests {
         svc.add_client(handle.clone());
 
         let outcome = svc
-            .subscribe_filter("home", "sensors/+/temp".to_string(), 1)
+            .subscribe_filter("home", "sensors/+/temp".to_string())
             .await;
         assert_eq!(outcome, Some(IngressSubscribeOutcome::SubscribedLive));
         assert_eq!(
@@ -755,8 +702,7 @@ mod tests {
         let (client, _eventloop) = live_client();
         *handle.client.lock().await = Some(client);
         svc.add_client(handle.clone());
-        svc.subscribe_filter("home", "sensors/#".to_string(), 1)
-            .await;
+        svc.subscribe_filter("home", "sensors/#".to_string()).await;
         assert_eq!(
             svc.subscription_acked("home", "sensors/#").await,
             Some(false),
@@ -776,8 +722,7 @@ mod tests {
         let (client, _eventloop) = live_client();
         *handle.client.lock().await = Some(client);
         svc.add_client(handle.clone());
-        svc.subscribe_filter("home", "sensors/#".to_string(), 1)
-            .await;
+        svc.subscribe_filter("home", "sensors/#".to_string()).await;
         assert_eq!(
             svc.subscription_refusal("home", "sensors/#").await,
             None,
@@ -815,8 +760,7 @@ mod tests {
         let (client, _eventloop) = live_client();
         *handle.client.lock().await = Some(client);
         svc.add_client(handle.clone());
-        svc.subscribe_filter("home", "sensors/#".to_string(), 1)
-            .await;
+        svc.subscribe_filter("home", "sensors/#".to_string()).await;
         handle.record_grant("sensors/#").await;
         assert_eq!(
             svc.subscription_acked("home", "sensors/#").await,
@@ -841,7 +785,7 @@ mod tests {
         *handle.client.lock().await = Some(client);
         svc.add_client(handle.clone());
 
-        let outcome = svc.subscribe_filter("home", "a/#/b".to_string(), 1).await;
+        let outcome = svc.subscribe_filter("home", "a/#/b".to_string()).await;
         match outcome {
             Some(IngressSubscribeOutcome::SendFailed(msg)) => assert!(!msg.is_empty()),
             other => panic!("expected SendFailed, got {other:?}"),
@@ -875,7 +819,7 @@ mod tests {
         svc.add_client(handle.clone());
 
         let outcome = svc
-            .subscribe_filter("home", "sensors/+/temp".to_string(), 1)
+            .subscribe_filter("home", "sensors/+/temp".to_string())
             .await;
         assert_eq!(outcome, Some(IngressSubscribeOutcome::SubscribedLive));
         assert!(handle.pending_subscribes.lock().unwrap().is_empty());
@@ -905,9 +849,7 @@ mod tests {
         *handle.client.lock().await = Some(client);
         svc.add_client(handle.clone());
 
-        let first = svc
-            .subscribe_filter("home", "sensors/a".to_string(), 1)
-            .await;
+        let first = svc.subscribe_filter("home", "sensors/a".to_string()).await;
         assert_eq!(first, Some(IngressSubscribeOutcome::SubscribedLive));
         assert_eq!(
             handle
@@ -921,9 +863,7 @@ mod tests {
         );
         assert!(handle.deferred_subscribes.lock().unwrap().is_empty());
 
-        let second = svc
-            .subscribe_filter("home", "sensors/b".to_string(), 1)
-            .await;
+        let second = svc.subscribe_filter("home", "sensors/b".to_string()).await;
         assert_eq!(second, Some(IngressSubscribeOutcome::SubscribedLive));
         assert_eq!(
             handle.pending_subscribes.lock().unwrap().len(),
@@ -986,10 +926,8 @@ mod tests {
     #[tokio::test]
     async fn ingress_filter_qos_reads_subscribed_filter() {
         let svc = MqttService::new();
-        let handle = make_handle("home");
-        handle
-            .add_subscription("sensors/+/temp".to_string(), 2)
-            .await;
+        let handle = make_handle_at("home", 2);
+        handle.add_subscription("sensors/+/temp".to_string()).await;
         svc.add_client(handle);
 
         assert_eq!(
@@ -1004,26 +942,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingress_urgency_and_qos_read_handle_values() {
+    async fn ingress_urgency_reads_the_handle_value() {
         let svc = MqttService::new();
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let mut config = brenn_lib::mqtt::test_support::test_client_config("home");
         config.identity.urgency = Urgency::High;
-        config.identity.qos = 2;
         let handle = MqttClientHandle::new(Arc::new(config), vec![], tx);
         svc.add_client(handle);
 
         assert_eq!(svc.ingress_urgency("home").await, Some(Urgency::High));
-        assert_eq!(svc.ingress_qos("home").await, Some(2));
         assert_eq!(svc.ingress_urgency("nonesuch").await, None);
-        assert_eq!(svc.ingress_qos("nonesuch").await, None);
     }
 
     #[tokio::test]
     async fn subscribe_filter_unknown_client_returns_none() {
         let svc = MqttService::new();
         assert!(
-            svc.subscribe_filter("nonesuch", "sensors/+/temp".to_string(), 1)
+            svc.subscribe_filter("nonesuch", "sensors/+/temp".to_string())
                 .await
                 .is_none()
         );
@@ -1032,10 +967,10 @@ mod tests {
     #[tokio::test]
     async fn subscribe_filter_disconnected_defers_but_registers() {
         let svc = MqttService::new();
-        svc.add_client(make_handle("home"));
+        svc.add_client(make_handle_at("home", 2));
 
         let outcome = svc
-            .subscribe_filter("home", "sensors/+/temp".to_string(), 2)
+            .subscribe_filter("home", "sensors/+/temp".to_string())
             .await;
         assert_eq!(outcome, Some(IngressSubscribeOutcome::DeferredDisconnected));
         assert_eq!(
@@ -1058,38 +993,6 @@ mod tests {
             .get(topic_filter)
             .cloned()
             .expect("filter held")
-    }
-
-    /// A QoS move on a live client goes out as a SUBSCRIBE now, the entry keeps
-    /// its identifier at the new QoS, and the grant recorded for the old QoS is
-    /// no longer reported.
-    #[tokio::test]
-    async fn resubscribe_filter_live_client_keeps_the_identifier() {
-        let svc = MqttService::new();
-        let handle = make_handle("home");
-        let (client, _eventloop) = live_client();
-        *handle.client.lock().await = Some(client);
-        svc.add_client(handle.clone());
-        svc.subscribe_filter("home", "sensors/a".to_string(), 0)
-            .await;
-        svc.subscribe_filter("home", "sensors/#".to_string(), 0)
-            .await;
-        handle.record_grant("sensors/#").await;
-        let before = entry(&svc, "home", "sensors/#").await;
-
-        let outcome = svc
-            .resubscribe_filter("home", "sensors/#".to_string(), 1)
-            .await;
-        assert_eq!(outcome, Some(IngressSubscribeOutcome::SubscribedLive));
-        let after = entry(&svc, "home", "sensors/#").await;
-        assert_eq!(after.sub_id, before.sub_id);
-        assert_eq!(after.qos, 1);
-        assert_eq!(handle.subscriptions.read().await.len(), 2);
-        assert_eq!(
-            svc.subscription_acked("home", "sensors/#").await,
-            Some(false),
-            "the grant was for the SUBSCRIBE at the old QoS",
-        );
     }
 
     /// A client connected to an in-process broker that answers the CONNECT and
@@ -1152,94 +1055,69 @@ mod tests {
         (client, subscribes_rx)
     }
 
-    /// The SUBSCRIBE that a live subscribe and a live QoS move put on the wire
-    /// carries the filter's identifier when the installed connection's broker
-    /// supports Subscription Identifiers, and none when it does not.
+    /// The SUBSCRIBE a live subscribe puts on the wire requests the `qos` of
+    /// the handle's configuration, and carries the filter's identifier when the
+    /// installed connection's broker supports Subscription Identifiers and none
+    /// when it does not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_subscribes_carry_the_identifier_only_where_the_broker_supports_it() {
+        let wire = [
+            (0, rumqttc::QoS::AtMostOnce),
+            (1, rumqttc::QoS::AtLeastOnce),
+            (2, rumqttc::QoS::ExactlyOnce),
+        ];
         for available in [true, false] {
-            let svc = MqttService::new();
-            let handle = make_handle("home");
-            let (client, mut subscribes) = subscribe_capturing_client().await;
-            crate::connection::install_connection(&handle, client, None, None, available).await;
-            svc.add_client(handle.clone());
+            for (qos, on_wire) in wire {
+                let svc = MqttService::new();
+                let handle = make_handle_at("home", qos);
+                let (client, mut subscribes) = subscribe_capturing_client().await;
+                crate::connection::install_connection(&handle, client, None, None, available).await;
+                svc.add_client(handle.clone());
 
-            assert_eq!(
-                svc.subscribe_filter("home", "sensors/#".to_string(), 0)
-                    .await,
-                Some(IngressSubscribeOutcome::SubscribedLive),
-            );
-            let sub_id = entry(&svc, "home", "sensors/#").await.sub_id as usize;
-            let expected_id = available.then_some(sub_id);
-            let sent = subscribes
-                .recv()
-                .await
-                .expect("the broker read the SUBSCRIBE");
-            assert_eq!(sent.filters.len(), 1);
-            assert_eq!(sent.filters[0].path, "sensors/#");
-            assert_eq!(
-                sent.properties.and_then(|p| p.id),
-                expected_id,
-                "subscribe_filter with identifiers available: {available}",
-            );
-
-            assert_eq!(
-                svc.resubscribe_filter("home", "sensors/#".to_string(), 1)
-                    .await,
-                Some(IngressSubscribeOutcome::SubscribedLive),
-            );
-            let sent = subscribes
-                .recv()
-                .await
-                .expect("the broker read the SUBSCRIBE");
-            assert_eq!(sent.filters.len(), 1);
-            assert_eq!(sent.filters[0].path, "sensors/#");
-            assert_eq!(sent.filters[0].qos, rumqttc::QoS::AtLeastOnce);
-            assert_eq!(
-                sent.properties.and_then(|p| p.id),
-                expected_id,
-                "resubscribe_filter with identifiers available: {available}",
-            );
+                assert_eq!(
+                    svc.subscribe_filter("home", "sensors/#".to_string()).await,
+                    Some(IngressSubscribeOutcome::SubscribedLive),
+                );
+                let sub_id = entry(&svc, "home", "sensors/#").await.sub_id as usize;
+                let sent = subscribes
+                    .recv()
+                    .await
+                    .expect("the broker read the SUBSCRIBE");
+                assert_eq!(sent.filters.len(), 1);
+                assert_eq!(sent.filters[0].path, "sensors/#");
+                assert_eq!(
+                    sent.filters[0].qos, on_wire,
+                    "a client configured at qos {qos} subscribes at it",
+                );
+                assert_eq!(
+                    sent.properties.and_then(|p| p.id),
+                    available.then_some(sub_id),
+                    "subscribe_filter with identifiers available: {available}",
+                );
+            }
         }
     }
 
-    /// With no connection the move is deferred to the reconnect, which asserts
-    /// the entry at its new QoS.
+    /// A second subscribe of a held filter, the shape a second subscriber of the
+    /// filter's channel takes, answers like the first and does not grow the set.
     #[tokio::test]
-    async fn resubscribe_filter_disconnected_defers_and_sets_the_qos() {
+    async fn subscribe_filter_on_a_held_filter_keeps_one_entry() {
         let svc = MqttService::new();
         svc.add_client(make_handle("home"));
-        svc.subscribe_filter("home", "sensors/#".to_string(), 0)
-            .await;
+        svc.subscribe_filter("home", "sensors/#".to_string()).await;
         let before = entry(&svc, "home", "sensors/#").await;
 
-        let outcome = svc
-            .resubscribe_filter("home", "sensors/#".to_string(), 2)
-            .await;
+        let outcome = svc.subscribe_filter("home", "sensors/#".to_string()).await;
         assert_eq!(outcome, Some(IngressSubscribeOutcome::DeferredDisconnected));
-        let after = entry(&svc, "home", "sensors/#").await;
-        assert_eq!((after.sub_id, after.qos), (before.sub_id, 2));
-    }
-
-    /// A filter the set does not hold is added with the identifier derived from
-    /// it.
-    #[tokio::test]
-    async fn resubscribe_filter_adds_an_absent_filter() {
-        let svc = MqttService::new();
-        svc.add_client(make_handle("home"));
-        svc.subscribe_filter("home", "sensors/a".to_string(), 0)
-            .await;
-
-        let outcome = svc
-            .resubscribe_filter("home", "sensors/#".to_string(), 1)
-            .await;
-        assert_eq!(outcome, Some(IngressSubscribeOutcome::DeferredDisconnected));
-        let added = entry(&svc, "home", "sensors/#").await;
-        assert_eq!(added, IngressSubscription::new("sensors/#", 1));
-        assert!(
-            svc.resubscribe_filter("nonesuch", "sensors/#".to_string(), 1)
+        assert_eq!(entry(&svc, "home", "sensors/#").await, before);
+        assert_eq!(
+            svc.get_client("home")
+                .expect("client registered")
+                .subscriptions
+                .read()
                 .await
-                .is_none()
+                .len(),
+            1
         );
     }
 
@@ -1249,7 +1127,7 @@ mod tests {
         let handle = make_handle("home");
         svc.add_client(handle.clone());
 
-        svc.subscribe_filter("home", "sensors/+/temp".to_string(), 2)
+        svc.subscribe_filter("home", "sensors/+/temp".to_string())
             .await;
         let outcome = svc.unsubscribe_filter("home", "sensors/+/temp").await;
         assert_eq!(
@@ -1274,9 +1152,7 @@ mod tests {
     async fn unsubscribe_filter_dead_client_reports_sendfailed_and_removes() {
         let svc = MqttService::new();
         let handle = make_handle("home");
-        handle
-            .add_subscription("sensors/+/temp".to_string(), 1)
-            .await;
+        handle.add_subscription("sensors/+/temp".to_string()).await;
         *handle.client.lock().await = Some(dead_live_client());
         svc.add_client(handle.clone());
 
@@ -1319,10 +1195,10 @@ mod tests {
     #[tokio::test]
     async fn ingress_filter_status_failed_state_reports_failed_with_qos() {
         let svc = MqttService::new();
-        let handle = make_handle("home");
+        let handle = make_handle_at("home", 2);
         svc.add_client(handle.clone());
         // Register a filter so qos is a fact, then drive the session to Failed.
-        svc.subscribe_filter("home", "sensors/+/temp".to_string(), 2)
+        svc.subscribe_filter("home", "sensors/+/temp".to_string())
             .await;
         *handle.supervisor_state.write().await = crate::state::SupervisorState::Failed {
             reason: "authoritative disconnect: gone".to_string(),
@@ -1347,7 +1223,7 @@ mod tests {
 
         // Fresh handle: no client installed, supervisor still retrying.
         assert_eq!(
-            svc.subscribe_filter("home", "sensors/+/temp".to_string(), 1)
+            svc.subscribe_filter("home", "sensors/+/temp".to_string())
                 .await,
             Some(IngressSubscribeOutcome::DeferredDisconnected)
         );
@@ -1356,7 +1232,7 @@ mod tests {
             reason: "authoritative connect failure: bad user name or password".to_string(),
         };
         assert_eq!(
-            svc.subscribe_filter("home", "sensors/other".to_string(), 1)
+            svc.subscribe_filter("home", "sensors/other".to_string())
                 .await,
             Some(IngressSubscribeOutcome::ClientFailed(
                 "authoritative connect failure: bad user name or password".to_string()
@@ -1600,7 +1476,7 @@ mod tests {
         let editing = svc.clone();
         let edit = tokio::spawn(async move {
             editing
-                .subscribe_filter("home", "home/state".to_string(), 1)
+                .subscribe_filter("home", "home/state".to_string())
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

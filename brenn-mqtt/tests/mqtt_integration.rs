@@ -30,9 +30,9 @@ use common::{
     SpawnedClient, TcpRelay, await_puback, broker_auth, broker_tls13, certs,
     direct_publisher_acked, direct_subscriber, direct_subscriber_every, direct_subscriber_publish,
     log_records_disconnect, log_records_disconnect_after, log_records_disconnect_before_reconnect,
-    log_records_publish_to_subscriber, log_records_unsubscribe, recv_delivery, session_client_id,
-    spawn_client, spawn_client_tls13, spawn_client_with_config, subscribe_live_confirmed,
-    test_client_config, wait_for_health,
+    log_records_publish_to_subscriber, log_records_subscribe_at, log_records_unsubscribe,
+    recv_delivery, session_client_id, spawn_client, spawn_client_tls13, spawn_client_with_config,
+    subscribe_live_confirmed, test_client_config, wait_for_health,
 };
 use rumqttc::mqttbytes::QoS;
 
@@ -453,7 +453,7 @@ async fn ingress_subscribe_filter_live_delivers() {
         "ingsub",
         &harness,
         ca.clone(),
-        vec![(static_topic.to_string(), 1)],
+        vec![static_topic.to_string()],
     )
     .await;
 
@@ -495,7 +495,7 @@ async fn ingress_subscribe_filter_live_delivers() {
     // 6. Idempotent live re-subscribe: still SubscribedLive, and OnEverySubscribe
     //    redelivers the retained barrier (live-1 was not retained).
     let outcome2 = svc
-        .subscribe_filter(&client_slug, dyn_topic.to_string(), 1)
+        .subscribe_filter(&client_slug, dyn_topic.to_string())
         .await;
     assert_eq!(outcome2, Some(IngressSubscribeOutcome::SubscribedLive));
     let msg = recv_delivery(&mut rx, "re-subscribe retained barrier").await;
@@ -632,7 +632,7 @@ async fn overlapping_filters_attribute_each_copy_to_its_subscription() {
         "overlap",
         &harness,
         ca.clone(),
-        vec![(wide.to_string(), 1), (narrow.to_string(), 1)],
+        vec![wide.to_string(), narrow.to_string()],
     )
     .await;
     for filter in [wide, narrow] {
@@ -713,12 +713,14 @@ async fn overlapping_filters_attribute_each_copy_to_its_subscription() {
     );
 }
 
-/// **A QoS move is one SUBSCRIBE in place.** A held filter re-subscribed at a
-/// new QoS keeps its identifier, the broker replaces its subscription without
-/// an UNSUBSCRIBE, and the next copy arrives at the new QoS attributed to the
-/// same filter.
+/// **A QoS edit moves every held filter by the successor's connect.** A
+/// successor configured at a new `qos` replaces a predecessor at 0, inherits
+/// its filter under the same identifier, and its first connect subscribes the
+/// filter at the successor's `qos`: the broker logs that SUBSCRIBE from the
+/// session's client id after the successor was registered, and no UNSUBSCRIBE,
+/// and the next copy arrives at the new QoS attributed to the same filter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_qos_move_resubscribes_in_place() {
+async fn a_successor_at_a_new_qos_resubscribes_in_place() {
     broker_gate!();
 
     let harness = BrokerHarness::start();
@@ -726,32 +728,59 @@ async fn a_qos_move_resubscribes_in_place() {
     let filter = "brenn/itest/qosmove/#";
     let topic = "brenn/itest/qosmove/a";
 
+    let mut config = test_client_config(
+        "testbroker-qosmove",
+        harness.port,
+        ca.clone(),
+        TlsVersionMin::Tls12,
+    );
+    config.identity.qos = 0;
     let SpawnedClient {
         svc,
         client_slug,
         handle,
         mut rx,
-    } = spawn_client(
-        "qosmove",
-        &harness,
-        ca.clone(),
-        vec![(filter.to_string(), 0)],
+    } = spawn_client_with_config(Arc::new(config.clone()), vec![filter.to_string()]).await;
+    wait_for_filter_acked(&svc, &client_slug, filter, 5, "qosmove filter granted at 0").await;
+    let subscriber = session_client_id(&client_slug);
+    assert!(
+        log_records_subscribe_at(&harness.log(), &subscriber, filter, 0),
+        "the predecessor subscribed at its own qos:\n{}",
+        harness.log_tail(),
+    );
+
+    let before_successor = harness.log_len();
+    config.identity.qos = 1;
+    let router = svc.router().await.expect("the harness set a router");
+    let successor = register_and_spawn(
+        &svc,
+        Arc::new(config),
+        ArrivingFilters::Successor(&handle),
+        router,
     )
     .await;
-    wait_for_filter_acked(&svc, &client_slug, filter, 5, "qosmove filter granted at 0").await;
-
-    assert_eq!(
-        svc.resubscribe_filter(&client_slug, filter.to_string(), 1)
-            .await,
-        Some(IngressSubscribeOutcome::SubscribedLive),
-    );
     wait_for_filter_acked(&svc, &client_slug, filter, 5, "qosmove filter granted at 1").await;
     {
-        let set = handle.subscriptions.read().await;
-        let entry = set.get(filter).expect("filter held");
-        assert_eq!(*entry, IngressSubscription::new(filter, 1));
+        let set = successor.subscriptions.read().await;
+        assert_eq!(
+            set.get(filter),
+            Some(&IngressSubscription::new(filter)),
+            "the inherited filter keeps its identifier",
+        );
         assert_eq!(set.len(), 1);
     }
+    let moved_log = harness
+        .wait_for_log(
+            before_successor,
+            5,
+            &format!("the broker never recorded a SUBSCRIBE for {filter} at QoS 1"),
+            |log| log_records_subscribe_at(log, &subscriber, filter, 1),
+        )
+        .await;
+    assert!(
+        !log_records_subscribe_at(&moved_log, &subscriber, filter, 0),
+        "the successor subscribed only at its own qos: {moved_log}",
+    );
 
     let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca.clone()).await;
     pubc.publish(
@@ -772,10 +801,11 @@ async fn a_qos_move_resubscribes_in_place() {
         InboundRouting::BySubscription(vec![filter.to_string()]),
     );
     assert!(
-        !log_records_unsubscribe(&harness.log(), &session_client_id(&client_slug), filter),
+        !log_records_unsubscribe(&harness.log(), &subscriber, filter),
         "a QoS move sends no UNSUBSCRIBE:\n{}",
         harness.log_tail(),
     );
+    successor.stop_and_join().await;
 }
 
 /// **The broker-log matchers, read against a real broker's wording.**
@@ -835,6 +865,14 @@ async fn the_matchers_read_a_live_brokers_wording() {
         )
         .await;
     for filter in [withdrawn, kept] {
+        assert!(
+            log_records_subscribe_at(&granted, &subscriber, filter, 1),
+            "{filter}'s SUBSCRIBE at the client's qos 1 is not read as one: {granted}",
+        );
+        assert!(
+            !log_records_subscribe_at(&granted, &subscriber, filter, 0),
+            "{filter}'s SUBSCRIBE read at a QoS it did not request: {granted}",
+        );
         assert!(
             !log_records_unsubscribe(&granted, &subscriber, filter),
             "{filter} was only ever subscribed, and its SUBSCRIBE listed it in the shape an \
@@ -993,7 +1031,7 @@ async fn reconnect_reasserts_filters() {
         client_slug,
         handle,
         mut rx,
-    } = spawn_client_with_config(config, vec![(sub_filter.to_string(), 1)]).await;
+    } = spawn_client_with_config(config, vec![sub_filter.to_string()]).await;
 
     wait_for_health(
         &svc,
@@ -1174,7 +1212,7 @@ async fn a_message_on_a_panicked_bodys_connection_is_delivered() {
     let handle = register_and_spawn(
         &svc,
         config,
-        ArrivingFilters::Declared(vec![IngressSubscription::new(trigger_topic, 1)]),
+        ArrivingFilters::Declared(vec![IngressSubscription::new(trigger_topic)]),
         router,
     )
     .await;
@@ -1230,9 +1268,9 @@ async fn a_message_on_a_panicked_bodys_connection_is_delivered() {
 /// than the 64 requests the session's request channel holds.
 const MANY_FILTERS: usize = 100;
 
-fn many_filters() -> Vec<(String, u8)> {
+fn many_filters() -> Vec<String> {
     (0..MANY_FILTERS)
-        .map(|i| (format!("brenn/itest/many/{i}/#"), 1))
+        .map(|i| format!("brenn/itest/many/{i}/#"))
         .collect()
 }
 
@@ -1255,7 +1293,7 @@ async fn connect_with_more_filters_than_the_request_channel_holds_asserts_all() 
         mut rx,
     } = spawn_client("many", &harness, ca.clone(), filters.clone()).await;
 
-    let last = &filters[MANY_FILTERS - 1].0;
+    let last = &filters[MANY_FILTERS - 1];
     wait_for_filter_acked(
         &svc,
         &client_slug,
@@ -1264,7 +1302,7 @@ async fn connect_with_more_filters_than_the_request_channel_holds_asserts_all() 
         "the last of the static filters was never granted",
     )
     .await;
-    for (filter, _) in &filters {
+    for filter in &filters {
         assert_eq!(
             svc.subscription_acked(&client_slug, filter).await,
             Some(true),
@@ -1306,7 +1344,7 @@ async fn live_subscribe_during_a_large_reassert_is_asserted() {
     let live = "brenn/itest/many/live/#";
     let outcome = tokio::time::timeout(
         Duration::from_secs(2),
-        svc.subscribe_filter(&client_slug, live.to_string(), 1),
+        svc.subscribe_filter(&client_slug, live.to_string()),
     )
     .await
     .expect("a live subscribe never waits on the request channel");
@@ -1323,7 +1361,7 @@ async fn live_subscribe_during_a_large_reassert_is_asserted() {
     wait_for_filter_acked(
         &svc,
         &client_slug,
-        &filters[MANY_FILTERS - 1].0,
+        &filters[MANY_FILTERS - 1],
         10,
         "the last of the static filters was never granted",
     )
@@ -1410,7 +1448,7 @@ async fn a_deferred_subscribe_is_sent_at_the_next_poll() {
         "deferred-drain",
         &harness,
         ca.clone(),
-        vec![(wake.to_string(), 1)],
+        vec![wake.to_string()],
     )
     .await;
     wait_for_filter_acked(
@@ -1425,7 +1463,7 @@ async fn a_deferred_subscribe_is_sent_at_the_next_poll() {
     // Registered first, as `subscribe_filter` does before it defers: the SUBACK
     // arm records a grant only for a filter in the session's set.
     let handed = "brenn/itest/deferred/handed/#";
-    let sub = handle.add_subscription(handed.to_string(), 1).await;
+    let sub = handle.add_subscription(handed.to_string()).await;
     handle
         .deferred_subscribes
         .lock()
@@ -1475,8 +1513,8 @@ async fn an_unsendable_static_filter_does_not_stall_the_reassert() {
     let valid: Vec<String> = (0..10)
         .map(|i| format!("brenn/itest/badfront/{i}/#"))
         .collect();
-    let mut filters = vec![("brenn/itest/#/bad".to_string(), 1)];
-    filters.extend(valid.iter().map(|f| (f.clone(), 1)));
+    let mut filters = vec!["brenn/itest/#/bad".to_string()];
+    filters.extend(valid.iter().cloned());
 
     let SpawnedClient {
         svc,
@@ -1563,7 +1601,7 @@ async fn auth_bad_credentials_drives_failed_with_reason() {
         client_slug,
         handle,
         ..
-    } = spawn_client_with_config(Arc::new(config), vec![(auth_filter.to_string(), 1)]).await;
+    } = spawn_client_with_config(Arc::new(config), vec![auth_filter.to_string()]).await;
 
     // Mosquitto answers the CONNACK with a bad-user/password or not-authorized
     // reason code; both map to authoritative, driving the session to Failed.
@@ -2285,7 +2323,7 @@ async fn an_inbound_publish_during_the_wait_is_routed() {
         client_slug,
         handle,
         mut rx,
-    } = spawn_client("stopinbound", &harness, ca, vec![(topic.to_string(), 1)]).await;
+    } = spawn_client("stopinbound", &harness, ca, vec![topic.to_string()]).await;
     wait_for_filter_acked(
         &svc,
         &client_slug,

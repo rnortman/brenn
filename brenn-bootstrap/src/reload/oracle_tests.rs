@@ -691,7 +691,7 @@ async fn dynamic_subs(messenger: &Messenger) -> Vec<String> {
         .into_iter()
         .map(|row| {
             format!(
-                "{} on {} push_depth={:?} retain_depth={:?} noise={:?} wake_min={:?} qos={:?} \
+                "{} on {} push_depth={:?} retain_depth={:?} noise={:?} wake_min={:?} \
              created_at={}",
                 row.app_slug,
                 row.channel_uuid,
@@ -699,7 +699,6 @@ async fn dynamic_subs(messenger: &Messenger) -> Vec<String> {
                 row.retain_depth,
                 row.noise,
                 row.wake_min,
-                row.qos,
                 row.created_at,
             )
         })
@@ -718,8 +717,8 @@ async fn dynamic_subs(messenger: &Messenger) -> Vec<String> {
 /// sides.
 ///
 /// `sub_id` is not rendered: it is a function of the filter string and adds
-/// nothing to it. The filter and its qos are the whole of what the broker was
-/// told.
+/// nothing to it. The filter and the qos of the session holding it are the
+/// whole of what the broker was told.
 async fn mqtt_ingress(
     booted: &Booted,
     entries: &[Arc<brenn_lib::messaging::ChannelEntry>],
@@ -731,11 +730,9 @@ async fn mqtt_ingress(
         let handle = service
             .get_client(&slug)
             .expect("a slug the registry just listed has a handle");
+        let qos = handle.config.identity.qos;
         for subscription in handle.subscriptions.read().await.iter() {
-            filters.push(format!(
-                "{slug} {} qos={}",
-                subscription.topic_filter, subscription.qos,
-            ));
+            filters.push(format!("{slug} {} qos={qos}", subscription.topic_filter));
         }
     }
     filters.sort();

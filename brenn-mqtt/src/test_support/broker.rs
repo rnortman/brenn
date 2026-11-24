@@ -535,19 +535,63 @@ impl BrokerHarness {
 /// suite, which is what fails when a `mosquitto` release re-spells one of them
 /// rather than this answering a constant.
 pub fn log_records_unsubscribe(log: &str, client_id: &str, topic_filter: &str) -> bool {
-    let opening = format!("Received UNSUBSCRIBE from {client_id}");
-    let closing = format!("Sending UNSUBACK to {client_id}");
-    let listed = format!("\t{topic_filter}");
+    log_block_lists(
+        log,
+        client_id,
+        ("UNSUBSCRIBE", "UNSUBACK"),
+        &format!("\t{topic_filter}"),
+    )
+}
+
+/// Whether `log` records the broker receiving a SUBSCRIBE from `client_id`
+/// that lists exactly `topic_filter` at `qos` —
+/// [`session_client_id`](super::client::session_client_id) for a brenn session.
+///
+/// At `log_type all` mosquitto brackets the packet with
+/// `Received SUBSCRIBE from <id>` and `Sending SUBACK to <id>`, and lists each
+/// filter between them on a tab-indented line trailed by `(QoS n)` — the QoS
+/// the SUBSCRIBE requested. As in [`log_records_unsubscribe`], a filter line is
+/// read only inside a block opened by this client's id, and the tab before the
+/// filter and the QoS after it keep out a filter that is a prefix or a suffix
+/// of another.
+///
+/// The broker strings it names are pinned against a real broker by
+/// `the_matchers_read_a_live_brokers_wording` in `brenn-mqtt`'s integration
+/// suite.
+pub fn log_records_subscribe_at(log: &str, client_id: &str, topic_filter: &str, qos: u8) -> bool {
+    log_block_lists(
+        log,
+        client_id,
+        ("SUBSCRIBE", "SUBACK"),
+        &format!("\t{topic_filter} (QoS {qos})"),
+    )
+}
+
+/// Whether `log` holds a line ending in `listed` inside a block mosquitto
+/// opens with `Received <received> from <client_id>` and closes with
+/// `Sending <sent> to <client_id>`.
+///
+/// A block opened by another client's id is skipped whole, so one session's
+/// packet never reads as another's.
+fn log_block_lists(
+    log: &str,
+    client_id: &str,
+    (received, sent): (&str, &str),
+    listed: &str,
+) -> bool {
+    let any_opening = format!("Received {received} from");
+    let opening = format!("{any_opening} {client_id}");
+    let closing = format!("Sending {sent} to {client_id}");
     let mut inside = false;
     for line in log.lines() {
-        if line.contains("Received UNSUBSCRIBE from") {
+        if line.contains(&any_opening) {
             inside = line.ends_with(&opening);
             continue;
         }
         if !inside {
             continue;
         }
-        if line.ends_with(&listed) {
+        if line.ends_with(listed) {
             return true;
         }
         if line.ends_with(&closing) {
@@ -833,8 +877,8 @@ mod tests {
     use super::{
         complete_lines, log_publishes_from, log_records_disconnect_after,
         log_records_disconnect_before_reconnect, log_records_publish_from,
-        log_records_publish_to_subscriber, log_records_unsubscribe, log_says_running,
-        read_complete_log,
+        log_records_publish_to_subscriber, log_records_subscribe_at, log_records_unsubscribe,
+        log_says_running, read_complete_log,
     };
 
     /// A broker's start-up in mosquitto's own shape, up to the line written once
@@ -930,6 +974,48 @@ mod tests {
 1700000005: carol brenn/itest/other
 1700000005: Sending UNSUBACK to carol
 ";
+
+    #[test]
+    fn a_subscribe_is_read_at_the_qos_it_requested() {
+        assert!(log_records_subscribe_at(
+            TRANSCRIPT,
+            "alice",
+            "brenn/itest/one",
+            1
+        ));
+        assert!(log_records_subscribe_at(
+            TRANSCRIPT,
+            "alice",
+            "brenn/itest/two",
+            1
+        ));
+        assert!(
+            !log_records_subscribe_at(TRANSCRIPT, "alice", "brenn/itest/one", 0),
+            "another QoS is not it",
+        );
+        assert!(
+            !log_records_subscribe_at(TRANSCRIPT, "alice", "brenn/itest/on", 1),
+            "a prefix of a listed filter is not it",
+        );
+        assert!(
+            !log_records_subscribe_at(TRANSCRIPT, "alice", "itest/one", 1),
+            "nor a suffix",
+        );
+        assert!(
+            !log_records_subscribe_at(TRANSCRIPT, "alice", "brenn/itest/other", 1),
+            "another session's filter is not this session's",
+        );
+        assert!(log_records_subscribe_at(
+            TRANSCRIPT,
+            "carol",
+            "brenn/itest/other",
+            1
+        ));
+        assert!(
+            !log_records_subscribe_at(TRANSCRIPT, "ali", "brenn/itest/one", 1),
+            "a client id that is a prefix of the subscriber's is not it",
+        );
+    }
 
     /// The restart shape: one session under `brenn:ha` disconnects and another
     /// connects under the same id, in that order, with an unrelated session's

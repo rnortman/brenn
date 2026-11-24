@@ -532,6 +532,83 @@ pub(super) mod tests {
         }
     }
 
+    /// The `MessageSubscribe` calls the QoS admission tests make: an `mqtt:` and
+    /// a `brenn:` address on the `test_new_for_mqtt_subscribe` bridge, each with
+    /// a `qos` argument. The second element is the `home` client's filter, if any.
+    pub(in crate::active_bridge::brenn_tools) const QOS_SUBSCRIBES: [(&str, Option<&str>); 2] = [
+        ("mqtt:home:sensors/temp", Some("sensors/temp")),
+        ("brenn:test-channel", None),
+    ];
+
+    /// The input of a `MessageSubscribe` to `address` that passes a `qos`.
+    pub(in crate::active_bridge::brenn_tools) fn subscribe_with_qos(
+        address: &str,
+    ) -> serde_json::Value {
+        json!({ "address": address, "push_depth": 0, "retain_depth": 1, "qos": 1 })
+    }
+
+    /// The admission refusal of a call that passes `qos`: it names the key and
+    /// the ones the schema accepts.
+    pub(in crate::active_bridge::brenn_tools) const QOS_REFUSAL: &str = concat!(
+        r#"unknown argument(s): ["qos"] (allowed: ["address", "noise", "push_depth", "#,
+        r#""retain_depth", "wake_min"])"#
+    );
+
+    /// A refused `MessageSubscribe` on `address` left nothing behind: no
+    /// dynamic row, no subscriber on the address, and no filter in the client's
+    /// subscription set.
+    pub(in crate::active_bridge::brenn_tools) async fn assert_subscribe_left_nothing(
+        bridge: &ActiveBridge,
+        address: &str,
+        filter: Option<&str>,
+    ) {
+        let messenger = bridge.messenger().expect("the bridge has a messenger");
+        let rows = {
+            let conn = messenger.db().lock().await;
+            brenn_messaging_store::db::load_dynamic_subscriptions(&conn)
+        };
+        assert!(rows.is_empty(), "no dynamic row for {address}: {rows:?}");
+        let subscribed = messenger
+            .directory()
+            .resolve(address)
+            .is_some_and(|entry| entry.app_subscriber(&bridge.app_slug).is_some());
+        assert!(!subscribed, "the app is not a subscriber of {address}");
+        if let Some(filter) = filter {
+            assert_eq!(
+                bridge
+                    .mqtt_service()
+                    .ingress_filter_qos("home", filter)
+                    .await,
+                None,
+                "the client's set does not hold {filter}"
+            );
+        }
+    }
+
+    /// Over the socket, a `MessageSubscribe` that passes `qos` is refused at
+    /// admission on any address, naming the key, before the handler runs.
+    #[tokio::test]
+    async fn socket_message_subscribe_refuses_qos() {
+        for (address, filter) in QOS_SUBSCRIBES {
+            let bridge = ActiveBridge::test_new_for_mqtt_subscribe().await;
+            let refusal = execute_tool(
+                &bridge,
+                CallOrigin::Socket,
+                "MessageSubscribe",
+                subscribe_with_qos(address),
+            )
+            .await
+            .expect_err("a qos argument is refused");
+            match &refusal {
+                ExecuteError::InvalidArgs(detail) => {
+                    assert!(detail.contains(QOS_REFUSAL), "{address}: {detail}")
+                }
+                other => panic!("{address}: expected invalid args, got {other:?}"),
+            }
+            assert_subscribe_left_nothing(&bridge, address, filter).await;
+        }
+    }
+
     #[tokio::test]
     async fn messaging_names_dispatch_to_the_messaging_family() {
         let (bridge, _e, _b, _a) = test_bridge().await;

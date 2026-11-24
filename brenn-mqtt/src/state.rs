@@ -201,8 +201,9 @@ pub const DEFAULT_RECEIVE_MAXIMUM: u16 = u16::MAX;
 // ---------------------------------------------------------------------------
 
 /// One entry in a client's deduplicated ingress subscription set: a topic filter
-/// to SUBSCRIBE to, the QoS to request, and the MQTT 5 Subscription Identifier
-/// it is subscribed with.
+/// to SUBSCRIBE to and the MQTT 5 Subscription Identifier it is subscribed
+/// with. The entry carries no QoS: every filter of a client is subscribed at
+/// the `qos` of the configuration the client's session runs with.
 ///
 /// The identifier is derived from the filter string
 /// ([`subscription_identifier`]), so every process gives a filter the same one.
@@ -213,24 +214,17 @@ pub const DEFAULT_RECEIVE_MAXIMUM: u16 = u16::MAX;
 pub struct IngressSubscription {
     /// The MQTT topic filter to subscribe to.
     pub topic_filter: String,
-    /// QoS requested from the broker: the client's `qos` for a filter a static
-    /// binding holds, otherwise the QoS stored on the first dynamic row of the
-    /// filter's channel. The QoS other dynamic subscribers asked for is not
-    /// consulted (`TODO(mqtt-dynamic-subscribe-qos-not-honoured)`).
-    pub qos: u8,
     /// [`subscription_identifier`] of `topic_filter`.
     pub sub_id: u32,
 }
 
 impl IngressSubscription {
-    /// The entry for `topic_filter` at `qos`, with the filter's derived
-    /// identifier.
-    pub fn new(topic_filter: impl Into<String>, qos: u8) -> Self {
+    /// The entry for `topic_filter`, with the filter's derived identifier.
+    pub fn new(topic_filter: impl Into<String>) -> Self {
         let topic_filter = topic_filter.into();
         let sub_id = subscription_identifier(&topic_filter);
         Self {
             topic_filter,
-            qos,
             sub_id,
         }
     }
@@ -291,26 +285,11 @@ impl IngressSubscriptionSet {
 
     /// The entry for `topic_filter`, adding one with the filter's derived
     /// identifier if the set does not hold the filter.
-    ///
-    /// # Panics
-    ///
-    /// If the filter is held at a different QoS. The subscribe path refuses a
-    /// re-subscribe with differing parameters for the same app only; a
-    /// different subscriber of the filter asking another QoS reaches this panic
-    /// (`TODO(mqtt-dynamic-subscribe-qos-not-honoured)`). A QoS change goes
-    /// through [`Self::set_qos`].
-    pub fn add(&mut self, topic_filter: String, qos: u8) -> IngressSubscription {
+    pub fn add(&mut self, topic_filter: String) -> IngressSubscription {
         if let Some(existing) = self.get(&topic_filter) {
-            assert_eq!(
-                existing.qos, qos,
-                "add_subscription: qos {qos} for existing filter {:?} differs from stored qos {} \
-                 — the subscribe path must reject a differing-params re-subscribe before reaching \
-                 add_subscription (host bug)",
-                existing.topic_filter, existing.qos,
-            );
             return existing.clone();
         }
-        let entry = IngressSubscription::new(topic_filter, qos);
+        let entry = IngressSubscription::new(topic_filter);
         self.entries.push(entry.clone());
         entry
     }
@@ -320,21 +299,6 @@ impl IngressSubscriptionSet {
         let before = self.entries.len();
         self.entries.retain(|e| e.topic_filter != topic_filter);
         self.entries.len() != before
-    }
-
-    /// Set the QoS of the entry for `topic_filter`, keeping its identifier, and
-    /// return it with `true`. A filter the set does not hold is added as
-    /// [`Self::add`] adds it, and the flag is `false`.
-    pub fn set_qos(&mut self, topic_filter: &str, qos: u8) -> (IngressSubscription, bool) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|e| e.topic_filter == topic_filter)
-        {
-            entry.qos = qos;
-            return (entry.clone(), true);
-        }
-        (self.add(topic_filter.to_string(), qos), false)
     }
 
     /// The other held filters whose identifier equals `topic_filter`'s.
@@ -635,10 +599,10 @@ impl MqttClientHandle {
     /// already exists, its existing entry is returned unchanged and the set is
     /// not grown (idempotent). Does not touch the broker — the caller issues the
     /// SUBSCRIBE on the live client.
-    pub async fn add_subscription(&self, topic_filter: String, qos: u8) -> IngressSubscription {
+    pub async fn add_subscription(&self, topic_filter: String) -> IngressSubscription {
         let mut set = self.subscriptions.write().await;
         let held = set.get(&topic_filter).is_some();
-        let entry = set.add(topic_filter, qos);
+        let entry = set.add(topic_filter);
         if !held {
             self.warn_if_shared(&set, &entry);
         }
@@ -655,29 +619,6 @@ impl MqttClientHandle {
         let removed = self.subscriptions.write().await.remove(topic_filter);
         self.forget_outcome(topic_filter).await;
         removed
-    }
-
-    /// Set the QoS of the subscription for `topic_filter`, keeping its
-    /// identifier, and return the entry with `true`; a filter the set does not
-    /// hold is added and the flag is `false`. Does not touch the broker.
-    ///
-    /// The broker's answer for the filter is forgotten, so that "granted" again
-    /// means the SUBSCRIBE at the entry's current QoS was answered.
-    pub async fn set_subscription_qos(
-        &self,
-        topic_filter: &str,
-        qos: u8,
-    ) -> (IngressSubscription, bool) {
-        let placed = {
-            let mut set = self.subscriptions.write().await;
-            let placed = set.set_qos(topic_filter, qos);
-            if !placed.1 {
-                self.warn_if_shared(&set, &placed.0);
-            }
-            placed
-        };
-        self.forget_outcome(topic_filter).await;
-        placed
     }
 
     /// Log at `warn` when `entry`, just placed in `set`, shares its identifier
@@ -949,16 +890,16 @@ mod tests {
     #[tokio::test]
     async fn add_subscription_appends_with_the_filters_identifier() {
         let handle = make_handle("broker");
-        let added = handle.add_subscription("sensors/#".into(), 0).await;
+        let added = handle.add_subscription("sensors/#".into()).await;
         assert_eq!(added.topic_filter, "sensors/#");
         assert_eq!(added.sub_id, subscription_identifier("sensors/#"));
-        let added2 = handle.add_subscription("home/#".into(), 0).await;
+        let added2 = handle.add_subscription("home/#".into()).await;
         assert_eq!(added2.sub_id, subscription_identifier("home/#"));
         assert_eq!(handle.subscriptions.read().await.len(), 2);
     }
 
-    fn entry(topic_filter: &str, qos: u8) -> IngressSubscription {
-        IngressSubscription::new(topic_filter, qos)
+    fn entry(topic_filter: &str) -> IngressSubscription {
+        IngressSubscription::new(topic_filter)
     }
 
     fn id(topic_filter: &str) -> usize {
@@ -972,29 +913,20 @@ mod tests {
     #[test]
     fn a_filter_takes_its_derived_identifier_whatever_else_was_added() {
         let mut set = IngressSubscriptionSet::new(vec![]);
-        assert_eq!(
-            set.add("a/#".into(), 1).sub_id,
-            subscription_identifier("a/#")
-        );
-        assert_eq!(
-            set.add("a/b".into(), 1).sub_id,
-            subscription_identifier("a/b")
-        );
+        assert_eq!(set.add("a/#".into()).sub_id, subscription_identifier("a/#"));
+        assert_eq!(set.add("a/b".into()).sub_id, subscription_identifier("a/b"));
         assert!(set.remove("a/b"));
         assert!(!set.remove("a/b"));
+        assert_eq!(set.add("a/c".into()).sub_id, subscription_identifier("a/c"));
         assert_eq!(
-            set.add("a/c".into(), 1).sub_id,
-            subscription_identifier("a/c")
-        );
-        assert_eq!(
-            set.add("a/b".into(), 1).sub_id,
+            set.add("a/b".into()).sub_id,
             subscription_identifier("a/b"),
             "a filter added back takes the identifier it had",
         );
 
         let mut reordered = IngressSubscriptionSet::new(vec![]);
         for filter in ["a/c", "a/b", "a/#"] {
-            reordered.add(filter.into(), 1);
+            reordered.add(filter.into());
         }
         for filter in ["a/#", "a/b", "a/c"] {
             assert_eq!(
@@ -1007,14 +939,14 @@ mod tests {
 
     #[test]
     fn a_clone_equals_the_original() {
-        let mut set = IngressSubscriptionSet::new(vec![entry("a/#", 0)]);
-        set.add("a/b".into(), 0);
+        let mut set = IngressSubscriptionSet::new(vec![entry("a/#")]);
+        set.add("a/b".into());
         assert_eq!(set.clone(), set);
     }
 
     #[test]
     fn filters_for_resolves_known_identifiers_and_reports_unknown_ones() {
-        let set = IngressSubscriptionSet::new(vec![entry("a/#", 1), entry("a/b", 1)]);
+        let set = IngressSubscriptionSet::new(vec![entry("a/#"), entry("a/b")]);
         let unknown = [9_usize, 10];
         for u in unknown {
             assert!(u != id("a/#") && u != id("a/b"));
@@ -1069,10 +1001,10 @@ mod tests {
         );
         let shared = id(wide);
 
-        let set = IngressSubscriptionSet::new(vec![entry(wide, 1), entry(narrow, 1)]);
+        let set = IngressSubscriptionSet::new(vec![entry(wide), entry(narrow)]);
         assert_eq!(set.len(), 2);
-        let mut added = IngressSubscriptionSet::new(vec![entry(wide, 1)]);
-        added.add(narrow.into(), 1);
+        let mut added = IngressSubscriptionSet::new(vec![entry(wide)]);
+        added.add(narrow.into());
         assert_eq!(added.len(), 2);
         assert_eq!(added.sharing_identifier(narrow), vec![wide.to_string()]);
         assert_eq!(added.sharing_identifier(wide), vec![narrow.to_string()]);
@@ -1099,7 +1031,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "appears twice")]
     fn new_panics_on_a_duplicate_filter() {
-        IngressSubscriptionSet::new(vec![entry("a/#", 0), entry("a/#", 1)]);
+        IngressSubscriptionSet::new(vec![entry("a/#"), entry("a/#")]);
     }
 
     #[test]
@@ -1107,50 +1039,17 @@ mod tests {
     fn new_panics_on_an_identifier_not_derived_from_its_filter() {
         IngressSubscriptionSet::new(vec![IngressSubscription {
             topic_filter: "a/#".into(),
-            qos: 0,
             sub_id: 1,
         }]);
-    }
-
-    /// `set_qos` on a held filter keeps its identifier; on an absent filter it
-    /// adds an entry with the filter's identifier.
-    #[test]
-    fn set_qos_keeps_the_identifier_of_a_held_filter() {
-        let mut set = IngressSubscriptionSet::new(vec![entry("a/#", 0)]);
-        assert_eq!(set.set_qos("a/#", 2), (entry("a/#", 2), true));
-        assert_eq!(set.get("a/#"), Some(&entry("a/#", 2)));
-        assert_eq!(set.set_qos("b/#", 1), (entry("b/#", 1), false));
-        assert_eq!(set.len(), 2);
-    }
-
-    /// The handle's QoS change forgets the broker's recorded answer, so a grant
-    /// is again the answer to the SUBSCRIBE at the current QoS.
-    #[tokio::test]
-    async fn set_subscription_qos_forgets_the_recorded_answer() {
-        let handle = make_handle("broker");
-        handle.add_subscription("a/#".into(), 0).await;
-        handle.record_grant("a/#").await;
-        let (sub, held) = handle.set_subscription_qos("a/#", 1).await;
-        assert!(held);
-        assert_eq!(sub, entry("a/#", 1));
-        assert!(!handle.is_granted("a/#").await);
     }
 
     #[tokio::test]
     async fn add_subscription_is_idempotent_for_existing_filter() {
         let handle = make_handle("broker");
-        handle.add_subscription("home/+/state".into(), 1).await;
-        let added = handle.add_subscription("home/+/state".into(), 1).await;
-        assert_eq!(added, entry("home/+/state", 1));
+        handle.add_subscription("home/+/state".into()).await;
+        let added = handle.add_subscription("home/+/state".into()).await;
+        assert_eq!(added, entry("home/+/state"));
         assert_eq!(handle.subscriptions.read().await.len(), 1);
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "differs from stored qos")]
-    async fn add_subscription_different_qos_for_existing_filter_panics() {
-        let handle = make_handle("broker");
-        handle.add_subscription("home/+/state".into(), 1).await;
-        let _ = handle.add_subscription("home/+/state".into(), 2).await;
     }
 
     /// Removing a filter reports whether an entry went, and takes the broker's
@@ -1159,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn remove_subscription_reports_match() {
         let handle = make_handle("broker");
-        handle.add_subscription("sensors/#".into(), 1).await;
+        handle.add_subscription("sensors/#".into()).await;
         handle.record_grant("sensors/#").await;
         assert!(handle.is_granted("sensors/#").await);
 
@@ -1182,7 +1081,7 @@ mod tests {
             .await;
         assert_eq!(handle.subscribe_outcome("sensors/#").await, None);
 
-        handle.add_subscription("sensors/#".into(), 1).await;
+        handle.add_subscription("sensors/#".into()).await;
         handle.record_grant("sensors/#").await;
         assert_eq!(
             handle.subscribe_outcome("sensors/#").await,

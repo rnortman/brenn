@@ -20,9 +20,9 @@ use super::dynamic::depth_from_sql;
 /// ([`create_and_seed_subscriber_cursors`]) and then the drop of the flat
 /// `messaging_subscriptions` mirror that seed is the last reader of.
 ///
-/// No structural migrations are currently registered; the marked slot below is
-/// where future column/table migrations are added behind `column_exists` /
-/// table-presence guards as the schema evolves.
+/// Structural migrations sit in the marked slot below, each behind a
+/// `column_exists` / table-presence guard, and bring a DB from before a column
+/// was added or dropped to the current schema.
 ///
 /// After the DDL, [`assert_messaging_schema_current`] fails the boot fast if the
 /// DB predates the urgency redesign (pre-2026-06); no migration path exists for
@@ -96,9 +96,9 @@ pub fn run_messaging_migrations(conn: &Connection) {
             WHERE deliver_after IS NOT NULL;
 
 
-        -- Durable dynamic (runtime-created) subscriptions, carrying a
-        -- transport-specific MQTT `qos` column (NULL for brenn:/webhook:) and a
-        -- created_at timestamp. CRUCIALLY this table is NOT truncated at boot:
+        -- Durable dynamic (runtime-created) subscriptions, with a created_at
+        -- timestamp. An mqtt: row carries no QoS: its filter is subscribed at
+        -- the client's configured qos. CRUCIALLY this table is NOT truncated at boot:
         -- it is the durable truth for dynamic subs, with its own independent
         -- lifecycle. The boot merge folds these rows into the directory;
         -- runtime subscribe/unsubscribe writes here. Registration state, not
@@ -111,7 +111,6 @@ pub fn run_messaging_migrations(conn: &Connection) {
             retain_depth   TEXT NOT NULL,
             noise          TEXT NOT NULL CHECK(noise IN ('silent','metered','alarm')),
             wake_min       TEXT NOT NULL CHECK(wake_min IN ('very-low','low','normal','high','never')),
-            qos            INTEGER CHECK(qos IN (0,1,2)),
             created_at     TEXT NOT NULL,
             PRIMARY KEY (channel_uuid, app_slug)
         );
@@ -196,6 +195,9 @@ pub fn run_messaging_migrations(conn: &Connection) {
         conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN attachments TEXT;")
             .expect("failed to add messaging_messages.attachments column");
     }
+    // A database from before dynamic subscriptions stopped storing an MQTT QoS
+    // still has the column; an mqtt: filter is held at its client's qos.
+    brenn_db::drop_column_if_present(conn, "messaging_dynamic_subscriptions", "qos");
     ensure_text_body_fts(conn);
     ensure_blob_tables(conn);
     if !brenn_db::column_exists(conn, "messaging_channels", "last_retained_seq") {
@@ -1241,6 +1243,115 @@ mod tests {
         assert!(EnvelopeTypeColumn::parse("bogus").is_none());
     }
 
+    /// A dynamic-subscription table that still has its per-row `qos` column, in
+    /// the shape an earlier release created it: the column carries its own
+    /// `CHECK` and sits between `wake_min` and `created_at`.
+    const DYNAMIC_SUBSCRIPTIONS_WITH_QOS: &str = "
+        CREATE TABLE messaging_dynamic_subscriptions (
+            channel_uuid   BLOB NOT NULL REFERENCES messaging_channels(uuid),
+            app_slug       TEXT NOT NULL,
+            push_depth     TEXT NOT NULL,
+            retain_depth   TEXT NOT NULL,
+            noise          TEXT NOT NULL CHECK(noise IN ('silent','metered','alarm')),
+            wake_min       TEXT NOT NULL CHECK(wake_min IN ('very-low','low','normal','high','never')),
+            qos            INTEGER CHECK(qos IN (0,1,2)),
+            created_at     TEXT NOT NULL,
+            PRIMARY KEY (channel_uuid, app_slug)
+        );
+        CREATE INDEX idx_messaging_dynamic_subscriptions_app
+            ON messaging_dynamic_subscriptions(app_slug);";
+
+    /// Every row of the dynamic-subscription table as text, in key order.
+    fn dynamic_rows(conn: &rusqlite::Connection) -> Vec<Vec<String>> {
+        conn.prepare(
+            "SELECT hex(channel_uuid), app_slug, push_depth, retain_depth, noise, wake_min,
+                    created_at
+             FROM messaging_dynamic_subscriptions ORDER BY app_slug",
+        )
+        .expect("prepare")
+        .query_map([], |r| {
+            (0..7)
+                .map(|i| r.get::<_, String>(i))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .expect("query")
+        .map(|r| r.expect("read"))
+        .collect()
+    }
+
+    /// A database whose dynamic subscriptions still store a QoS loses the
+    /// column on migration and keeps every row with every other column as
+    /// written, whether its stored QoS was set or NULL. A second pass changes
+    /// nothing.
+    #[test]
+    fn migration_drops_the_stored_dynamic_qos_and_keeps_the_rows() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        conn.execute_batch("DROP TABLE messaging_dynamic_subscriptions;")
+            .expect("drop the current table");
+        conn.execute_batch(DYNAMIC_SUBSCRIPTIONS_WITH_QOS)
+            .expect("create the table with its qos column");
+        let ch = uuid::Uuid::new_v4();
+        conn.execute_batch(&format!(
+            "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch)
+             VALUES (X'{ch}', 'mqtt:home:sensors/temp', 'now', X'{epoch}');
+             INSERT INTO messaging_dynamic_subscriptions
+                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos,
+                  created_at)
+             VALUES (X'{ch}', 'alpha', '0', '5', 'silent', 'normal', 2, '2026-06-20T00:00:00Z'),
+                    (X'{ch}', 'bravo', 'unbounded', '1', 'alarm', 'high', NULL,
+                     '2026-06-21T00:00:00Z');",
+            ch = ch.simple(),
+            epoch = uuid::Uuid::new_v4().simple(),
+        ))
+        .expect("seed rows the way the earlier release wrote them");
+        let hex = ch.simple().to_string().to_uppercase();
+        let expected = vec![
+            [
+                &hex,
+                "alpha",
+                "0",
+                "5",
+                "silent",
+                "normal",
+                "2026-06-20T00:00:00Z",
+            ],
+            [
+                &hex,
+                "bravo",
+                "unbounded",
+                "1",
+                "alarm",
+                "high",
+                "2026-06-21T00:00:00Z",
+            ],
+        ]
+        .into_iter()
+        .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+        super::run_messaging_migrations(&conn);
+
+        assert!(!column_exists(
+            &conn,
+            "messaging_dynamic_subscriptions",
+            "qos"
+        ));
+        assert_eq!(dynamic_rows(&conn), expected, "both rows survive intact");
+
+        super::run_messaging_migrations(&conn);
+        assert!(!column_exists(
+            &conn,
+            "messaging_dynamic_subscriptions",
+            "qos"
+        ));
+        assert_eq!(
+            dynamic_rows(&conn),
+            expected,
+            "a second pass changes nothing"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Current-schema column assertions
     // -----------------------------------------------------------------------
@@ -1283,8 +1394,8 @@ mod tests {
             );
         }
 
-        // messaging_dynamic_subscriptions: the depth/wake model, plus the MQTT
-        // qos column and created_at.
+        // messaging_dynamic_subscriptions: the depth/wake model and created_at;
+        // no QoS column.
         for col in &[
             "channel_uuid",
             "app_slug",
@@ -1292,7 +1403,6 @@ mod tests {
             "retain_depth",
             "noise",
             "wake_min",
-            "qos",
             "created_at",
         ] {
             assert!(
@@ -1300,6 +1410,10 @@ mod tests {
                 "messaging_dynamic_subscriptions missing current column {col}"
             );
         }
+        assert!(
+            !column_exists(&conn, "messaging_dynamic_subscriptions", "qos"),
+            "messaging_dynamic_subscriptions still has the qos column"
+        );
 
         // messaging_pending_pushes: eager_wake present, legacy wake_kind absent.
         assert!(

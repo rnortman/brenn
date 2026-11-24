@@ -316,8 +316,6 @@ pub struct ResolvedMqttIngressChannel {
     pub client_slug: String,
     /// MQTT topic filter (the subscribed pattern).
     pub topic: String,
-    /// Broker SUBSCRIBE QoS (from the client's `[[mqtt_client]].qos`).
-    pub qos: u8,
     /// Sender-side injection urgency (from the client's `[[mqtt_client]].urgency`).
     pub urgency: Urgency,
 }
@@ -689,7 +687,8 @@ pub fn client_identities(
 ///   (`push_depth = 0`) subscription may be multi-user / non-singleton.
 ///
 /// `qos`/`urgency` are NOT per-subscription — they are connection-level on
-/// `[[mqtt_client]]` and applied later from the client config.
+/// `[[mqtt_client]]`. The urgency is copied onto the channel; the filter is
+/// subscribed at the `qos` of the session the client runs.
 ///
 /// # Panics
 ///
@@ -826,7 +825,7 @@ pub fn resolve_mqtt_ingress_channel(
     let topic = parsed.topic;
 
     // The parsed client must be a declared `[[mqtt_client]]` (the ACL/session
-    // boundary); qos/urgency are read from it for the broker SUBSCRIBE.
+    // boundary); the channel's urgency is read from it.
     let client = clients.get(&client_slug).unwrap_or_else(|| {
         panic!(
             "{owner_desc}: mqtt subscription channel {channel:?} references client \
@@ -847,7 +846,6 @@ pub fn resolve_mqtt_ingress_channel(
         channel_uuid,
         client_slug,
         topic,
-        qos: client.qos,
         urgency: client.urgency,
     }
 }

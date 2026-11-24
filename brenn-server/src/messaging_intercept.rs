@@ -1335,25 +1335,11 @@ async fn execute_subscribe(
         },
     };
 
-    // `qos` (optional; MQTT-only — the wrapper/core rejects it on non-mqtt). A
-    // present value must be 0/1/2.
-    let qos = match tool_input.get("qos") {
-        None => None,
-        Some(serde_json::Value::Null) => None,
-        Some(v) => match v.as_u64() {
-            Some(n @ 0..=2) => Some(n as u8),
-            _ => {
-                return reject(tool_name, "`qos` must be 0, 1, or 2");
-            }
-        },
-    };
-
     let params = DynamicSubscribeParams {
         push_depth,
         retain_depth,
         noise,
         wake_min,
-        qos,
     };
 
     let app_slug = bridge.app_slug.clone();
@@ -4279,7 +4265,6 @@ mod tests {
                     retain_depth: brenn_lib::messaging::config::Depth::Bounded(5),
                     noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                     wake_min: brenn_lib::messaging::WakeMin::Normal,
-                    qos: None,
                     created_at: brenn_db::format_ts_for_db(chrono::Utc::now()),
                 },
             );
@@ -4353,18 +4338,6 @@ mod tests {
             v["error"].as_str().unwrap_or("").contains("static"),
             "error must explain the static-sub conflict: {v}"
         );
-    }
-
-    /// `qos` supplied for a `brenn:` address → ok:false (qos is mqtt-only).
-    #[tokio::test]
-    async fn message_subscribe_qos_on_brenn_errors() {
-        let bridge = crate::active_bridge::ActiveBridge::test_new_for_mqtt_subscribe().await;
-        let v = subscribe_result(
-            &bridge,
-            json!({ "address": "brenn:test-channel", "push_depth": 0, "retain_depth": 1, "qos": 1 }),
-        )
-        .await;
-        assert_eq!(v["ok"], json!(false), "expected error: {v}");
     }
 
     /// Missing required `push_depth` → ok:false with a field-naming error.

@@ -50,7 +50,7 @@ pub fn load_dynamic_subscriptions(conn: &Connection) -> Vec<DynamicSubscriptionR
     let mut stmt = conn
         .prepare(
             "SELECT channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, \
-                    qos, created_at \
+                    created_at \
              FROM messaging_dynamic_subscriptions \
              ORDER BY app_slug, channel_uuid",
         )
@@ -63,8 +63,7 @@ pub fn load_dynamic_subscriptions(conn: &Connection) -> Vec<DynamicSubscriptionR
             let retain_depth_s: String = row.get(3)?;
             let noise_s: String = row.get(4)?;
             let wake_min_s: String = row.get(5)?;
-            let qos: Option<u8> = row.get(6)?;
-            let created_at: String = row.get(7)?;
+            let created_at: String = row.get(6)?;
             Ok(DynamicSubscriptionRow {
                 channel_uuid: Uuid::from_slice(&uuid_bytes).unwrap_or_else(|e| {
                     panic!(
@@ -82,7 +81,6 @@ pub fn load_dynamic_subscriptions(conn: &Connection) -> Vec<DynamicSubscriptionR
                         "messaging: malformed dynamic-subscription wake_min {wake_min_s:?} in DB"
                     )
                 }),
-                qos,
                 created_at,
             })
         })
@@ -109,7 +107,7 @@ pub fn load_dynamic_subscription_for(
 ) -> Option<DynamicSubscriptionRow> {
     conn.query_row(
         "SELECT channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, \
-                qos, created_at \
+                created_at \
          FROM messaging_dynamic_subscriptions \
          WHERE channel_uuid = ?1 AND app_slug = ?2",
         rusqlite::params![channel_uuid.as_bytes().to_vec(), app_slug],
@@ -120,8 +118,7 @@ pub fn load_dynamic_subscription_for(
             let retain_depth_s: String = row.get(3)?;
             let noise_s: String = row.get(4)?;
             let wake_min_s: String = row.get(5)?;
-            let qos: Option<u8> = row.get(6)?;
-            let created_at: String = row.get(7)?;
+            let created_at: String = row.get(6)?;
             Ok(DynamicSubscriptionRow {
                 channel_uuid: Uuid::from_slice(&uuid_bytes).unwrap_or_else(|e| {
                     panic!(
@@ -139,7 +136,6 @@ pub fn load_dynamic_subscription_for(
                         "messaging: malformed dynamic-subscription wake_min {wake_min_s:?} in DB"
                     )
                 }),
-                qos,
                 created_at,
             })
         },
@@ -168,8 +164,8 @@ pub fn load_dynamic_subscription_for(
 pub fn insert_dynamic_subscription(conn: &Connection, row: &DynamicSubscriptionRow) {
     conn.execute(
         "INSERT INTO messaging_dynamic_subscriptions \
-         (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             row.channel_uuid.as_bytes().to_vec(),
             &row.app_slug,
@@ -177,7 +173,6 @@ pub fn insert_dynamic_subscription(conn: &Connection, row: &DynamicSubscriptionR
             depth_to_sql(row.retain_depth),
             noise_to_sql(row.noise),
             row.wake_min.as_str(),
-            row.qos,
             &row.created_at,
         ],
     )
@@ -247,18 +242,12 @@ mod tests {
 
     /// `params` is `[push_depth, retain_depth, noise, wake_min]` in SQL wire form
     /// (bundled into one slice so the helper stays under clippy's arg limit).
-    fn insert_dyn_row(
-        conn: &Connection,
-        uuid: Uuid,
-        app: &str,
-        params: [&str; 4],
-        qos: Option<u8>,
-    ) {
+    fn insert_dyn_row(conn: &Connection, uuid: Uuid, app: &str, params: [&str; 4]) {
         let [push, retain, noise, wake] = params;
         conn.execute(
             "INSERT INTO messaging_dynamic_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 uuid.as_bytes().to_vec(),
                 app,
@@ -266,7 +255,6 @@ mod tests {
                 retain,
                 noise,
                 wake,
-                qos,
                 "2026-06-20T00:00:00Z",
             ],
         )
@@ -291,20 +279,13 @@ mod tests {
             ChannelScheme::Mqtt,
         );
         seed_channel(&conn, brenn_uuid, "heartbeat", ChannelScheme::Brenn);
-        // mqtt: pull-only with qos; brenn: push-enabled, unbounded, no qos.
-        insert_dyn_row(
-            &conn,
-            mqtt_uuid,
-            "graf",
-            ["0", "5", "silent", "normal"],
-            Some(1),
-        );
+        // mqtt: pull-only; brenn: push-enabled, unbounded.
+        insert_dyn_row(&conn, mqtt_uuid, "graf", ["0", "5", "silent", "normal"]);
         insert_dyn_row(
             &conn,
             brenn_uuid,
             "pfin",
             ["unbounded", "unbounded", "alarm", "high"],
-            None,
         );
 
         let rows = load_dynamic_subscriptions(&conn);
@@ -317,7 +298,6 @@ mod tests {
         assert_eq!(graf.retain_depth, Depth::Bounded(5));
         assert_eq!(graf.noise, NoiseLevel::Silent);
         assert_eq!(graf.wake_min, WakeMin::Normal);
-        assert_eq!(graf.qos, Some(1));
 
         let pfin = &rows[1];
         assert_eq!(pfin.app_slug, "pfin");
@@ -326,7 +306,6 @@ mod tests {
         assert_eq!(pfin.retain_depth, Depth::Unbounded);
         assert_eq!(pfin.noise, NoiseLevel::Alarm);
         assert_eq!(pfin.wake_min, WakeMin::High);
-        assert_eq!(pfin.qos, None);
     }
 
     #[test]
@@ -335,23 +314,11 @@ mod tests {
         let conn = test_conn();
         let uuid = Uuid::new_v4();
         seed_channel(&conn, uuid, "heartbeat", ChannelScheme::Brenn);
-        insert_dyn_row(
-            &conn,
-            uuid,
-            "graf",
-            ["garbage", "5", "silent", "normal"],
-            None,
-        );
+        insert_dyn_row(&conn, uuid, "graf", ["garbage", "5", "silent", "normal"]);
         let _ = load_dynamic_subscriptions(&conn);
     }
 
-    fn row(
-        uuid: Uuid,
-        app: &str,
-        push: Depth,
-        retain: Depth,
-        qos: Option<u8>,
-    ) -> DynamicSubscriptionRow {
+    fn row(uuid: Uuid, app: &str, push: Depth, retain: Depth) -> DynamicSubscriptionRow {
         DynamicSubscriptionRow {
             channel_uuid: uuid,
             app_slug: app.to_string(),
@@ -359,13 +326,12 @@ mod tests {
             retain_depth: retain,
             noise: NoiseLevel::Metered,
             wake_min: WakeMin::High,
-            qos,
             created_at: "2026-06-20T00:00:00Z".to_string(),
         }
     }
 
-    /// A runtime insert writes the durable dynamic-table row, MQTT `qos` and
-    /// all, and it decodes back as written.
+    /// A runtime insert writes the durable dynamic-table row, and it decodes back
+    /// as written.
     #[test]
     fn insert_writes_the_durable_row() {
         let conn = test_conn();
@@ -374,7 +340,7 @@ mod tests {
 
         insert_dynamic_subscription(
             &conn,
-            &row(uuid, "graf", Depth::Bounded(3), Depth::Bounded(5), Some(2)),
+            &row(uuid, "graf", Depth::Bounded(3), Depth::Bounded(5)),
         );
 
         let durable = load_dynamic_subscriptions(&conn);
@@ -382,7 +348,8 @@ mod tests {
         assert_eq!(durable[0].app_slug, "graf");
         assert_eq!(durable[0].push_depth, Depth::Bounded(3));
         assert_eq!(durable[0].retain_depth, Depth::Bounded(5));
-        assert_eq!(durable[0].qos, Some(2));
+        assert_eq!(durable[0].noise, NoiseLevel::Metered);
+        assert_eq!(durable[0].wake_min, WakeMin::High);
     }
 
     /// A runtime delete removes the durable row and reports `true`; deleting a
@@ -395,7 +362,7 @@ mod tests {
         seed_channel(&conn, uuid, "heartbeat", ChannelScheme::Brenn);
         insert_dynamic_subscription(
             &conn,
-            &row(uuid, "pfin", Depth::Bounded(0), Depth::Bounded(1), None),
+            &row(uuid, "pfin", Depth::Bounded(0), Depth::Bounded(1)),
         );
 
         assert!(
@@ -422,11 +389,11 @@ mod tests {
         seed_channel(&conn, uuid, "heartbeat", ChannelScheme::Brenn);
         insert_dynamic_subscription(
             &conn,
-            &row(uuid, "graf", Depth::Bounded(0), Depth::Bounded(1), None),
+            &row(uuid, "graf", Depth::Bounded(0), Depth::Bounded(1)),
         );
         insert_dynamic_subscription(
             &conn,
-            &row(uuid, "pfin", Depth::Bounded(0), Depth::Bounded(1), None),
+            &row(uuid, "pfin", Depth::Bounded(0), Depth::Bounded(1)),
         );
 
         assert!(delete_dynamic_subscription(&conn, uuid, "graf"));

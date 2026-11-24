@@ -566,6 +566,10 @@ fn a_database_from_before_byte_bodies_migrates_and_serves_its_rows_unchanged() {
         brenn_db::column_exists(&conn, "messaging_messages", "transport"),
         "the transport column is added"
     );
+    assert!(
+        !brenn_db::column_exists(&conn, "messaging_dynamic_subscriptions", "qos"),
+        "the stored dynamic-subscription qos is dropped"
+    );
     assert_eq!(fts_ids(&conn, "november"), [1]);
     assert_eq!(fts_ids(&conn, "papa"), [2]);
     assert!(
