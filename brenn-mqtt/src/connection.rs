@@ -91,6 +91,8 @@ fn subscribe_request(
         qos: rumq_qos,
         nolocal: false,
         preserve_retain: false,
+        // TODO(mqtt-retained-replay-repeated-on-resubscribe): every reconnect
+        // and every repeated SUBSCRIBE replays the filter's retained messages.
         retain_forward_rule: RetainForwardRule::OnEverySubscribe,
     };
     let props = SubscribeProperties {
@@ -203,6 +205,7 @@ pub(crate) fn client_id_of_slug(slug: &str) -> String {
 /// wrapper on every reconnect attempt, avoiding repeated disk I/O and crypto-provider
 /// allocation on the reconnect hot path.
 fn build_mqtt_options(broker: &MqttClientConfig, transport: Transport) -> MqttOptions {
+    // TODO(mqtt-receive-maximum-unset): no Receive Maximum is set on CONNECT.
     let mut opts = MqttOptions::new(
         client_id(broker),
         (broker.identity.host.clone(), broker.identity.port),
@@ -1176,6 +1179,8 @@ async fn handle_event(
         // only, each after checking that its filter covers the topic. A copy
         // whose identifiers name no subscription this client holds is dropped
         // here. A copy with no identifier is routed by topic.
+        // TODO(mqtt-inbound-retain-flag-not-on-envelope): `p.retain` is not
+        // carried to the subscriber.
         Event::Incoming(Incoming::Publish(p)) => {
             let topic_str = String::from_utf8_lossy(&p.topic).into_owned();
 

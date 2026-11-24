@@ -1022,6 +1022,7 @@ automation {
     max_error_reports_per_hour_per_job = 4;
     consecutive_failures_to_disable = 6;
     max_jobs_per_app = 51;
+    max_fires_per_day_per_app = 501;
 }
 
 events { delivered_retention_days = 8; }
@@ -1240,6 +1241,7 @@ container cc {
                 max_error_reports_per_hour_per_job: 4,
                 consecutive_failures_to_disable: 6,
                 max_jobs_per_app: 51,
+                max_fires_per_day_per_app: 501,
             },
             events: EventsConfig {
                 delivered_retention_days: 8,

@@ -2074,6 +2074,9 @@ fn automation(body: &mut Body, errors: &mut Vec<Diagnostic>) -> AutomationGlobal
         max_jobs_per_app: body
             .int("max_jobs_per_app", errors)
             .unwrap_or(defaults.max_jobs_per_app),
+        max_fires_per_day_per_app: body
+            .int("max_fires_per_day_per_app", errors)
+            .unwrap_or(defaults.max_fires_per_day_per_app),
     }
 }
 

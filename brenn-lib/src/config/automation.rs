@@ -18,6 +18,12 @@ pub struct AutomationGlobalConfig {
     /// cannot circumvent this by disabling then re-creating; deleted jobs free
     /// slots. Default 50.
     pub max_jobs_per_app: u32,
+    /// Per-app cap on fires handed to their action in any sliding 24 hours,
+    /// all of the app's jobs together. A fire over it is skipped, does not
+    /// count toward auto-disable, and is reported at most once per app per
+    /// 24 hours. Job deletion, re-creation and restart do not refill it.
+    /// `0` admits no fire. Default 500.
+    pub max_fires_per_day_per_app: u32,
 }
 
 impl Default for AutomationGlobalConfig {
@@ -27,6 +33,7 @@ impl Default for AutomationGlobalConfig {
             max_error_reports_per_hour_per_job: 3,
             consecutive_failures_to_disable: 5,
             max_jobs_per_app: 50,
+            max_fires_per_day_per_app: 500,
         }
     }
 }
@@ -42,5 +49,6 @@ mod tests {
         assert_eq!(cfg.max_error_reports_per_hour_per_job, 3);
         assert_eq!(cfg.consecutive_failures_to_disable, 5);
         assert_eq!(cfg.max_jobs_per_app, 50);
+        assert_eq!(cfg.max_fires_per_day_per_app, 500);
     }
 }

@@ -4,6 +4,34 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Behaviour change:** recurring automation jobs now keep firing with nobody
+  attending. Before, every fire used one unit of a conversation's send budget
+  (the allowance that only a person's interaction refills), so a schedule
+  emptied it within days and was then disabled. Fires no longer draw it. A
+  deployment that enlarged `send_budget` or `default_send_budget` for its
+  schedules can bring it back down. A `send_message` fire delivered into a
+  conversation still costs that conversation one unit for the turn it
+  provokes.
+- **Behaviour change:** `AutoCreate`, and an `AutoEdit` that changes a job's
+  action or trigger or enables it, now draw one unit of the calling
+  conversation's send budget and are refused when none remains; a write the
+  engine refuses gives its unit back. Renaming, disabling, listing and
+  deleting jobs are free.
+- **New: `automation { max_fires_per_day_per_app }`**, default 500: the most
+  fires of all one app's jobs together in any sliding 24 hours. A fire over it
+  is skipped, recorded with the new outcome `app_fire_cap`, and the job fires
+  again by itself at its next slot with room; it does not count toward
+  `consecutive_failures_to_disable`, so it never disables a job. The first
+  such refusal of an app in any 24 hours is reported to the owner's
+  conversation and later ones are not; the operator is alerted once per
+  process per app. The `automation` section's keys are now documented in
+  `docs/config-dsl.md`.
+- **Upgrade note:** on first start the `automation_fires` table is rebuilt
+  (its stored outcomes no longer include `budget`; existing `budget` rows
+  become `action_error` with `error_class` `budget`), and a new table,
+  `automation_app_fires`, is created. After that, rolling back to an older
+  binary is not supported: an older binary panics when it records a fire on
+  an empty send budget.
 - **Fixed:** a client holding overlapping MQTT subscription filters (`a/#` and
   `a/b`) received each message on the overlap once per covering filter in each
   covering channel. It now receives it once in each: every message is routed
@@ -68,9 +96,8 @@ All notable changes to Brenn are documented here.
   `body_base64`), plus `content_type`, `qos`, `retain`, a required
   `lifetime_s` (counted from each fire) and an optional `status_to`. It obeys
   the same rules as the `MqttSend` tool: only apps with the MQTT publish
-  grant are offered it, the target is checked when the job is created or
-  edited and again on every fire, and each fire uses one unit of the send
-  budget of the conversation it fires under.
+  grant are offered it, and the target is checked when the job is created or
+  edited and again on every fire.
 - **Upgrade note:** on first start the `automation_jobs` table is migrated
   (its `action_kind` column is dropped). After that, rolling back to an older
   binary cannot create or edit automations.

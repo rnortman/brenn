@@ -1821,29 +1821,35 @@ operator or to the action's `status_to`. A refused fire is recorded with an
 outcome naming the cause — `auth` for a grant, ACL or client that is gone
 (an ACL that no longer covers the stored `reply_to` included),
 `action_error` for an argument the admission no longer accepts or the send
-rate, `budget` for an empty send budget — counts toward the job's
+rate — counts toward the job's
 consecutive failures and auto-disable, and raises the job's error report.
 With `persistent` set, a slot missed while the server was down fires once at
 restart, late, and a slot whose fire was cut off by a crash between commit
 and bookkeeping fires again, so a device command should set a state rather
 than toggle one.
 
-**Sizing the send budget for automations.** Every automation fire, `brenn:`
-or MQTT, draws one unit of the send budget of the conversation it fires
-under. Time never refills that budget; only a person's interaction reaching
-that conversation does — their chat message in it, or a delivered bus
-message carrying impetus, which only a sender holding the `mint_impetus`
-grant can mint. So the budget is sized as fires per day times the days of
-absence to survive, on top of the conversation's own sends, bus-provoked
-turns and pushes. A singleton agent's fires draw its one conversation's
-budget, which the owner's ordinary chatting restores. Any other agent's
-fires draw the budget of that agent's automation-events conversation, which
-nothing asks anyone to interact with, so unless the owner opens that
-conversation and sends a message in it the budget is to be sized as a total
-number of fires, not a per-absence one. A job whose fires fail on an empty
-budget is disabled after `consecutive_failures_to_disable` failures and stays
-disabled until re-enabled. `TODO.md`'s `automation-fire-budget-needs-a-person`
-is the open work.
+**What bounds a fire.** An automation fire, `brenn:` or MQTT, draws no
+conversation's send budget: the tick reacts to nothing, and it fires with
+nobody attending. Writing the job (`AutoCreate`, or an `AutoEdit` of its
+action or trigger or one that enables it) is the reaction, and draws one unit
+of the writing conversation's send budget. The engine bounds fires itself,
+with three caps from the configuration's `automation` block
+(`docs/config-dsl.md`, "Automation limits", gives their defaults):
+`max_jobs_per_app`, `max_fires_per_hour_per_job` and
+`max_fires_per_day_per_app`, the last counting all of one app's
+fires over a sliding 24 hours, kept apart from the jobs so that deleting or
+re-creating a job, or a restart, refills nothing. A fire over the per-app cap
+is recorded with the outcome `app_fire_cap` and its slot is skipped, not
+queued; it does not count toward the job's consecutive failures, and the job
+fires again by itself at its next slot at which the window has room. The first
+such refusal of an app in any 24 hours is reported to the owner's
+conversation, whichever job it was, and later ones are not. A `send_message`
+fire delivered into a conversation still costs that conversation one unit for
+the turn it provokes (§7 of `docs/chat-protocol.md`). The engine is a host
+cron loop that the rule against a scheduler subsystem excludes, kept for now
+and not a sanctioned exception; its replacement by component-owned schedules
+is `TODO.md`'s `scheduling-component-managed`, and it must carry an equivalent
+bound (`docs/security-posture.md` §7.7).
 
 ### 2.7.3 MQTT egress
 

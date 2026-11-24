@@ -6,7 +6,7 @@
 //!
 //! Module layout:
 //! - `db`        — DAO helpers over the automation tables.
-//! - `fire`      — per-fire logic (auth + budget + send + bookkeeping).
+//! - `fire`      — per-fire logic (auth + send + bookkeeping).
 //! - `job`       — job/trigger/action types, MCP tool-name constants.
 //! - `loop_task` — background scheduler loop (poll + kick).
 //! - `schema`    — the automation tables' DDL and the outcome constants.

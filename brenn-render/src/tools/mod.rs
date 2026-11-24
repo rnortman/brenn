@@ -56,7 +56,8 @@ pub fn build_tool_registry(
         Box::new(AutoApproveTool(messaging::MCP_MESSAGE_PENDING_LIST_TOOL)),
         Box::new(AutoApproveTool(messaging::MCP_MESSAGE_CANCEL_TOOL)),
         Box::new(AutoApproveTool(messaging::MCP_MESSAGE_EDIT_TOOL)),
-        // Automation tools: all four auto-approved (budget is the control).
+        // Automation tools: all four auto-approved; the server's automation
+        // intercept prices and bounds what they write.
         Box::new(AutoApproveTool(mcp_tool_names::MCP_AUTO_CREATE_TOOL)),
         Box::new(AutoApproveTool(mcp_tool_names::MCP_AUTO_LIST_TOOL)),
         Box::new(AutoApproveTool(mcp_tool_names::MCP_AUTO_EDIT_TOOL)),

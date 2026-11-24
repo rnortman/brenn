@@ -1,6 +1,10 @@
 //! Intercept handlers for the four automation MCP virtual tools.
 //!
-//! All four tools are auto-approved:
+//! All four tools are auto-approved. Writing a job — `AutoCreate`, or an
+//! `AutoEdit` that sets its action or trigger or enables it — draws one unit
+//! of the calling conversation's send budget as a `BrennSend` does, and is
+//! refused when none remains; the engine's job and fire caps, with the owner
+//! app's grants and ACLs, bound what the written jobs then publish:
 //! - PreToolUse intercepted, returns `Allow`.
 //! - PostToolUse intercepted, executes the real work through
 //!   `execute_admitted`, returns `Continue { updated_output }` so CC sees the
@@ -161,7 +165,14 @@ async fn execute_create(
         action,
         enabled,
     };
-    match engine.create(&bridge.app_slug, req).await {
+    if !bridge.draw_for_job_write().await {
+        return budget_exhausted();
+    }
+    let result = engine.create(&bridge.app_slug, req).await;
+    if !matches!(result, CreateResult::Ok { .. }) {
+        bridge.refund_job_write().await;
+    }
+    match result {
         CreateResult::Ok { id, next_fire_at } => outcome_ok(&AutomationCreateOk {
             id,
             next_fire_at: next_fire_at.to_rfc3339(),
@@ -255,7 +266,15 @@ async fn execute_edit(
         action,
         enabled,
     };
-    match engine.edit(&bridge.app_slug, req).await {
+    let priced = edit_is_priced(&req);
+    if priced && !bridge.draw_for_job_write().await {
+        return budget_exhausted();
+    }
+    let result = engine.edit(&bridge.app_slug, req).await;
+    if priced && !matches!(result, EditResult::Ok { .. }) {
+        bridge.refund_job_write().await;
+    }
+    match result {
         EditResult::Ok { next_fire_at } => outcome_ok(&AutomationEditOk {
             next_fire_at: next_fire_at.to_rfc3339(),
             ok: true,
@@ -541,6 +560,21 @@ fn signal_address_denial(bridge: &ActiveBridge, kind: brenn_obs::security::Denia
     );
 }
 
+/// Whether an edit can change what the job publishes or when: a new action, a
+/// new trigger, or enabling it. Decided on the request alone — enabling a job
+/// that is already enabled is still priced. Renaming and disabling are free.
+fn edit_is_priced(req: &EditJob) -> bool {
+    req.action.is_some() || req.trigger.is_some() || req.enabled == Some(true)
+}
+
+/// The answer to a priced job write at an empty send budget, worded as
+/// `BrennSend`'s.
+fn budget_exhausted() -> ToolOutcome {
+    outcome_err(Cow::Borrowed(
+        "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
+    ))
+}
+
 /// A rejection of the call's arguments: warn-logged, `{"ok":false,"error":…}`.
 fn reject(tool_name: &str, error: &str) -> ToolOutcome {
     outcome_rejection(REJECTION_CONTEXT, tool_name, error)
@@ -548,6 +582,9 @@ fn reject(tool_name: &str, error: &str) -> ToolOutcome {
 
 /// The log category of an automation tool's argument rejection.
 const REJECTION_CONTEXT: &str = "automation tool";
+
+#[cfg(test)]
+mod budget_tests;
 
 #[cfg(test)]
 mod mqtt_tests;

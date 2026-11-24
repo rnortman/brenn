@@ -1,27 +1,38 @@
 # TODOs
 
-## `automation-fire-budget-needs-a-person`
+## `mqtt-retained-replay-repeated-on-resubscribe`
 
-An automation's fire (`brenn:` and MQTT actions alike) draws one unit of
-the send budget of the conversation it fires under. That budget is never
-refilled by time; only a person's interaction reaching that conversation
-restores it — their chat message in it, or a delivered bus message
-carrying impetus, which only a sender holding the `mint_impetus` grant
-can mint. So schedules meant to run unattended stop when the pool
-empties — about four days for 26 daily jobs on the default of 100 — and
-each job is then auto-disabled after its consecutive failures. For an
-app that is not a singleton, fires use a per-app automation-events
-conversation: an untitled entry in the owner's conversation list, which
-nothing asks anyone to chat in and where a message starts a Claude Code
-session; unless the owner does that, the budget is a lifetime cap on the
-app's fires. Today's only remedy is sizing the app's `send_budget` for
-the longest absence, or for all fires ever. Left undone: a bound on
-automation fires that does not depend on a person chatting. Done when a
-fixed-payload recurring job keeps firing indefinitely with no human
-interaction, still under a runaway bound the security posture document
-names (the engine's own per-job fire rate and per-app job count, a
-time-based refill, or another), and `docs/security-posture.md` says
-which.
+Every reconnect re-asserts every filter, and a second subscriber's
+SUBSCRIBE to a filter already held is sent again with the stored
+identifier; with "send retained on every subscribe"
+(`brenn-mqtt/src/connection.rs`, `subscribe_request`) the broker
+replays the filter's retained messages into its channel again each
+time, so the channel's window takes repeated copies of values it
+already holds. Suppressing that replay was a non-goal of the routing
+cycle, with no reason given. Done when the repeated replay is
+suppressed where the channel already holds it (e.g. retain handling
+"send only on new subscription" with what that means for a resumed or
+discarded session), or this is closed as not wanted.
+
+## `mqtt-inbound-retain-flag-not-on-envelope`
+
+An inbound PUBLISH's retain flag is not read onto the bus envelope or
+its transport metadata (the inbound arm reads topic, payload, QoS,
+Content Type and, since the routing change, Subscription
+Identifiers), so a subscriber cannot tell a retained replay from a
+live publish. Reading it was a non-goal of the routing cycle, with no
+reason given. Done when the flag reaches the subscriber with a test,
+or this is closed as not wanted.
+
+## `mqtt-receive-maximum-unset`
+
+Brenn sets no Receive Maximum on CONNECT; mosquitto's defaults (20 in
+flight, 1000 queued per client) then bound a retained burst, and the
+broker drops over them telling the client nothing. Setting a Receive
+Maximum, or any other CONNECT change, was a non-goal of the routing
+cycle, with no reason given. Done when Brenn states a Receive Maximum
+suited to its serial inbound path, or this is closed as not wanted
+because the broker's queue, not Brenn's, is the bound.
 
 ## `mqtt-refused-status-alert-test-sees-two-alerts`
 
@@ -76,6 +87,26 @@ components on `deliver_after`, the host cron loop is gone and existing
 jobs — `brenn:` and MQTT actions alike — are migrated or recreated; or
 the instructions file and `docs/message-bus.md` name the automation
 engine as the sanctioned exception to the rule, and say why.
+
+Since the unattended-fires change the engine also holds the bound on
+what a job set written by an LLM with no human approval can publish:
+fires draw no conversation's send budget
+(`PublishOrigin::AutomationFire` in `brenn-messaging`), and an
+operator-set cap on one app's fires in any 24 hours
+(`max_fires_per_day_per_app`, the `automation_app_fires` table, the
+`app_fire_cap` outcome) lives in the host engine
+(`docs/security-posture.md` §7.7). Writing a job is the priced
+reaction: `AutoCreate`, and an `AutoEdit` of a job's action or trigger
+or one that enables it, draw one unit of the calling conversation's
+send budget (`brenn-server/src/automation_intercept.rs`,
+`brenn-server/src/active_bridge/impetus_pool.rs`). All of that goes with the engine,
+the origin variant included. Whatever replaces it must carry an
+equivalent bound that the operator sets, the app cannot raise and time
+alone refills, and existing deployments' cap setting is migrated or
+dropped by name in `CHANGELOG.md`; and whatever lets an LLM choose what
+a schedule publishes must price that choice against the choosing
+conversation's send budget.
+
 ## `blob-append-finish-erases-write-error`
 
 `brenn-provider-kit`'s `Append::finish` writes the buffered tail and turns

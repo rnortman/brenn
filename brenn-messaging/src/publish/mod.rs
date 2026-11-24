@@ -67,8 +67,8 @@ pub enum PublishResult {
         message_id: Uuid,
         address: String,
         /// `Some` for a `Conversation` origin (remaining per-conversation send
-        /// budget after this publish); `None` for a `System` origin, which has
-        /// no send budget.
+        /// budget after this publish); `None` for every other origin, none of
+        /// which has a send budget.
         remaining_budget: Option<u32>,
     },
     /// Budget exhausted; no message was inserted.
@@ -217,9 +217,18 @@ pub enum MissingChannelPosture {
 /// Identifies the publisher for the send-budget gate.
 #[derive(Debug, Clone, Copy)]
 pub enum PublishOrigin {
-    /// LLM/automation publish attributed to a conversation; the per-conversation
+    /// An LLM tool publish attributed to a conversation; the per-conversation
     /// send budget applies (decrement_send_budget).
     Conversation { id: i64 },
+    /// A recurring automation job's fire, published under the owner app as
+    /// principal. No send budget: the tick reacts to nothing, and the choice of
+    /// what it publishes was priced against the writing conversation's send
+    /// budget when the job was written. It is bounded instead by the
+    /// automation engine's caps, which the caller must have applied before
+    /// publishing; every other gate (grant, ACL, body cap, MQTT admission,
+    /// send rate) applies unchanged. `BudgetExhausted` is unrepresentable for
+    /// this origin.
+    AutomationFire,
     /// Every publisher the per-conversation send budget does not price: the
     /// in-process system publishers, surfaces, and a conversation publishing its
     /// own chat record. No send budget — flood protection is the per-channel
@@ -327,9 +336,10 @@ impl Messenger {
     ///
     /// The `origin` and `sender_app_slug` identify the publisher (used for
     /// budget bookkeeping and sender-config lookup). A `Conversation` origin
-    /// consumes the per-conversation send budget; a `System` origin has no
-    /// budget. The message body, channel address, and option fields come from
-    /// the LLM tool call.
+    /// consumes the per-conversation send budget; an `AutomationFire` origin
+    /// (an automation job's fire, under the owner app) and a `System` origin
+    /// have no budget, and `System` is refused here. The message body, channel
+    /// address, and option fields come from the LLM tool call or the job.
     ///
     /// [`Messenger::publish_with_attachments`] with no attachments;
     /// `publish_from_attacher` is the sibling entry for attach publishers.
@@ -1288,8 +1298,8 @@ impl Messenger {
         // 5. Per-conversation send budget. It bounds what a conversation sends,
         //    not where the bytes land, so every scheme draws on it. The
         //    `UPDATE ... WHERE remaining > 0` row count is the authoritative
-        //    gate; a `System` origin has no budget and touches no row at all
-        //    (no INSERT, no FK exposure).
+        //    gate; an `AutomationFire` or `System` origin has no budget and
+        //    touches no row at all (no INSERT, no FK exposure).
         let remaining_budget = match origin {
             PublishOrigin::Conversation { id } => {
                 let budget = conversation_send_budget.expect(
@@ -1302,7 +1312,7 @@ impl Messenger {
                     BudgetDecrement::Exhausted => return PublishResult::BudgetExhausted,
                 }
             }
-            PublishOrigin::System => None,
+            PublishOrigin::AutomationFire | PublishOrigin::System => None,
         };
 
         // 5a. An MQTT payload over the body cap is written to the blob store

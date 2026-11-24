@@ -110,8 +110,9 @@ pub enum MqttPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttCommitted {
     pub message_id: Uuid,
-    /// The conversation's send budget left after this publish; `None` for an
-    /// origin with no budget.
+    /// `Some` for a `Conversation` origin (the conversation's send budget left
+    /// after this publish); `None` for every other origin, none of which has a
+    /// send budget.
     pub remaining_budget: Option<u32>,
 }
 
@@ -439,8 +440,9 @@ impl Messenger {
     ///
     /// # Panics
     ///
-    /// Panics on a `System` origin: an app's publish is priced by its
-    /// conversation.
+    /// Panics on a `System` origin: an app's MQTT publish is a `Conversation`
+    /// origin (an LLM tool publish) or an `AutomationFire` origin (a job's
+    /// fire), never `System`.
     pub async fn publish_mqtt(
         &self,
         origin: PublishOrigin,
@@ -453,7 +455,7 @@ impl Messenger {
         assert!(
             !matches!(origin, PublishOrigin::System),
             "Messenger::publish_mqtt called with PublishOrigin::System — an app's MQTT \
-             publish is attributed to a conversation"
+             publish is a Conversation or an AutomationFire origin, never System"
         );
         let principal = PublishPrincipal::App {
             slug: sender_app_slug,

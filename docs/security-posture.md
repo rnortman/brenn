@@ -506,7 +506,7 @@ A surface component with an operator-authored durable output binding
 `[[surface.output]]` onto a `brenn:` channel — all three, all boot-validated)
 publishes to the durable channel via `Messenger::publish_from_surface`. Every
 such publish is a `System`-origin send: it takes **no** per-conversation send
-budget (that gate is for LLM/automation origins), so the only rate limit is the
+budget (that gate is for LLM origins), so the only rate limit is the
 same per-connection publish token bucket that already meters ephemeral surface
 publishes, plus the session body cap. Unlike an ephemeral publish, a durable
 publish **writes to SQLite** (a message row + per-subscriber pending-push rows).
@@ -1171,6 +1171,98 @@ by reference (`docs/message-bus.md` §2.1.2a).
   another database, or that holds blob files and no record, before it deletes
   anything, so a host pointed at another host's directory cannot sweep it
   even while that host is down and its lock is free.
+
+### 7.7 Recurring automation jobs: the fire bound
+
+The automation engine (`brenn-automation`) fires recurring jobs that an app's
+LLM creates with the automation tools. The engine is a host cron loop, which
+the project's rule against a scheduler subsystem excludes. It is kept for now
+and is **not a sanctioned exception**: its replacement by schedules owned by
+components is tracked as `scheduling-component-managed` in `TODO.md`, and the
+bound below is one that replacement has to carry. What follows is the bound on
+a component awaiting replacement, not a description of a settled part of
+Brenn.
+
+**Policies:**
+
+- **What a fire is.** A clock tick that publishes the payload its job holds at
+  that moment — a `send_message` to a `brenn:` channel or an `mqtt_publish` to
+  `mqtt:<client>:<topic>`. The tick reacts to nothing. The payload, the
+  schedule and whether the job is enabled are whatever the app's LLM last
+  wrote with the automation tools, on any turn, with no human approval. It is
+  published under the owner app as principal, and the app's
+  grant and ACL are checked again at every fire, with the same body caps, MQTT
+  admission and per-(app, channel) send rate as any publish of that app.
+- **Why a fire is outside the impetus pool.** A conversation's impetus pool
+  (its send budget) is the count of reactions it may make before a person
+  interacts with it again; it exists so that machinery cannot answer machinery
+  without end (`docs/chat-protocol.md` §7). The reaction is the writing of the
+  job, and that is what the pool prices (next bullet). A tick that repeats what
+  was written answers nothing, and a pool that only a person's attention
+  refills would stop every unattended schedule. A fire therefore draws no
+  conversation's send budget (`PublishOrigin::AutomationFire`).
+- **What writing a job costs.** A priced job write is an `AutoCreate`, or an
+  `AutoEdit` whose input gives `action` or `trigger` or sets `enabled` true;
+  the rule reads the request, not the job, so enabling a job already enabled
+  is priced too. Each draws one unit of the calling conversation's pool, is
+  refused at an empty pool, and gets its unit back when the engine refuses
+  the write. Renaming, disabling, listing and deleting are free, so stopping a
+  job never needs a unit. One unit buys one payload and schedule, published
+  again at every slot for as long as the job exists, up to the caps below,
+  with no further unit — where a `BrennSend` buys one message. The residue:
+  the moment a job is disabled or deleted is free and visible to whoever
+  subscribes to its destination, so each job can be silenced once per priced
+  write.
+- **What bounds it instead.** Three caps the operator sets in the
+  configuration's `automation` block: `max_jobs_per_app` (default 50),
+  `max_fires_per_hour_per_job` (default 60) and `max_fires_per_day_per_app`
+  (default 500, over a sliding 24 hours). The worst case at the defaults is
+  **500 fires per app in any 24 hours**, each one publish of at most the
+  payload caps that already apply (`max_body_bytes` for a `send_message`, the
+  MQTT client's `outbound_payload_cap_bytes` for an `mqtt_publish`), to
+  addresses the app's ACL covers at the moment of the fire. The per-app count
+  is kept in its own table, apart from the jobs: no tool call, job edit,
+  deletion, re-creation or restart raises it or refills it; time alone does. A
+  fire that is refused inside its action — by the ACL, a removed MQTT client
+  or the send rate — still counts.
+- **Who writes the job set.** All four automation tools are tools whose
+  PreToolUse leg is an unconditional allow, as `BrennSend`'s is: no human
+  approves a job, and what the tools cause is bounded by the price of each job
+  write ("What writing a job costs", above), by the engine's caps and by the
+  app's grant and ACL, which the operator configures, not by an authorization
+  under §7.3. An LLM, including one steered by text it read, can therefore
+  cause at most the worst case above and the reports below, to destinations its
+  app could already publish to, carrying payloads and schedules it paid one
+  unit each to choose; with an empty pool it can stop its jobs and change
+  nothing else about what they publish. It cannot make a fire carry impetus,
+  and it cannot use fires to exceed what its app's ACL allows.
+- **What still bounds a fire that wakes an LLM.** A `send_message` fire
+  delivered into a conversation costs that receiving conversation one unit of
+  its impetus pool for the turn it provokes, and whatever that turn sends
+  draws the same pool. Fires cannot refill any pool.
+- **What a fire's error reports cost.** A report is delivered into the owner
+  app's own conversation (its singleton conversation, or the app's
+  automation-events conversation) and draws no impetus. It buys no spawn: a
+  sleeping conversation is not woken for it and receives it at its next
+  spawn. A conversation with a live bridge takes it at once, as a turn the
+  pool does not price. Reports are therefore bounded by the engine: a refusal
+  by the per-app cap is reported **once per app in any 24 hours**, whatever
+  the number of jobs held, and never disables a job; a failing fire is
+  reported under `max_error_reports_per_hour_per_job` (default 3), and
+  `consecutive_failures_to_disable` (default 5) consecutive failures disable
+  the job, so a job whose fires all fail reports at most 5 times before it
+  stops — 250 for an app at `max_jobs_per_app`. Re-enabling or re-creating a
+  job is a priced job write, so a conversation with an empty pool cannot
+  re-arm a disabled job from a report turn.
+
+**What the reviewer verifies:** every fire passes the per-app cap before its
+action and the cap's count survives job deletion and restart; a fire's
+publish takes the owner app's grant, ACL and caps; nothing but the engine
+constructs `PublishOrigin::AutomationFire`; a cap refusal reaches the
+owner's conversation at most once per app per 24 hours; every tool path that
+creates a job, sets its action or trigger, or enables it draws the calling
+conversation's send budget and is refused at an empty pool; and nothing an LLM
+reaches writes a job by another path.
 
 ---
 

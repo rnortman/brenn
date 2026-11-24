@@ -589,6 +589,66 @@ async fn publish_budget_exhaustion() {
     assert!(matches!(r, PublishResult::BudgetExhausted));
 }
 
+/// An `AutomationFire` origin reports no remaining budget and writes no budget
+/// row, and an exhausted `Conversation` budget under the same app does not
+/// refuse it.
+#[tokio::test]
+async fn automation_fire_origin_draws_no_send_budget() {
+    let (m, _, _, _, _) = build_messenger(1).await;
+    let fire = async |body: &str| {
+        m.publish(
+            crate::PublishOrigin::AutomationFire,
+            "pa-bob",
+            &canonical_address("pa-alice"),
+            body.into(),
+            Urgency::Low,
+            None,
+            None,
+            None,
+        )
+        .await
+    };
+    let budget_rows = async || -> i64 {
+        m.db.lock()
+            .await
+            .query_row("SELECT count(*) FROM messaging_send_budget", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+
+    let r = fire("first").await;
+    assert!(
+        matches!(
+            r,
+            PublishResult::Ok {
+                remaining_budget: None,
+                ..
+            }
+        ),
+        "{r:?}"
+    );
+    assert_eq!(budget_rows().await, 0, "a fire writes no budget row");
+
+    db::reset_send_budget(&*m.db.lock().await, 1, 0);
+    let r = fire("second").await;
+    assert!(
+        matches!(
+            r,
+            PublishResult::Ok {
+                remaining_budget: None,
+                ..
+            }
+        ),
+        "an empty conversation budget does not refuse a fire: {r:?}"
+    );
+    assert_eq!(
+        db::read_send_budget(&*m.db.lock().await, 1),
+        Some(0),
+        "the conversation's budget is untouched"
+    );
+}
+
 /// AC1: bus publish stamps `app:<slug>@<server>` as the stored sender value.
 /// Regression guard: a revert to stamping msg_cfg.sender or any other value
 /// would not be caught by tests that only check the PublishResult variant.

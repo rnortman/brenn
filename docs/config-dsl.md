@@ -278,8 +278,7 @@ messaging { max_body_bytes = 393216; }
 ```
 
 - `default_send_budget` — a conversation's send budget when its app states
-  none. Default 100. Automation fires draw this budget; the agent's
-  `send_budget` entry ([Agents](#agents)) says how to size it.
+  none. Default 100.
 - `max_body_bytes` — the largest body any publish carries, in bytes. Default
   65 536 (64 KiB). It bounds every message on the bus, a tool result
   included: a result over it is answered to its caller as an `internal` error
@@ -323,6 +322,48 @@ messaging { max_body_bytes = 393216; }
 (stated or default), is refused at load.
 
 `messaging` is a restart section (see [What reload converges](#what-reload-converges)).
+
+#### Automation limits
+
+The `automation` section bounds the recurring jobs apps create with the
+automation tools (`AutoCreate` and its siblings); every key is optional, and
+each is one figure for every app:
+
+```
+automation { max_fires_per_day_per_app = 1500; }
+```
+
+- `max_fires_per_hour_per_job` — the most fires one job makes in any sliding
+  hour. A fire over it is dropped, recorded as `rate_limit`, reported, and
+  counts toward the job's consecutive failures. Default 60.
+- `max_error_reports_per_hour_per_job` — the most error reports one job sends
+  its owner's conversation in any sliding hour; the first report over it
+  raises one operator alert, and later ones are dropped. Default 3.
+- `consecutive_failures_to_disable` — how many failed fires in a row disable
+  a job; it stays disabled until re-enabled. Default 5.
+- `max_jobs_per_app` — the most jobs one app owns, disabled ones included;
+  deleting a job frees its slot. Default 50.
+- `max_fires_per_day_per_app` — the most fires of all one app's jobs together
+  in any sliding 24 hours; "per day" means that window. A fire over it is
+  skipped, not queued, and recorded as `app_fire_cap`; it does not count
+  toward the job's consecutive failures, and the job fires again by itself at
+  its next slot at which the window has room. The first such skip of an app in
+  any 24 hours is reported to the owner's conversation and later ones are not.
+  Deleting or re-creating jobs, and restarting the server, refill nothing.
+  `0` admits no fire. Default 500.
+
+An automation fire draws no conversation's send budget, so these caps, with
+the app's grants and ACLs, are what bound fires
+(`docs/security-posture.md` §7.7). Writing a job does draw: `AutoCreate`, and
+an `AutoEdit` that sets a job's action or trigger or enables it, take one unit
+each of the writing conversation's send budget, so a `send_budget` smaller
+than the number of jobs an owner sets up in one request needs more than one
+message from them. The engine that reads them is a host cron
+loop that the rule against a scheduler subsystem excludes, kept for now and
+not a sanctioned exception; its replacement is `TODO.md`'s
+`scheduling-component-managed`.
+
+`automation` is a restart section (see [What reload converges](#what-reload-converges)).
 
 ### Claude accounts
 
@@ -2080,21 +2121,15 @@ no document byte and bounces nothing. `--permission-mode` through
 
 `send_budget` is the send budget of each of the agent's conversations: a whole
 number of at least 1, falling back to `messaging { default_send_budget }`.
-Every publish, push and bus-provoked turn a conversation causes draws one
-unit, and so does every automation fire, `brenn:` or MQTT, of the agent's
-jobs. Time never refills it; only a person's interaction reaching the
+Every publish, push, bus-provoked turn and priced automation job write
+(`AutoCreate`, or an `AutoEdit` that sets a job's action or trigger or enables
+it) a conversation causes draws one unit. Time never refills it; only a person's interaction reaching the
 conversation does — their chat message in it, or a delivered bus message
 carrying impetus, which only a sender holding the `mint_impetus` grant can
-mint. Size it as fires per day times the days of absence to survive, on top
-of the conversation's own sends, bus-provoked turns and pushes. A singleton
-agent's fires draw its one conversation's budget, which the owner's ordinary
-chatting restores; any other agent's fires draw the budget of its
-automation-events conversation, which nothing asks anyone to interact with,
-so unless the owner opens that conversation and sends a message there, size
-it as a total number of fires. A job whose fires fail on an empty budget is
-disabled after `consecutive_failures_to_disable` failures and stays disabled
-until re-enabled. `TODO.md`'s `automation-fire-budget-needs-a-person` is the
-open work.
+mint. Automation fires of the agent's jobs do not draw it; they are bounded by
+the `automation` section ([Automation limits](#automation-limits)). A
+`send_message` fire delivered into a conversation still provokes a turn there,
+which draws that conversation's budget like any bus-provoked turn.
 
 #### Conversation epoch
 

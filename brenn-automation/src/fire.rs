@@ -1,5 +1,6 @@
-//! Per-fire logic: auth re-check, budget gate, rate-limit gate, action dispatch,
-//! and bookkeeping (automation_fires insert + automation_jobs UPDATE).
+//! Per-fire logic: per-job rate-limit gate, auth re-check, per-app fire cap,
+//! action dispatch, and bookkeeping (automation_fires insert +
+//! automation_jobs UPDATE). A fire draws no conversation's send budget.
 //!
 //! Called sequentially by the background loop for each due job snapshot.
 
@@ -19,9 +20,12 @@ use brenn_messaging::publish::{
 };
 
 use crate::schema::{
-    OUTCOME_ACTION_ERROR, OUTCOME_APP_GONE, OUTCOME_AUTH, OUTCOME_BUDGET, OUTCOME_OK,
-    OUTCOME_RATE_LIMIT, OUTCOME_RATE_LIMIT_SUPPRESSED,
+    APP_FIRE_KIND_CAP_REPORT, APP_FIRE_KIND_FIRE, OUTCOME_ACTION_ERROR, OUTCOME_APP_FIRE_CAP,
+    OUTCOME_APP_GONE, OUTCOME_AUTH, OUTCOME_OK, OUTCOME_RATE_LIMIT, OUTCOME_RATE_LIMIT_SUPPRESSED,
 };
+
+/// The per-app fire cap's window: a sliding 24 hours before the fire.
+const APP_FIRE_CAP_WINDOW_SECS: i64 = 86_400;
 
 /// Execute one scheduled fire for `job`. Sequenced by the automation loop.
 /// Every path ends in `finish_fire`, which writes the fire record and
@@ -119,58 +123,56 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
         }
     };
 
-    let owner_user_id = {
+    let owner_user_present = {
         let conn = engine.db.lock().await;
-        match get_user_by_username(&conn, &owner_username) {
-            Some(u) => u.id,
-            None => {
-                drop(conn);
-                let detail = format!("owner user {owner_username:?} not found in DB");
-                finish_fire(
-                    engine,
-                    &job,
-                    fire_ts,
-                    OUTCOME_AUTH,
-                    Some(OUTCOME_AUTH),
-                    Some(&detail),
-                )
-                .await;
-                return;
-            }
-        }
+        get_user_by_username(&conn, &owner_username).is_some()
     };
-
-    // The conversation a fire publishes under, and so the send budget it
-    // draws one unit of, for either action kind.
-    // TODO(automation-fire-budget-needs-a-person): that budget is restored
-    // only by a person's interaction reaching the conversation, so a job meant
-    // to run unattended stops when it empties.
-    let is_singleton = app_config.singleton;
-    let sender_conv_id = {
-        let conn = engine.db.lock().await;
-        let id = if is_singleton {
-            let conv =
-                get_or_create_singleton_conversation(&conn, owner_user_id, &job.owner_app_slug);
-            conv.id
-        } else {
-            get_or_create_automation_events_conversation(&conn, &job.owner_app_slug, owner_user_id)
-        };
-        // Either branch may have just created the conversation, and a
-        // conversation without its chat channels is unaddressable on the bus.
-        engine
-            .messenger
-            .provision_conversation_chat_channels(&conn, &job.owner_app_slug, id);
-        id
-    };
-    // Outside the lock the publish needs, and deduplicated against the last
-    // snapshot: the common fire finds its conversation already there and
-    // announces nothing.
-    engine
-        .messenger
-        .republish_chat_roster(&job.owner_app_slug)
+    if !owner_user_present {
+        let detail = format!("owner user {owner_username:?} not found in DB");
+        finish_fire(
+            engine,
+            &job,
+            fire_ts,
+            OUTCOME_AUTH,
+            Some(OUTCOME_AUTH),
+            Some(&detail),
+        )
         .await;
+        return;
+    }
 
-    let origin = PublishOrigin::Conversation { id: sender_conv_id };
+    // (d) Per-app fire cap, immediately before the action: a fire that passes
+    // it is counted whatever the action then answers.
+    let gate = {
+        let conn = engine.db.lock().await;
+        app_fire_gate(
+            &conn,
+            &job.owner_app_slug,
+            fire_ts,
+            engine.defaults.max_fires_per_day_per_app,
+        )
+    };
+    if let AppFireGate::Refuse { report, count } = gate {
+        let detail = format!(
+            "app fire cap: {count} fires of app {:?} in last 24 hours (cap={})",
+            job.owner_app_slug, engine.defaults.max_fires_per_day_per_app
+        );
+        record_fire(
+            engine,
+            &job,
+            fire_ts,
+            FireClass::AppCapRefused { report, count },
+            OUTCOME_APP_FIRE_CAP,
+            Some(OUTCOME_APP_FIRE_CAP),
+            Some(&detail),
+        )
+        .await;
+        return;
+    }
+
+    // A fire is published under the owner app and draws no conversation's
+    // send budget; the engine's own caps bound it.
+    let origin = PublishOrigin::AutomationFire;
     let (stored_outcome, error_class, detail) = match &job.action {
         Action::SendMessage(sma) => {
             fire_send_message(engine, &job, &app_config.policy, origin, fire_ts, sma).await
@@ -187,6 +189,84 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
         detail.as_deref(),
     )
     .await;
+}
+
+/// The per-app fire cap's answer for one fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppFireGate {
+    /// Under the cap; the fire's ledger row is written.
+    Admit,
+    /// Over the cap with `count` fires in the window; `report` is true for
+    /// the app's first refusal in the window and false once one was reported.
+    Refuse { report: bool, count: i64 },
+}
+
+/// Decide one fire of `owner_app_slug` against the per-app cap, in one
+/// transaction: prune ledger rows of every app older than the window, count
+/// the app's `fire` rows left, and admit (writing a `fire` row) under `cap`.
+/// Over it, refuse, writing a `cap_report` row when the app has none in the
+/// window. Rows stamped after `fire_ts` still count.
+fn app_fire_gate(
+    conn: &Connection,
+    owner_app_slug: &str,
+    fire_ts: DateTime<Utc>,
+    cap: u32,
+) -> AppFireGate {
+    let fire_ts_str = brenn_db::format_ts_for_db(fire_ts);
+    let window_start =
+        brenn_db::format_ts_for_db(fire_ts - chrono::Duration::seconds(APP_FIRE_CAP_WINDOW_SECS));
+    let count_kind = |kind: &str| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM automation_app_fires \
+             WHERE owner_app_slug = ?1 AND kind = ?2",
+            rusqlite::params![owner_app_slug, kind],
+            |row| row.get(0),
+        )
+        .expect("app_fire_gate: count ledger rows")
+    };
+    let insert_kind = |kind: &str| {
+        conn.execute(
+            "INSERT INTO automation_app_fires (owner_app_slug, kind, at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![owner_app_slug, kind, fire_ts_str],
+        )
+        .expect("app_fire_gate: insert ledger row");
+    };
+
+    conn.execute("BEGIN", []).expect("begin app_fire_gate txn");
+    conn.execute(
+        "DELETE FROM automation_app_fires WHERE at < ?1",
+        rusqlite::params![window_start],
+    )
+    .expect("app_fire_gate: prune ledger");
+    let count = count_kind(APP_FIRE_KIND_FIRE);
+    let gate = if count < i64::from(cap) {
+        insert_kind(APP_FIRE_KIND_FIRE);
+        AppFireGate::Admit
+    } else if count_kind(APP_FIRE_KIND_CAP_REPORT) == 0 {
+        insert_kind(APP_FIRE_KIND_CAP_REPORT);
+        AppFireGate::Refuse {
+            report: true,
+            count,
+        }
+    } else {
+        AppFireGate::Refuse {
+            report: false,
+            count,
+        }
+    };
+    conn.execute("COMMIT", [])
+        .expect("commit app_fire_gate txn");
+    gate
+}
+
+/// How a recorded fire bears on its job: a success resets the failure count,
+/// a failure raises it and may disable the job, and a refusal by the per-app
+/// cap leaves it as it was and is reported only when the gate said so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FireClass {
+    Success,
+    Failure,
+    AppCapRefused { report: bool, count: i64 },
 }
 
 /// A fire's stored outcome, its error class, and the detail naming its cause.
@@ -262,11 +342,6 @@ async fn fire_send_message(
 
     match publish_result {
         PublishResult::Ok { .. } => (OUTCOME_OK, None, None),
-        PublishResult::BudgetExhausted => (
-            OUTCOME_BUDGET,
-            Some(OUTCOME_BUDGET),
-            Some("budget exhausted".to_string()),
-        ),
         PublishResult::UnknownChannel(addr) => auth_failure(format!("unknown channel: {addr}")),
         PublishResult::MalformedAddress(addr) => auth_failure(format!("malformed address: {addr}")),
         PublishResult::MissingSender => auth_failure("missing sender".to_string()),
@@ -286,6 +361,11 @@ async fn fire_send_message(
         PublishResult::DeferredQuotaExceeded { cap } => {
             action_error(format!("deferred-message quota exceeded (cap {cap})"))
         }
+        PublishResult::BudgetExhausted => unreachable!(
+            "automation fire publish returned BudgetExhausted: an AutomationFire origin draws \
+             no send budget; job uuid={}",
+            job.uuid
+        ),
         // A job's publish passes no impetus — unreachable unless the
         // publish construction changes.
         PublishResult::ImpetusUnauthorized => unreachable!(
@@ -345,13 +425,13 @@ async fn fire_mqtt_publish(
         PublishResult::MalformedAddress(addr) => {
             action_error(format!("malformed MQTT address: {addr:?}"))
         }
-        PublishResult::BudgetExhausted => (
-            OUTCOME_BUDGET,
-            Some(OUTCOME_BUDGET),
-            Some("budget exhausted".to_string()),
-        ),
         PublishResult::RateLimited => action_error("send rate limit exceeded".to_string()),
         PublishResult::MqttRefused(refusal) => mqtt_refusal_outcome(job, refusal),
+        PublishResult::BudgetExhausted => unreachable!(
+            "automation MQTT fire got BudgetExhausted: an AutomationFire origin draws no send \
+             budget; job uuid={}",
+            job.uuid
+        ),
         other @ (PublishResult::Ok { .. }
         | PublishResult::BodyTooLarge { .. }
         | PublishResult::DeferredQuotaExceeded { .. }
@@ -421,8 +501,8 @@ fn mqtt_refusal_outcome(job: &JobSnapshot, refusal: MqttRefusal) -> FireOutcome 
     }
 }
 
-/// Write the fire record and update the job row. Handles report-rate-limit
-/// suppression, consecutive-failure tracking, auto-disable, and alerting.
+/// [`record_fire`] for a fire that reached no per-app cap refusal: `ok` is a
+/// success and every other outcome a failure.
 async fn finish_fire(
     engine: &AutomationEngine,
     job: &JobSnapshot,
@@ -431,9 +511,50 @@ async fn finish_fire(
     error_class: Option<&str>,
     detail: Option<&str>,
 ) {
+    let class = if raw_outcome == OUTCOME_OK {
+        FireClass::Success
+    } else {
+        FireClass::Failure
+    };
+    record_fire(
+        engine,
+        job,
+        fire_ts,
+        class,
+        raw_outcome,
+        error_class,
+        detail,
+    )
+    .await;
+}
+
+/// Write the fire record and update the job row. Handles report-rate-limit
+/// suppression, consecutive-failure tracking, auto-disable, and alerting.
+/// Panics unless `class` is `Success` exactly when `raw_outcome` is `ok` and
+/// `AppCapRefused` exactly when it is `app_fire_cap`.
+async fn record_fire(
+    engine: &AutomationEngine,
+    job: &JobSnapshot,
+    fire_ts: DateTime<Utc>,
+    class: FireClass,
+    raw_outcome: &str,
+    error_class: Option<&str>,
+    detail: Option<&str>,
+) {
+    assert_eq!(
+        (
+            class == FireClass::Success,
+            matches!(class, FireClass::AppCapRefused { .. })
+        ),
+        (
+            raw_outcome == OUTCOME_OK,
+            raw_outcome == OUTCOME_APP_FIRE_CAP
+        ),
+        "record_fire: class {class:?} disagrees with outcome {raw_outcome:?}"
+    );
     let now = Utc::now();
     let job_id = job.row_id;
-    let is_success = raw_outcome == OUTCOME_OK;
+    let is_success = class == FireClass::Success;
 
     // Compute next fire time from the trigger.
     let next_fire_at = match compute_next(job.trigger.cron_trigger(), fire_ts) {
@@ -445,9 +566,13 @@ async fn finish_fire(
         }
     };
 
-    // Determine stored outcome (may be overridden by report-rate-limit suppression).
+    // Determine stored outcome (may be overridden by report-rate-limit
+    // suppression). A cap refusal is reported under the per-app rule the gate
+    // applied, never under the per-job report limit.
     let (stored_outcome, emit_report) = if is_success {
         (OUTCOME_OK, false)
+    } else if let FireClass::AppCapRefused { report, .. } = class {
+        (raw_outcome, report)
     } else {
         // Check the per-job error-report cap.
         let report_count = {
@@ -475,13 +600,13 @@ async fn finish_fire(
     };
 
     // Compute updated job fields.
-    let new_consecutive_failures = if is_success {
-        0i64
-    } else {
-        job.consecutive_failures + 1
+    let new_consecutive_failures = match class {
+        FireClass::Success => 0i64,
+        FireClass::Failure => job.consecutive_failures + 1,
+        FireClass::AppCapRefused { .. } => job.consecutive_failures,
     };
 
-    let should_auto_disable = !is_success
+    let should_auto_disable = class == FireClass::Failure
         && new_consecutive_failures >= engine.defaults.consecutive_failures_to_disable as i64;
 
     // DB transaction: UPDATE automation_jobs + INSERT automation_fires + prune.
@@ -539,6 +664,19 @@ async fn finish_fire(
                 "job_id={job_id} name={:?} consecutive_failures={new_consecutive_failures} \
                  threshold={}",
                 job.name, engine.defaults.consecutive_failures_to_disable
+            ),
+        );
+    }
+
+    if let FireClass::AppCapRefused { count, .. } = class {
+        engine.alerts.alert_once_per_process(
+            brenn_obs::alerting::AlertSeverity::Warning,
+            "Automation app fire cap reached".to_string(),
+            &format!("automation_app_fire_cap:{}", job.owner_app_slug),
+            format!(
+                "app={:?} fires_in_last_24h={count} cap={}; further fires of the app are \
+                 skipped until the window has room",
+                job.owner_app_slug, engine.defaults.max_fires_per_day_per_app
             ),
         );
     }
@@ -753,7 +891,8 @@ fn get_or_create_automation_events_conversation(
 }
 
 /// Count fires for `job_id` in the last `window_secs` seconds where the
-/// outcome is NOT 'rate_limit' (the fire rate-limit gate excludes prior drops).
+/// outcome is NOT 'rate_limit' or 'app_fire_cap' (the fire rate-limit gate
+/// excludes prior drops and per-app cap refusals).
 fn count_fires_in_window(
     conn: &Connection,
     job_id: i64,
@@ -763,15 +902,21 @@ fn count_fires_in_window(
     let window_start = now - chrono::Duration::seconds(window_secs);
     conn.query_row(
         "SELECT count(*) FROM automation_fires \
-         WHERE job_id = ?1 AND fired_at >= ?2 AND outcome != 'rate_limit'",
-        rusqlite::params![job_id, brenn_db::format_ts_for_db(window_start)],
+         WHERE job_id = ?1 AND fired_at >= ?2 AND outcome NOT IN (?3, ?4)",
+        rusqlite::params![
+            job_id,
+            brenn_db::format_ts_for_db(window_start),
+            OUTCOME_RATE_LIMIT,
+            OUTCOME_APP_FIRE_CAP
+        ],
         |row| row.get(0),
     )
     .expect("count_fires_in_window")
 }
 
 /// Count fires for `job_id` in the last `window_secs` seconds that are NOT
-/// `ok` or `rate_limit_suppressed_report` (the report rate-limit gate).
+/// `ok`, `rate_limit_suppressed_report` or `app_fire_cap` (the report
+/// rate-limit gate; a cap refusal is reported under the per-app rule).
 fn count_reportable_fires_in_window(
     conn: &Connection,
     job_id: i64,
@@ -781,9 +926,14 @@ fn count_reportable_fires_in_window(
     let window_start = now - chrono::Duration::seconds(window_secs);
     conn.query_row(
         "SELECT count(*) FROM automation_fires \
-         WHERE job_id = ?1 AND fired_at >= ?2 \
-           AND outcome NOT IN ('ok', 'rate_limit_suppressed_report')",
-        rusqlite::params![job_id, brenn_db::format_ts_for_db(window_start)],
+         WHERE job_id = ?1 AND fired_at >= ?2 AND outcome NOT IN (?3, ?4, ?5)",
+        rusqlite::params![
+            job_id,
+            brenn_db::format_ts_for_db(window_start),
+            OUTCOME_OK,
+            OUTCOME_RATE_LIMIT_SUPPRESSED,
+            OUTCOME_APP_FIRE_CAP
+        ],
         |row| row.get(0),
     )
     .expect("count_reportable_fires_in_window")
@@ -854,7 +1004,7 @@ fn commit_fire(
                 job_id,
             ],
         )
-        .expect("update job (failure)")
+        .expect("update job (failure or cap refusal)")
     };
 
     if rows_updated == 0 {
@@ -1144,18 +1294,20 @@ mod tests {
         assert!(events.is_empty(), "no error reports on success");
     }
 
-    /// A fire is a conversation-creation site: the first one mints the app's
-    /// automation-events conversation, so it owes the bus a roster snapshot
-    /// naming it. Nobody watches this path — the conversation is created by
-    /// machinery, not a person — so an announcement that stopped happening would
-    /// leave a fleet driver blind to it with nothing to notice.
+    /// A fire publishes under no conversation, so a successful one creates
+    /// none and announces nothing. The error-report path is the creation site:
+    /// the first failing fire of an app that is not a singleton mints the
+    /// app's automation-events conversation, so it owes the bus a roster
+    /// snapshot naming it. Nobody watches this path — the conversation is
+    /// created by machinery, not a person — so an announcement that stopped
+    /// happening would leave a fleet driver blind to it with nothing to notice.
     ///
-    /// The second fire finds the conversation already there and announces
-    /// nothing: provisioning is idempotent and runs on *every* fire, so a
-    /// republish per fire would wake every subscribed peer at automation cadence
-    /// to tell it nothing.
+    /// The second failing fire finds the conversation already there and
+    /// announces nothing: provisioning is idempotent and runs on *every*
+    /// report, so a republish per report would wake every subscribed peer at
+    /// automation cadence to tell it nothing.
     #[tokio::test]
-    async fn a_fire_announces_the_events_conversation_it_creates_exactly_once() {
+    async fn a_failing_fire_announces_the_events_conversation_it_creates_exactly_once() {
         let (db, _user_id, _channel_uuid, directory) = make_db_with_user_and_channel().await;
         let engine = make_engine_announcing(db.clone(), directory).await;
 
@@ -1164,12 +1316,38 @@ mod tests {
             let conn = db.lock().await;
             insert_job_row(&conn, &job);
         }
-        assert!(
-            roster_snapshots(&engine, "test-app").await.is_empty(),
-            "precondition: nothing has been announced yet"
-        );
 
         fire_one(&engine, job.clone()).await;
+        assert_eq!(last_fire(&engine).await.0, OUTCOME_OK);
+        let conversations = |db: brenn_db::Db| async move {
+            db.lock()
+                .await
+                .query_row(
+                    "SELECT count(*) FROM conversations WHERE app_slug = 'test-app'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            conversations(db.clone()).await,
+            0,
+            "a successful fire creates no conversation"
+        );
+        assert!(
+            roster_snapshots(&engine, "test-app").await.is_empty(),
+            "a successful fire announces nothing"
+        );
+
+        let mut failing = job;
+        failing.action = Action::SendMessage(SendMessageAction {
+            to: "brenn:nonexistent-channel".to_string(),
+            body: "hello".to_string(),
+            urgency: Urgency::Low,
+            reply_to: None,
+            delivery_deadline_secs: None,
+        });
+        fire_one(&engine, failing.clone()).await;
 
         let conv_id = {
             let conn = db.lock().await;
@@ -1178,7 +1356,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .expect("the fire created the automation-events conversation")
+            .expect("the report created the automation-events conversation")
         };
         assert_eq!(
             roster_snapshots(&engine, "test-app").await,
@@ -1186,11 +1364,11 @@ mod tests {
             "the created conversation was announced"
         );
 
-        fire_one(&engine, job).await;
+        fire_one(&engine, failing).await;
         assert_eq!(
             roster_snapshots(&engine, "test-app").await.len(),
             1,
-            "a fire that creates nothing announces nothing"
+            "a report that creates nothing announces nothing"
         );
     }
 
@@ -1463,56 +1641,45 @@ mod tests {
         );
     }
 
-    /// Budget exhaustion: `PublishResult::BudgetExhausted` → OUTCOME_BUDGET →
-    /// `consecutive_failures++`.
+    /// An empty send budget on the singleton conversation does not stop a
+    /// fire of either action kind: it is `ok`, reports nothing, and leaves the
+    /// budget at zero.
     #[tokio::test]
-    async fn fire_budget_exhausted_increments_failures_and_reports() {
-        let (db, user_id, _channel_uuid, directory) = make_db_with_user_and_channel().await;
-        let ingress_router = FakeIngressRouter::new();
-        let engine = make_engine(
-            db.clone(),
-            directory,
-            user_id,
-            ingress_router.clone() as Arc<dyn IngressRouter>,
-        );
-
-        let mut job = make_job_snapshot(1, "test-app");
-        job.consecutive_failures = 0;
-        {
-            let conn = db.lock().await;
-            insert_job_row(&conn, &job);
-            // Pre-create the singleton conversation so we can exhaust its budget.
-            // `get_or_create_singleton_conversation` uses the `conversations` table;
-            // calling it here ensures the conversation exists before we set budget=0.
-            let singleton_conv =
-                brenn_db::conversation::get_or_create_singleton_conversation(&conn, 1, "test-app");
-            // Exhaust the budget for the singleton conversation.
-            brenn_messaging_store::db::reset_send_budget(&conn, singleton_conv.id, 0);
-        }
-
-        fire_one(&engine, job).await;
-
-        let conn = db.lock().await;
-        let failures: i64 = conn
-            .query_row(
-                "SELECT consecutive_failures FROM automation_jobs WHERE id = 1",
-                [],
-                |r| r.get(0),
+    async fn fire_with_an_empty_send_budget_succeeds() {
+        for action in [
+            send_message_to_status(),
+            Action::MqttPublish(mqtt_action(KITCHEN, b"ON")),
+        ] {
+            let ingress = FakeIngressRouter::new();
+            let (engine, _) = make_mqtt_engine(
+                mqtt_sender_policy(),
+                ingress.clone() as Arc<dyn IngressRouter>,
             )
-            .unwrap();
-        assert_eq!(
-            failures, 1,
-            "consecutive_failures should increment on budget exhausted"
-        );
+            .await;
+            let conv = singleton_conversation(&engine).await;
+            brenn_messaging_store::db::reset_send_budget(&*engine.db.lock().await, conv, 0);
+            let job = JobSnapshot {
+                action,
+                ..make_job_snapshot(1, "test-app")
+            };
+            insert_job_row(&*engine.db.lock().await, &job);
 
-        // An error report should be submitted.
-        let events = ingress_router.events().await;
-        assert_eq!(
-            events.len(),
-            1,
-            "budget exhausted should emit an error report"
-        );
-        assert_eq!(events[0].2, "automation:error");
+            fire_one(&engine, job.clone()).await;
+
+            assert_eq!(
+                last_fire(&engine).await,
+                (OUTCOME_OK.to_string(), String::new(), 0),
+                "{:?}",
+                job.action
+            );
+            assert!(ingress.events().await.is_empty(), "{:?}", job.action);
+            assert_eq!(
+                send_budget(&engine, conv).await,
+                Some(0),
+                "{:?}",
+                job.action
+            );
+        }
     }
 
     /// Disabled job: `get_due_jobs` skips `enabled = 0` rows. No fire should
@@ -2759,44 +2926,210 @@ mod tests {
         );
     }
 
-    /// A committed fire draws one unit of the send budget; an exhausted
-    /// budget fails the fire as `budget`; a closed egress channel refunds the
-    /// unit it drew; the threshold failure disables the job.
+    /// A `send_message` action to the MQTT engine's `brenn:` channel.
+    fn send_message_to_status() -> Action {
+        Action::SendMessage(SendMessageAction {
+            to: MQTT_STATUS.to_string(),
+            body: "hello".to_string(),
+            urgency: Urgency::Low,
+            reply_to: None,
+            delivery_deadline_secs: None,
+        })
+    }
+
+    /// "test-app"'s singleton conversation, created if absent.
+    async fn singleton_conversation(engine: &AutomationEngine) -> i64 {
+        let conn = engine.db.lock().await;
+        brenn_db::conversation::get_or_create_singleton_conversation(&conn, 1, "test-app").id
+    }
+
+    /// The send budget row of `conv`, if one was ever written.
+    async fn send_budget(engine: &AutomationEngine, conv: i64) -> Option<u32> {
+        brenn_messaging_store::db::read_send_budget(&*engine.db.lock().await, conv)
+    }
+
+    /// Set "test-app"'s singleton flag and its configured send budget.
+    fn shape_app(apps: &brenn_lib::config::AppTable, singleton: bool, send_budget: u32) {
+        let mut map = (*apps.load()).clone();
+        let app = map.get_mut("test-app").unwrap();
+        app.singleton = singleton;
+        app.messaging.as_mut().unwrap().send_budget = send_budget;
+        apps.store(Arc::new(map));
+    }
+
+    /// With nobody interacting, a job of either action kind fires more times
+    /// than its app's send budget holds, every fire `ok`, for a singleton app
+    /// and for one that is not. No budget is touched: the singleton
+    /// conversation's reads the same after the fires, and for the other app no
+    /// conversation, events mapping or budget row is created at all.
     #[tokio::test]
-    async fn mqtt_fire_budget_refund_and_auto_disable() {
+    async fn fires_outlast_the_send_budget_and_leave_it_untouched() {
+        const BUDGET: u32 = 2;
+        for singleton in [true, false] {
+            for action in [
+                send_message_to_status(),
+                Action::MqttPublish(mqtt_action(KITCHEN, b"ON")),
+            ] {
+                let case = format!("singleton={singleton} {action:?}");
+                let ingress = FakeIngressRouter::new();
+                let (engine, apps) = make_mqtt_engine(
+                    mqtt_sender_policy(),
+                    ingress.clone() as Arc<dyn IngressRouter>,
+                )
+                .await;
+                shape_app(&apps, singleton, BUDGET);
+                let conv = if singleton {
+                    let conv = singleton_conversation(&engine).await;
+                    brenn_messaging_store::db::reset_send_budget(
+                        &*engine.db.lock().await,
+                        conv,
+                        BUDGET,
+                    );
+                    Some(conv)
+                } else {
+                    None
+                };
+                let job = JobSnapshot {
+                    action,
+                    ..make_job_snapshot(1, "test-app")
+                };
+                insert_job_row(&*engine.db.lock().await, &job);
+
+                for _ in 0..BUDGET * 3 {
+                    fire_one(&engine, job.clone()).await;
+                    assert_eq!(
+                        last_fire(&engine).await,
+                        (OUTCOME_OK.to_string(), String::new(), 0),
+                        "{case}"
+                    );
+                }
+                assert!(ingress.events().await.is_empty(), "{case}");
+
+                let conn = engine.db.lock().await;
+                let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+                assert_eq!(
+                    count("SELECT count(*) FROM automation_fires WHERE outcome = 'ok'"),
+                    i64::from(BUDGET * 3),
+                    "{case}"
+                );
+                match conv {
+                    Some(conv) => assert_eq!(
+                        brenn_messaging_store::db::read_send_budget(&conn, conv),
+                        Some(BUDGET),
+                        "{case}: the singleton conversation's budget is untouched"
+                    ),
+                    None => {
+                        assert_eq!(
+                            count("SELECT count(*) FROM conversations"),
+                            0,
+                            "{case}: no conversation"
+                        );
+                        assert_eq!(
+                            count("SELECT count(*) FROM automation_app_event_conversation"),
+                            0,
+                            "{case}: no events conversation"
+                        );
+                        assert_eq!(
+                            count("SELECT count(*) FROM messaging_send_budget"),
+                            0,
+                            "{case}: no budget row"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The app's own LLM publishes still draw its conversation's budget in the
+    /// same fixture: a `Conversation`-origin publish lowers it by one and is
+    /// refused at zero, while an `AutomationFire`-origin publish to the same
+    /// channel under the same app succeeds.
+    #[tokio::test]
+    async fn a_conversation_publish_still_draws_the_budget_a_fire_does_not() {
         let (engine, _) = make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
-        let conv = {
-            let conn = engine.db.lock().await;
-            brenn_db::conversation::get_or_create_singleton_conversation(&conn, 1, "test-app").id
+        let conv = singleton_conversation(&engine).await;
+        brenn_messaging_store::db::reset_send_budget(&*engine.db.lock().await, conv, 2);
+        let publish = async |origin| {
+            engine
+                .messenger
+                .publish(
+                    origin,
+                    "test-app",
+                    MQTT_STATUS,
+                    "hello".into(),
+                    Urgency::Low,
+                    None,
+                    None,
+                    None,
+                )
+                .await
         };
-        let set_budget = |conn: &rusqlite::Connection, n| {
-            brenn_messaging_store::db::reset_send_budget(conn, conv, n)
-        };
-        let budget =
-            async || brenn_messaging_store::db::read_send_budget(&*engine.db.lock().await, conv);
-        set_budget(&*engine.db.lock().await, 5);
+
+        let r = publish(PublishOrigin::Conversation { id: conv }).await;
+        assert!(
+            matches!(
+                r,
+                PublishResult::Ok {
+                    remaining_budget: Some(1),
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+        assert_eq!(send_budget(&engine, conv).await, Some(1));
+
+        brenn_messaging_store::db::reset_send_budget(&*engine.db.lock().await, conv, 0);
+        let r = publish(PublishOrigin::Conversation { id: conv }).await;
+        assert!(matches!(r, PublishResult::BudgetExhausted), "{r:?}");
+        let r = publish(PublishOrigin::AutomationFire).await;
+        assert!(
+            matches!(
+                r,
+                PublishResult::Ok {
+                    remaining_budget: None,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+        assert_eq!(send_budget(&engine, conv).await, Some(0));
+    }
+
+    /// A committed fire leaves the send budget where it was; a fire to a
+    /// removed client (its egress channel closed) is refused as `auth`,
+    /// commits nothing and leaves the budget where it was; a failing fire at
+    /// the threshold disables the job.
+    #[tokio::test]
+    async fn mqtt_fire_leaves_the_budget_and_a_removed_client_disables_at_threshold() {
+        let (engine, _) = make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
+        let conv = singleton_conversation(&engine).await;
+        brenn_messaging_store::db::reset_send_budget(&*engine.db.lock().await, conv, 5);
         let mut job = mqtt_job(mqtt_action(KITCHEN, b"ON"));
         insert_job_row(&*engine.db.lock().await, &job);
         fire_one(&engine, job.clone()).await;
         assert_eq!(last_fire(&engine).await.0, "ok");
-        assert_eq!(budget().await, Some(4), "a committed fire draws one unit");
+        assert_eq!(
+            send_budget(&engine, conv).await,
+            Some(5),
+            "a committed fire draws nothing"
+        );
         assert_eq!(egress_rows(&engine, "home").await.len(), 1);
 
-        set_budget(&*engine.db.lock().await, 5);
         job.action = Action::MqttPublish(mqtt_action("mqtt:away:lights/a/set", b"ON"));
         fire_one(&engine, job.clone()).await;
+        let (outcome, detail, failures) = last_fire(&engine).await;
+        assert_eq!((outcome.as_str(), failures), ("auth", 1), "{detail}");
+        assert!(egress_rows(&engine, "away").await.is_empty());
         assert_eq!(
-            budget().await,
+            send_budget(&engine, conv).await,
             Some(5),
-            "the closed channel refunds its unit"
+            "the refused fire draws nothing"
         );
 
-        set_budget(&*engine.db.lock().await, 0);
-        job.action = Action::MqttPublish(mqtt_action(KITCHEN, b"ON"));
         job.consecutive_failures = i64::from(engine.defaults.consecutive_failures_to_disable) - 1;
         fire_one(&engine, job).await;
         let (outcome, _, _) = last_fire(&engine).await;
-        assert_eq!(outcome, "budget");
+        assert_eq!(outcome, "auth");
         let enabled: i64 = engine
             .db
             .lock()
@@ -2812,6 +3145,509 @@ mod tests {
             egress_rows(&engine, "home").await.len(),
             1,
             "the refused fire commits nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-app fire cap
+    // -----------------------------------------------------------------------
+
+    type CapturedAlerts = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// A `make_engine_full` engine on the `brenn:test` fixture under `cfg`,
+    /// whose alerts are captured. Read the alerts with [`drain_alerts`].
+    async fn make_capped_engine(
+        cfg: AutomationGlobalConfig,
+    ) -> (
+        Arc<AutomationEngine>,
+        Arc<FakeIngressRouter>,
+        CapturedAlerts,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use brenn_obs::alerting::{CapturingAlerter, RateLimiter};
+        let (db, _user_id, _channel_uuid, directory) = make_db_with_user_and_channel().await;
+        let ingress = FakeIngressRouter::new();
+        let captured = CapturedAlerts::default();
+        let (alerts, handle) = AlertDispatcher::new(
+            CapturingAlerter(captured.clone()),
+            RateLimiter::new(1000, 3600),
+        );
+        let engine = make_engine_full(
+            db,
+            directory,
+            ingress.clone() as Arc<dyn IngressRouter>,
+            Arc::new(FakeWakeRouter),
+            alerts,
+            cfg,
+            true,
+        );
+        (engine, ingress, captured, handle)
+    }
+
+    /// Drop `engine`, wait for its alerts to drain, and count them by title.
+    async fn drain_alerts(
+        engine: Arc<AutomationEngine>,
+        captured: CapturedAlerts,
+        handle: tokio::task::JoinHandle<()>,
+        title: &str,
+    ) -> usize {
+        drop(engine);
+        handle.await.expect("alert drainer task must not panic");
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| t == title)
+            .count()
+    }
+
+    const CAP_ALERT: &str = "Automation app fire cap reached";
+    const OVERFLOW_ALERT: &str = "Automation report overflow";
+
+    fn cap_config(cap: u32) -> AutomationGlobalConfig {
+        AutomationGlobalConfig {
+            max_fires_per_day_per_app: cap,
+            ..AutomationGlobalConfig::default()
+        }
+    }
+
+    /// `n` ledger rows of `kind` for `slug`, stamped now.
+    async fn add_ledger_rows(engine: &AutomationEngine, slug: &str, kind: &str, n: usize) {
+        let conn = engine.db.lock().await;
+        for _ in 0..n {
+            conn.execute(
+                "INSERT INTO automation_app_fires (owner_app_slug, kind, at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![slug, kind, brenn_db::format_ts_for_db(Utc::now())],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Stamp every ledger row of `kind` 25 hours ago, past the cap's window.
+    async fn age_ledger_rows(engine: &AutomationEngine, kind: &str) {
+        engine
+            .db
+            .lock()
+            .await
+            .execute(
+                "UPDATE automation_app_fires SET at = ?1 WHERE kind = ?2",
+                rusqlite::params![
+                    brenn_db::format_ts_for_db(Utc::now() - chrono::Duration::hours(25)),
+                    kind
+                ],
+            )
+            .unwrap();
+    }
+
+    async fn ledger_rows(engine: &AutomationEngine, slug: &str, kind: &str) -> i64 {
+        engine
+            .db
+            .lock()
+            .await
+            .query_row(
+                "SELECT count(*) FROM automation_app_fires WHERE owner_app_slug = ?1 AND kind = ?2",
+                rusqlite::params![slug, kind],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `(enabled, consecutive_failures, last_fired_at, next_fire_at)` of job `id`.
+    async fn job_state(engine: &AutomationEngine, id: i64) -> (i64, i64, Option<String>, String) {
+        engine
+            .db
+            .lock()
+            .await
+            .query_row(
+                "SELECT enabled, consecutive_failures, last_fired_at, next_fire_at \
+                 FROM automation_jobs WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// The `(outcome, error_class)` of job `id`'s fire rows, oldest first.
+    async fn fire_outcomes(engine: &AutomationEngine, id: i64) -> Vec<(String, Option<String>)> {
+        let conn = engine.db.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT outcome, error_class FROM automation_fires WHERE job_id = ?1 ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The rows on the `brenn:test` fixture channel.
+    async fn test_channel_rows(engine: &AutomationEngine) -> usize {
+        let channel = engine.directory.resolve("brenn:test").unwrap();
+        let conn = engine.db.lock().await;
+        brenn_messaging_store::db::load_channel_retained_tail(&conn, channel.uuid, Depth::Unbounded)
+            .len()
+    }
+
+    /// A job of "test-app" with row id `id`, inserted with `failures`.
+    async fn insert_capped_job(engine: &AutomationEngine, id: i64, failures: i64) -> JobSnapshot {
+        let mut job = make_job_snapshot(id, "test-app");
+        job.consecutive_failures = failures;
+        insert_job_row(&*engine.db.lock().await, &job);
+        job
+    }
+
+    fn failing(mut job: JobSnapshot) -> JobSnapshot {
+        job.action = Action::SendMessage(SendMessageAction {
+            to: "brenn:nonexistent-channel".to_string(),
+            body: "hi".to_string(),
+            urgency: Urgency::Low,
+            reply_to: None,
+            delivery_deadline_secs: None,
+        });
+        job
+    }
+
+    /// The first fire over the cap is stored as `app_fire_cap`, commits no
+    /// message, is reported once and alerted once, leaves the job's failure
+    /// count where it was and the job enabled with its next slot advanced.
+    /// Once the ledger rows age past the window the same job, unedited, fires
+    /// `ok`.
+    #[tokio::test]
+    async fn the_app_fire_cap_skips_the_slot_and_the_job_comes_back_by_itself() {
+        let (engine, ingress, captured, handle) = make_capped_engine(cap_config(2)).await;
+        add_ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE, 2).await;
+        let job = insert_capped_job(&engine, 1, 2).await;
+        let (_, _, _, next_before) = job_state(&engine, 1).await;
+
+        fire_one(&engine, job.clone()).await;
+        let (outcome, detail, failures) = last_fire(&engine).await;
+        assert_eq!((outcome.as_str(), failures), (OUTCOME_APP_FIRE_CAP, 2));
+        assert!(detail.contains("cap=2"), "{detail}");
+        assert_eq!(
+            fire_outcomes(&engine, 1).await,
+            vec![(
+                OUTCOME_APP_FIRE_CAP.to_string(),
+                Some(OUTCOME_APP_FIRE_CAP.to_string())
+            )]
+        );
+        let (enabled, _, last_fired, next_after) = job_state(&engine, 1).await;
+        assert_eq!(enabled, 1);
+        assert!(last_fired.is_some());
+        assert!(next_after > next_before, "{next_after} > {next_before}");
+        assert_eq!(test_channel_rows(&engine).await, 0, "nothing committed");
+        let events = ingress.events().await;
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].4.contains(OUTCOME_APP_FIRE_CAP),
+            "{}",
+            events[0].4
+        );
+        assert_eq!(
+            ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE).await,
+            2
+        );
+
+        age_ledger_rows(&engine, APP_FIRE_KIND_FIRE).await;
+        fire_one(&engine, job).await;
+        assert_eq!(
+            last_fire(&engine).await,
+            (OUTCOME_OK.into(), String::new(), 0)
+        );
+        assert_eq!(test_channel_rows(&engine).await, 1);
+        assert_eq!(drain_alerts(engine, captured, handle, CAP_ALERT).await, 1);
+    }
+
+    /// More refusals in a row than the auto-disable threshold leave the job
+    /// enabled with no failure counted; every row is `app_fire_cap`, none is
+    /// `rate_limit_suppressed_report`, and neither per-job window counts them.
+    /// A cap of 0 admits no fire.
+    #[tokio::test]
+    async fn a_cap_refusal_never_disables_and_stays_out_of_both_job_windows() {
+        let (engine, ingress, _, _) = make_capped_engine(cap_config(0)).await;
+        let job = insert_capped_job(&engine, 1, 0).await;
+        let refusals = engine.defaults.consecutive_failures_to_disable as usize + 2;
+        for _ in 0..refusals {
+            fire_one(&engine, job.clone()).await;
+        }
+        assert_eq!(job_state(&engine, 1).await.0, 1, "still enabled");
+        assert_eq!(job_state(&engine, 1).await.1, 0, "no failure counted");
+        let outcomes = fire_outcomes(&engine, 1).await;
+        assert_eq!(outcomes.len(), refusals);
+        assert!(
+            outcomes.iter().all(|(o, _)| o == OUTCOME_APP_FIRE_CAP),
+            "{outcomes:?}"
+        );
+        let conn = engine.db.lock().await;
+        assert_eq!(count_fires_in_window(&conn, 1, Utc::now(), 3600), 0);
+        assert_eq!(
+            count_reportable_fires_in_window(&conn, 1, Utc::now(), 3600),
+            0
+        );
+        drop(conn);
+        assert_eq!(ingress.events().await.len(), 1, "one report per app");
+        assert_eq!(test_channel_rows(&engine).await, 0);
+    }
+
+    /// Several jobs of one app, each refused more than the per-job report
+    /// limit across more than an hour, are reported once in all. Once the
+    /// `cap_report` row ages past the window the next refusal is reported
+    /// again. One cap alert is raised and no report-overflow alert.
+    #[tokio::test]
+    async fn cap_refusals_are_reported_once_per_app_per_window() {
+        let (engine, ingress, captured, handle) = make_capped_engine(cap_config(1)).await;
+        add_ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE, 1).await;
+        let mut jobs = Vec::new();
+        for id in 1..=3 {
+            jobs.push(insert_capped_job(&engine, id, 0).await);
+        }
+        let per_job = engine.defaults.max_error_reports_per_hour_per_job as usize + 1;
+        for _hour in 0..2 {
+            for job in &jobs {
+                for _ in 0..per_job {
+                    fire_one(&engine, job.clone()).await;
+                }
+            }
+            engine
+                .db
+                .lock()
+                .await
+                .execute(
+                    "UPDATE automation_fires SET fired_at = ?1",
+                    rusqlite::params![brenn_db::format_ts_for_db(
+                        Utc::now() - chrono::Duration::minutes(70)
+                    )],
+                )
+                .unwrap();
+        }
+        assert_eq!(ingress.events().await.len(), 1);
+        for job in &jobs {
+            assert!(
+                fire_outcomes(&engine, job.row_id)
+                    .await
+                    .iter()
+                    .all(|(o, _)| o == OUTCOME_APP_FIRE_CAP)
+            );
+        }
+
+        age_ledger_rows(&engine, APP_FIRE_KIND_CAP_REPORT).await;
+        fire_one(&engine, jobs[1].clone()).await;
+        assert_eq!(
+            ingress.events().await.len(),
+            2,
+            "a new window, a new report"
+        );
+
+        let alerts = captured.clone();
+        assert_eq!(drain_alerts(engine, captured, handle, CAP_ALERT).await, 1);
+        assert!(
+            !alerts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(t, _)| t == OVERFLOW_ALERT),
+            "no report-overflow alert"
+        );
+    }
+
+    /// Deleting and re-creating a job refills neither the cap nor the report
+    /// allowance: the admitted fire's ledger row stays, the re-created job is
+    /// refused and reported, and after a second re-creation it is refused
+    /// without a report.
+    #[tokio::test]
+    async fn deleting_and_recreating_a_job_refills_neither_the_cap_nor_the_reports() {
+        let (engine, ingress, _, _) = make_capped_engine(cap_config(1)).await;
+        let job = insert_capped_job(&engine, 1, 0).await;
+        fire_one(&engine, job).await;
+        assert_eq!(last_fire(&engine).await.0, OUTCOME_OK);
+
+        for reports in [1, 1] {
+            engine
+                .db
+                .lock()
+                .await
+                .execute("DELETE FROM automation_jobs", [])
+                .unwrap();
+            let job = insert_capped_job(&engine, 1, 0).await;
+            fire_one(&engine, job).await;
+            assert_eq!(last_fire(&engine).await.0, OUTCOME_APP_FIRE_CAP);
+            assert_eq!(ingress.events().await.len(), reports);
+        }
+        assert_eq!(test_channel_rows(&engine).await, 1);
+    }
+
+    /// A cap refusal does not use the job's hourly report allowance: the same
+    /// job then failing for another cause in the same hour is still reported
+    /// `max_error_reports_per_hour_per_job` times before suppression.
+    #[tokio::test]
+    async fn a_cap_refusal_leaves_the_jobs_report_allowance() {
+        let (engine, ingress, _, _) = make_capped_engine(cap_config(10)).await;
+        add_ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE, 10).await;
+        let job = failing(insert_capped_job(&engine, 1, 0).await);
+        fire_one(&engine, job.clone()).await;
+        assert_eq!(last_fire(&engine).await.0, OUTCOME_APP_FIRE_CAP);
+        assert_eq!(ingress.events().await.len(), 1);
+
+        age_ledger_rows(&engine, APP_FIRE_KIND_FIRE).await;
+        let limit = engine.defaults.max_error_reports_per_hour_per_job as usize;
+        for _ in 0..limit {
+            fire_one(&engine, job.clone()).await;
+            assert_eq!(last_fire(&engine).await.0, OUTCOME_AUTH);
+        }
+        assert_eq!(ingress.events().await.len(), 1 + limit);
+        fire_one(&engine, job).await;
+        assert_eq!(last_fire(&engine).await.0, OUTCOME_RATE_LIMIT_SUPPRESSED);
+        assert_eq!(ingress.events().await.len(), 1 + limit);
+    }
+
+    /// The cap counts `fire` rows only, and only the owner app's: with the
+    /// cap at N, N−1 `fire` rows and a `cap_report` row of the app and N rows
+    /// of another app in the window, the next fire is admitted.
+    #[tokio::test]
+    async fn the_cap_counts_the_apps_fire_rows_only() {
+        let (engine, _, _, _) = make_capped_engine(cap_config(2)).await;
+        add_ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE, 1).await;
+        add_ledger_rows(&engine, "test-app", APP_FIRE_KIND_CAP_REPORT, 1).await;
+        add_ledger_rows(&engine, "other-app", APP_FIRE_KIND_FIRE, 2).await;
+        let job = insert_capped_job(&engine, 1, 0).await;
+        fire_one(&engine, job).await;
+        assert_eq!(last_fire(&engine).await.0, OUTCOME_OK);
+        assert_eq!(
+            ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE).await,
+            2
+        );
+    }
+
+    /// The gate on its own: two apps are admitted, refused with a report and
+    /// refused silently independently; it prunes every app's rows older than
+    /// the window; a row stamped after the fire still counts.
+    #[test]
+    fn the_gate_keeps_each_app_apart_and_prunes_every_app() {
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let now = Utc::now();
+        let stamp = |slug: &str, at: DateTime<Utc>| {
+            conn.execute(
+                "INSERT INTO automation_app_fires (owner_app_slug, kind, at) \
+                 VALUES (?1, 'fire', ?2)",
+                rusqlite::params![slug, brenn_db::format_ts_for_db(at)],
+            )
+            .unwrap();
+        };
+        stamp("gone-app", now - chrono::Duration::hours(25));
+        for slug in ["app-a", "app-b"] {
+            assert_eq!(app_fire_gate(&conn, slug, now, 1), AppFireGate::Admit);
+            assert_eq!(
+                app_fire_gate(&conn, slug, now, 1),
+                AppFireGate::Refuse {
+                    report: true,
+                    count: 1
+                }
+            );
+            assert_eq!(
+                app_fire_gate(&conn, slug, now, 1),
+                AppFireGate::Refuse {
+                    report: false,
+                    count: 1
+                }
+            );
+        }
+        let gone: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM automation_app_fires WHERE owner_app_slug = 'gone-app'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0, "another app's expired rows are pruned");
+
+        stamp("app-c", now + chrono::Duration::hours(2));
+        assert_eq!(
+            app_fire_gate(&conn, "app-c", now, 1),
+            AppFireGate::Refuse {
+                report: true,
+                count: 1
+            },
+            "a row stamped later than the fire still counts"
+        );
+    }
+
+    /// A fire the action refuses still holds its ledger row: an MQTT fire to
+    /// a removed client is `auth` and counted.
+    #[tokio::test]
+    async fn a_fire_refused_inside_its_action_is_counted() {
+        let (engine, _) = make_mqtt_engine(mqtt_sender_policy(), FakeIngressRouter::new()).await;
+        let job = mqtt_job(mqtt_action("mqtt:away:lights/a/set", b"ON"));
+        insert_job_row(&*engine.db.lock().await, &job);
+        fire_one(&engine, job).await;
+        assert_eq!(last_fire(&engine).await.0, OUTCOME_AUTH);
+        assert_eq!(
+            ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE).await,
+            1
+        );
+    }
+
+    /// A fire the per-job hourly gate or an owner check stops never reaches
+    /// the per-app cap: it writes no ledger row and leaves the app's allowance
+    /// for its healthy jobs. With the cap full, an owner check still answers
+    /// first.
+    #[tokio::test]
+    async fn a_fire_stopped_before_the_cap_leaves_no_ledger_row() {
+        let (engine, _ingress, _captured, _handle) = make_capped_engine(cap_config(1)).await;
+
+        let rate_limited = insert_capped_job(&engine, 1, 0).await;
+        {
+            let conn = engine.db.lock().await;
+            let now = brenn_db::format_ts_for_db(Utc::now());
+            for _ in 0..engine.defaults.max_fires_per_hour_per_job {
+                conn.execute(
+                    "INSERT INTO automation_fires (job_id, fired_at, outcome) VALUES (1, ?1, ?2)",
+                    rusqlite::params![now, OUTCOME_OK],
+                )
+                .unwrap();
+            }
+        }
+        fire_one(&engine, rate_limited).await;
+        assert_eq!(
+            fire_outcomes(&engine, 1).await.last().unwrap().0,
+            OUTCOME_RATE_LIMIT
+        );
+
+        let mut gone = insert_capped_job(&engine, 2, 0).await;
+        gone.owner_app_slug = "ghost-app".to_string();
+        fire_one(&engine, gone).await;
+        assert_eq!(fire_outcomes(&engine, 2).await[0].0, OUTCOME_APP_GONE);
+
+        assert_eq!(
+            ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE).await,
+            0
+        );
+        assert_eq!(
+            ledger_rows(&engine, "ghost-app", APP_FIRE_KIND_FIRE).await,
+            0
+        );
+
+        let healthy = insert_capped_job(&engine, 3, 0).await;
+        fire_one(&engine, healthy).await;
+        assert_eq!(fire_outcomes(&engine, 3).await[0].0, OUTCOME_OK);
+        assert_eq!(
+            ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE).await,
+            1
+        );
+
+        edit_app_policy(&engine.apps, |p| {
+            grant_only(p, AppCapability::MessagingSubscribe)
+        });
+        let unauthorised = insert_capped_job(&engine, 4, 0).await;
+        fire_one(&engine, unauthorised).await;
+        assert_eq!(fire_outcomes(&engine, 4).await[0].0, OUTCOME_AUTH);
+        assert_eq!(
+            ledger_rows(&engine, "test-app", APP_FIRE_KIND_FIRE).await,
+            1
+        );
+        assert_eq!(
+            ledger_rows(&engine, "test-app", APP_FIRE_KIND_CAP_REPORT).await,
+            0
         );
     }
 }

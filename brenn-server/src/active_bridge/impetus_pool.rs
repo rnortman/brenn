@@ -3,7 +3,8 @@
 //!
 //! One stock per conversation, stored in `messaging_send_budget` and shared with
 //! the outbound draws that also use it (the LLM's own `BrennSend`, PWA push,
-//! MQTT egress). This module is the conversation-side half: the two
+//! MQTT egress, and the automation tool calls that write what a job
+//! publishes). This module is the conversation-side half: the two
 //! motions that turn a send budget into a general bound on unattended activity.
 //!
 //! - **Draw.** Every turn-provoking bus injection — an accepted `send` or
@@ -25,7 +26,7 @@ use tracing::{debug, info, warn};
 
 use brenn_lib::messaging::{Impetus, MessageEnvelope};
 use brenn_messaging_store::db::{
-    BudgetDecrement, decrement_send_budget, read_send_budget, reset_send_budget,
+    BudgetDecrement, decrement_send_budget, read_send_budget, refund_send_budget, reset_send_budget,
 };
 
 use super::ActiveBridge;
@@ -149,6 +150,33 @@ impl ActiveBridge {
                 );
             }
         }
+    }
+
+    /// Spend one unit on an automation tool call that sets what a job
+    /// publishes, or when: the LLM's choice is the reaction, priced as a
+    /// `BrennSend` is. `false` when the pool is empty and nothing was drawn.
+    pub(crate) async fn draw_for_job_write(&self) -> bool {
+        let ceiling = self.impetus_ceiling();
+        let conn = self.db.lock().await;
+        match decrement_send_budget(&conn, self.conversation_id, ceiling) {
+            BudgetDecrement::Ok { remaining } => {
+                debug!(
+                    conversation_id = self.conversation_id,
+                    remaining, "send budget drawn for an automation job write"
+                );
+                true
+            }
+            BudgetDecrement::Exhausted => false,
+        }
+    }
+
+    /// Give back the unit [`ActiveBridge::draw_for_job_write`] took, for a
+    /// write the engine refused. Clamped at the ceiling, so a refund racing a
+    /// reset mints nothing.
+    pub(crate) async fn refund_job_write(&self) {
+        let ceiling = self.impetus_ceiling();
+        let conn = self.db.lock().await;
+        refund_send_budget(&conn, self.conversation_id, ceiling);
     }
 }
 

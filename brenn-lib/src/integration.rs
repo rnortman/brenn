@@ -1464,9 +1464,12 @@ fn automation_virtual_tools(mqtt: bool) -> Vec<VirtualToolDef> {
         ));
     }
     create_description.push_str(concat!(
-        "Each fire draws one unit of the send budget of the ",
-        "conversation it fires under, which only a person's interaction with that ",
-        "conversation restores. A job whose fires keep failing is disabled.\n",
+        "All of this app's jobs together are held to an operator-set number of fires ",
+        "in any 24 hours. A fire over it is skipped; the first such skip in any 24 hours ",
+        "is reported and later ones are not, and the job carries on by itself at its ",
+        "next slot. A job whose fires keep failing is disabled.\n",
+        "Creating a job draws one unit of this conversation's send budget and is refused ",
+        "when none remains; its fires draw none.\n",
         "`enabled`: optional boolean (default true).\n\n",
         "Returns `{ ok: true, id, next_fire_at }` on success. ",
         "Errors: `{ ok: false, error: \"...\" }`."
@@ -1575,7 +1578,11 @@ fn automation_virtual_tools(mqtt: bool) -> Vec<VirtualToolDef> {
                 "All fields other than `id` are optional — only provided fields are changed. ",
                 "Trigger and action have the same shape as AutoCreate. An `action` replaces ",
                 "the whole action, including its kind: give every field. ",
-                "Editing recomputes next-fire from now; does not retroactively fire missed slots.\n\n",
+                "A `trigger` edit recomputes next-fire; any other edit keeps the scheduled slot. ",
+                "Editing does not retroactively fire missed slots. ",
+                "An edit that gives `action` or `trigger`, or sets `enabled` true, draws one ",
+                "unit of this conversation's send budget and is refused when none remains; ",
+                "renaming and disabling are free.\n\n",
                 "Returns `{ ok: true, next_fire_at }` on success. ",
                 "Errors: `{ ok: false, error: \"...\" }`. Cross-app attempts return forbidden."
             )
@@ -3400,7 +3407,9 @@ mod tests {
             "`lifetime_s`",
             "fires once at restart, late",
             "set a state, not toggle one",
-            "send budget",
+            "operator-set number of fires in any 24 hours",
+            "Creating a job draws one unit of this conversation's send budget",
+            "its fires draw none",
         ] {
             assert!(d.contains(needle), "missing {needle:?}: {d}");
         }
@@ -3414,6 +3423,22 @@ mod tests {
             action["properties"]["body"]["type"],
             serde_json::json!(["string", "object", "array"])
         );
+    }
+
+    #[test]
+    fn auto_edit_names_the_priced_fields_and_what_keeps_the_slot() {
+        let tools = automation_virtual_tools(true);
+        let edit = tools.iter().find(|t| t.name == "AutoEdit").unwrap();
+        let d = &edit.description;
+        for needle in [
+            "An edit that gives `action` or `trigger`, or sets `enabled` true, draws one \
+             unit of this conversation's send budget and is refused when none remains",
+            "renaming and disabling are free",
+            "A `trigger` edit recomputes next-fire; any other edit keeps the scheduled slot",
+        ] {
+            assert!(d.contains(needle), "missing {needle:?}: {d}");
+        }
+        assert!(!d.contains("recomputes next-fire from now"), "{d}");
     }
 
     /// `AutoCreate` offers the `mqtt_publish` kind, and names `MqttSend`, only
@@ -3441,7 +3466,9 @@ mod tests {
         );
         assert_eq!(action["properties"]["body"]["type"], "string");
         assert!(
-            without.description.contains("send budget"),
+            without
+                .description
+                .contains("operator-set number of fires in any 24 hours"),
             "{}",
             without.description
         );

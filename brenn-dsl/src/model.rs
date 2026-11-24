@@ -2065,12 +2065,13 @@ vocabulary! {
         opt endpoint_host_allowlist_enforce: V,
     }
 
-    /// The `automation` section: the per-job caps.
+    /// The `automation` section: the per-job and per-app caps.
     struct AutomationAttrs<V> {
         opt max_fires_per_hour_per_job: V,
         opt max_error_reports_per_hour_per_job: V,
         opt consecutive_failures_to_disable: V,
         opt max_jobs_per_app: V,
+        opt max_fires_per_day_per_app: V,
     }
 
     /// The `events` section: how long a delivered event is kept.

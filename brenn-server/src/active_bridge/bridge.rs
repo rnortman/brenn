@@ -1126,7 +1126,8 @@ pub(super) const GLOBAL_EXTRA_STATIC_BASE: &[&str] = &[
     brenn_render::tools::messaging::MCP_MESSAGE_SUBSCRIPTION_LIST_TOOL,
     brenn_render::tools::messaging::MCP_MESSAGE_SEND_TOOL,
     brenn_render::tools::messaging::MCP_MESSAGE_QUERY_CHANNEL_TOOL,
-    // Automation tools — all four are auto-approved.
+    // Automation tools — all four are auto-approved; `automation_intercept`
+    // prices and bounds what they write.
     brenn_automation::MCP_AUTO_CREATE_TOOL,
     brenn_automation::MCP_AUTO_LIST_TOOL,
     brenn_automation::MCP_AUTO_EDIT_TOOL,
