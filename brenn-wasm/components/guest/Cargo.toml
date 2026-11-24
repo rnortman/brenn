@@ -16,5 +16,7 @@ crate-type = ["rlib"]
 # split. cargo-component is fully retired — not installed, not invoked.
 wit-bindgen = "0.60"
 brenn-envelope = { path = "../host-crates/brenn-envelope" }
+chrono = { version = "0.4.44", default-features = false, features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+uuid = { version = "1", features = ["serde"] }

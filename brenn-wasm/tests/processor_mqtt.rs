@@ -6,18 +6,27 @@
 // the client's egress channel; an activation that errs or traps returns none.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use brenn_activation::{ProcessorActivation, ProcessorPortWindow};
 use brenn_budget::{MAX_PUBLISH_CALLS_PER_ACTIVATION, MAX_PUBLISHES_PER_ACTIVATION};
 use brenn_envelope::addressing::mqtt_egress_address;
 use brenn_wasm::{
-    ComponentGrant, MqttAdmission, MqttPublishFn, MqttPublishProps, MqttPublisher, MqttTarget,
-    ProcessorComponent, ProcessorLoadSpec, ProcessorMqttPublish, ProcessorOutcome,
+    ComponentGrant, MqttAdmission, MqttPublishFn, MqttPublishLifetime, MqttPublishProps,
+    MqttTarget, ProcessorComponent, ProcessorLoadSpec, ProcessorMqttPublish, ProcessorOutcome,
     ProcessorPublish, SinkBudget,
 };
 
 mod common;
+
+use common::{ScriptedPublisher, failure, ok_publishes};
+
+/// An admission that admits and parsed no reply topic.
+fn admitted() -> MqttAdmission {
+    MqttAdmission::Admitted {
+        response_topic: None,
+    }
+}
 
 fn component_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -49,65 +58,6 @@ fn activation_with_body(body: &str) -> ProcessorActivation {
     }
 }
 
-/// What one `admit` call saw.
-type SeenAdmit = (MqttTarget, usize, MqttPublishProps);
-
-/// A publisher whose admission is read from a shared cell at call time, so one
-/// loaded component serves several answers: loading compiles the guest, which
-/// dominates this suite's runtime.
-///
-/// `resolve` maps every `home:<suffix>` client string to `home`, as the host's
-/// parser joins and splits the address, and leaves every other one unchanged.
-struct ScriptedPublisher {
-    admission: Mutex<MqttAdmission>,
-    seen: Mutex<Vec<SeenAdmit>>,
-}
-
-impl ScriptedPublisher {
-    fn new(admission: MqttAdmission) -> Arc<Self> {
-        Arc::new(Self {
-            admission: Mutex::new(admission),
-            seen: Mutex::new(Vec::new()),
-        })
-    }
-
-    fn answer(&self, admission: MqttAdmission) {
-        *self.admission.lock().expect("not poisoned") = admission;
-        self.seen.lock().expect("not poisoned").clear();
-    }
-
-    fn seen(&self) -> Vec<SeenAdmit> {
-        self.seen.lock().expect("not poisoned").clone()
-    }
-}
-
-impl MqttPublisher for ScriptedPublisher {
-    fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String> {
-        let client = if client.starts_with("home:") {
-            "home"
-        } else {
-            client
-        };
-        Ok(MqttTarget {
-            client: client.to_string(),
-            topic: topic.to_string(),
-        })
-    }
-
-    fn admit(
-        &self,
-        target: &MqttTarget,
-        payload_len: usize,
-        props: &MqttPublishProps,
-    ) -> MqttAdmission {
-        self.seen
-            .lock()
-            .expect("not poisoned")
-            .push((target.clone(), payload_len, props.clone()));
-        self.admission.lock().expect("not poisoned").clone()
-    }
-}
-
 /// Load the fixture over `publisher`, with `out` bound so the interleave
 /// path's port publishes flush, and `mqtt_sinks` as the clients' buckets.
 fn load_mqtt_test(
@@ -128,22 +78,6 @@ fn load_mqtt_test(
         mqtt_publish: Some(Arc::clone(publisher) as MqttPublishFn),
         ..ProcessorLoadSpec::minimal(&component_path(), "mqtt-test")
     })
-}
-
-/// The publishes of an ok activation.
-fn ok_publishes(outcome: ProcessorOutcome) -> Vec<ProcessorPublish> {
-    match outcome {
-        ProcessorOutcome::Ok { publishes, .. } => publishes,
-        other => panic!("expected ProcessorOutcome::Ok; got {other:?}"),
-    }
-}
-
-/// The rendering of an activation the guest failed.
-fn failure(outcome: ProcessorOutcome) -> String {
-    match outcome {
-        ProcessorOutcome::Err(re) => re.to_string(),
-        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
-    }
 }
 
 /// A `PUBLISH_TO` body: the sentinel, then client, topic, QoS, retain, expiry,
@@ -179,7 +113,7 @@ fn only_mqtt_entry(publishes: &[ProcessorPublish]) -> (&ProcessorPublish, &Proce
 /// the resolved target, the guest's properties, and the payload as the body.
 #[test]
 fn each_function_buffers_one_mqtt_entry() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
 
     let outcome = comp.handle(common::host_activation(activation_with_body(&publish_to(
@@ -197,26 +131,24 @@ fn each_function_buffers_one_mqtt_entry() {
         content_type: Some("application/json".to_string()),
         qos: 1,
         retain: true,
-        message_expiry_s: None,
+        lifetime: MqttPublishLifetime::Forever,
+        status_to: None,
+        reply_topic: None,
     };
     let target = MqttTarget {
         client: "home".to_string(),
         topic: "sensors/temp".to_string(),
     };
-    assert_eq!(
-        *mqtt,
-        ProcessorMqttPublish {
-            target: target.clone(),
-            props: props.clone(),
-        }
-    );
+    assert_eq!(mqtt.target, target);
+    assert_eq!(mqtt.props, props);
+    assert_eq!(mqtt.response_topic, None);
     assert_eq!(entry.channel_address, mqtt_egress_address("home"));
     assert_eq!(entry.body.as_bytes(), br#"{"c":21}"#);
     assert_eq!(entry.reply_to, None);
     assert_eq!(entry.deliver_after, None);
     assert_eq!(publisher.seen(), vec![(target, 8, props)]);
 
-    publisher.answer(MqttAdmission::Admitted);
+    publisher.answer(admitted());
     let outcome = comp.handle(common::host_activation(activation_with_body(&publish_to(
         "office",
         "lights/state",
@@ -236,7 +168,9 @@ fn each_function_buffers_one_mqtt_entry() {
             content_type: None,
             qos: 2,
             retain: false,
-            message_expiry_s: Some(90),
+            lifetime: MqttPublishLifetime::Seconds(90),
+            status_to: None,
+            reply_topic: None,
         }
     );
     assert_eq!(entry.channel_address, mqtt_egress_address("office"));
@@ -246,7 +180,7 @@ fn each_function_buffers_one_mqtt_entry() {
 /// An empty payload buffers an empty body.
 #[test]
 fn an_empty_payload_buffers_an_empty_body() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
     let outcome = comp.handle(common::host_activation(activation_with_body(&publish_to(
         "home",
@@ -266,7 +200,7 @@ fn an_empty_payload_buffers_an_empty_body() {
 /// MQTT entries flush in call order with the activation's port publishes.
 #[test]
 fn mqtt_entries_keep_call_order_with_port_publishes() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
     let publishes =
         ok_publishes(comp.handle(common::host_activation(activation_with_body("INTERLEAVE"))));
@@ -296,7 +230,7 @@ const INTERLEAVE_CALLS: usize = 20;
 /// host admitted the call.
 #[test]
 fn a_failed_activation_discards_its_mqtt_publishes() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
 
     let msg = failure(comp.handle(common::host_activation(activation_with_body(
@@ -305,7 +239,7 @@ fn a_failed_activation_discards_its_mqtt_publishes() {
     assert!(msg.contains("err-after-publish"), "{msg:?}");
     assert_eq!(publisher.seen().len(), 1, "the publish was admitted");
 
-    publisher.answer(MqttAdmission::Admitted);
+    publisher.answer(admitted());
     let outcome = comp.handle(common::host_activation(activation_with_body(
         "TRAP_AFTER_PUBLISH",
     )));
@@ -341,7 +275,7 @@ fn admission_refusals_reach_the_guest() {
 /// admission runs.
 #[test]
 fn publish_expiring_with_zero_expiry_is_invalid_payload() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
 
     let msg = failure(comp.handle(common::host_activation(activation_with_body(
@@ -364,7 +298,7 @@ fn the_bounded_loop_ends_at_the_buffered_publish_ceiling() {
             "the buffered-publish ceiling is the first one an admitting loop meets"
         )
     };
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
 
     let msg = failure(comp.handle(common::host_activation(activation_with_body("ping"))));
@@ -380,7 +314,7 @@ fn the_bounded_loop_ends_at_the_buffered_publish_ceiling() {
 /// client strings, one session, five tokens.
 #[test]
 fn spellings_of_one_client_share_one_bucket() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     // No carry between activations; one activation's grant is the input
     // grant (1000) plus the fill (4000): five publishes.
     let comp = load_mqtt_test(
@@ -420,7 +354,7 @@ fn spellings_of_one_client_share_one_bucket() {
 /// the value the guest handed it.
 #[test]
 fn publish_json_sends_json_under_the_json_content_type() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
 
     let publishes = ok_publishes(comp.handle(common::host_activation(activation_with_body(
@@ -433,7 +367,11 @@ fn publish_json_sends_json_under_the_json_content_type() {
         mqtt.props,
         MqttPublishProps {
             content_type: Some("application/json".to_string()),
-            ..Default::default()
+            qos: 0,
+            retain: false,
+            lifetime: MqttPublishLifetime::Forever,
+            status_to: None,
+            reply_topic: None,
         }
     );
     // The fixture publishes the body it was handed, so the payload is that
@@ -446,7 +384,7 @@ fn publish_json_sends_json_under_the_json_content_type() {
 /// `mqtt::publish_text` sends the bytes as given, under `text/plain`.
 #[test]
 fn publish_text_sends_the_body_under_the_text_content_type() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
 
     let publishes = ok_publishes(comp.handle(common::host_activation(activation_with_body(
@@ -454,7 +392,7 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
     ))));
     let (entry, mqtt) = only_mqtt_entry(&publishes);
     assert_eq!(mqtt.props.content_type.as_deref(), Some("text/plain"));
-    assert_eq!(mqtt.props.message_expiry_s, None);
+    assert_eq!(mqtt.props.lifetime, MqttPublishLifetime::Forever);
     assert_eq!(
         entry.body.as_bytes(),
         b"PUBLISH_TEXT",
@@ -467,7 +405,7 @@ fn publish_text_sends_the_body_under_the_text_content_type() {
 /// QoS and retain flag the guest chose.
 #[test]
 fn publish_text_expiring_sends_the_expiry() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
 
     let publishes = ok_publishes(comp.handle(common::host_activation(activation_with_body(
@@ -480,7 +418,9 @@ fn publish_text_expiring_sends_the_expiry() {
             content_type: Some("text/plain".to_string()),
             qos: 1,
             retain: true,
-            message_expiry_s: Some(90),
+            lifetime: MqttPublishLifetime::Seconds(90),
+            status_to: None,
+            reply_topic: None,
         }
     );
     assert_eq!(entry.body.as_bytes(), b"PUBLISH_TEXT_EXPIRING");
@@ -491,7 +431,7 @@ fn publish_text_expiring_sends_the_expiry() {
 /// permanent refusal retryable would retry it on every activation, forever.
 #[test]
 fn the_sdk_classifies_and_renders_every_refusal() {
-    let publisher = ScriptedPublisher::new(MqttAdmission::Admitted);
+    let publisher = ScriptedPublisher::new(admitted());
     let comp = load_mqtt_test(&publisher, HashMap::new());
 
     for (admission, expected) in [
@@ -505,7 +445,7 @@ fn the_sdk_classifies_and_renders_every_refusal() {
         ),
         // Admitted throughout: the loop meets the host's own ceiling.
         (
-            MqttAdmission::Admitted,
+            admitted(),
             "transient=false mqtt publish test-client/test/topic: quota-exceeded",
         ),
     ] {

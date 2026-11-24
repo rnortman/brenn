@@ -1063,9 +1063,11 @@ async fn drain(
                         }),
                         attachments: &p.attachments,
                         mqtt: p.mqtt.as_ref().map(|m| WasmMqttPublish {
+                            message_id: m.message_id,
                             client: &m.target.client,
                             topic: &m.target.topic,
-                            options: mqtt::mqtt_options(&m.props),
+                            options: mqtt::mqtt_options(&m.target, &m.props),
+                            response_topic: m.response_topic.as_deref(),
                         }),
                     })
                     .collect();

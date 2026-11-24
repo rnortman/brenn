@@ -1257,9 +1257,11 @@ fn wasm_mqtt<'a>(
         deliver_after: None,
         attachments: none,
         mqtt: Some(WasmMqttPublish {
+            message_id: Uuid::new_v4(),
             client,
             topic,
             options,
+            response_topic: None,
         }),
     }
 }
@@ -1275,7 +1277,7 @@ impl Fixture {
 /// admission's variant for it, and spends nothing deciding.
 #[tokio::test]
 async fn the_components_admission_answers_each_case() {
-    type Expect = fn(&Result<(), PublishResult>) -> bool;
+    type Expect = fn(&Result<Option<String>, PublishResult>) -> bool;
     let f = fixture().await;
     let policy = f.policy();
     let typed = |ct: &str| MqttPublishOptions {
@@ -1658,17 +1660,93 @@ async fn a_flush_with_a_bad_entry_commits_nothing() {
     assert!(f.rows(&f.outbound).await.is_empty());
 }
 
+/// A component's entry commits under the id minted at the call, and its row's
+/// transport carries the `status_to` and the response topic it was admitted
+/// with.
 #[tokio::test]
-#[should_panic(expected = "names a status_to, which a component cannot")]
-async fn a_flushed_mqtt_entry_naming_a_status_to_panics() {
+async fn a_flushed_mqtt_entry_commits_under_its_id_with_status_to_and_response_topic() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let opts = MqttPublishOptions {
+        status_to: Some(STATUS.to_string()),
+        reply_to: Some(format!("mqtt:{CLIENT}:lights/replies/set")),
+        ..options()
+    };
+    let mut entry = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", opts, &none);
+    let id = Uuid::new_v4();
+    let mqtt = entry.mqtt.as_mut().unwrap();
+    mqtt.message_id = id;
+    mqtt.response_topic = Some("lights/replies/set");
+    f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+    let rows = f.rows(&f.outbound).await;
+    let [row] = rows.as_slice() else {
+        panic!("one row, got {}", rows.len());
+    };
+    assert_eq!(row.message_id, id);
+    let transport = mqtt_transport(row);
+    assert_eq!(transport.status_to.as_deref(), Some(STATUS));
+    assert_eq!(
+        transport.response_topic.as_deref(),
+        Some("lights/replies/set")
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "not a `brenn:` channel")]
+async fn a_flushed_mqtt_entry_naming_a_status_to_outside_brenn_panics() {
     let f = fixture().await;
     let none = HeldAttachments::none();
     let naming = MqttPublishOptions {
-        status_to: Some(STATUS.to_string()),
+        status_to: Some("ephemeral:light-status".to_string()),
         ..options()
     };
     let entry = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", naming, &none);
     f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "states reply_to")]
+async fn a_flushed_mqtt_entry_with_a_reply_to_and_no_response_topic_panics() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let opts = MqttPublishOptions {
+        reply_to: Some(format!("mqtt:{CLIENT}:lights/replies/set")),
+        ..options()
+    };
+    let entry = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", opts, &none);
+    f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "states reply_to")]
+async fn a_flushed_mqtt_entry_with_a_response_topic_and_no_reply_to_panics() {
+    let f = fixture().await;
+    let none = HeldAttachments::none();
+    let mut entry = wasm_mqtt(EGRESS_HOME, CLIENT, "lights/a/set", b"1", options(), &none);
+    entry.mqtt.as_mut().unwrap().response_topic = Some("lights/replies/set");
+    f.m.publish_from_wasm(COMPONENT, &[entry]).await;
+}
+
+/// The component's entry point answers the bare reply topic it admitted, and
+/// none when no reply address is stated.
+#[tokio::test]
+async fn the_components_admission_answers_the_reply_topic() {
+    let f = fixture().await;
+    let policy = f.policy();
+    let replying = MqttPublishOptions {
+        reply_to: Some(format!("mqtt:{CLIENT}:lights/replies/set")),
+        ..options()
+    };
+    assert_eq!(
+        f.m.admit_mqtt_from_wasm(&policy, CLIENT, "lights/kitchen/set", &replying, 2)
+            .expect("admitted"),
+        Some("lights/replies/set".to_string())
+    );
+    assert_eq!(
+        f.m.admit_mqtt_from_wasm(&policy, CLIENT, "lights/kitchen/set", &options(), 2)
+            .expect("admitted"),
+        None
+    );
 }
 
 // ── status_to ───────────────────────────────────────────────────────────

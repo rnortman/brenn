@@ -33,6 +33,7 @@ COMPONENT_NAMES = [
     "processor-log",
     "processor-mem-exhaust",
     "processor-mqtt-test",
+    "processor-mqtt-tracked-test",
     "processor-multiport",
     "processor-page-blobs-test",
     "processor-page-bytes-test",
@@ -351,6 +352,7 @@ WASM_TEST_SUITES = [
             "processor-log",
             "processor-mem-exhaust",
             "processor-mqtt-test",
+            "processor-mqtt-tracked-test",
             "processor-multiport",
             "processor-page-test",
             "processor-provider-test",
@@ -454,6 +456,7 @@ WASM_TEST_SUITES = [
     ("processor_config", ["processor-config"], [], [], []),
     ("processor_log", ["processor-log"], [], [], []),
     ("processor_mqtt", ["processor-mqtt-test"], [], [], []),
+    ("processor_mqtt_tracked", ["processor-mqtt-tracked-test"], [], [], []),
     ("processor_provides", ["processor-provider-test"], [], [], []),
     (
         "processor_transplant",

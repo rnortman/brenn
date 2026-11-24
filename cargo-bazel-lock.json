@@ -1,5 +1,5 @@
 {
-  "checksum": "b45f265a1a38e47c994f1b68eb15a1ceb1be7532fe16f868dfca491367b2dc93",
+  "checksum": "a2814b29c0d8379c2c040255d29049cc8fa67e8d843c48fedce82014d2582201",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -6562,6 +6562,10 @@
             {
               "id": "tracing 0.1.44",
               "target": "tracing"
+            },
+            {
+              "id": "uuid 1.24.0",
+              "target": "uuid"
             },
             {
               "id": "wasmtime 48.0.10",

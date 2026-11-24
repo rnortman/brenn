@@ -19,6 +19,7 @@ use brenn_lib::mqtt::MqttClientDirectory;
 use brenn_messaging::Messenger;
 use brenn_messaging::mqtt_outbound::mqtt_egress_entry;
 use brenn_obs::alerting::{AlertSeverity, make_capturing_alerter_with_severity};
+use brenn_wasm::{MqttAdmission, MqttPublishProps, StatusChannelRefusal};
 use std::collections::HashMap;
 
 const MQTT_WASM: &str = "brenn-wasm/target/components/brenn_processor_mqtt_test.wasm";
@@ -156,7 +157,11 @@ impl Rig {
     }
 }
 
-async fn rows(messenger: &Messenger, address: &str) -> Vec<brenn_envelope::MessageEnvelope> {
+/// Every row retained on `address`, oldest first.
+pub(super) async fn rows(
+    messenger: &Messenger,
+    address: &str,
+) -> Vec<brenn_envelope::MessageEnvelope> {
     testutils::retained_on(messenger, address)
         .await
         .into_iter()
@@ -168,7 +173,8 @@ fn sender(slug: &str) -> String {
     ParticipantId::for_wasm(slug).as_str().to_owned()
 }
 
-fn transport(envelope: &brenn_envelope::MessageEnvelope) -> &MqttPublishTransport {
+/// An egress row's MQTT publish transport.
+pub(super) fn transport(envelope: &brenn_envelope::MessageEnvelope) -> &MqttPublishTransport {
     match &envelope.transport {
         Some(TransportMeta::MqttPublish(t)) => t,
         other => panic!("an egress row carries MqttPublish, got {other:?}"),
@@ -428,7 +434,9 @@ fn admit_at_seam(rig: &Rig, policy: AppPolicy, client: &str, topic: &str) {
         content_type: None,
         qos: 0,
         retain: false,
-        message_expiry_s: None,
+        lifetime: brenn_wasm::MqttPublishLifetime::Forever,
+        status_to: None,
+        reply_topic: None,
     };
     let answer = seam.admit(
         &brenn_wasm::MqttTarget {
@@ -439,6 +447,223 @@ fn admit_at_seam(rig: &Rig, policy: AppPolicy, client: &str, topic: &str) {
         &props,
     );
     panic!("the seam answered {answer:?} instead of panicking");
+}
+
+/// A tracked publish's options at QoS 0, kept forever, with the given
+/// `status_to` and reply topic.
+fn tracked_props(status_to: Option<&str>, reply_topic: Option<&str>) -> MqttPublishProps {
+    MqttPublishProps {
+        content_type: None,
+        qos: 0,
+        retain: false,
+        lifetime: brenn_wasm::MqttPublishLifetime::Forever,
+        status_to: status_to.map(str::to_owned),
+        reply_topic: reply_topic.map(str::to_owned),
+    }
+}
+
+/// [`policy`] plus the `brenn:` publish grant and an ACL entry covering the
+/// rig's `out` channel, the channel a wired status port names.
+fn status_policy(rig: &Rig) -> AppPolicy {
+    let mut policy = policy();
+    policy.grants.insert(AppCapability::MessagingPublish);
+    let name = rig
+        .out
+        .address
+        .strip_prefix("brenn:")
+        .expect("the out channel is a brenn: channel");
+    policy
+        .acls
+        .brenn_publish
+        .push(brenn_lib::access::acl::ChannelMatcher::Exact(
+            name.to_string(),
+        ));
+    policy
+}
+
+/// The production seam's answer, built over `rig`'s messenger under `policy`
+/// and attributed to `slug`, for one byte to `topic` on [`CLIENT`] with
+/// `props`. The seam is dropped before returning, so `rig.alerts()` can end.
+fn seam_answer(
+    rig: &Rig,
+    slug: &str,
+    policy: AppPolicy,
+    topic: &str,
+    props: &MqttPublishProps,
+) -> MqttAdmission {
+    let seam = crate::mqtt_publisher_over(
+        &rig.messenger,
+        policy,
+        slug.to_string(),
+        rig.cfg.alert_dispatcher.clone(),
+    );
+    seam.admit(
+        &brenn_wasm::MqttTarget {
+            client: CLIENT.to_string(),
+            topic: topic.to_string(),
+        },
+        1,
+        props,
+    )
+}
+
+/// The publish-denial signals among `alerts`, by body.
+fn denials(alerts: &[(AlertSeverity, String, String)]) -> Vec<&str> {
+    alerts
+        .iter()
+        .filter(|(_, title, _)| title == DENIAL_TITLE)
+        .map(|(_, _, body)| body.as_str())
+        .collect()
+}
+
+/// A reply topic the ACL admits is admitted, and the seam answers the bare
+/// topic the admission parsed; a status channel the component may publish to
+/// is admitted too.
+#[tokio::test]
+async fn the_seam_admits_a_permitted_reply_topic_and_status_channel() {
+    let slug = "mq-seam-ok";
+    let rig = rig(slug).await;
+    let out = rig.out.address.clone();
+    let answer = seam_answer(
+        &rig,
+        slug,
+        status_policy(&rig),
+        TOPIC,
+        &tracked_props(Some(&out), Some("allowed/replies")),
+    );
+    assert_eq!(
+        answer,
+        MqttAdmission::Admitted {
+            response_topic: Some("allowed/replies".to_string())
+        }
+    );
+    let alerts = rig.alerts().await;
+    assert!(denials(&alerts).is_empty(), "{alerts:?}");
+}
+
+/// A reply topic outside the ACL is `ReplyTopicNotPermitted` and raises one
+/// publish-denial signal attributed to the component and naming the reply
+/// address; a wildcard reply topic is `InvalidPayload` with the parser's text
+/// and raises nothing.
+#[tokio::test]
+async fn the_seam_refuses_a_reply_topic_outside_the_acl_and_signals() {
+    let slug = "mq-seam-reply";
+    let rig = rig(slug).await;
+    assert_eq!(
+        seam_answer(
+            &rig,
+            slug,
+            policy(),
+            TOPIC,
+            &tracked_props(None, Some(DENIED_TOPIC))
+        ),
+        MqttAdmission::ReplyTopicNotPermitted
+    );
+    match seam_answer(
+        &rig,
+        slug,
+        policy(),
+        TOPIC,
+        &tracked_props(None, Some("allowed/#")),
+    ) {
+        MqttAdmission::InvalidPayload(text) => {
+            assert!(text.starts_with("invalid reply topic: "), "{text}")
+        }
+        other => panic!("expected invalid-payload, got {other:?}"),
+    }
+    let alerts = rig.alerts().await;
+    let denials = denials(&alerts);
+    assert_eq!(denials.len(), 1, "{alerts:?}");
+    assert!(
+        denials[0].contains(&format!("component {slug} denied publish"))
+            && denials[0].contains(&format!("mqtt:{CLIENT}:{DENIED_TOPIC}")),
+        "{}",
+        denials[0]
+    );
+}
+
+/// A status channel the component cannot take statuses on is
+/// `StatusChannelRefused` with the cause for the operator, and raises no
+/// security signal: an `ephemeral:` channel, a `brenn:` channel the publish
+/// ACL does not cover, and one not in the directory.
+#[tokio::test]
+async fn the_seam_refuses_an_unusable_status_channel_without_a_signal() {
+    let slug = "mq-seam-status";
+    let rig = rig(slug).await;
+    let out = rig.out.address.clone();
+    let mut uncovered = policy();
+    uncovered.grants.insert(AppCapability::MessagingPublish);
+    let mut unknown = status_policy(&rig);
+    unknown
+        .acls
+        .brenn_publish
+        .push(brenn_lib::access::acl::ChannelMatcher::Exact(
+            "mq-nonesuch".to_string(),
+        ));
+    for (policy, status_to, expected) in [
+        (
+            status_policy(&rig),
+            "ephemeral:mq-status",
+            StatusChannelRefusal::NotPlainBrenn,
+        ),
+        (uncovered, out.as_str(), StatusChannelRefusal::NotCovered),
+        (
+            unknown,
+            "brenn:mq-nonesuch",
+            StatusChannelRefusal::NotInDirectory,
+        ),
+    ] {
+        match seam_answer(
+            &rig,
+            slug,
+            policy,
+            TOPIC,
+            &tracked_props(Some(status_to), None),
+        ) {
+            MqttAdmission::StatusChannelRefused { cause } => {
+                assert_eq!(cause, expected, "{status_to}")
+            }
+            other => panic!("{status_to}: expected status-channel-refused, got {other:?}"),
+        }
+    }
+    let alerts = rig.alerts().await;
+    assert!(denials(&alerts).is_empty(), "{alerts:?}");
+}
+
+/// A topic so long that a status about it would not fit the bus's body cap is
+/// `InvalidPayload` naming both lengths while a status channel is named, and
+/// is admitted without one.
+#[tokio::test]
+async fn the_seam_refuses_a_topic_too_long_for_a_status() {
+    let slug = "mq-seam-long";
+    let rig = rig(slug).await;
+    let out = rig.out.address.clone();
+    let topic = format!("allowed/{}", "a".repeat(65_000));
+    match seam_answer(
+        &rig,
+        slug,
+        status_policy(&rig),
+        &topic,
+        &tracked_props(Some(&out), None),
+    ) {
+        MqttAdmission::InvalidPayload(text) => assert!(
+            text.contains("delivery status") && text.contains("65536"),
+            "{text}"
+        ),
+        other => panic!("expected invalid-payload, got {other:?}"),
+    }
+    assert_eq!(
+        seam_answer(
+            &rig,
+            slug,
+            status_policy(&rig),
+            &topic,
+            &tracked_props(None, None)
+        ),
+        MqttAdmission::Admitted {
+            response_topic: None
+        }
+    );
 }
 
 #[tokio::test]

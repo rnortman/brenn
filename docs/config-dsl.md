@@ -1756,6 +1756,47 @@ reconnects (`docs/message-bus.md` §2.1.2a, "A surface page is a reader by
 place", for the bound and its table). A reader that must not wait on another
 instance's attachments is bound to a channel no binding on that surface gates.
 
+**A component's MQTT status port.** A component that names one of its ports as
+the status port of `mqtt-publish-tracked` is told what became of the publish on
+the channel that port is bound to. To let it both name the channel and read
+what arrives there, bind the port `io` to a declared durable channel, and list
+the channel in the instance's `acl publish` beside its MQTT topic filters — an
+explicit `acl publish` holds the whole publish plane, so a bound output it does
+not cover is refused:
+
+```
+channel light_status at "brenn:light-status" {
+  push_depth = 8;
+  retain_depth = 64;
+  standing_retain_depth = 64;
+}
+
+component LightSwitch {
+  abi = processor;
+  requires = [ports, mqtt];
+  in commands;
+  io delivery;
+  optional in broker;
+}
+
+new lights: LightSwitch {
+  grants = [ports, mqtt];
+  acl publish [topic_filter "mqtt:ha:lights/+/set", topic_filter "mqtt:ha:lights/replies", exact light_status];
+  in commands <- light_cmds { push_depth = 8; }
+  io delivery <-> light_status { push_depth = 8; retain_depth = 64; }
+  in broker <- "brenn:mqtt-connection.ha" { push_depth = 0; retain_depth = 1; }
+}
+```
+
+The channel must be a plain `brenn:` channel; one the admission cannot take is
+answered `status-port-unusable` at the call and logged at `warn`. A publish
+draws two statuses, so size the channel's window and `send_rate` for two per
+publish, and the binding's `push_depth` for how many the component should see
+as new in one activation; `amplification` on the binding is what a status
+funds in further publishes (`docs/security-posture.md` §8.2). The `broker`
+binding is how the component settles a `handed` with no outcome. A status port
+bound `out` to a channel another participant reads is equally legal.
+
 `io port { … }` with no arrow is a **free io** form: it claims the port and tunes
 it without connecting it, which is how a timer port gets an anonymous
 page-local ring. A claimed port counts as bound for the optionality check.

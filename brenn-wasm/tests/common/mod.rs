@@ -15,8 +15,9 @@ use brenn_wasm::store::DEFAULT_MAX_PAGE_COUNT;
 use brenn_wasm::{
     GuestAlertSeverity, HostActivation, KvStore, MqttAdmission, MqttPublishFn, MqttPublishProps,
     MqttPublisher, MqttTarget, OutputAclFn, OutputPortSpec, ProcessorAlerter, ProcessorLoadSpec,
-    ProcessorUrgency, ProvidesCallError, ProvidesHost, ProvidesHostFn, QueuedToolRequest,
-    ReplayComponent, RequestAttachmentRefusal, SinkBudget, ToolCallError, ToolHost, ToolHostFn,
+    ProcessorOutcome, ProcessorPublish, ProcessorUrgency, ProvidesCallError, ProvidesHost,
+    ProvidesHostFn, QueuedToolRequest, ReplayComponent, RequestAttachmentRefusal, SinkBudget,
+    ToolCallError, ToolHost, ToolHostFn,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -242,7 +243,86 @@ impl MqttPublisher for AdmitAllMqtt {
     }
 
     fn admit(&self, _: &MqttTarget, _: usize, _: &MqttPublishProps) -> MqttAdmission {
-        MqttAdmission::Admitted
+        MqttAdmission::Admitted {
+            response_topic: None,
+        }
+    }
+}
+
+/// What one `admit` call saw.
+pub type SeenAdmit = (MqttTarget, usize, MqttPublishProps);
+
+/// A publisher whose admission is read from a shared cell at call time, so one
+/// loaded component serves several answers: loading compiles the guest, which
+/// dominates an MQTT suite's runtime.
+///
+/// `resolve` maps every `home:<suffix>` client string to `home` and leaves
+/// every other one unchanged.
+pub struct ScriptedPublisher {
+    admission: Mutex<MqttAdmission>,
+    seen: Mutex<Vec<SeenAdmit>>,
+}
+
+impl ScriptedPublisher {
+    pub fn new(admission: MqttAdmission) -> Arc<Self> {
+        Arc::new(Self {
+            admission: Mutex::new(admission),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Answer `admission` from now on, and forget every call seen so far.
+    pub fn answer(&self, admission: MqttAdmission) {
+        *self.admission.lock().expect("not poisoned") = admission;
+        self.seen.lock().expect("not poisoned").clear();
+    }
+
+    /// Every `admit` call since the last [`Self::answer`], in call order.
+    pub fn seen(&self) -> Vec<SeenAdmit> {
+        self.seen.lock().expect("not poisoned").clone()
+    }
+}
+
+impl MqttPublisher for ScriptedPublisher {
+    fn resolve(&self, client: &str, topic: &str) -> Result<MqttTarget, String> {
+        let client = if client.starts_with("home:") {
+            "home"
+        } else {
+            client
+        };
+        Ok(MqttTarget {
+            client: client.to_string(),
+            topic: topic.to_string(),
+        })
+    }
+
+    fn admit(
+        &self,
+        target: &MqttTarget,
+        payload_len: usize,
+        props: &MqttPublishProps,
+    ) -> MqttAdmission {
+        self.seen
+            .lock()
+            .expect("not poisoned")
+            .push((target.clone(), payload_len, props.clone()));
+        self.admission.lock().expect("not poisoned").clone()
+    }
+}
+
+/// The publishes of an ok activation.
+pub fn ok_publishes(outcome: ProcessorOutcome) -> Vec<ProcessorPublish> {
+    match outcome {
+        ProcessorOutcome::Ok { publishes, .. } => publishes,
+        other => panic!("expected ProcessorOutcome::Ok; got {other:?}"),
+    }
+}
+
+/// The rendering of an activation the guest failed.
+pub fn failure(outcome: ProcessorOutcome) -> String {
+    match outcome {
+        ProcessorOutcome::Err(re) => re.to_string(),
+        other => panic!("expected ProcessorOutcome::Err; got {other:?}"),
     }
 }
 

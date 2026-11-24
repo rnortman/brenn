@@ -29,9 +29,10 @@ pub enum DeliveryStatusPublish {
 pub enum DeliveryStatusRefusal {
     /// The channel is no longer in the directory.
     ChannelGone,
-    /// No app in the current table has the message's sender as its identity
-    /// and holds `MessagingPublish`: the app was removed, lost the grant, or
-    /// the server's source changed across a restart.
+    /// Neither an app in the current table nor a live WASM consumer has the
+    /// message's sender as its identity and holds `MessagingPublish`: the app
+    /// was removed, lost the grant, or the server's source changed across a
+    /// restart; or the consumer was retired, or lost the grant.
     SenderGone,
     /// The sender's `brenn:` publish ACL no longer covers the channel.
     SenderNotPermitted,

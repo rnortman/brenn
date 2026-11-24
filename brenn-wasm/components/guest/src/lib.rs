@@ -66,6 +66,7 @@ pub use brenn_envelope::{
 };
 pub use serde;
 pub use serde_json;
+pub use uuid;
 
 // ── error ─────────────────────────────────────────────────────────────────────
 
@@ -2106,19 +2107,300 @@ pub mod mqtt {
     //! not connected is not an error: the committed message waits on the
     //! client's egress channel and is sent when the client connects, within
     //! the window the operator sizes for that client. QoS 1 may be delivered
-    //! twice after a reconnect. A failure after commit — a broker refusal, a
-    //! packet over the broker's maximum, a message lost or dropped — is
-    //! reported to the operator, not to the component.
+    //! twice after a reconnect.
+    //!
+    //! Two families of call. [`publish`] and its wrappers give the message a
+    //! lifetime of forever, or a number of seconds through the `_expiring`
+    //! ones; they cannot ask for a delivery status or name a reply topic, and
+    //! a failure after commit — a broker refusal, a packet over the broker's
+    //! maximum, a message lost or dropped — is reported to the operator, not
+    //! to the component. [`publish_tracked`] states the lifetime, and
+    //! optionally a status port the host reports on and a reply topic, and
+    //! returns the message's id.
     //!
     //! `client` is the `[[mqtt_client]]` slug; `topic` is a concrete topic
     //! under that client and must contain no wildcard.
 
+    use core::num::NonZeroU32;
+
     use super::Error;
     use crate::contract::mqtt::{self as raw};
 
+    pub mod connection {
+        //! Reading a client's connection state off a received message.
+        //!
+        //! The host publishes every declared client's state on
+        //! `brenn:mqtt-connection.<client>`; each message is the whole state
+        //! and subsumes the one before. A component reads it on an `in` port
+        //! the deployer binds, `retain_depth = 1` being enough. The one use
+        //! the SDK names is [`outcome_will_never_come`]: settling a `handed`
+        //! status that has no outcome.
+
+        use crate::{Error, Message};
+
+        pub use brenn_envelope::mqtt_connection::{
+            Connection, MqttConnectionState, PreviousEnd, PreviousSession,
+        };
+
+        /// The state `message` carries, or `None` when it is not from the
+        /// host's connection-state sender.
+        ///
+        /// `Err(MalformedEnvelope)` when the header does not read, or when a
+        /// message from that sender does not decode — a body version this SDK
+        /// does not know.
+        pub fn read(message: &Message) -> Result<Option<MqttConnectionState>, Error> {
+            if message.origin()?.sender != brenn_envelope::mqtt_connection::MQTT_CONNECTION_SENDER {
+                return Ok(None);
+            }
+            let text = message.body().as_text()?;
+            brenn_envelope::mqtt_connection::decode(text)
+                .map(Some)
+                .map_err(|e| Error::malformed(format!("mqtt connection state: {e}")))
+        }
+
+        /// Whether a `handed` status published at `handed_published_ms`
+        /// ([`crate::delivery::Received::published_ms`]) will never be
+        /// followed by an outcome, judged against the client's newest
+        /// `state`: true when it was published before this process found the
+        /// previous session's end, so it was handed by a session that has
+        /// ended.
+        ///
+        /// False says only that the message may still be in flight on the
+        /// current session; it promises no outcome.
+        pub fn outcome_will_never_come(
+            handed_published_ms: i64,
+            state: &MqttConnectionState,
+        ) -> bool {
+            handed_published_ms < state.previous_session.found_at_ms
+        }
+    }
+
+    /// How long the host keeps a message it has not yet sent, counted from
+    /// commit.
+    ///
+    /// Judged when the host reaches the message to send it: what is left is
+    /// sent as the MQTT 5 Message Expiry Interval, and a message reached past
+    /// its lifetime is not sent. A message already handed to the MQTT library
+    /// when the connection is lost may be sent after its lifetime when the
+    /// client reconnects.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Lifetime {
+        /// Kept this many seconds from commit.
+        Seconds(NonZeroU32),
+        /// Kept until sent, within the client's egress window, where the
+        /// oldest messages are dropped first.
+        Forever,
+    }
+
+    /// The id of a message [`publish_tracked`] returned: the type of
+    /// [`crate::delivery::DeliveryStatus::message_id`], so a status is matched
+    /// with `==`.
+    ///
+    /// Name it as `brenn_guest::uuid::Uuid` (or through this alias). A
+    /// component that declares a `uuid` dependency of its own gets a second
+    /// crate instance whose `Uuid` is not this type; a Bazel build names the
+    /// SDK's `uuid` alias target instead.
+    pub type MessageId = crate::uuid::Uuid;
+
+    /// The options of a [`publish_tracked`]: the three every publish states,
+    /// and three it may.
+    ///
+    /// ```ignore
+    /// let options = TrackedPublish::new(1, false, Lifetime::Forever)
+    ///     .status_port("delivery")
+    ///     .reply_topic("lights/replies");
+    /// ```
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TrackedPublish<'a> {
+        qos: u8,
+        retain: bool,
+        lifetime: Lifetime,
+        content_type: Option<&'a str>,
+        status_port: Option<&'a str>,
+        reply_topic: Option<&'a str>,
+    }
+
+    impl<'a> TrackedPublish<'a> {
+        /// QoS 0, 1 or 2; whether the broker retains the message; and its
+        /// lifetime. No content type, no status port, no reply topic.
+        pub fn new(qos: u8, retain: bool, lifetime: Lifetime) -> Self {
+            TrackedPublish {
+                qos,
+                retain,
+                lifetime,
+                content_type: None,
+                status_port: None,
+                reply_topic: None,
+            }
+        }
+
+        /// The MQTT 5 content type sent with the message.
+        pub fn content_type(mut self, content_type: &'a str) -> Self {
+            self.content_type = Some(content_type);
+            self
+        }
+
+        /// One of this component's own `out` or `io` ports, on whose channel
+        /// the host reports what became of the message.
+        ///
+        /// Declared and wired: the host reports on the wired channel, unless
+        /// that channel cannot take the statuses
+        /// ([`TrackedPublishError::StatusPortUnusable`]). Declared and left
+        /// unwired by the deployer: the publish is admitted and its statuses
+        /// go nowhere. Not declared `out` or `io`: the activation traps.
+        /// Naming a port costs none of that port's publish budget. A failure
+        /// reported on the status port is logged and not alerted to the
+        /// operator, a broker's rejection excepted.
+        pub fn status_port(mut self, port: &'a str) -> Self {
+            self.status_port = Some(port);
+            self
+        }
+
+        /// A concrete topic on the publish's own client, sent as the MQTT 5
+        /// Response Topic: no wildcard, and admitted by the consumer's
+        /// `mqtt_publish` ACL on that client. A bare topic, never an address.
+        pub fn reply_topic(mut self, topic: &'a str) -> Self {
+            self.reply_topic = Some(topic);
+            self
+        }
+    }
+
+    /// Why the host refused a [`publish_tracked`]. Every case is the host's
+    /// decision at the call; none is a broker outcome.
+    ///
+    /// Only [`TrackedPublishError::QuotaExceeded`] can be outlived: the
+    /// ceilings it reports are per activation. Every other case is permanent
+    /// for this configuration, and a component that retries it on a later
+    /// activation retries it forever.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum TrackedPublishError {
+        /// No entry of the consumer's `mqtt_publish` ACL admits the topic on
+        /// the client.
+        NotPermitted,
+        /// The publish is malformed or too large, with the host's diagnostic:
+        /// an address the host cannot parse, a wildcard in the topic, a QoS
+        /// above 2, a malformed content type, a payload over the bus's body
+        /// cap or the client's outbound cap, a reply topic that is not a
+        /// concrete topic name, or a topic so long that a status about it
+        /// would not fit the bus's body cap while the status port is wired.
+        InvalidPublish(String),
+        /// A per-activation ceiling is reached.
+        QuotaExceeded,
+        /// The reply topic is well formed and no entry of the consumer's
+        /// `mqtt_publish` ACL admits it on the client.
+        ReplyTopicNotPermitted,
+        /// The channel the deployer wired to the status port cannot take this
+        /// component's delivery statuses; the operator's log names the cause.
+        StatusPortUnusable,
+    }
+
+    impl core::fmt::Display for TrackedPublishError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::NotPermitted => f.write_str("not-permitted"),
+                Self::InvalidPublish(m) => write!(f, "invalid-publish: {m}"),
+                Self::QuotaExceeded => f.write_str("quota-exceeded"),
+                Self::ReplyTopicNotPermitted => f.write_str("reply-topic-not-permitted"),
+                Self::StatusPortUnusable => f.write_str("status-port-unusable"),
+            }
+        }
+    }
+
+    /// `QuotaExceeded` to [`Error::QuotaExceeded`], every other case to
+    /// [`Error::ProcessingFailed`], each carrying the case's rendering.
+    impl From<TrackedPublishError> for Error {
+        fn from(e: TrackedPublishError) -> Error {
+            let msg = format!("mqtt publish: {e}");
+            match e {
+                TrackedPublishError::QuotaExceeded => Error::QuotaExceeded(msg),
+                _ => Error::ProcessingFailed(msg),
+            }
+        }
+    }
+
+    /// Publish `payload` to `topic` on `client` under `options`, returning
+    /// the message's id.
+    ///
+    /// **The return.** The host's decision and the id, equal to `message_id`
+    /// in every delivery status about the message. The publish is buffered
+    /// with the activation, committed in call order with the activation's
+    /// other publishes when it returns ok, and discarded when it errs or
+    /// traps; the id then names nothing. Nothing has been sent, no broker
+    /// outcome is returned and the call never waits. The grant, the ACL and
+    /// the budgets are those of [`publish`].
+    ///
+    /// **Statuses and their order.** On the status port, read with
+    /// [`crate::delivery::read`]: `handed` when the message goes to the MQTT
+    /// library, then one outcome — `delivered`, `rejected`, `expired`,
+    /// `unknown` or `dropped`. `expired` and `dropped` can come with no
+    /// `handed`; an outcome can come without its `handed`; a `handed` can
+    /// come twice; a message the egress window dropped before it was reached
+    /// gets nothing; not every publish gets an outcome. `rejected` is the
+    /// broker's refusal or a packet over the broker's maximum, and does not
+    /// say the broker never took the message. A broker that stays connected
+    /// and never answers leaves a `handed` with no outcome for as long as the
+    /// connection lasts.
+    ///
+    /// **A `handed` with no outcome** is either still in flight or lost to an
+    /// unclean restart. A `restarted` status for its client on the same port,
+    /// after it, says the second. Without one, the client's connection state
+    /// settles it: [`connection::outcome_will_never_come`].
+    ///
+    /// **Matching.** A status concerns this component only if its
+    /// `message_id` is one this component's publishes returned: other
+    /// publishers may name the same channel, and a consumer re-added under the
+    /// same name is told of its predecessor's messages. A status binding too
+    /// shallow for the statuses owed between activations hands over only the
+    /// newest as new; read the window's context as well when it reports
+    /// drops, and treat a missing status as proof of nothing.
+    ///
+    /// Imports `mqtt-publish-tracked`, which a host that predates it does not
+    /// provide: a component calling this does not link there.
+    ///
+    /// # Panics
+    ///
+    /// If the host returns an id that is not a UUID: a host contract
+    /// violation.
+    pub fn publish_tracked(
+        client: &str,
+        topic: &str,
+        payload: &[u8],
+        options: &TrackedPublish<'_>,
+    ) -> Result<MessageId, TrackedPublishError> {
+        let lifetime = match options.lifetime {
+            Lifetime::Seconds(n) => raw::MessageLifetime::Seconds(n.get()),
+            Lifetime::Forever => raw::MessageLifetime::Forever,
+        };
+        let raw_options = raw::TrackedPublishOptions {
+            content_type: options.content_type,
+            qos: options.qos,
+            retain: options.retain,
+            lifetime,
+            status_port: options.status_port,
+            reply_topic: options.reply_topic,
+        };
+        match raw::mqtt_publish_tracked(client, topic, payload, raw_options) {
+            Ok(id) => Ok(MessageId::parse_str(&id).unwrap_or_else(|e| {
+                panic!("the host returned a message id {id:?} that is not a UUID: {e}")
+            })),
+            Err(raw::TrackedPublishError::NotPermitted) => Err(TrackedPublishError::NotPermitted),
+            Err(raw::TrackedPublishError::InvalidPublish(m)) => {
+                Err(TrackedPublishError::InvalidPublish(m))
+            }
+            Err(raw::TrackedPublishError::QuotaExceeded) => Err(TrackedPublishError::QuotaExceeded),
+            Err(raw::TrackedPublishError::ReplyTopicNotPermitted) => {
+                Err(TrackedPublishError::ReplyTopicNotPermitted)
+            }
+            Err(raw::TrackedPublishError::StatusPortUnusable) => {
+                Err(TrackedPublishError::StatusPortUnusable)
+            }
+        }
+    }
+
     /// Why the host refused a publish, for a guest that classifies before it
     /// gives up. [`publish`] flattens this into an [`Error`]; reach
-    /// for [`try_publish`] to keep it.
+    /// for [`try_publish`] to keep it. [`publish_tracked`] answers its own
+    /// [`TrackedPublishError`] instead.
     pub use crate::contract::mqtt::MqttPublishError as PublishError;
 
     /// Whether a later activation may retry this failure: true only for
@@ -2150,6 +2432,9 @@ pub mod mqtt {
     ///
     /// The whole WIT surface, for the guest that needs `content_type` or wants
     /// to classify the failure with [`is_transient`].
+    ///
+    /// The message's lifetime is forever. This cannot ask for a delivery
+    /// status or name a reply topic; [`publish_tracked`] can.
     pub fn try_publish(
         client: &str,
         topic: &str,
@@ -2183,7 +2468,8 @@ pub mod mqtt {
     /// sent. A message already handed to the MQTT library when the
     /// connection is lost may be sent after its lifetime, when the client
     /// reconnects, with the expiry interval it was first sent with. Zero is
-    /// refused as `invalid-payload`.
+    /// refused as `invalid-payload`. This cannot ask for a delivery status or
+    /// name a reply topic; [`publish_tracked`] can.
     ///
     /// Imports `mqtt-publish-expiring`, which a host that predates it does not
     /// provide: a component calling this does not link there.
@@ -2270,6 +2556,64 @@ pub mod mqtt {
             qos,
             retain,
         )
+    }
+}
+
+// ── delivery ──────────────────────────────────────────────────────────────────
+
+pub mod delivery {
+    //! Reading a delivery status off a received message.
+    //!
+    //! The host reports what became of a message on the status port its
+    //! publish named ([`crate::mqtt::publish_tracked`]). A status channel is
+    //! one this component may write itself, so it may carry the component's
+    //! own messages and those of any other publisher that may write it:
+    //! [`read`] believes only the host's status sender, and the component
+    //! matches a [`StatusBody::Message`]'s `message_id` against the ids its
+    //! own publishes returned. A [`StatusBody::Restarted`] concerns a
+    //! transport, not a message, and carries no id.
+    //!
+    //! A failure reported on a status port is logged and not alerted to the
+    //! operator, a broker's rejection excepted: the component has taken the
+    //! report.
+
+    use crate::{Error, Message};
+
+    pub use brenn_envelope::delivery::{
+        DeliveryDropCause, DeliveryKind, DeliveryStatus, DeliveryUnknownCause, MqttDelivery,
+        MqttRestarted, StatusBody, TransportRestarted,
+    };
+
+    /// A status as received: the body, and when the host published it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Received {
+        pub status: StatusBody,
+        /// The envelope's publish time, Unix milliseconds: what
+        /// [`crate::mqtt::connection::outcome_will_never_come`] compares.
+        pub published_ms: i64,
+    }
+
+    /// The status `message` carries, or `None` when it is not from the host's
+    /// status sender — on a channel this component may write, the
+    /// component's own traffic or another publisher's.
+    ///
+    /// `Err(MalformedEnvelope)` when the envelope does not read, or when a
+    /// message from the status sender does not decode — a body version this
+    /// SDK does not know. Whether that fails the activation is the
+    /// component's choice.
+    pub fn read(message: &Message) -> Result<Option<Received>, Error> {
+        let origin = message.origin()?;
+        if origin.sender != brenn_envelope::delivery::DELIVERY_STATUS_SENDER {
+            return Ok(None);
+        }
+        let published_ms = origin.publish_ts.timestamp_millis();
+        let text = message.body().as_text()?;
+        let status = brenn_envelope::delivery::decode(text)
+            .map_err(|e| Error::malformed(format!("delivery status: {e}")))?;
+        Ok(Some(Received {
+            status,
+            published_ms,
+        }))
     }
 }
 

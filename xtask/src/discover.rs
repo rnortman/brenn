@@ -191,6 +191,7 @@ mod tests {
             ("processor-kit-file-test", Family::Guest),
             ("processor-log", Family::Guest),
             ("processor-mqtt-test", Family::Guest),
+            ("processor-mqtt-tracked-test", Family::Guest),
             ("processor-multiport", Family::Guest),
             ("processor-page-blobs-test", Family::Guest),
             ("processor-provider-test", Family::Guest),

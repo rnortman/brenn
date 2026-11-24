@@ -588,7 +588,13 @@ and corrects the two doc comments in its usage-proxy component that still
 describe a broker refusal or rejection as an outcome of the publish. The
 private ops annex moves its deploy pin to the release and corrects the
 comment in the prod switcher configuration that claims a refused publish
-traps the activation, false from that release. Done = both repositories
+traps the activation, false from that release. The components
+repository may also move its usage-proxy publishes to
+`mqtt-publish-tracked`, to state a lifetime and to hear of a publish lost
+after commit; until it does it stays on `mqtt-publish` and
+`mqtt-publish-expiring`, which keep working. Its tests that implement
+`MqttPublisher` or build `MqttPublishProps` follow the shapes of the
+release. Done = both repositories
 are on the release with those changes. The comment sits at
 `MqttPublisher::admit` in `brenn-wasm/src/lib.rs`.
 
@@ -758,6 +764,20 @@ Receive Maximum on CONNECT becomes the bound on what the broker has
 outstanding to Brenn's serial inbound path, and that work chooses it. Code
 site (`TODO(mqtt-inbound-acked-before-routed)`): the drop-time log in
 `drop_event_loop`, `brenn-mqtt/src/connection.rs`.
+
+## `mqtt-legacy-publish-functions-retire`
+
+`brenn:processor/mqtt@0.1.0` keeps `mqtt-publish` and `mqtt-publish-expiring`
+beside `mqtt-publish-tracked`, the function that states a lifetime, a status
+port and a reply topic. `mqtt-publish` gives its message a lifetime of forever
+that the component never stated, and neither function can ask for a delivery
+status, so a component on them is never told of a message lost after commit.
+Removing them is a breaking change to a published interface: a new version of
+`mqtt` served beside `@0.1.0` through an announced removal period, begun only
+after the owner has decided the out-of-tree components have moved. Done when
+the two functions are removed under such a period, or this is closed as not
+wanted. Code site (`TODO(mqtt-legacy-publish-functions-retire)`): above
+`mqtt-publish` in `brenn-wasm/wit/processor.wit`.
 
 ## `mqtt-lost-events-incoming-test-flaky`
 

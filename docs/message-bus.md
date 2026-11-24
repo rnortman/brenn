@@ -1877,8 +1877,9 @@ committed: it is reported as rejected — to the operator, naming the packet's
 size and the broker's maximum, or on its `status_to` as `rejected` with no
 reason code. A broker that advertises no maximum arms no check.
 
-**A component's publish.** A component's `mqtt-publish` and
-`mqtt-publish-expiring` go through the same egress channel. The call is
+**A component's publish.** A component's `mqtt-publish`,
+`mqtt-publish-expiring` and `mqtt-publish-tracked` go through the same egress
+channel. The call is
 admitted at once by the same bus admission as `MqttSend` — the grant and
 per-topic ACL, the client and its channel, QoS and content type, the bound —
 after the component's own per-activation checks, and buffered with the
@@ -1887,9 +1888,22 @@ committed together: its MQTT publishes and its publishes to durable channels
 in one transaction, in call order. When it errs or traps the buffer is
 discarded. The call answers the admission and never a broker outcome; what
 happens after commit goes to the operator (§2.7.3), with `wasm:<slug>` as the
-sender: a component cannot name a `status_to` or a `reply_to`. `mqtt-publish` is committed with no lifetime and
-`mqtt-publish-expiring` with a lifetime of its seconds, counted from the
-commit. Nothing in the call waits on the broker or its session.
+sender, or to the component's status port when it named one.
+`mqtt-publish` is committed with no lifetime and `mqtt-publish-expiring` with a
+lifetime of its seconds, counted from the commit; neither names a `status_to`
+or a `reply_to`. `mqtt-publish-tracked` states its lifetime — a number of
+seconds, or `forever` — and may name a status port and a reply topic. The
+status port is one of the component's own `out` or `io` ports: the host takes
+the channel the operator wired it to as the publish's `status_to`, which the
+admission then judges as any other (*Delivery status*, below); a port the
+component does not declare `out` or `io` traps the activation, a declared port
+left unwired names no `status_to`, and a wired channel the admission refuses is
+answered `status-port-unusable`. The reply topic is a bare topic on the
+publish's own client, sent as the MQTT 5 Response Topic and admitted by the
+component's own `mqtt_publish` ACL. The call returns the message's id, the
+`message_id` its statuses carry; the id names a message only once the
+activation returns ok. Nothing in the call waits on the broker or its
+session.
 
 **A recurring automation's publish.** An automation job (`AutoCreate`,
 `AutoEdit`) can fire an `mqtt_publish` action: a `to` of the form
@@ -2308,7 +2322,10 @@ channel it could publish to itself. The host publishes there `handed`, then
 one outcome. It is the bus's own idiom — an outcome is a fact, a fact is a
 message on a channel, the sender reads it with an ordinary subscription — and
 there is nothing to wait on or poll. `MqttSend` takes a `status_to`; a
-component cannot name one.
+component names a status port on `mqtt-publish-tracked`, one of its own `out`
+or `io` ports, and the host names the channel the operator wired to it. To
+both name the channel and read what arrives on it, the operator binds the port
+`io` to a declared `brenn:` channel the component's publish ACL covers.
 
 **Admission.** A named `status_to` is checked after the publish's target and
 before its QoS and payload, and each refusal commits nothing and spends
@@ -2349,12 +2366,12 @@ in v1: a new kind moves `v`. Causes are open: a reader treats a cause word it
 does not know as some other cause. Unknown fields are ignored.
 
 A reader believes only `sender` `system:delivery-status`: the channel is by
-rule one the publishing app may itself write, so anything else on it may be
-the app's own traffic. The sender says the host wrote a status, not whose
-message it concerns. Every app whose `brenn_publish` ACL admits a channel may
-name it, and every conversation of one app publishes as that app, so a reader
-matches a message kind's `message_id` against the ids its own publishes
-returned and ignores the rest. A `restarted` names no message: it is published
+rule one the publishing app or component may itself write, so anything else on
+it may be its own traffic. The sender says the host wrote a status, not whose
+message it concerns. Every app and every component whose `brenn_publish` ACL
+admits a channel may name it, and every conversation of one app publishes as
+that app, so a reader matches a message kind's `message_id` against the ids
+its own publishes returned and ignores the rest. A `restarted` names no message: it is published
 on the authority of the first sender, among those that named the channel on a
 message the previous process may have handed, whose policy admits it now —
 which need not be the reader's own app — and it concerns every unanswered
@@ -2468,9 +2485,10 @@ counted and alerted as *status not published*, naming the marker.
   readers owe before the process exits.
 
 **When a status is not published.** A status is published at report time on
-the sender's authority as it stands then: the app named in the stored sender
-must still exist, hold `publish`, and admit the channel in its
-`brenn_publish` ACL; the channel must still exist; the channel's send rate
+the sender's authority as it stands then: the app or the live component whose
+identity is the stored sender must still exist, hold `publish`, and admit the
+channel in its `brenn_publish` ACL — a retired component's statuses are
+refused; the channel must still exist; the channel's send rate
 and body cap apply. A status refused for any of these is never retried and
 never holds a message back: the operator is told (*status not published*,
 above), and the outcome of a failure whose status was refused is alerted as
@@ -2481,7 +2499,8 @@ that falls out of it before it is read is gone. Its `send_rate` is drawn
 under `system:delivery-status` and is shared by every sender naming that
 channel: it must cover two statuses per publish into it. A conversation
 subscribed to its own status channel with a push depth is woken by its
-statuses.
+statuses, and so is a component whose status port is `io` with a push depth
+(`docs/security-posture.md` §8.2 bounds the loop that can make).
 
 ### 2.8 The reload pair
 

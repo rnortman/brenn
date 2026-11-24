@@ -368,8 +368,9 @@ impl Messenger {
 
     /// Decide whether a component under `policy` may publish `payload_len`
     /// bytes to `mqtt:<client>:<topic>` with `options`. Spends nothing. The
-    /// decision is [`Self::admit_mqtt`]'s, with no `delivery_deadline`; a
-    /// component's options state no `reply_to`. The commit is the activation's
+    /// decision is [`Self::admit_mqtt`]'s, with no `delivery_deadline`.
+    /// Answers the bare reply topic parsed out of a stated `reply_to`, the
+    /// Response Topic the commit carries. The commit is the activation's
     /// flush, through [`Self::publish_from_wasm`].
     pub fn admit_mqtt_from_wasm(
         &self,
@@ -378,7 +379,7 @@ impl Messenger {
         topic: &str,
         options: &MqttPublishOptions,
         payload_len: u64,
-    ) -> Result<(), PublishResult> {
+    ) -> Result<Option<String>, PublishResult> {
         self.admit_mqtt(
             policy,
             &format!("mqtt:{client}:{topic}"),
@@ -386,7 +387,7 @@ impl Messenger {
             Some(payload_len),
             None,
         )
-        .map(|_| ())
+        .map(|admitted| admitted.response_topic)
     }
 
     /// Decide whether the app `app_slug` may publish `payload_len` bytes to the

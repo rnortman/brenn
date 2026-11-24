@@ -1518,6 +1518,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-test",
+ "uuid",
  "wasmtime",
  "wat",
 ]

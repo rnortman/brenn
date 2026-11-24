@@ -34,6 +34,7 @@ const SDK_COMPONENTS: &[&str] = &[
     "processor-kit-file-test",
     "processor-log",
     "processor-mqtt-test",
+    "processor-mqtt-tracked-test",
     "processor-multiport",
     "processor-provider-test",
     "processor-sdk-bytes-test",
@@ -372,5 +373,35 @@ fn the_kit_file_fixture_imports_open_request() {
     assert!(
         blobs.iter().any(|m| m == "open-request"),
         "processor-kit-file-test does not import open-request: {blobs:?}"
+    );
+}
+
+/// The `mqtt@0.1.0` functions `fixture` imports.
+fn mqtt_functions(engine: &Engine, fixture: &str) -> Vec<String> {
+    const MQTT: &str = "brenn:processor/mqtt@0.1.0";
+    let members = instance_members(engine, fixture, MQTT)
+        .unwrap_or_else(|| panic!("{fixture} does not import {MQTT}"));
+    let mut functions: Vec<String> = members
+        .into_iter()
+        .filter(|m| is_function(engine, fixture, MQTT, m))
+        .collect();
+    functions.sort();
+    functions
+}
+
+/// A component imports only the `mqtt` functions it calls: the fixture of the
+/// two legacy functions imports exactly those, so an artifact built before
+/// `mqtt-publish-tracked` was added links as it did, and the tracked fixture
+/// imports the new function.
+#[test]
+fn an_mqtt_component_imports_only_the_functions_it_calls() {
+    let engine = engine();
+    assert_eq!(
+        mqtt_functions(&engine, "processor-mqtt-test"),
+        ["mqtt-publish", "mqtt-publish-expiring"]
+    );
+    assert_eq!(
+        mqtt_functions(&engine, "processor-mqtt-tracked-test"),
+        ["mqtt-publish-tracked"]
     );
 }

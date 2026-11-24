@@ -4,6 +4,32 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **New for component authors: a component can state a lifetime, ask for
+  delivery statuses and name a reply topic on an MQTT publish.**
+  `brenn:processor/mqtt@0.1.0` gains a function, `mqtt-publish-tracked`, beside
+  `mqtt-publish` and `mqtt-publish-expiring`, which are unchanged. It takes a
+  required lifetime — a number of seconds, or `forever` — and optionally a
+  status port, one of the component's own `out` or `io` ports, and a reply
+  topic on the same client, sent as the MQTT 5 Response Topic. It returns the
+  message's id, the `message_id` every status about it carries. The host names
+  the channel the operator wired to the status port as the publish's
+  `status_to`; a port the component does not declare `out` or `io` traps the
+  activation, a declared port left unwired names none, and a wired channel the
+  bus cannot take is answered `status-port-unusable`. A component that does not
+  call the function imports nothing new; one that does needs this brenn or
+  later. In `brenn-guest`: `mqtt::publish_tracked` with `mqtt::TrackedPublish`
+  and `mqtt::Lifetime`; `delivery::read` reads a status off a received message
+  and believes only the host's status sender; `mqtt::connection::read` and
+  `mqtt::connection::outcome_will_never_come` settle a `handed` with no outcome
+  against the client's connection state. Message ids are
+  `brenn_guest::uuid::Uuid` (`brenn_guest::mqtt::MessageId`); use that `uuid`,
+  or the Bazel alias `//brenn-wasm/components/guest:uuid`, not a `uuid` of your
+  own, whose `Uuid` is a different type. To read the statuses, bind the status
+  port `io` to a declared durable channel and list it in the instance's `acl
+  publish` (`docs/config-dsl.md`, *Instances and bindings*). A publish draws
+  two statuses; a component woken by its own statuses is bounded by its
+  activation pacer and the status binding's `push_depth` and `amplification`
+  (`docs/security-posture.md` §8.2).
 - **Breaking config:** boot now refuses an `[llm_chat] prefix` of
   `mqtt-connection` or `device-location`. Either would place every chat
   channel inside a channel family only the server itself may write, and give
@@ -225,8 +251,8 @@ All notable changes to Brenn are documented here.
   a QoS 1 message refused when re-sent after a lost connection (cause
   `resend_refused`), whose first copy may have arrived. A broker's rejection
   still alerts the operator whether or not the caller was told, since it means
-  the app's topic ACL admits what the broker forbids. Components cannot name a
-  `status_to` yet.
+  the app's topic ACL admits what the broker forbids. Components name a status
+  port through `mqtt-publish-tracked` (above).
 - **New for operators: an MQTT session waits for its broker's answers when it
   stops.** A server shutdown, a reload that changes a client and a reload that
   removes one all stop the client's session the same way: nothing more is
@@ -272,8 +298,9 @@ All notable changes to Brenn are documented here.
   `body`, and is refused beside an `attachment`, which publishes its own.
 - **For component authors:** `MqttPublishTransport` gained a `status_to`
   field (absent on the wire when unset). A guest that builds or destructures
-  it exhaustively needs a source change; a component cannot name a
-  `status_to`, and its publish always carries none.
+  it exhaustively needs a source change; a component names a status port
+  through `mqtt-publish-tracked` (above), and its publish then carries the
+  wired channel as its `status_to`.
 - **BREAKING for component authors:** a component's `mqtt-publish` and
   `mqtt-publish-expiring` now go through the bus, like `MqttSend`, and never
   wait on the broker. The WIT shapes are unchanged and every existing component
@@ -307,6 +334,14 @@ All notable changes to Brenn are documented here.
   component repository not named there was not and could not be surveyed.
   Until this release is tagged the old behaviour can be restored without a new
   contract version; after it, restoring it needs one.
+- **For authors of host tests:** `brenn_wasm::MqttPublishProps` states a
+  `lifetime` (`MqttPublishLifetime`), a `status_to` and a `reply_topic` in
+  place of `message_expiry_s`, and no longer has a `Default`;
+  `brenn_wasm::MqttAdmission::Admitted` carries the admitted `response_topic`
+  and the enum gains `ReplyTopicNotPermitted` and `StatusChannelRefused`,
+  whose `cause` is a `brenn_wasm::StatusChannelRefusal`;
+  `brenn_wasm::ProcessorMqttPublish` gains `message_id` and `response_topic`;
+  and the `mqtt` host functions are trappable.
 - **For authors of host tests:** `brenn_wasm::MqttPublisher::publish` is
   replaced by `admit`, which returns an `MqttAdmission`, and
   `MqttPublishOutcome` is gone. A test reads what a component published from

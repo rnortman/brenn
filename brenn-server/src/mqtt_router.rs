@@ -2240,6 +2240,7 @@ mod tests {
             ] {
                 insert_message_in_tx(
                     &tx,
+                    None,
                     mqtt_channel_uuid_from_address(address),
                     address,
                     "broker",

@@ -254,6 +254,16 @@ struct AttachmentsHeader {
     attachments: Attachments,
 }
 
+/// The two header keys [`Message::origin`] reads; every other key is skipped
+/// unparsed into values.
+#[derive(serde::Deserialize)]
+pub(crate) struct Origin {
+    /// Who published the message.
+    pub(crate) sender: String,
+    /// When the host committed it.
+    pub(crate) publish_ts: chrono::DateTime<chrono::Utc>,
+}
+
 impl Message {
     pub(crate) fn new(header_json: String, body: Body, port: Arc<str>, index: u32) -> Message {
         Message {
@@ -308,6 +318,14 @@ impl Message {
                 content_type: blob.content_type.clone(),
             })
             .collect())
+    }
+
+    /// Who published the message and when, read off the header's `sender`
+    /// and `publish_ts` keys alone; the body is not copied.
+    /// `Err(MalformedEnvelope)` when the header does not read.
+    pub(crate) fn origin(&self) -> Result<Origin, Error> {
+        serde_json::from_str(&self.header_json)
+            .map_err(|e| Error::malformed(format!("envelope header origin: {e}")))
     }
 
     /// The whole envelope, parsed: the header read as an

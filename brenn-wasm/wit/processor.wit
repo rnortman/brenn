@@ -512,6 +512,9 @@ interface mqtt {
 
     // TODO(mqtt-component-publish-behaviour-cut-unconfirmed): this function
     // and `mqtt-publish-expiring` changed behaviour without a new version.
+    // TODO(mqtt-legacy-publish-functions-retire): this function and
+    // `mqtt-publish-expiring` stay beside `mqtt-publish-tracked` until a new
+    // version of this interface retires them.
     /// Publish to an MQTT broker through the client's egress channel.
     ///
     /// Buffered like `ports.publish`: when the activation returns ok the
@@ -533,6 +536,10 @@ interface mqtt {
     /// gates which topics on which clients are reachable: an entry names a
     /// client and a topic filter, matched by the MQTT rules (`#` and a leading
     /// `+` match no topic whose first level starts with `$`).
+    ///
+    /// The message's lifetime is forever. Neither this function nor
+    /// `mqtt-publish-expiring` can ask for a delivery status or name a reply
+    /// topic; `mqtt-publish-tracked` can.
     mqtt-publish: func(
         client: string,
         topic: string,
@@ -554,7 +561,9 @@ interface mqtt {
     /// errors as `mqtt-publish`. `message-expiry-s = 0` is refused as
     /// `invalid-payload`. Existing components compiled without this import
     /// keep working (additive WIT ABI — no package version bump); a component
-    /// that imports it does not link on a host that predates it.
+    /// that imports it does not link on a host that predates it. It cannot
+    /// ask for a delivery status or name a reply topic;
+    /// `mqtt-publish-tracked` can.
     mqtt-publish-expiring: func(
         client: string,
         topic: string,
@@ -564,6 +573,133 @@ interface mqtt {
         retain: bool,
         message-expiry-s: u32,
     ) -> result<_, mqtt-publish-error>;
+
+    /// How long the host keeps a message it has not yet sent.
+    variant message-lifetime {
+        /// Kept this many seconds from commit; zero is refused.
+        seconds(u32),
+        /// Kept until sent, within the client's egress window, where the
+        /// oldest messages are dropped first.
+        forever,
+    }
+
+    /// The options of `mqtt-publish-tracked`. A record cannot gain a field: a
+    /// later option reaches components as another function beside this one,
+    /// with its own options record.
+    record tracked-publish-options {
+        /// MQTT 5 content type; `none` sends none.
+        content-type: option<string>,
+        /// Delivery QoS: 0, 1 or 2.
+        qos: u8,
+        /// Whether the broker retains the message.
+        retain: bool,
+        /// How long the host keeps the message unsent. Required: there is no
+        /// default.
+        lifetime: message-lifetime,
+        /// One of this component's own `out` or `io` ports, on whose channel
+        /// the host reports what became of the message.
+        status-port: option<string>,
+        /// A concrete topic on the same client, sent as the MQTT 5 Response
+        /// Topic.
+        reply-topic: option<string>,
+    }
+
+    /// Failure modes the guest can observe from `mqtt-publish-tracked`. Every
+    /// one is the host's decision at the call; none is a broker outcome.
+    variant tracked-publish-error {
+        /// No entry of the consumer's `mqtt_publish` ACL admits `topic` on
+        /// `client`. Permanent for this configuration.
+        not-permitted,
+        /// The publish is malformed or too large, with a diagnostic string:
+        /// an address the host cannot parse, a wildcard in `topic`, a QoS
+        /// above 2, a lifetime of zero seconds, a malformed `content-type`, a
+        /// payload over the bus's message body cap or the client's outbound
+        /// payload cap, a `reply-topic` that is not a concrete topic name, or a
+        /// `topic` so long that a status about it would not fit the bus's
+        /// message body cap while `status-port` is wired. Permanent.
+        invalid-publish(string),
+        /// A per-activation ceiling is reached, the ones `mqtt-publish` has.
+        /// A later activation can outlive it.
+        quota-exceeded,
+        /// `reply-topic` is a well-formed topic that no entry of the
+        /// consumer's `mqtt_publish` ACL admits on `client`. Permanent for this
+        /// configuration.
+        reply-topic-not-permitted,
+        /// The channel the deployer wired to `status-port` cannot take this
+        /// component's delivery statuses. Permanent for this configuration;
+        /// the operator's log names the cause.
+        status-port-unusable,
+    }
+
+    /// Publish to an MQTT broker through the client's egress channel, stating
+    /// the message's lifetime and, optionally, a status port and a reply
+    /// topic. Returns the message's id.
+    ///
+    /// `client`, `topic` and `payload`, the grant, the ACL and the budgets
+    /// are those of `mqtt-publish`.
+    ///
+    /// **The return.** The host's decision and the message id: the canonical
+    /// lowercase hyphenated UUID, equal to `message-id` in every delivery
+    /// status about the message. The publish is buffered with the activation,
+    /// committed in call order with the activation's other publishes when it
+    /// returns ok, and discarded when it errs or traps; the id then names
+    /// nothing. Nothing has been sent, no broker outcome is returned and the
+    /// call never waits.
+    ///
+    /// **Lifetime.** Counted from commit, and judged when the host reaches the
+    /// message to send it: what is left is sent as the MQTT 5 Message Expiry
+    /// Interval, and a message reached past its lifetime is not sent. A
+    /// message already handed to the MQTT library when the connection is lost
+    /// may be sent after its lifetime when the client reconnects. `forever` is
+    /// bounded by the client's egress window, where the oldest messages are
+    /// dropped first.
+    ///
+    /// **The status port.** `status-port` names a port this component's
+    /// specification declares `out` or `io`. Declared and wired: the host
+    /// reports on the wired channel. Declared and left unwired by the
+    /// deployer: the publish is admitted and its statuses go nowhere. Not
+    /// declared `out` or `io`: the activation traps. Naming a port costs none
+    /// of that port's publish budget. A failure reported on the status port
+    /// is logged and not alerted to the operator, a broker's rejection
+    /// excepted.
+    ///
+    /// **Statuses and their order.** `handed` when the message goes to the
+    /// MQTT library, then one outcome: `delivered`, `rejected`, `expired`,
+    /// `unknown` or `dropped`. `expired` and `dropped` can come with no
+    /// `handed`; an outcome can come without its `handed`; a `handed` can
+    /// come twice; a message the egress window dropped before it was reached
+    /// gets nothing; not every publish gets an outcome. `rejected` is the
+    /// broker's refusal or a packet over the broker's maximum, and does not
+    /// say the broker never took the message. A broker that stays connected
+    /// and never answers leaves a `handed` with no outcome for as long as the
+    /// connection lasts.
+    ///
+    /// **A `handed` with no outcome** is either still in flight or lost to an
+    /// unclean restart. A `restarted` status for its client on the same port,
+    /// after it, says the second. Without one, the client's connection-state
+    /// channel (`brenn:mqtt-connection.<client>`, read on an `in` port the
+    /// deployer binds) settles it: a `handed` published before the newest
+    /// state's `previous-session.found-at-ms` will never have an outcome.
+    ///
+    /// **Matching.** A status is from sender `system:delivery-status` and
+    /// concerns this component only if its `message-id` is one this
+    /// component's publishes returned: other publishers may name the same
+    /// channel, and the component may publish there itself. A status binding
+    /// too shallow for the statuses owed between activations hands over only
+    /// the newest; a missing status is proof of nothing.
+    ///
+    /// **The reply topic.** `reply-topic` is a bare topic on `client`, never
+    /// an address: a concrete topic name with no wildcard that the consumer's
+    /// `mqtt_publish` ACL admits on `client`.
+    ///
+    /// Existing components compiled without this import keep working; a
+    /// component that imports it does not link on a host that predates it.
+    mqtt-publish-tracked: func(
+        client: string,
+        topic: string,
+        payload: list<u8>,
+        options: tracked-publish-options,
+    ) -> result<string, tracked-publish-error>;
 }
 
 interface calls {

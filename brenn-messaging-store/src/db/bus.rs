@@ -53,6 +53,7 @@ pub fn insert_message(
     let tx = conn.unchecked_transaction().expect("messaging: begin tx");
     let result = insert_message_in_tx(
         &tx,
+        None,
         channel_uuid,
         source,
         sender,
@@ -80,11 +81,15 @@ pub fn insert_message(
 /// called [`HeldAttachments::make_durable`] and, once the transaction commits,
 /// calls [`HeldAttachments::confirm_adopted`].
 ///
+/// The row's id is `message_id` when the caller minted one, and a fresh
+/// version-4 UUID otherwise.
+///
 /// Used by the `Messenger`, which batches messages into one outer transaction
 /// and is the one writer of `transport`; other callers use `insert_message`.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_message_in_tx(
     tx: &rusqlite::Transaction<'_>,
+    message_id: Option<Uuid>,
     channel_uuid: Uuid,
     source: &str,
     sender: &str,
@@ -100,7 +105,7 @@ pub fn insert_message_in_tx(
     publish_ts_ns: i64,
 ) -> InsertedMessage {
     let now = format_ts_for_db(Utc::now());
-    let uuid = Uuid::new_v4();
+    let uuid = message_id.unwrap_or_else(Uuid::new_v4);
     let uuid_bytes = uuid.as_bytes().to_vec();
     let channel_bytes = channel_uuid.as_bytes().to_vec();
     let reply_to_bytes = reply_to_uuid.map(|u| u.as_bytes().to_vec());

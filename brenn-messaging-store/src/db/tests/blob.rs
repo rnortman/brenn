@@ -432,6 +432,7 @@ async fn a_rolled_back_insert_leaves_a_blob_the_next_reap_collects() {
         let tx = conn.unchecked_transaction().unwrap();
         insert_message_in_tx(
             &tx,
+            None,
             f.channel,
             "node",
             "alice",

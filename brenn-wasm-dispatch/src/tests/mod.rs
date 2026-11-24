@@ -887,6 +887,8 @@ mod mount;
 #[cfg(test)]
 mod mqtt;
 #[cfg(test)]
+mod mqtt_tracked;
+#[cfg(test)]
 mod multiport;
 #[cfg(test)]
 mod non_text;

@@ -244,6 +244,25 @@ not call it imports nothing new, so a bundle built before it links as it did.
 One that calls it needs a brenn that serves it, by the same ordering rule as
 `calls`. `brenn-guest` reaches it through `provides::open_request_attachment`.
 
+A fifth additive change in force: **`mqtt-publish-tracked`**, a new function
+in the existing `brenn:processor/mqtt@0.1.0` interface, beside
+`mqtt-publish` and `mqtt-publish-expiring`, which keep their shapes and their
+behaviour. It states a required lifetime (`message-lifetime`: a number of
+seconds, or `forever`), and optionally one of the component's own `out` or
+`io` ports as its status port and a bare reply topic on the same client, in
+the record `tracked-publish-options`; it answers with the message's id, the
+`message_id` of every delivery status about it, or with
+`tracked-publish-error`, a variant of its own. It took the route
+`mqtt-publish-expiring` took: no package version bump and no new grant word,
+and no existing type or function changed. A component that does not call it
+imports nothing new, so a bundle built before it links as it did. One that
+calls it needs a brenn that serves it, by the same ordering rule as `calls`.
+A WIT record cannot gain a field, so a further option reaches components the
+same way, as another function beside these. `brenn-guest` reaches it through
+`mqtt::publish_tracked`, reads the statuses with `delivery::read` and the
+client's connection state with `mqtt::connection::read`, and names message ids
+as `brenn_guest::uuid::Uuid`.
+
 **Blobs and tool calls.** An asynchronous tool call carries named
 attachments by reference in both directions. Three functions of `blobs` are
 the forms that do, each taking a list of `(name, blob)` pairs as

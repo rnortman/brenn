@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use tracing::{debug, error, info, trace, warn};
+use uuid::Uuid;
 
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable, bindgen};
 use wasmtime::{Config, Engine, EngineWeak, Store, StoreLimits, StoreLimitsBuilder, WasmFeatures};
@@ -677,8 +678,8 @@ mod processor_bindings {
         with: {
             "brenn:processor/store.transaction": crate::store::Transaction,
         },
-        // `ports`, `calls` and `provides` are the imports that can end an
-        // activation rather than answer it: naming a port the component's
+        // `ports`, `calls`, `provides` and `mqtt` are the imports that can end
+        // an activation rather than answer it: naming a port the component's
         // specification does not declare, or completing more requests than any
         // provider can hold, is a contract violation, and the host traps
         // instead of refusing call by call. Every other interface keeps the
@@ -687,6 +688,7 @@ mod processor_bindings {
             "brenn:processor/ports": trappable,
             "brenn:processor/calls": trappable,
             "brenn:processor/provides": trappable,
+            "brenn:processor/mqtt": trappable,
         },
     });
 }
@@ -757,6 +759,10 @@ pub use blobs::{BlobHost, BlobHostFn};
 use processor_bindings::ProcessorPre;
 use processor_bindings::brenn::processor::calls::CallError as CallWitError;
 use processor_bindings::brenn::processor::mqtt::MqttPublishError as MqttPublishWitError;
+use processor_bindings::brenn::processor::mqtt::{
+    MessageLifetime as MessageLifetimeWit, TrackedPublishError as TrackedPublishWitError,
+    TrackedPublishOptions as TrackedPublishWitOptions,
+};
 use processor_bindings::brenn::processor::ports::DeferError;
 use processor_bindings::brenn::processor::ports::PublishError;
 use processor_bindings::brenn::processor::provides::CompleteError as CompleteWitError;
@@ -800,22 +806,61 @@ pub trait ProcessorAlerter: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MqttAdmission {
     /// The publish may be made; the host buffers it with the activation.
-    Admitted,
+    /// `response_topic` is the bare reply topic the admission parsed out of
+    /// the stated reply address: `Some` exactly when `reply_topic` was stated.
+    Admitted { response_topic: Option<String> },
     /// The consumer's publish ACL does not admit the target.
     NotPermitted,
     /// The payload or its properties break a rule of the target client.
     /// Diagnostic string.
     InvalidPayload(String),
+    /// The stated reply topic is well formed and outside the consumer's MQTT
+    /// publish ACL.
+    ReplyTopicNotPermitted,
+    /// The channel named as `status_to` cannot take this consumer's delivery
+    /// statuses. `cause` is for the operator's log, never the guest.
+    StatusChannelRefused { cause: StatusChannelRefusal },
 }
 
-/// The per-publish MQTT properties a guest supplies, as received over the WIT
-/// boundary.
+/// Why a wired status channel cannot take a consumer's delivery statuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusChannelRefusal {
+    /// Not a plain `brenn:` channel: another scheme, or a name outside the
+    /// characters a `brenn:` status channel may use.
+    NotPlainBrenn,
+    /// The consumer's `brenn:` publish ACL does not cover it.
+    NotCovered,
+    /// The channel directory does not hold it.
+    NotInDirectory,
+}
+
+impl std::fmt::Display for StatusChannelRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotPlainBrenn => "not a plain `brenn:` channel",
+            Self::NotCovered => "not covered by the component's `brenn:` publish ACL",
+            Self::NotInDirectory => "not in the channel directory",
+        })
+    }
+}
+
+/// How long the host keeps an MQTT message it has not yet sent, counted from
+/// commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MqttPublishLifetime {
+    /// Kept until sent.
+    Forever,
+    /// Kept this many seconds; `do_mqtt_publish` refuses zero before the
+    /// callback runs.
+    Seconds(u32),
+}
+
+/// The per-publish MQTT properties of a guest's publish, as the host hands
+/// them to the [`MqttPublisher`] seam.
 ///
 /// Like [`MqttAdmission`], this is the `brenn-wasm`-local shape at the
-/// [`MqttPublisher`] seam; the host maps it onto the bus's own publish
-/// options. `Default` is QoS 0, not retained, with no content type
-/// and no expiry.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// seam; the host maps it onto the bus's own publish options.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttPublishProps {
     /// MQTT 5 content type; `None` sends none.
     pub content_type: Option<String>,
@@ -824,9 +869,16 @@ pub struct MqttPublishProps {
     pub qos: u8,
     /// Whether the broker retains the message.
     pub retain: bool,
-    /// MQTT 5 message-expiry interval in seconds: `None` for `mqtt-publish`,
-    /// a non-zero `Some` for `mqtt-publish-expiring`.
-    pub message_expiry_s: Option<u32>,
+    /// `Forever` for `mqtt-publish`, `Seconds` for `mqtt-publish-expiring`,
+    /// as stated for `mqtt-publish-tracked`.
+    pub lifetime: MqttPublishLifetime,
+    /// The address of the channel the deployer wired to the guest's status
+    /// port, resolved by the host; `None` when no status port was named or
+    /// the named one is unwired.
+    pub status_to: Option<String>,
+    /// The reply topic as the guest stated it, a bare topic on the publish's
+    /// own client.
+    pub reply_topic: Option<String>,
 }
 
 /// Where a guest's MQTT publish goes, as the host's address parser resolved it
@@ -1659,10 +1711,16 @@ pub struct ProcessorPublish {
 /// Where a buffered `mqtt` publish goes and with what MQTT properties.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessorMqttPublish {
+    /// The id the message is committed under, minted at the call.
+    pub message_id: Uuid,
     /// The client and topic the host's parser resolved.
     pub target: MqttTarget,
-    /// The guest's QoS, retain flag, content type and message expiry.
+    /// The guest's QoS, retain flag, content type and lifetime, and the
+    /// host-resolved `status_to`.
     pub props: MqttPublishProps,
+    /// The bare reply topic the admission parsed, sent as the MQTT 5 Response
+    /// Topic.
+    pub response_topic: Option<String>,
 }
 
 /// One buffered deferred-message control op from a guest activation.
@@ -2641,8 +2699,9 @@ impl ProcessorData {
         )
     }
 
-    /// One MQTT publish (the `mqtt.mqtt-publish` import, and
-    /// `mqtt.mqtt-publish-expiring` with `message_expiry_s` set).
+    /// One MQTT publish: the `mqtt-publish`, `mqtt-publish-expiring` and
+    /// `mqtt-publish-tracked` imports share this body. Answers the id the
+    /// buffered entry carries.
     ///
     /// Buffered like `do_publish`: an admitted publish joins the activation's
     /// publish buffer as an entry for the client's egress channel, committed
@@ -2650,46 +2709,66 @@ impl ProcessorData {
     /// err or trap. The call returns the host's decision and never waits on a
     /// broker.
     ///
-    /// Order: the shared call ceiling; the argument checks and the body cap;
-    /// resolving the client; the client's bucket, charged on attempt; the
-    /// host's admission; the buffered-entry ceiling and the byte aggregate.
-    /// Each refusal buffers nothing.
+    /// Order: the shared call ceiling; the status port, when one is named; the
+    /// argument checks and the body cap; resolving the client; the client's
+    /// bucket, charged on attempt; the host's admission; the buffered-entry
+    /// ceiling and the byte aggregate. Each refusal buffers nothing and mints
+    /// no id. The status port is judged by `do_publish`'s three-way rule: a
+    /// wired port names its channel as `status_to`, a declared port the
+    /// deployer left unwired names none, and a name the specification does not
+    /// declare `out` or `io` takes the outer `Err` and traps the activation.
     fn do_mqtt_publish(
         &mut self,
         client: String,
         topic: String,
         payload: Vec<u8>,
-        props: MqttPublishProps,
-    ) -> Result<(), MqttPublishWitError> {
+        publish: GuestMqttPublish,
+    ) -> wasmtime::Result<Result<Uuid, MqttPublishRefusal>> {
         // Per-activation total-call budget, shared with `do_publish`. Bumped and
         // checked first (anti-flood) — a failed call consumes budget too, exactly
-        // as in `do_publish`.
+        // as in `do_publish`, and a guest looping on an undeclared status port
+        // cannot escape the bound by trapping.
         if self.gate.charge_call().is_err() {
-            return Err(MqttPublishWitError::QuotaExceeded);
+            return Ok(Err(MqttPublishRefusal::QuotaExceeded));
         }
+
+        let status_to = match publish.status_port.as_deref() {
+            None => None,
+            Some(port) => match self.output_ports.get(port) {
+                Some(spec) => Some(spec.channel_address.clone()),
+                None if self.declared_out_ports.contains(port) => None,
+                None => return Err(undeclared_port_trap(&self.slug, port)),
+            },
+        };
+        let props = MqttPublishProps {
+            content_type: publish.content_type,
+            qos: publish.qos,
+            retain: publish.retain,
+            lifetime: publish.lifetime,
+            status_to,
+            reply_topic: publish.reply_topic,
+        };
 
         // Malformed guest input is a permanent `invalid-payload`. The WIT qos
         // type is `u8` but only 0/1/2 are valid.
         if props.qos > 2 {
-            return Err(MqttPublishWitError::InvalidPayload(format!(
+            return Ok(Err(MqttPublishRefusal::InvalidPayload(format!(
                 "invalid qos {}: must be 0, 1, or 2",
                 props.qos
-            )));
+            ))));
         }
-        // A zero expiry interval would have the message expire on commit; it is
-        // a guest bug, refused as permanent.
-        if props.message_expiry_s == Some(0) {
-            return Err(MqttPublishWitError::InvalidPayload(
-                "message-expiry-s must be at least 1".to_string(),
-            ));
+        // A zero lifetime would have the message expire on commit; it is a
+        // guest bug, refused as permanent.
+        if props.lifetime == MqttPublishLifetime::Seconds(0) {
+            return Ok(Err(MqttPublishRefusal::ZeroLifetime));
         }
         // The payload becomes a bus message body, so it takes the bus body cap.
         let max_payload_bytes = self.gate.max_body_bytes();
         if payload.len() > max_payload_bytes {
-            return Err(MqttPublishWitError::InvalidPayload(format!(
+            return Ok(Err(MqttPublishRefusal::InvalidPayload(format!(
                 "payload {} bytes exceeds max {max_payload_bytes}",
                 payload.len(),
-            )));
+            ))));
         }
 
         // The callback is `Some` iff the `Mqtt` capability is linked (the host fn
@@ -2705,7 +2784,7 @@ impl ProcessorData {
         // charged per client below is keyed on it, not on the guest's text.
         let target = match publisher.resolve(&client, &topic) {
             Ok(target) => target,
-            Err(reason) => return Err(MqttPublishWitError::InvalidPayload(reason)),
+            Err(reason) => return Ok(Err(MqttPublishRefusal::InvalidPayload(reason))),
         };
 
         // Per-sink token-bucket budget, keyed by the resolved client and charged
@@ -2716,11 +2795,11 @@ impl ProcessorData {
         let sink_key = SinkKey::MqttClient(target.client.clone());
         if self.gate.charge_sink_on_attempt(&sink_key).is_err() {
             *self.publish_suppressed_by_sink.entry(sink_key).or_insert(0) += 1;
-            return Err(MqttPublishWitError::QuotaExceeded);
+            return Ok(Err(MqttPublishRefusal::QuotaExceeded));
         }
 
-        match publisher.admit(&target, payload.len(), &props) {
-            MqttAdmission::Admitted => {}
+        let response_topic = match publisher.admit(&target, payload.len(), &props) {
+            MqttAdmission::Admitted { response_topic } => response_topic,
             MqttAdmission::NotPermitted => {
                 // Security-relevant: an operator policy actively blocking a WASM
                 // publish. ACL denials must be logged on both the WASM and LLM
@@ -2731,12 +2810,43 @@ impl ProcessorData {
                     topic = %cap_guest_for_log(&topic),
                     "wasm mqtt-publish: not-permitted — target outside the publish ACL"
                 );
-                return Err(MqttPublishWitError::NotPermitted);
+                return Ok(Err(MqttPublishRefusal::NotPermitted));
             }
             MqttAdmission::InvalidPayload(reason) => {
-                return Err(MqttPublishWitError::InvalidPayload(reason));
+                return Ok(Err(MqttPublishRefusal::InvalidPayload(reason)));
             }
-        }
+            MqttAdmission::ReplyTopicNotPermitted => {
+                warn!(
+                    slug = %self.slug,
+                    client = %cap_guest_for_log(&client),
+                    reply_topic = %cap_guest_for_log(props.reply_topic.as_deref().unwrap_or("")),
+                    "wasm mqtt-publish: reply-topic-not-permitted — reply topic outside the \
+                     publish ACL"
+                );
+                return Ok(Err(MqttPublishRefusal::ReplyTopicNotPermitted));
+            }
+            MqttAdmission::StatusChannelRefused { cause } => {
+                // The channel is host-resolved from the deployer's binding, so it
+                // is logged verbatim; the port name is the guest's.
+                warn!(
+                    slug = %self.slug,
+                    port = %cap_guest_for_log(publish.status_port.as_deref().unwrap_or("")),
+                    channel = %props.status_to.as_deref().unwrap_or(""),
+                    cause = %cause,
+                    "wasm mqtt-publish: status-port-unusable — the wired channel cannot take \
+                     this component's delivery statuses"
+                );
+                return Ok(Err(MqttPublishRefusal::StatusChannelRefused));
+            }
+        };
+        assert_eq!(
+            response_topic.is_some(),
+            props.reply_topic.is_some(),
+            "consumer {}: mqtt admission answered a response topic {response_topic:?} for a \
+             stated reply topic {:?} (host bug)",
+            self.slug,
+            props.reply_topic.as_deref().map(cap_guest_for_log),
+        );
 
         // MQTT entries ride the entry ceiling and the byte aggregate with the
         // port publishes; buffered async tool requests travel as the addend.
@@ -2745,9 +2855,10 @@ impl ProcessorData {
             .admit_buffered(payload.len(), self.tool_request_buffer.len())
             .is_err()
         {
-            return Err(MqttPublishWitError::QuotaExceeded);
+            return Ok(Err(MqttPublishRefusal::QuotaExceeded));
         }
 
+        let message_id = Uuid::new_v4();
         let body = MessageBody::carrying(props.content_type.as_deref(), &payload);
         self.publish_buffer.push(ProcessorPublish {
             port: MQTT_PUBLISH_LOG_PORT.to_string(),
@@ -2757,9 +2868,93 @@ impl ProcessorData {
             reply_to: None,
             deliver_after: None,
             attachments: HeldAttachments::none(),
-            mqtt: Some(ProcessorMqttPublish { target, props }),
+            mqtt: Some(ProcessorMqttPublish {
+                message_id,
+                target,
+                props,
+                response_topic,
+            }),
         });
-        Ok(())
+        Ok(Ok(message_id))
+    }
+}
+
+/// An MQTT publish as the guest made it, before any check has run. The status
+/// port is the guest's name; `do_mqtt_publish` resolves it to a channel.
+struct GuestMqttPublish {
+    content_type: Option<String>,
+    qos: u8,
+    retain: bool,
+    lifetime: MqttPublishLifetime,
+    status_port: Option<String>,
+    reply_topic: Option<String>,
+}
+
+impl GuestMqttPublish {
+    /// A legacy publish: no status port, no reply topic.
+    fn legacy(
+        content_type: Option<String>,
+        qos: u8,
+        retain: bool,
+        lifetime: MqttPublishLifetime,
+    ) -> Self {
+        Self {
+            content_type,
+            qos,
+            retain,
+            lifetime,
+            status_port: None,
+            reply_topic: None,
+        }
+    }
+}
+
+/// Why an MQTT publish was refused, in the host's own terms; each function
+/// spells it as its own error variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MqttPublishRefusal {
+    NotPermitted,
+    InvalidPayload(String),
+    /// A lifetime of zero seconds.
+    ZeroLifetime,
+    QuotaExceeded,
+    ReplyTopicNotPermitted,
+    StatusChannelRefused,
+}
+
+impl MqttPublishRefusal {
+    /// The refusal as `mqtt-publish` and `mqtt-publish-expiring` spell it.
+    ///
+    /// # Panics
+    ///
+    /// On a reply-topic or status-port refusal: a legacy call states neither.
+    fn into_legacy(self) -> MqttPublishWitError {
+        match self {
+            Self::NotPermitted => MqttPublishWitError::NotPermitted,
+            Self::InvalidPayload(why) => MqttPublishWitError::InvalidPayload(why),
+            Self::ZeroLifetime => {
+                MqttPublishWitError::InvalidPayload("message-expiry-s must be at least 1".into())
+            }
+            Self::QuotaExceeded => MqttPublishWitError::QuotaExceeded,
+            Self::ReplyTopicNotPermitted | Self::StatusChannelRefused => panic!(
+                "host invariant: a legacy mqtt publish drew {self:?}, and it states no reply \
+                 topic and no status port"
+            ),
+        }
+    }
+
+    /// The refusal as `mqtt-publish-tracked` spells it.
+    fn into_tracked(self) -> TrackedPublishWitError {
+        match self {
+            Self::NotPermitted => TrackedPublishWitError::NotPermitted,
+            Self::InvalidPayload(why) => TrackedPublishWitError::InvalidPublish(why),
+            Self::ZeroLifetime => {
+                TrackedPublishWitError::InvalidPublish("lifetime seconds must be at least 1".into())
+            }
+            Self::QuotaExceeded => TrackedPublishWitError::QuotaExceeded,
+            Self::ReplyTopicNotPermitted => TrackedPublishWitError::ReplyTopicNotPermitted,
+            Self::StatusChannelRefused => TrackedPublishWitError::StatusPortUnusable,
+        }
     }
 }
 
@@ -3050,18 +3245,13 @@ impl processor_bindings::brenn::processor::mqtt::Host for ProcessorData {
         content_type: Option<String>,
         qos: u8,
         retain: bool,
-    ) -> Result<(), MqttPublishWitError> {
-        self.do_mqtt_publish(
-            client,
-            topic,
-            payload,
-            MqttPublishProps {
-                content_type,
-                qos,
-                retain,
-                message_expiry_s: None,
-            },
-        )
+    ) -> wasmtime::Result<Result<(), MqttPublishWitError>> {
+        let publish =
+            GuestMqttPublish::legacy(content_type, qos, retain, MqttPublishLifetime::Forever);
+        Ok(self
+            .do_mqtt_publish(client, topic, payload, publish)?
+            .map(drop)
+            .map_err(MqttPublishRefusal::into_legacy))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3074,18 +3264,42 @@ impl processor_bindings::brenn::processor::mqtt::Host for ProcessorData {
         qos: u8,
         retain: bool,
         message_expiry_s: u32,
-    ) -> Result<(), MqttPublishWitError> {
-        self.do_mqtt_publish(
-            client,
-            topic,
-            payload,
-            MqttPublishProps {
-                content_type,
-                qos,
-                retain,
-                message_expiry_s: Some(message_expiry_s),
-            },
-        )
+    ) -> wasmtime::Result<Result<(), MqttPublishWitError>> {
+        let publish = GuestMqttPublish::legacy(
+            content_type,
+            qos,
+            retain,
+            MqttPublishLifetime::Seconds(message_expiry_s),
+        );
+        Ok(self
+            .do_mqtt_publish(client, topic, payload, publish)?
+            .map(drop)
+            .map_err(MqttPublishRefusal::into_legacy))
+    }
+
+    fn mqtt_publish_tracked(
+        &mut self,
+        client: String,
+        topic: String,
+        payload: Vec<u8>,
+        options: TrackedPublishWitOptions,
+    ) -> wasmtime::Result<Result<String, TrackedPublishWitError>> {
+        let lifetime = match options.lifetime {
+            MessageLifetimeWit::Seconds(s) => MqttPublishLifetime::Seconds(s),
+            MessageLifetimeWit::Forever => MqttPublishLifetime::Forever,
+        };
+        let publish = GuestMqttPublish {
+            content_type: options.content_type,
+            qos: options.qos,
+            retain: options.retain,
+            lifetime,
+            status_port: options.status_port,
+            reply_topic: options.reply_topic,
+        };
+        Ok(self
+            .do_mqtt_publish(client, topic, payload, publish)?
+            .map(|id| id.to_string())
+            .map_err(MqttPublishRefusal::into_tracked))
     }
 }
 
@@ -6396,10 +6610,67 @@ mod processor_store_host_tests {
         })
     }
 
-    fn mqtt_qos1() -> MqttPublishProps {
-        MqttPublishProps {
+    /// A legacy `mqtt-publish` at QoS 1.
+    fn mqtt_qos1() -> GuestMqttPublish {
+        GuestMqttPublish::legacy(None, 1, false, MqttPublishLifetime::Forever)
+    }
+
+    /// An admission that admits and parsed no reply topic.
+    fn admitted() -> MqttAdmission {
+        MqttAdmission::Admitted {
+            response_topic: None,
+        }
+    }
+
+    /// The legacy imports' view of `do_mqtt_publish`: a call that must not
+    /// trap, answered in `mqtt-publish-error`.
+    trait LegacyMqtt {
+        fn legacy_mqtt(
+            &mut self,
+            client: String,
+            topic: String,
+            payload: Vec<u8>,
+            publish: GuestMqttPublish,
+        ) -> Result<(), MqttPublishWitError>;
+    }
+
+    impl LegacyMqtt for ProcessorData {
+        fn legacy_mqtt(
+            &mut self,
+            client: String,
+            topic: String,
+            payload: Vec<u8>,
+            publish: GuestMqttPublish,
+        ) -> Result<(), MqttPublishWitError> {
+            self.do_mqtt_publish(client, topic, payload, publish)
+                .expect("a legacy publish never traps")
+                .map(drop)
+                .map_err(MqttPublishRefusal::into_legacy)
+        }
+    }
+
+    /// `do_mqtt_publish` for `mqtt-publish-tracked`, answered in its error
+    /// variant; the outer `Err` is the trap.
+    fn tracked(
+        data: &mut ProcessorData,
+        topic: &str,
+        publish: GuestMqttPublish,
+    ) -> wasmtime::Result<Result<Uuid, TrackedPublishWitError>> {
+        Ok(data
+            .do_mqtt_publish("home".into(), topic.into(), b"p".to_vec(), publish)?
+            .map_err(MqttPublishRefusal::into_tracked))
+    }
+
+    /// A tracked publish at QoS 1, kept 60 seconds, naming `status_port` and
+    /// `reply_topic`.
+    fn tracked_publish(status_port: Option<&str>, reply_topic: Option<&str>) -> GuestMqttPublish {
+        GuestMqttPublish {
+            content_type: None,
             qos: 1,
-            ..Default::default()
+            retain: false,
+            lifetime: MqttPublishLifetime::Seconds(60),
+            status_port: status_port.map(str::to_owned),
+            reply_topic: reply_topic.map(str::to_owned),
         }
     }
 
@@ -6458,19 +6729,26 @@ mod processor_store_host_tests {
     /// the body; nothing waits, so nothing is credited to `blocked`.
     #[test]
     fn an_admitted_publish_buffers_one_entry_for_the_egress_channel() {
-        let mut data = make_mqtt_data(MqttAdmission::Admitted);
-        let seen = script_mqtt(&mut data, resolve_unchanged, MqttAdmission::Admitted);
+        let mut data = make_mqtt_data(admitted());
+        let seen = script_mqtt(&mut data, resolve_unchanged, admitted());
         let props = MqttPublishProps {
             content_type: Some("application/json".into()),
             qos: 2,
             retain: true,
-            message_expiry_s: None,
+            lifetime: MqttPublishLifetime::Forever,
+            status_to: None,
+            reply_topic: None,
         };
-        data.do_mqtt_publish(
+        data.legacy_mqtt(
             "home".into(),
             "sensors/temp".into(),
             br#"{"c":21}"#.to_vec(),
-            props.clone(),
+            GuestMqttPublish::legacy(
+                Some("application/json".into()),
+                2,
+                true,
+                MqttPublishLifetime::Forever,
+            ),
         )
         .expect("admitted");
 
@@ -6495,13 +6773,10 @@ mod processor_store_host_tests {
         assert_eq!(entry.urgency, ProcessorUrgency::Normal);
         assert_eq!(entry.reply_to, None);
         assert_eq!(entry.deliver_after, None);
-        assert_eq!(
-            entry.mqtt,
-            Some(ProcessorMqttPublish {
-                target,
-                props: props.clone()
-            })
-        );
+        let mqtt = entry.mqtt.as_ref().expect("an mqtt entry");
+        assert_eq!(mqtt.target, target);
+        assert_eq!(mqtt.props, props);
+        assert_eq!(mqtt.response_topic, None);
         assert_eq!(data.gate.entries(), 1);
         assert_eq!(data.gate.bytes(), 8);
         assert_eq!(data.blocked, std::time::Duration::ZERO);
@@ -6511,22 +6786,22 @@ mod processor_store_host_tests {
     /// payload its content type cannot hold is carried as octet-stream.
     #[test]
     fn an_expiring_publish_carries_its_interval() {
-        let mut data = make_mqtt_data(MqttAdmission::Admitted);
-        data.do_mqtt_publish(
+        let mut data = make_mqtt_data(admitted());
+        data.legacy_mqtt(
             "home".into(),
             "t".into(),
             vec![0xff, 0xfe],
-            MqttPublishProps {
-                content_type: Some("text/plain".into()),
-                qos: 1,
-                retain: false,
-                message_expiry_s: Some(90),
-            },
+            GuestMqttPublish::legacy(
+                Some("text/plain".into()),
+                1,
+                false,
+                MqttPublishLifetime::Seconds(90),
+            ),
         )
         .expect("admitted");
         let entry = &data.publish_buffer[0];
         let mqtt = entry.mqtt.as_ref().expect("an mqtt entry");
-        assert_eq!(mqtt.props.message_expiry_s, Some(90));
+        assert_eq!(mqtt.props.lifetime, MqttPublishLifetime::Seconds(90));
         assert_eq!(
             mqtt.props.content_type.as_deref(),
             Some("text/plain"),
@@ -6539,7 +6814,7 @@ mod processor_store_host_tests {
     /// MQTT entries and port publishes share one buffer in call order.
     #[test]
     fn mqtt_entries_and_port_publishes_keep_call_order() {
-        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        let mut data = make_mqtt_data(admitted());
         bind_ports(
             &mut data,
             HashMap::from([("out".to_string(), test_out_spec("brenn:out"))]),
@@ -6548,11 +6823,11 @@ mod processor_store_host_tests {
             1024,
             HashMap::from([(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT)]),
         );
-        data.do_mqtt_publish("home".into(), "a".into(), b"1".to_vec(), mqtt_qos1())
+        data.legacy_mqtt("home".into(), "a".into(), b"1".to_vec(), mqtt_qos1())
             .expect("mqtt 1");
         data.do_publish_declared("out".to_string(), "2".to_string(), None, None)
             .expect("port");
-        data.do_mqtt_publish("office".into(), "b".into(), b"3".to_vec(), mqtt_qos1())
+        data.legacy_mqtt("office".into(), "b".into(), b"3".to_vec(), mqtt_qos1())
             .expect("mqtt 2");
         let order: Vec<(&str, &[u8])> = data
             .publish_buffer
@@ -6583,7 +6858,7 @@ mod processor_store_host_tests {
             HashMap::from([(SinkKey::MqttClient("blocked-client".to_string()), 5000u64)]),
         );
         assert!(matches!(
-            np.do_mqtt_publish("blocked-client".into(), "t".into(), vec![], mqtt_qos1()),
+            np.legacy_mqtt("blocked-client".into(), "t".into(), vec![], mqtt_qos1()),
             Err(MqttPublishWitError::NotPermitted)
         ));
         assert!(np.publish_buffer.is_empty());
@@ -6598,7 +6873,7 @@ mod processor_store_host_tests {
         assert!(logs_contain("blocked-client"));
 
         let mut ip = make_mqtt_data(MqttAdmission::InvalidPayload("bad content type".into()));
-        match ip.do_mqtt_publish("home".into(), "t".into(), vec![1], mqtt_qos1()) {
+        match ip.legacy_mqtt("home".into(), "t".into(), vec![1], mqtt_qos1()) {
             Err(MqttPublishWitError::InvalidPayload(s)) => assert_eq!(s, "bad content type"),
             other => panic!("expected invalid-payload, got {other:?}"),
         }
@@ -6620,12 +6895,12 @@ mod processor_store_host_tests {
         let seen = script_mqtt(&mut data, resolve_unchanged, MqttAdmission::NotPermitted);
         for _ in 0..2 {
             assert!(matches!(
-                data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+                data.legacy_mqtt("home".into(), "t".into(), vec![], mqtt_qos1()),
                 Err(MqttPublishWitError::NotPermitted)
             ));
         }
         assert!(matches!(
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+            data.legacy_mqtt("home".into(), "t".into(), vec![], mqtt_qos1()),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
         assert_eq!(
@@ -6644,9 +6919,9 @@ mod processor_store_host_tests {
     /// governs it.
     #[test]
     fn a_client_with_no_bucket_is_unmetered() {
-        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        let mut data = make_mqtt_data(admitted());
         for _ in 0..50 {
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1())
+            data.legacy_mqtt("home".into(), "t".into(), vec![], mqtt_qos1())
                 .expect("no per-sink limit when the client has no bucket");
         }
         assert!(data.publish_suppressed_by_sink.is_empty());
@@ -6656,16 +6931,16 @@ mod processor_store_host_tests {
     /// Spellings that resolve to one client share its one token bucket.
     #[test]
     fn spellings_of_one_client_share_its_token_bucket() {
-        let mut data = make_mqtt_data(MqttAdmission::Admitted);
-        script_mqtt(&mut data, resolve_all_to_home, MqttAdmission::Admitted);
+        let mut data = make_mqtt_data(admitted());
+        script_mqtt(&mut data, resolve_all_to_home, admitted());
         data.gate = ActivationGate::new(
             1024,
             HashMap::from([(SinkKey::MqttClient("home".to_string()), 1000u64)]),
         );
-        data.do_mqtt_publish("home:a".into(), "b".into(), vec![1], mqtt_qos1())
+        data.legacy_mqtt("home:a".into(), "b".into(), vec![1], mqtt_qos1())
             .expect("the bucket's one token");
         assert!(matches!(
-            data.do_mqtt_publish("home:x".into(), "b".into(), vec![1], mqtt_qos1()),
+            data.legacy_mqtt("home:x".into(), "b".into(), vec![1], mqtt_qos1()),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
         assert_eq!(
@@ -6682,13 +6957,13 @@ mod processor_store_host_tests {
         fn refuse(_client: &str, _topic: &str) -> Result<MqttTarget, String> {
             Err("bad address".to_string())
         }
-        let mut data = make_mqtt_data(MqttAdmission::Admitted);
-        let seen = script_mqtt(&mut data, refuse, MqttAdmission::Admitted);
+        let mut data = make_mqtt_data(admitted());
+        let seen = script_mqtt(&mut data, refuse, admitted());
         data.gate = ActivationGate::new(
             1024,
             HashMap::from([(SinkKey::MqttClient("home".to_string()), 1000u64)]),
         );
-        match data.do_mqtt_publish("home".into(), "t/#".into(), vec![1], mqtt_qos1()) {
+        match data.legacy_mqtt("home".into(), "t/#".into(), vec![1], mqtt_qos1()) {
             Err(MqttPublishWitError::InvalidPayload(text)) => assert_eq!(text, "bad address"),
             other => panic!("expected invalid-payload, got {other:?}"),
         }
@@ -6708,47 +6983,31 @@ mod processor_store_host_tests {
     /// accepted.
     #[test]
     fn argument_checks_refuse_before_the_seam() {
-        let cases: [(MqttPublishProps, usize, &str); 3] = [
+        let forever =
+            |qos| GuestMqttPublish::legacy(None, qos, false, MqttPublishLifetime::Forever);
+        let cases: [(GuestMqttPublish, usize, &str); 3] = [
+            (forever(3), 1, "invalid qos 3: must be 0, 1, or 2"),
             (
-                MqttPublishProps {
-                    qos: 3,
-                    ..Default::default()
-                },
+                GuestMqttPublish::legacy(None, 1, false, MqttPublishLifetime::Seconds(0)),
                 1,
-                "qos",
+                "message-expiry-s must be at least 1",
             ),
-            (
-                MqttPublishProps {
-                    qos: 1,
-                    message_expiry_s: Some(0),
-                    ..Default::default()
-                },
-                1,
-                "message-expiry-s",
-            ),
-            (MqttPublishProps::default(), 1025, "exceeds max"),
+            (forever(0), 1025, "payload 1025 bytes exceeds max 1024"),
         ];
         for (props, len, needle) in cases {
-            let mut data = make_mqtt_data(MqttAdmission::Admitted);
-            let seen = script_mqtt(&mut data, resolve_unchanged, MqttAdmission::Admitted);
-            match data.do_mqtt_publish("home".into(), "t".into(), vec![0u8; len], props) {
-                Err(MqttPublishWitError::InvalidPayload(s)) => {
-                    assert!(s.contains(needle), "{needle}: got {s:?}")
-                }
+            let mut data = make_mqtt_data(admitted());
+            let seen = script_mqtt(&mut data, resolve_unchanged, admitted());
+            match data.legacy_mqtt("home".into(), "t".into(), vec![0u8; len], props) {
+                Err(MqttPublishWitError::InvalidPayload(s)) => assert_eq!(s, needle),
                 other => panic!("{needle}: expected invalid-payload, got {other:?}"),
             }
             assert!(seen.lock().unwrap().is_empty(), "{needle}: seam reached");
             assert!(data.publish_buffer.is_empty());
             assert_eq!(data.gate.calls(), 1);
         }
-        let mut at_cap = make_mqtt_data(MqttAdmission::Admitted);
+        let mut at_cap = make_mqtt_data(admitted());
         at_cap
-            .do_mqtt_publish(
-                "home".into(),
-                "t".into(),
-                vec![0u8; 1024],
-                MqttPublishProps::default(),
-            )
+            .legacy_mqtt("home".into(), "t".into(), vec![0u8; 1024], forever(0))
             .expect("a payload exactly at the body cap is accepted");
     }
 
@@ -6772,14 +7031,14 @@ mod processor_store_host_tests {
         }
         for _ in half..MAX_PUBLISH_CALLS_PER_ACTIVATION {
             assert!(matches!(
-                data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+                data.legacy_mqtt("home".into(), "t".into(), vec![], mqtt_qos1()),
                 Err(MqttPublishWitError::NotPermitted)
             ));
         }
         assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
-        script_mqtt(&mut data, resolve_unchanged, MqttAdmission::Admitted);
+        script_mqtt(&mut data, resolve_unchanged, admitted());
         assert!(matches!(
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+            data.legacy_mqtt("home".into(), "t".into(), vec![], mqtt_qos1()),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
         assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION + 1);
@@ -6791,13 +7050,13 @@ mod processor_store_host_tests {
     /// `quota-exceeded`, and the gate's count and the buffer agree.
     #[test]
     fn the_buffered_entry_ceiling_bounds_mqtt_entries() {
-        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        let mut data = make_mqtt_data(admitted());
         for i in 0..MAX_PUBLISHES_PER_ACTIVATION {
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1())
+            data.legacy_mqtt("home".into(), "t".into(), vec![], mqtt_qos1())
                 .unwrap_or_else(|e| panic!("entry {i} under the ceiling, got {e:?}"));
         }
         assert!(matches!(
-            data.do_mqtt_publish("home".into(), "t".into(), vec![], mqtt_qos1()),
+            data.legacy_mqtt("home".into(), "t".into(), vec![], mqtt_qos1()),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
         assert_eq!(data.publish_buffer.len(), MAX_PUBLISHES_PER_ACTIVATION);
@@ -6812,19 +7071,249 @@ mod processor_store_host_tests {
     /// call is `quota-exceeded` and buffers nothing.
     #[test]
     fn the_byte_aggregate_bounds_mqtt_payloads() {
-        let mut data = make_mqtt_data(MqttAdmission::Admitted);
+        let mut data = make_mqtt_data(admitted());
         let chunk = MAX_PUBLISH_BYTES_PER_ACTIVATION / 4;
         data.gate = ActivationGate::new(chunk, HashMap::new());
         for _ in 0..4 {
-            data.do_mqtt_publish("home".into(), "t".into(), vec![0u8; chunk], mqtt_qos1())
+            data.legacy_mqtt("home".into(), "t".into(), vec![0u8; chunk], mqtt_qos1())
                 .expect("within the aggregate");
         }
         assert!(matches!(
-            data.do_mqtt_publish("home".into(), "t".into(), vec![0u8; 1], mqtt_qos1()),
+            data.legacy_mqtt("home".into(), "t".into(), vec![0u8; 1], mqtt_qos1()),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
         assert_eq!(data.publish_buffer.len(), 4);
         assert_eq!(data.gate.bytes(), MAX_PUBLISH_BYTES_PER_ACTIVATION);
+    }
+
+    /// The debug spelling of a tracked refusal, for comparison; the generated
+    /// error type has no `PartialEq`.
+    fn refused(answer: Result<Uuid, TrackedPublishWitError>) -> String {
+        format!("{:?}", answer.expect_err("refused"))
+    }
+
+    /// `make_mqtt_data` with `delivery` wired to `brenn:light-status` and
+    /// `spare` declared and left unwired.
+    fn make_tracked_data(admission: MqttAdmission) -> ProcessorData {
+        let mut data = make_mqtt_data(admission);
+        bind_ports(
+            &mut data,
+            HashMap::from([("delivery".to_string(), test_out_spec("brenn:light-status"))]),
+        );
+        data.declared_out_ports = Arc::new(
+            ["delivery", "spare"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        data
+    }
+
+    /// A wired status port hands the seam its channel as `status_to`, the
+    /// stated reply topic and lifetime reach the seam as stated, the entry
+    /// carries the admission's response topic, and the call returns the id the
+    /// entry is committed under. Naming the port charges none of its tokens.
+    #[test]
+    fn a_tracked_publish_names_the_wired_channel_and_returns_its_entry_id() {
+        let mut data = make_tracked_data(admitted());
+        let seen = script_mqtt(
+            &mut data,
+            resolve_unchanged,
+            MqttAdmission::Admitted {
+                response_topic: Some("lights/replies".into()),
+            },
+        );
+        let id = tracked(
+            &mut data,
+            "lights/1/set",
+            tracked_publish(Some("delivery"), Some("lights/replies")),
+        )
+        .expect("no trap")
+        .expect("admitted");
+
+        let expected = MqttPublishProps {
+            content_type: None,
+            qos: 1,
+            retain: false,
+            lifetime: MqttPublishLifetime::Seconds(60),
+            status_to: Some("brenn:light-status".into()),
+            reply_topic: Some("lights/replies".into()),
+        };
+        assert_eq!(seen.lock().unwrap()[0].2, expected);
+        let entries = mqtt_entries(&data);
+        assert_eq!(entries.len(), 1);
+        let mqtt = entries[0].mqtt.as_ref().unwrap();
+        assert_eq!(mqtt.message_id, id);
+        assert_eq!(mqtt.props, expected);
+        assert_eq!(mqtt.response_topic.as_deref(), Some("lights/replies"));
+        assert_eq!(
+            data.gate.entries(),
+            1,
+            "only the MQTT entry is buffered, nothing on the status port"
+        );
+    }
+
+    /// A declared status port the deployer left unwired admits the publish
+    /// with no `status_to`.
+    #[test]
+    fn an_unwired_status_port_admits_with_no_status_to() {
+        let mut data = make_tracked_data(admitted());
+        let seen = script_mqtt(&mut data, resolve_unchanged, admitted());
+        tracked(&mut data, "t", tracked_publish(Some("spare"), None))
+            .expect("no trap")
+            .expect("admitted");
+        assert_eq!(seen.lock().unwrap()[0].2.status_to, None);
+        assert_eq!(mqtt_entries(&data).len(), 1);
+    }
+
+    /// A status port the specification does not declare `out` or `io` traps
+    /// the activation, after the call ceiling is charged and before the seam
+    /// is reached; nothing is buffered.
+    #[test]
+    fn an_undeclared_status_port_traps_after_the_call_charge() {
+        for port in ["inbound", "nonesuch"] {
+            let mut data = make_tracked_data(admitted());
+            let seen = script_mqtt(&mut data, resolve_unchanged, admitted());
+            let trap = tracked(&mut data, "t", tracked_publish(Some(port), None))
+                .expect_err("an undeclared port traps");
+            assert!(trap.to_string().contains(port), "{port}: {trap}");
+            assert_eq!(data.gate.calls(), 1, "{port}: the call was charged");
+            assert!(seen.lock().unwrap().is_empty(), "{port}: seam reached");
+            assert!(data.publish_buffer.is_empty());
+        }
+    }
+
+    /// Each refusal reaches the guest as its `tracked-publish-error` case and
+    /// buffers nothing; an unusable status channel is logged with the port,
+    /// the channel and the admission's reason.
+    #[traced_test]
+    #[test]
+    fn tracked_refusals_map_to_their_cases() {
+        let cases = [
+            (
+                MqttAdmission::NotPermitted,
+                TrackedPublishWitError::NotPermitted,
+            ),
+            (
+                MqttAdmission::InvalidPayload("bad content type".into()),
+                TrackedPublishWitError::InvalidPublish("bad content type".into()),
+            ),
+            (
+                MqttAdmission::ReplyTopicNotPermitted,
+                TrackedPublishWitError::ReplyTopicNotPermitted,
+            ),
+            (
+                MqttAdmission::StatusChannelRefused {
+                    cause: StatusChannelRefusal::NotCovered,
+                },
+                TrackedPublishWitError::StatusPortUnusable,
+            ),
+        ];
+        for (admission, expected) in cases {
+            let mut data = make_tracked_data(admission.clone());
+            let answer = tracked(
+                &mut data,
+                "t",
+                tracked_publish(Some("delivery"), Some("replies")),
+            )
+            .expect("no trap");
+            assert_eq!(refused(answer), format!("{expected:?}"), "{admission:?}");
+            assert!(data.publish_buffer.is_empty(), "{admission:?}");
+            assert_eq!(data.gate.entries(), 0);
+        }
+        assert!(logs_contain("reply-topic-not-permitted"));
+        assert!(logs_contain("status-port-unusable"));
+        assert!(logs_contain("brenn:light-status"));
+        assert!(logs_contain("not covered by the component"));
+    }
+
+    /// A zero lifetime is refused before the seam, in the tracked function's
+    /// own words.
+    #[test]
+    fn a_zero_lifetime_is_invalid_publish() {
+        let mut data = make_tracked_data(admitted());
+        let seen = script_mqtt(&mut data, resolve_unchanged, admitted());
+        let mut publish = tracked_publish(None, None);
+        publish.lifetime = MqttPublishLifetime::Seconds(0);
+        assert_eq!(
+            refused(tracked(&mut data, "t", publish).expect("no trap")),
+            format!(
+                "{:?}",
+                TrackedPublishWitError::InvalidPublish(
+                    "lifetime seconds must be at least 1".into()
+                )
+            )
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// `forever` reaches the seam as `Forever`; the call ceiling's refusal is
+    /// `quota-exceeded`.
+    #[test]
+    fn a_forever_lifetime_reaches_the_seam_and_the_ceiling_is_quota() {
+        let mut data = make_tracked_data(admitted());
+        let seen = script_mqtt(&mut data, resolve_unchanged, admitted());
+        let mut publish = tracked_publish(None, None);
+        publish.lifetime = MqttPublishLifetime::Forever;
+        tracked(&mut data, "t", publish).unwrap().unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].2.lifetime,
+            MqttPublishLifetime::Forever
+        );
+        for _ in 1..MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            assert!(matches!(
+                data.legacy_mqtt("home".into(), "t".into(), vec![], mqtt_qos1()),
+                Ok(()) | Err(MqttPublishWitError::QuotaExceeded)
+            ));
+        }
+        assert!(matches!(
+            tracked(&mut data, "t", tracked_publish(Some("nonesuch"), None)).expect(
+                "the ceiling answers before the port check, so an undeclared port does not trap"
+            ),
+            Err(TrackedPublishWitError::QuotaExceeded)
+        ));
+    }
+
+    /// Every buffered MQTT entry carries its own id, legacy entries included,
+    /// and the tracked call returns its entry's.
+    #[test]
+    fn every_mqtt_entry_carries_a_distinct_id() {
+        let mut data = make_tracked_data(admitted());
+        data.legacy_mqtt("home".into(), "a".into(), vec![], mqtt_qos1())
+            .unwrap();
+        let id = tracked(&mut data, "b", tracked_publish(None, None))
+            .unwrap()
+            .unwrap();
+        data.legacy_mqtt("home".into(), "c".into(), vec![], mqtt_qos1())
+            .unwrap();
+        let ids: Vec<Uuid> = mqtt_entries(&data)
+            .iter()
+            .map(|p| p.mqtt.as_ref().unwrap().message_id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[1], id);
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+    }
+
+    /// A legacy call states no reply topic and no status port, so drawing
+    /// either refusal is a host bug.
+    #[test]
+    #[should_panic(expected = "a legacy mqtt publish drew")]
+    fn a_legacy_call_drawing_a_status_port_refusal_panics() {
+        MqttPublishRefusal::StatusChannelRefused.into_legacy();
+    }
+
+    /// An admission answering a response topic for a publish that stated no
+    /// reply topic is a host bug.
+    #[test]
+    #[should_panic(expected = "answered a response topic")]
+    fn a_response_topic_without_a_reply_topic_panics() {
+        let mut data = make_tracked_data(MqttAdmission::Admitted {
+            response_topic: Some("replies".into()),
+        });
+        tracked(&mut data, "t", tracked_publish(None, None))
+            .expect("the assertion panics first")
+            .expect("the assertion panics first");
     }
 
     // --- do_fast_call / do_queue_async host-fn tests ---

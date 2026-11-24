@@ -118,6 +118,7 @@ impl DbStore {
         let tx = conn.unchecked_transaction().expect("messaging: begin tx");
         let inserted = db::insert_message_in_tx(
             &tx,
+            None,
             self.channel_uuid,
             &msg.source,
             &msg.sender,

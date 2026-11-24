@@ -145,8 +145,10 @@ name = "brenn-guest"
 version = "0.1.0"
 dependencies = [
  "brenn-envelope",
+ "chrono",
  "serde",
  "serde_json",
+ "uuid",
  "wit-bindgen",
 ]
 
@@ -241,6 +243,13 @@ dependencies = [
 
 [[package]]
 name = "brenn-processor-mqtt-test"
+version = "0.1.0"
+dependencies = [
+ "brenn-guest",
+]
+
+[[package]]
+name = "brenn-processor-mqtt-tracked-test"
 version = "0.1.0"
 dependencies = [
  "brenn-guest",

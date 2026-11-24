@@ -318,9 +318,13 @@ enum PublishPrincipal<'a> {
     /// The host reporting what became of a message to the `status_to` its
     /// sender named. `sender` is that message's stored sender. Layer-1 finds
     /// the app in the current app table whose own identity is `sender`, by
-    /// constructing each app's identity, never by parsing `sender`; layer-1
-    /// and layer-2 both read that app's authored policy as it stands now, so
-    /// a status lands only where its sender may publish at report time.
+    /// constructing each app's identity and never by parsing `sender` (an
+    /// app's identity carries a server segment a restart can change), or else
+    /// the live WASM consumer keyed by the slug of a `wasm:<slug>` sender,
+    /// which names exactly one consumer; layer-1 and layer-2 both read that
+    /// sender's policy as it stands now (an app's authored policy, a
+    /// consumer's registered one), so a status lands only where its sender may
+    /// publish at report time.
     ///
     /// The stored principal is [`DELIVERY_STATUS_SENDER`], one host identity
     /// for every status, registered nowhere: its authority is borrowed, never
@@ -1066,6 +1070,14 @@ impl Messenger {
                         ParticipantId::for_app(slug, &self.source).as_str() == concerning
                     })
                     .map(|(_, app)| Arc::clone(&app.policy))
+                    .or_else(|| {
+                        let sender = ParticipantId::from_stored(concerning.to_owned());
+                        if !sender.is_wasm() {
+                            return None;
+                        }
+                        self.targets
+                            .policy(&SubscriberEntryKind::Wasm(sender.as_wasm_slug().to_owned()))
+                    })
                     .filter(|p| p.has_grant(grant))
                 {
                     Some(p) => p,
@@ -1649,6 +1661,7 @@ impl Messenger {
     fn insert_message(
         &self,
         tx: &rusqlite::Transaction<'_>,
+        message_id: Option<Uuid>,
         channel: &Arc<super::ChannelEntry>,
         envelope_type: ChannelScheme,
         source: &str,
@@ -1665,6 +1678,7 @@ impl Messenger {
         channel.assert_may_hold(body);
         insert_message_in_tx(
             tx,
+            message_id,
             channel.uuid,
             source,
             sender,
@@ -1933,6 +1947,7 @@ impl Messenger {
             }
             self.insert_message(
                 &tx,
+                None,
                 &channel,
                 scheme,
                 source,
@@ -2038,15 +2053,21 @@ pub struct WasmPublish<'a> {
 /// Where a component's MQTT publish goes and how, as admitted at the call by
 /// [`Messenger::admit_mqtt_from_wasm`].
 pub struct WasmMqttPublish<'a> {
+    /// The id the row is committed under, minted at the call.
+    pub message_id: Uuid,
     pub client: &'a str,
     pub topic: &'a str,
     pub options: MqttPublishOptions,
+    /// The bare reply topic the admission answered for `options.reply_to`.
+    pub response_topic: Option<&'a str>,
 }
 
 /// Panic unless `publish` is a well-formed entry for the egress namespace: an
-/// MQTT entry is aimed at its own client's egress channel and carries no
-/// `reply_to` (envelope or MQTT), release time, attachment or `status_to`, and
-/// an entry aimed anywhere in the egress namespace is an MQTT entry.
+/// MQTT entry is aimed at its own client's egress channel, carries no
+/// envelope `reply_to`, release time or attachment, states a response topic
+/// exactly when it states an MQTT `reply_to`, and names a `brenn:` channel as
+/// any `status_to`; an entry aimed anywhere in the egress namespace is an
+/// MQTT entry.
 fn assert_wasm_egress_entry(consumer_slug: &str, publish: &WasmPublish<'_>) {
     let addr = publish.channel_address;
     match &publish.mqtt {
@@ -2066,15 +2087,19 @@ fn assert_wasm_egress_entry(consumer_slug: &str, publish: &WasmPublish<'_>) {
                  time or an attachment (slug={consumer_slug})"
             );
             assert!(
-                mqtt.options.status_to.is_none(),
-                "publish_from_wasm: MQTT entry for {addr:?} names a status_to, which a \
-                 component cannot (slug={consumer_slug})"
+                mqtt.options.reply_to.is_some() == mqtt.response_topic.is_some(),
+                "publish_from_wasm: MQTT entry for {addr:?} states reply_to {:?} with response \
+                 topic {:?} (slug={consumer_slug})",
+                mqtt.options.reply_to,
+                mqtt.response_topic
             );
-            assert!(
-                mqtt.options.reply_to.is_none(),
-                "publish_from_wasm: MQTT entry for {addr:?} names an MQTT reply_to, which a \
-                 component cannot (slug={consumer_slug})"
-            );
+            if let Some(status_to) = mqtt.options.status_to.as_deref() {
+                assert!(
+                    ChannelScheme::of(status_to) == Some(ChannelScheme::Brenn),
+                    "publish_from_wasm: MQTT entry for {addr:?} names status_to {status_to:?}, \
+                     not a `brenn:` channel (slug={consumer_slug})"
+                );
+            }
         }
         None => {
             let in_egress = matches!(
@@ -2107,11 +2132,14 @@ impl Messenger {
     ///
     /// An MQTT entry (`mqtt` set) was admitted at the call and draws no send
     /// rate here: it commits to its client's egress channel with `MqttPublish`
-    /// transport metadata whose expiry counts from the row's own timestamp, in
-    /// the same transaction and timestamp sequence as the batch's other durable
-    /// entries. Panics on an MQTT entry not aimed at its client's egress
-    /// channel or carrying a `reply_to`, release time or attachment, and on a
-    /// non-MQTT entry aimed into the egress namespace.
+    /// transport metadata whose expiry counts from the row's own timestamp,
+    /// carrying its `status_to` and its response topic, under the id minted at
+    /// the call, in the same transaction and timestamp sequence as the batch's
+    /// other durable entries. Panics on an MQTT entry not aimed at its
+    /// client's egress channel, carrying an envelope `reply_to`, a release
+    /// time or an attachment, stating a response topic without an MQTT
+    /// `reply_to` or the reverse, or naming a `status_to` outside `brenn:`, and
+    /// on a non-MQTT entry aimed into the egress namespace.
     ///
     /// Attachments of a durable entry are synced before the database lock is
     /// taken, adopted with the entry's row, and confirmed after the commit; an
@@ -2322,12 +2350,13 @@ impl Messenger {
                         m.client,
                         m.topic,
                         &m.options,
-                        None,
+                        m.response_topic,
                         db::ns_to_utc(publish_ts_ns),
                     ))
                 });
                 let inserted = self.insert_message(
                     &tx,
+                    publish.mqtt.as_ref().map(|m| m.message_id),
                     channel,
                     ChannelScheme::Brenn,
                     source,
@@ -2767,6 +2796,7 @@ impl Messenger {
                     }
                     self.insert_message(
                         &tx,
+                        None,
                         channel,
                         ChannelScheme::Brenn,
                         source,
@@ -2788,6 +2818,7 @@ impl Messenger {
 
                 let inserted = self.insert_message(
                     &tx,
+                    None,
                     channel,
                     ChannelScheme::Brenn,
                     source,

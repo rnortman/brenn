@@ -218,6 +218,7 @@ rust_test(
         "//brenn-wasm:fixture_processor_demo",
         "//brenn-wasm:fixture_processor_dual",
         "//brenn-wasm:fixture_processor_mqtt_test",
+        "//brenn-wasm:fixture_processor_mqtt_tracked_test",
         "//brenn-wasm:fixture_replay",
         "//bazel/tools:mosquitto",
     ],

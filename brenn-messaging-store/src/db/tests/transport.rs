@@ -70,6 +70,7 @@ fn insert(
     let tx = conn.unchecked_transaction().unwrap();
     let inserted = insert_message_in_tx(
         &tx,
+        None,
         channel_uuid,
         "src",
         "alice",

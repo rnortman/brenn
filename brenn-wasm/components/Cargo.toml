@@ -45,6 +45,7 @@ members = [
     "processor-log",
     "processor-mem-exhaust",
     "processor-mqtt-test",
+    "processor-mqtt-tracked-test",
     "processor-page-blobs-test",
     "processor-page-bytes-test",
     "processor-page-test",

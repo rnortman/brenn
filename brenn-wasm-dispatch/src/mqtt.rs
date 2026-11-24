@@ -11,16 +11,19 @@ use std::sync::Arc;
 
 use brenn_lib::access::AppPolicy;
 use brenn_lib::mqtt::{MqttLifetime, MqttPublishOptions};
-use brenn_messaging::{Messenger, MqttRefusal, PublishResult};
+use brenn_messaging::{Messenger, MqttRefusal, PublishResult, ReplyToRefusal, StatusToRefusal};
 use brenn_obs::alerting::AlertDispatcher;
 use brenn_obs::security::{DenialKind, DenialOrigin, SecurityEventType, signal_publish_denial};
-use brenn_wasm::{MqttAdmission, MqttPublishProps, MqttTarget};
+use brenn_wasm::{
+    MqttAdmission, MqttPublishLifetime, MqttPublishProps, MqttTarget, StatusChannelRefusal,
+};
 
 /// The admission seam for a consumer holding the `mqtt` grant under `policy`.
 ///
 /// `resolve` parses `mqtt:<client>:<topic>` and refuses a wildcard; `admit`
-/// asks the bus. An ACL denial raises the publish-denial security signal,
-/// attributed to the component, once per denied call.
+/// asks the bus. An ACL denial of the target or of the reply topic raises the
+/// publish-denial security signal, attributed to the component, once per
+/// denied call; an unusable status channel raises none.
 ///
 /// # Panics
 ///
@@ -43,17 +46,18 @@ pub fn mqtt_publisher_over(
     })
 }
 
-/// The bus options of a component's publish: `mqtt-publish` is lifetime
-/// forever, `mqtt-publish-expiring` a lifetime of its seconds.
+/// The bus options of a component's publish, stated whole: the lifetime,
+/// the host-resolved `status_to`, and the reply topic as an address on the
+/// target's own client.
 ///
 /// # Panics
 ///
-/// On a zero expiry, which the import refuses before the seam is reached.
-pub(crate) fn mqtt_options(props: &MqttPublishProps) -> MqttPublishOptions {
-    let lifetime = match props.message_expiry_s {
-        None => MqttLifetime::Forever,
-        Some(s) => MqttLifetime::Seconds(
-            NonZeroU32::new(s).expect("a zero message expiry is refused at the mqtt import"),
+/// On a zero lifetime, which the import refuses before the seam is reached.
+pub(crate) fn mqtt_options(target: &MqttTarget, props: &MqttPublishProps) -> MqttPublishOptions {
+    let lifetime = match props.lifetime {
+        MqttPublishLifetime::Forever => MqttLifetime::Forever,
+        MqttPublishLifetime::Seconds(s) => MqttLifetime::Seconds(
+            NonZeroU32::new(s).expect("a zero lifetime is refused at the mqtt import"),
         ),
     };
     MqttPublishOptions {
@@ -61,8 +65,11 @@ pub(crate) fn mqtt_options(props: &MqttPublishProps) -> MqttPublishOptions {
         retain: props.retain,
         lifetime,
         content_type: props.content_type.clone(),
-        status_to: None,
-        reply_to: None,
+        status_to: props.status_to.clone(),
+        reply_to: props
+            .reply_topic
+            .as_ref()
+            .map(|topic| format!("mqtt:{}:{topic}", target.client)),
     }
 }
 
@@ -99,11 +106,11 @@ impl brenn_wasm::MqttPublisher for BusMqttPublisher {
             &self.policy,
             &target.client,
             &target.topic,
-            &mqtt_options(props),
+            &mqtt_options(target, props),
             len,
         );
         match answer {
-            Ok(()) => MqttAdmission::Admitted,
+            Ok(response_topic) => MqttAdmission::Admitted { response_topic },
             Err(PublishResult::AclDenied(address)) => {
                 // `address` is guest-derived; `signal_publish_denial` sanitizes it.
                 signal_publish_denial(
@@ -126,6 +133,43 @@ impl brenn_wasm::MqttPublisher for BusMqttPublisher {
                     "payload {len} bytes exceeds the client's outbound cap of {cap}"
                 ))
             }
+            Err(PublishResult::MqttRefused(MqttRefusal::ReplyTo {
+                why: ReplyToRefusal::Malformed { detail },
+                ..
+            })) => MqttAdmission::InvalidPayload(format!("invalid reply topic: {detail}")),
+            Err(PublishResult::MqttRefused(MqttRefusal::ReplyTo {
+                address,
+                why: ReplyToRefusal::AclDenied,
+            })) => {
+                // `address` is guest-derived; `signal_publish_denial` sanitizes it.
+                signal_publish_denial(
+                    &self.alerts,
+                    SecurityEventType::MqttPublishDenied,
+                    DenialOrigin::Component { slug: &self.slug },
+                    DenialKind::AclDenied,
+                    &address,
+                );
+                MqttAdmission::ReplyTopicNotPermitted
+            }
+            Err(PublishResult::MqttRefused(MqttRefusal::StatusTo {
+                why: StatusToRefusal::Malformed,
+                ..
+            })) => status_channel_refused(StatusChannelRefusal::NotPlainBrenn),
+            Err(PublishResult::MqttRefused(MqttRefusal::StatusTo {
+                why: StatusToRefusal::AclDenied,
+                ..
+            })) => status_channel_refused(StatusChannelRefusal::NotCovered),
+            Err(PublishResult::MqttRefused(MqttRefusal::StatusTo {
+                why: StatusToRefusal::Unknown,
+                ..
+            })) => status_channel_refused(StatusChannelRefusal::NotInDirectory),
+            Err(PublishResult::MqttRefused(MqttRefusal::StatusTo {
+                why: StatusToRefusal::StatusOverBodyCap { len, max },
+                ..
+            })) => MqttAdmission::InvalidPayload(format!(
+                "a delivery status about this topic would be {len} bytes, over the message body \
+                 cap of {max}"
+            )),
             Err(PublishResult::MissingSender) => panic!(
                 "consumer {:?}: mqtt admission without the mqtt publish grant — the seam is \
                  built only for a consumer holding `mqtt` (host bug)",
@@ -139,9 +183,17 @@ impl brenn_wasm::MqttPublisher for BusMqttPublisher {
             ),
             Err(other) => panic!(
                 "consumer {:?}: mqtt admission answered {other:?} for an address built from \
-                 `resolve`'s own output with no stated option and a stated length (host bug)",
+                 `resolve`'s own output, a reply address on the target's client, a status \
+                 channel a wired output port names, no deadline and a stated length (host bug)",
                 self.slug
             ),
         }
     }
+}
+
+/// A wired status channel that cannot take a component's delivery statuses.
+/// The channel is the deployer's binding, not the component's choice, so this
+/// is a wiring mistake and raises no security signal.
+fn status_channel_refused(cause: StatusChannelRefusal) -> MqttAdmission {
+    MqttAdmission::StatusChannelRefused { cause }
 }

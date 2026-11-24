@@ -294,3 +294,145 @@ async fn an_address_on_another_scheme_panics() {
     f.m.publish_delivery_status(&sender(), "ephemeral:ticks", &status(DeliveryKind::Handed))
         .await;
 }
+
+const CONSUMER: &str = "lights";
+
+/// A WASM consumer's registered policy: `MessagingPublish` and a `brenn:`
+/// publish ACL covering `channels`.
+fn consumer_registration(channels: &[&str]) -> brenn_lib::messaging::SubscriberRegistration {
+    let mut policy = brenn_lib::access::AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingPublish);
+    policy.acls.brenn_publish = channels
+        .iter()
+        .map(|c| ChannelMatcher::Exact((*c).to_string()))
+        .collect();
+    brenn_lib::messaging::SubscriberRegistration {
+        policy: Arc::new(policy),
+        wake: brenn_lib::messaging::WakeEconomics::Eager,
+    }
+}
+
+fn consumer_kind() -> SubscriberEntryKind {
+    SubscriberEntryKind::Wasm(CONSUMER.to_string())
+}
+
+fn consumer_sender() -> String {
+    ParticipantId::for_wasm(CONSUMER).as_str().to_owned()
+}
+
+impl Fixture {
+    fn register_consumer(&self, channels: &[&str]) {
+        self.m
+            .register_subscriber_registration(consumer_kind(), consumer_registration(channels));
+    }
+
+    async fn publish_for_consumer(&self) -> DeliveryStatusPublish {
+        self.m
+            .publish_delivery_status(&consumer_sender(), STATUS, &status(DeliveryKind::Handed))
+            .await
+    }
+}
+
+/// A status about a component's message lands under the live consumer's
+/// registered policy, from the status sender, drawing the status sender's
+/// rate and nothing of the consumer's.
+#[tokio::test]
+async fn a_consumers_status_lands_under_its_registered_policy() {
+    let f = fixture().await;
+    f.register_consumer(&["light-status"]);
+    assert_eq!(
+        f.publish_for_consumer().await,
+        DeliveryStatusPublish::Published
+    );
+    let rows = f.rows().await;
+    let [row] = rows.as_slice() else {
+        panic!("one row, got {}", rows.len());
+    };
+    assert_eq!(row.sender, DELIVERY_STATUS_SENDER);
+    let text = row.body.as_text().expect("a status is text");
+    assert_eq!(delivery::decode(text), Ok(status(DeliveryKind::Handed)));
+    assert!(f.rate_drawn_by(DELIVERY_STATUS_SENDER));
+    assert!(!f.rate_drawn_by(&consumer_sender()));
+}
+
+/// The app path is unchanged when a consumer is also registered.
+#[tokio::test]
+async fn an_app_sender_lands_beside_a_registered_consumer() {
+    let f = fixture().await;
+    f.register_consumer(&[]);
+    assert_eq!(
+        f.publish(DeliveryKind::Handed).await,
+        DeliveryStatusPublish::Published
+    );
+}
+
+#[tokio::test]
+async fn a_consumer_never_registered_is_sender_gone() {
+    let f = fixture().await;
+    assert_eq!(
+        f.publish_for_consumer().await,
+        DeliveryStatusPublish::Refused(DeliveryStatusRefusal::SenderGone)
+    );
+    assert!(f.rows().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_retired_consumer_is_sender_gone() {
+    let f = fixture().await;
+    f.register_consumer(&["light-status"]);
+    f.m.retire_subscriber_registration(&consumer_kind());
+    assert_eq!(
+        f.publish_for_consumer().await,
+        DeliveryStatusPublish::Refused(DeliveryStatusRefusal::SenderGone)
+    );
+    assert!(f.rows().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_consumer_without_the_publish_grant_is_sender_gone() {
+    let f = fixture().await;
+    let mut registration = consumer_registration(&["light-status"]);
+    let mut policy = (*registration.policy).clone();
+    policy.grants = brenn_lib::access::GrantSet::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    registration.policy = Arc::new(policy);
+    f.m.register_subscriber_registration(consumer_kind(), registration);
+    assert_eq!(
+        f.publish_for_consumer().await,
+        DeliveryStatusPublish::Refused(DeliveryStatusRefusal::SenderGone)
+    );
+}
+
+/// The consumer's policy is read as it stands at report time: rewired so
+/// its ACL no longer covers the channel, the status is refused.
+#[tokio::test]
+async fn a_consumer_rewired_off_the_channel_is_sender_not_permitted() {
+    let f = fixture().await;
+    f.register_consumer(&["light-status"]);
+    f.m.replace_subscriber_registration(&consumer_kind(), consumer_registration(&["records"]));
+    assert_eq!(
+        f.publish_for_consumer().await,
+        DeliveryStatusPublish::Refused(DeliveryStatusRefusal::SenderNotPermitted)
+    );
+    assert!(f.rows().await.is_empty());
+}
+
+/// Only a WASM consumer's identity resolves through the registry: a
+/// system component registered under the same name is not a status sender.
+#[tokio::test]
+async fn a_registered_non_wasm_subscriber_is_not_a_status_sender() {
+    let f = fixture().await;
+    f.m.register_subscriber_registration(
+        SubscriberEntryKind::System(CONSUMER.to_string()),
+        consumer_registration(&["light-status"]),
+    );
+    assert_eq!(
+        f.m.publish_delivery_status(
+            ParticipantId::for_system(CONSUMER).as_str(),
+            STATUS,
+            &status(DeliveryKind::Handed),
+        )
+        .await,
+        DeliveryStatusPublish::Refused(DeliveryStatusRefusal::SenderGone)
+    );
+}

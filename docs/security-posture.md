@@ -162,6 +162,16 @@ In rough order of severity if compromised:
   not alert; each is still a `warn` line and a per-client count, as every
   egress failure is. A broker refusal can only concern a topic the app's own
   `acl publish` entries admit, and is not a security event, told or not.
+  A component names a status port on `mqtt-publish-tracked`, never an
+  address: the port is one it declares `out` or `io`, and the channel is the
+  one the operator wired to it, so the component cannot probe the channel
+  namespace. The channel is held to the same admission as an app's
+  `status_to`; a wired channel it refuses is answered `status-port-unusable`
+  and logged at `warn`, with no security signal, because the address is the
+  operator's wiring and not something the component chose. Its statuses are
+  published on the authority of the live consumer whose identity is the
+  message's stored sender, as its registered policy stands then; a retired
+  consumer's statuses are refused and the operator is told.
 - **MQTT reply topics.** A `reply_to` on an MQTT publish is sent as the MQTT
   5 Response Topic, which asks whoever answers to publish there. It is
   admitted only as a concrete topic on the client the message goes through
@@ -170,7 +180,9 @@ In rough order of severity if compromised:
   needs publish rights on its own reply topic. A reply topic the ACL does
   not cover is refused as an MQTT publish denial, the same security event as
   a denied target; an automation's stored reply topic is judged again at
-  every fire.
+  every fire. A component's reply topic on `mqtt-publish-tracked` is a bare
+  topic on the publish's own client, held to the same rule and raising the
+  same signal, attributed to the component.
 - **Scheduled MQTT publishes.** An `MqttSend` with a future `deliver_after`
   is admitted once, at the call — target, ACL, reply topic, `status_to` —
   and parked on the client's egress channel until its release time. An app
@@ -1491,6 +1503,34 @@ deliberate and does not create an unbounded loop:
   to its own input topics cannot loop) and operator review of config for
   input-filter/publish-matcher topic-space overlap remain the gates for that case,
   and the per-period cost is bounded regardless.
+- **WASM status-port loop.** A component that names one of its own `io` ports
+  as the status port of `mqtt-publish-tracked`, with a push depth on that
+  binding, is woken by the statuses of its own publishes and may publish
+  again. It is the WASM republish loop above through one more channel, and the
+  same mechanisms bound it: the activation pacer; coalescing, which hands one
+  activation at most the status binding's `push_depth` newest statuses as new;
+  the per-client publish buckets, each seeded per activation from the same
+  shared input grant; and the per-activation ceilings behind them. One
+  property is new: a publish draws **two** statuses (`handed` and an outcome),
+  so at the default amplification a component that republishes once per
+  status grows each round instead of holding steady. The growth stops at the
+  status binding's `push_depth` — at the default `amplification`,
+  `publish_per_activation` and `publish_capacity`, at most `2 + push_depth`
+  MQTT publishes per activation from the status port **to each client the
+  component's ACL reaches**, so a component reaching K clients makes up to
+  K × (2 + push_depth) and draws twice that many statuses; the whole loop
+  never exceeds `PROCESSOR_MAX_PUBLISHES_PER_ACTIVATION` per activation, at no
+  more than the pacer's rate — inside the worst case above. Raising a
+  client's `publish_per_activation` or `publish_capacity` raises its share
+  accordingly. Statuses
+  draw no per-activation ceiling and no token of the port they arrive on: the
+  host publishes them later, outside any activation, under
+  `system:delivery-status`, drawing the status channel's send rate (shared by
+  every sender naming the channel), so a flood of statuses is refused at the
+  channel and reported to the operator, never queued. The operator's levers
+  are on the status binding: `push_depth`, and `amplification`, where `0`
+  makes a status wake the component without funding a publish beyond the
+  bucket's fill.
 - **Retained self-publish.** `retain=true` to a self-matched filter echoes now and
   re-delivers on every reconnect (`OnEverySubscribe`) — already true before
   unification, cross-session.
@@ -1513,7 +1553,8 @@ compile time, because a document whose `call` graph has a cycle is refused.
 
 A call is charged against the caller's shared per-activation call ceiling
 (`MAX_PUBLISH_CALLS_PER_ACTIVATION`, 512 — one counter over `ports.publish`,
-`mqtt.mqtt-publish`, `mqtt.mqtt-publish-expiring` and `calls.call`) and its payload against the publish-body
+`mqtt.mqtt-publish`, `mqtt.mqtt-publish-expiring`, `mqtt.mqtt-publish-tracked`
+and `calls.call`) and its payload against the publish-body
 cap; an oversize reply traps the callee. **What that bounds is how many peer
 activations one activation raises, not what one of them costs.** A call is one
 whole, uncoalesced activation of the peer under the peer's own ceilings —
@@ -1550,7 +1591,8 @@ Both substrate halves, and the residual each leaves:
   a page component needs no grant at all to hold the main thread — and not a
   property of the `calls` grant.
 
-`mqtt.mqtt-publish` (and `mqtt-publish-expiring`) does not wait on the broker:
+`mqtt.mqtt-publish` (and `mqtt-publish-expiring` and `mqtt-publish-tracked`)
+does not wait on the broker:
 the call is admitted and buffered with the activation's other publishes, and
 committed to the client's egress channel when the activation returns ok
 (`docs/message-bus.md` §2.7.2). What bounds a component's MQTT output is the
