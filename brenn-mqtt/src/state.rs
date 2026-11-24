@@ -731,6 +731,8 @@ impl MqttClientHandle {
         })
     }
 
+    // TODO(mqtt-added-client-clean-start-lost-to-restart): the requirement
+    // lives in memory; a server restart before the first CONNACK loses it.
     /// Make the supervisor's next CONNECT, and every one up to the first
     /// CONNACK, a clean start.
     pub(crate) fn require_clean_start(&self) {

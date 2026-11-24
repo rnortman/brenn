@@ -1966,7 +1966,8 @@ minted with the client at boot and by a reload that adds it. It is a durable,
 output may name it. A component's
 `in` port may read a declared client's channel. Each message carries the
 publish in the envelope's `transport` key — `{"mqtt_publish": {"client_slug",
-"topic", "qos", "retain", "content_type", "expires"}}`, where `expires` is
+"topic", "qos", "retain", "content_type", "expires", "status_to",
+"response_topic"}}`, where `expires` is
 `{"at": "<rfc3339>"}` or `"never"`, `content_type` is absent when the call
 stated none, `status_to` is the canonical `brenn:` address the call named
 for its delivery statuses, absent when it named none, and `response_topic` is
@@ -2041,11 +2042,15 @@ the message's `status_to` and was not a broker's rejection:
 | dropped | the session stopped, or its client was removed, with messages the reader held or still owed; reported as a count, and one by one for those naming a `status_to`. Nothing is handed or resent once a stop begins |
 
 A broker's rejection is always alerted, whether or not its sender was told:
-it means Brenn's per-topic ACL admits a topic the broker's configuration
-forbids, which only the operator can fix, and naming a `status_to` cannot
-silence it. Its alert says when the sender was told. Every other failure told
-on its `status_to` — an oversize packet's rejection among them — is logged and
-counted and raises no alert. One with no `status_to`, or whose status could
+it usually means Brenn's per-topic ACL admits a topic the broker's
+configuration forbids, which only the operator can fix, and naming a
+`status_to` cannot silence it. Every refusal by the broker is told and
+alerted this way, whatever its reason code: also Quota exceeded (151), a
+"not now" that is not sent again (`TODO(mqtt-quota-exceeded-told-rejected)`),
+and a QoS 2 completion the broker refuses after taking the message
+(`TODO(mqtt-qos2-completion-refusal-told-rejected)`). Its alert says when the
+sender was told. Every other failure told on its `status_to` — an oversize
+packet's rejection among them — is logged and counted and raises no alert. One with no `status_to`, or whose status could
 not be published, is alerted.
 Alerts are coalesced per client and kind: the first failure of a kind raises
 an alert and opens an episode; later failures of that kind are logged and
@@ -2104,16 +2109,21 @@ plain DISCONNECT, as at any stop. A removed client with no connection at that
 moment — in backoff, or failed — cannot tell the broker anything, and the same
 holds when the DISCONNECT is not written within the stop bound or is lost to
 the socket's reset (`TODO(mqtt-disconnect-lost-to-reset)`): the session stays
-at the broker until it expires, and the stop logs that at `warn` with the
-expiry. A client a reload adds starts clean: every CONNECT up to its first
-CONNACK asks for a new session, so whatever the broker kept under the slug for
-an earlier declaration — its filters, its queued messages — is discarded
-before the commit adds the client's filters. A reload that changes the client
-before that first CONNACK keeps the clean start; after it the client resumes
-its session as any other. A server shutdown and a reload that changes a
-client keep the session. A session the broker kept is met by a later boot
-that declares the slug and resumed, with whatever filters it holds (*Across a
-restart*, §2.7.1).
+at the broker until it expires. The stop logs that at `warn` with the
+expiry when no DISCONNECT was written; one written and then lost to the
+reset is logged as written, and nothing says the session stayed. A client a
+reload adds starts clean: every CONNECT up to its first CONNACK asks for a
+new session, so whatever the broker kept under the slug for an earlier
+declaration — its filters, its queued messages — is discarded before the
+commit adds the client's filters. A reload that changes the client before
+that first CONNACK keeps the clean start; after it the client resumes its
+session as any other. A server restart before that first CONNACK does not
+keep it: the requirement lives in the process, and the next boot resumes
+whatever the broker kept
+(`TODO(mqtt-added-client-clean-start-lost-to-restart)`). A server shutdown and
+a reload that changes a client keep the session. A session the broker kept is
+met by a later boot that declares the slug and resumed, with whatever filters
+it holds (*Across a restart*, §2.7.1).
 
 **What the MQTT library decides across a reconnect.** Two limits of a kept
 client, stated here and only here:

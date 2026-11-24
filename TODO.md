@@ -559,6 +559,29 @@ sender whose grant was revoked and one whose ACL was narrowed. The comment
 sits at the messaging-grant check in `Messenger::edit` in
 `brenn-messaging/src/edit.rs`.
 
+## `mqtt-added-client-clean-start-lost-to-restart`
+
+A client a reload adds must make its first connection a clean start, so
+that whatever the broker kept under the slug for an earlier declaration —
+its filters, its queued messages — is discarded. The requirement is a flag
+in memory on the client's handle (`clean_start_pending`,
+`brenn-mqtt/src/state.rs`), set when the reload adds the client and cleared
+at its first CONNACK. A server restart before that CONNACK loses it: boot
+registers every declared client with no such requirement, and the client's
+first connection resumes the kept session, as for a client that was always
+declared. The window is short when the broker answers and unbounded when it
+does not: a client added while its broker is unreachable, or refusing its
+credentials, stays in it until it first connects. The resumed session then
+holds what `mqtt-deferred-unsubscribe-not-withdrawn` describes — filters
+this process never holds — and delivers what it queued for any filter the
+new declaration holds too. The work: decide whether the requirement must
+outlive the process, and if so where it is recorded; the per-client record
+that entry proposes is one candidate, since a session met with no record is
+the same case. Done = a client added by a reload and first connected by a
+later process starts clean, with a test, or this is closed as not wanted.
+Code site (`TODO(mqtt-added-client-clean-start-lost-to-restart)`):
+`require_clean_start` in `brenn-mqtt/src/state.rs`.
+
 ## `mqtt-component-publish-behaviour-cut-unconfirmed`
 
 `brenn:processor/mqtt@0.1.0`'s `mqtt-publish`/`mqtt-publish-expiring` now

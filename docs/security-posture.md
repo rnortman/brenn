@@ -156,22 +156,26 @@ In rough order of severity if compromised:
   sender could itself write, and its body can only be a status.
   `system:mqtt-outbound` still publishes nothing. A broker's rejection
   always alerts the operator, whether or not the message's `status_to` told
-  its sender: it means Brenn's per-topic ACL admits a topic the broker's
-  configuration forbids, which only the operator can fix, so naming a
-  `status_to` cannot silence it. The other failures told on a `status_to` do
-  not alert; each is still a `warn` line and a per-client count, as every
-  egress failure is. A broker refusal can only concern a topic the app's own
-  `acl publish` entries admit, and is not a security event, told or not.
-  A component names a status port on `mqtt-publish-tracked`, never an
-  address: the port is one it declares `out` or `io`, and the channel is the
-  one the operator wired to it, so the component cannot probe the channel
-  namespace. The channel is held to the same admission as an app's
-  `status_to`; a wired channel it refuses is answered `status-port-unusable`
-  and logged at `warn`, with no security signal, because the address is the
-  operator's wiring and not something the component chose. Its statuses are
-  published on the authority of the live consumer whose identity is the
-  message's stored sender, as its registered policy stands then; a retired
-  consumer's statuses are refused and the operator is told.
+  its sender: it usually means Brenn's per-topic ACL admits a topic the
+  broker's configuration forbids, which only the operator can fix, so naming
+  a `status_to` cannot silence it. Every refusal by the broker is alerted
+  this way, whatever its reason: also a quota refusal
+  (`TODO(mqtt-quota-exceeded-told-rejected)`) and a refused QoS 2 completion
+  (`TODO(mqtt-qos2-completion-refusal-told-rejected)`). Failures told on a
+  `status_to` that are not a broker's refusal do not alert; each is still a
+  `warn` line and a per-client count, as every egress failure is. A broker
+  refusal can only concern a topic the app's own `acl publish` entries admit,
+  and is not a security event, told or not. A component names a status port on
+  `mqtt-publish-tracked`, never an address: the port is one it declares `out`
+  or `io`, and the channel is the one the operator wired to it, so the
+  component cannot probe the channel namespace. The channel is held to the
+  same admission as an app's `status_to`; a wired channel it refuses is
+  answered `status-port-unusable` and logged at `warn`, with no security
+  signal, because the address is the operator's wiring and not something the
+  component chose. Its statuses are published on the authority of the live
+  consumer whose identity is the message's stored sender, as its registered
+  policy stands then; a retired consumer's statuses are refused and the
+  operator is told.
 - **MQTT reply topics.** A `reply_to` on an MQTT publish is sent as the MQTT
   5 Response Topic, which asks whoever answers to publish there. It is
   admitted only as a concrete topic on the client the message goes through

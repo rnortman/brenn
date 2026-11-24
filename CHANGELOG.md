@@ -4,24 +4,16 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
-- **Behaviour change:** the `MqttSend` tool and an automation's `mqtt_publish`
-  action now publish a number or boolean `body` as its JSON text (`42`,
-  `true`). Before, both were refused, with advice to send the value as a
-  string, which could lead an agent round in circles. A null `body` is still
-  refused; the error now says to send the text `null` as base64
-  (`bnVsbA==`) in `body_base64`. A number with many digits can lose some of
-  them, on the way to Brenn or in Brenn's own parse, which holds at most a
-  64-bit integer or an `f64`; to publish a number's exact digits, give the
-  base64 of its text in `body_base64`. No upgrade step.
 - **New for component authors: a component can state a lifetime, ask for
   delivery statuses and name a reply topic on an MQTT publish.**
   `brenn:processor/mqtt@0.1.0` gains a function, `mqtt-publish-tracked`, beside
-  `mqtt-publish` and `mqtt-publish-expiring`, which are unchanged. It takes a
-  required lifetime — a number of seconds, or `forever` — and optionally a
-  status port, one of the component's own `out` or `io` ports, and a reply
-  topic on the same client, sent as the MQTT 5 Response Topic. It returns the
-  message's id, the `message_id` every status about it carries. The host names
-  the channel the operator wired to the status port as the publish's
+  `mqtt-publish` and `mqtt-publish-expiring`, whose WIT shapes are unchanged
+  (what a call to them does changes: **BREAKING for component authors**,
+  below). It takes a required lifetime — a number of seconds, or `forever` —
+  and optionally a status port, one of the component's own `out` or `io` ports,
+  and a reply topic on the same client, sent as the MQTT 5 Response Topic. It
+  returns the message's id, the `message_id` every status about it carries. The
+  host names the channel the operator wired to the status port as the publish's
   `status_to`; a port the component does not declare `out` or `io` traps the
   activation, a declared port left unwired names none, and a wired channel the
   bus cannot take is answered `status-port-unusable`. A component that does not
@@ -54,15 +46,16 @@ All notable changes to Brenn are documented here.
   "brenn:mqtt-connection.<client>"]` for an agent, an `in` port for a
   component — and no configuration can write to it or resize it
   (`docs/message-bus.md` §2.7, §2.7.3).
-- **Feature:** senders learn about crashes. A sender that asked for delivery
-  status (`status_to`) could be left holding `handed` with no outcome after
-  the server died. Now, after an unclean stop, the next server process first
+- **Feature:** senders learn about crashes. A sender that asks for delivery
+  status (`status_to`, below) would be left holding `handed` with no outcome
+  when the server dies. After an unclean stop, the next server process first
   sends one `restarted` status to every `status_to` named on a message the
-  old process may have handed, before sending anything new: "nobody knows
-  whether it arrived". A clean stop sends none, except one that overlaps a
-  configuration reload (`docs/message-bus.md`, *Delivery status*). A
-  `restarted` status has no `message_id`, so readers of delivery statuses
-  must check `kind` before reading `message_id`.
+  old process may have handed and the client's egress channel still holds,
+  before sending anything new: "nobody knows whether it arrived". A clean stop
+  sends none, except one that overlaps a configuration reload
+  (`docs/message-bus.md`, *Delivery status*). A `restarted` status has no
+  `message_id`, so readers of delivery statuses must check `kind` before
+  reading `message_id`.
 - **Upgrade note:** the first boot of this version cannot know how the
   previous version stopped, so it sends no `restarted` statuses and its
   connection state reports no unclean end. A sender resolves an old
@@ -70,21 +63,27 @@ All notable changes to Brenn are documented here.
   sender may infer").
 - **Behaviour change:** every final stop of an MQTT client — the broker
   rejecting its credentials, or ending a connected session for good — now
-  raises a `Critical` alert, "MQTT client stopped: <client>". Before, most
-  such stops were only a log line. A placeholder client with wrong
-  credentials will now alert at every boot.
+  raises a `Critical` alert, "MQTT client stopped: <client>". Before, every
+  such stop was only a log line. A placeholder client with wrong credentials
+  will now alert at every boot.
 - **Behaviour change:** MQTT clients now handle a session the broker kept
-  (`session_expiry_secs` above 0) correctly on the receiving side. Nothing
-  changes for clients left at the default expiry of 0:
-  - Messages the broker queued while Brenn was down are no longer lost at
-    boot. Before, ones that arrived before Brenn's inbound routing was ready
-    were dropped after the broker had already been told they were received.
+  (`session_expiry_secs` above 0) correctly on the receiving side. The
+  first two items below change every client; the last two change nothing
+  for clients left at the default expiry of 0:
+  - Messages that reach Brenn at boot before its inbound routing is ready
+    are no longer lost: what the broker queued while Brenn was down, and
+    the retained values it sends at the first subscribe. Before, they were
+    dropped, the queued ones after the broker had already been told they
+    were received.
   - Reconnecting no longer fills a channel with copies of values it already
     has. The broker still resends each topic's retained (last-known) value on
     every subscribe, so a value that changed while Brenn was away still
     arrives. But a resent value that matches the newest one the channel
-    holds for that topic is not added again. Live messages are added as
-    before. A subscriber that relied on getting a new message on every
+    holds for that topic is not added again. The exception is a payload
+    that is not text on a wrapped channel (the default shape), which is
+    still added on every reconnect and repeated subscribe
+    (`mqtt-retained-replay-repeated-on-resubscribe`). Live messages are
+    added as before. A subscriber that relied on getting a new message on every
     reconnect or repeated subscribe no longer gets one.
   - A filter unsubscribed while the client is disconnected is now withdrawn
     at the broker on the next connection that finds the kept session.
@@ -95,9 +94,14 @@ All notable changes to Brenn are documented here.
     a filter a previous process held and this one does not
     (`mqtt-deferred-unsubscribe-not-withdrawn`).
   - An `mqtt_client` removed by a config reload ends its broker session
-    instead of leaving it to queue messages until it expires. One added by a
-    reload starts clean, discarding anything the broker kept under that
-    slug. A server boot still resumes a kept session.
+    when it is connected at that moment, instead of leaving it to queue
+    messages until it expires. One with no connection then, or whose
+    DISCONNECT is lost on the way (`mqtt-disconnect-lost-to-reset`), leaves
+    the session at the broker until it expires. One added by a reload
+    starts clean on its first connection, discarding anything the broker
+    kept under that slug; a server restart before that first connection
+    resumes a kept session, as every server boot does
+    (`mqtt-added-client-clean-start-lost-to-restart`).
 - **Upgrade note:** the reload status body gains `mqtt_unsubscribe_deferred`,
   which lists unsubscribes waiting for the client's next connection.
   `mqtt_deferred` no longer lists them.
@@ -106,10 +110,15 @@ All notable changes to Brenn are documented here.
   messages it has received, so subscribing at 2 could deliver a message twice
   or fail the connection on every reconnect. Publishes may still use QoS 2.
 - **Behaviour change:** an MQTT client keeps its session state across a lost
-  connection. With `session_expiry_secs` above 0, a publish in flight when the
-  connection drops is completed by the resumed session — QoS 1 is not sent as
-  a second publish, QoS 2 is delivered exactly once — instead of resent or
-  reported unknown. With the default of 0 outcomes are as before.
+  connection. With `session_expiry_secs` above 0, when the broker resumes the
+  session, a publish in flight when the connection dropped is completed by
+  it: QoS 1 is sent again under its original packet identifier, not as a new
+  publish, and QoS 2 is delivered exactly once. The completion is made
+  however late the client reconnects, even after the message's lifetime
+  (`mqtt-expired-replay-not-stopped`). With the default of 0, or when the
+  broker did not keep the session, a QoS 1 publish in flight is sent again as
+  a new publish within its lifetime, and a QoS 2 publish, or a QoS 0 one not
+  yet written, ends as `unknown`.
 - **Behaviour change:** an unsolicited acknowledgement from the broker (one
   for a message the client has no record of) no longer reconnects an MQTT client forever; the client's session is discarded
   once with an alert, and a second in a row stops the client with a critical
@@ -164,9 +173,11 @@ All notable changes to Brenn are documented here.
 - **Fixed:** a client holding overlapping MQTT subscription filters (`a/#` and
   `a/b`) received each message on the overlap once per covering filter in each
   covering channel. It now receives it once in each: every message is routed
-  by the MQTT 5 Subscription Identifier the broker returns on it. The
-  exception is two filters that share a Subscription Identifier, which is
-  rare; see "Which channels an inbound MQTT message reaches" in
+  by the MQTT 5 Subscription Identifier the broker returns on it. Not so
+  where two filters share a Subscription Identifier, which is rare, or where
+  the broker sends a message without one and it is routed by topic as before,
+  as is every message of a broker that does not support Subscription
+  Identifiers; see "Which channels an inbound MQTT message reaches" in
   `docs/message-bus.md`.
 - **BREAKING for operators with a non-zero `session_expiry_secs`:** on the
   first start of this version, messages the broker queued for the client while
@@ -185,21 +196,22 @@ All notable changes to Brenn are documented here.
   the new QoS, and the filter is reported in `mqtt_subscribed` only.
 - **BREAKING for operators:** an MQTT subscribe ACL entry whose filter starts
   with `#` or `+` no longer covers a subscription whose first level starts
-  with `$` (`$SYS/…`, `$share/…`), matching what publish entries already do.
-  Write an entry that spells the first level, for example
-  `topic_filter "mqtt:<c>:$SYS/#"`. What you see if a subscription is no
-  longer covered: a static subscription or a surface binding stops the server
-  at start with a message naming the subscriber and the channel; a stored
-  dynamic subscription is kept but goes dormant, with a `warn` line "dynamic
-  subscription revoked", and resumes once a covering entry is added; a new
-  dynamic subscribe is refused as not permitted. On a client with a non-zero
-  `session_expiry_secs`, the broker can resume its session with the dormant
-  subscription's filter still in place and keep sending on it: each such
-  message is dropped with a `warn` naming the Subscription Identifier it
-  carried, unless a filter the client holds shares that identifier and covers
-  the topic, in which case that filter's channel receives the message a second
-  time (rare; `docs/message-bus.md`, the same passage); this lasts until the
-  broker's session for the client ends or a covering entry is added.
+  with `$` (`$SYS/…`, `$share/…`), as the per-topic publish entries this
+  release introduces (below) do not either. Write an entry that spells the
+  first level, for example `topic_filter "mqtt:<c>:$SYS/#"`. What you see if
+  a subscription is no longer covered: a static subscription or a surface
+  binding stops the server at start with a message naming the subscriber and
+  the channel; a stored dynamic subscription is kept but goes dormant, with a
+  `warn` line "dynamic subscription revoked", and resumes once a covering
+  entry is added; a new dynamic subscribe is refused as not permitted. On a
+  client with a non-zero `session_expiry_secs`, the broker can resume its
+  session with the dormant subscription's filter still in place and keep
+  sending on it: each such message is dropped with a `warn` naming the
+  Subscription Identifier it carried, unless a filter the client holds shares
+  that identifier and covers the topic, in which case that filter's channel
+  receives the message a second time (rare; `docs/message-bus.md`, the same
+  passage); this lasts until the broker's session for the client ends or a
+  covering entry is added.
 - **New: an MQTT publish can name a reply topic.** `MqttSend` and an
   automation's `mqtt_publish` action take an optional `reply_to`, written
   `mqtt:<client>:<topic>`, which is sent to the broker as the MQTT 5 Response
@@ -239,12 +251,14 @@ All notable changes to Brenn are documented here.
 - **BREAKING for MqttSend callers:** `MqttSend` now commits the message to the
   bus and returns, instead of waiting for the broker. A new argument,
   `lifetime_s`, is required: a number of seconds from 1 to 4294967295, or
-  `"forever"`. It is how long Brenn keeps trying to send the message, and what
-  is left of it is sent as the MQTT message expiry. The answer is `ok` with
-  the message's id, the remaining budget and whether the client is connected
-  now; it never reports delivery. A client that is not connected is no longer
-  an error: the message waits for the connection within its lifetime. Without
-  a `status_to` (below), failures go to the operator as `warn` lines and phone
+  `"forever"`. It is how long Brenn keeps trying to hand the message to the
+  broker, and what is left of it at that moment is sent as the MQTT message
+  expiry; a message already in flight when the connection is lost can be sent
+  after it, when the client reconnects. The answer is `ok` with the message's
+  id, the remaining budget and whether the client is connected now; it never
+  reports delivery. A client that is not connected is no longer an error: the
+  message waits for the connection within its lifetime. Without a
+  `status_to` (below), failures go to the operator as `warn` lines and phone
   alerts, not to the caller. At QoS 1 a message may be delivered twice after a
   reconnect. An
   inline payload over `[messaging] max_body_bytes` needs a blob store and is
@@ -253,14 +267,22 @@ All notable changes to Brenn are documented here.
 - **New: a sender can learn what became of its MQTT message.** `MqttSend`
   takes an optional `status_to`, a `brenn:` channel the app may publish to.
   Brenn publishes JSON statuses there (sender `system:delivery-status`):
-  `handed` when the message goes to the broker, then one outcome — delivered,
-  refused by the broker, too large for the broker, `expired`, `dropped` or
-  `unknown`. `expired` and `dropped` mean the message was never sent;
-  `unknown` means it may have been sent and will not be sent again, including
-  a QoS 1 message refused when re-sent after a lost connection (cause
-  `resend_refused`), whose first copy may have arrived. A broker's rejection
-  still alerts the operator whether or not the caller was told, since it means
-  the app's topic ACL admits what the broker forbids. Components name a status
+  `handed` when the message is handed over to be sent, then one outcome —
+  `delivered`, `rejected` (refused by the broker, or too large for it),
+  `expired`, `dropped` or `unknown`. `expired` and `dropped` mean the message
+  was never sent, and can come with no `handed` before them; `unknown` means
+  it may have been sent and will not be sent again, including a QoS 1 message
+  refused when re-sent after a lost connection (cause `resend_refused`),
+  whose first copy may have arrived. Not every message gets an outcome
+  (`docs/message-bus.md`, *What a sender may infer*). A refusal by the broker
+  alerts the operator whether or not the caller was told. It usually means
+  the app's topic ACL admits what the broker forbids, but in this release
+  every refusal by the broker is told and alerted alike: also a Quota
+  exceeded answer, which says "not now" and which Brenn does not send again
+  (`mqtt-quota-exceeded-told-rejected`), and, at QoS 2, a broker that takes a
+  message and then refuses the last step of the exchange, so that a message
+  told `rejected` has probably been delivered
+  (`mqtt-qos2-completion-refusal-told-rejected`). Components name a status
   port through `mqtt-publish-tracked` (above).
 - **New for operators: an MQTT session waits for its broker's answers when it
   stops.** A server shutdown, a reload that changes a client and a reload that
@@ -272,12 +294,14 @@ All notable changes to Brenn are documented here.
   `unknown`, `stopped`. A session with nothing in flight, or a broker that
   answers, stops in milliseconds. A shutdown stops every session at once and
   does not exit until each has finished and its statuses are committed, so a
-  `handed` with no outcome now means the server crashed or was killed. Keep
-  `stop_wait_secs` shorter than the service manager's stop timeout (systemd's
-  `TimeoutStopSec`, 90 s unless set), or a shutdown against a silent broker is
-  killed mid-wait. A reload that both removes and changes clients, against
-  brokers that do not answer, can wait up to two bounds (120 s at the
-  default); allow for that in anything that waits on a reload's outcome.
+  `handed` with no outcome after a restart means the server crashed or was
+  killed, or that the outcome's status could not be published, which the
+  operator is told. Keep `stop_wait_secs` shorter than the service manager's
+  stop timeout (systemd's `TimeoutStopSec`, 90 s unless set), or a shutdown
+  against a silent broker is killed mid-wait. A reload that both removes and
+  changes clients, against brokers that do not answer, can wait up to two
+  bounds (120 s at the default); allow for that in anything that waits on a
+  reload's outcome.
 - **Development:** `make check` no longer spends about eleven minutes on the
   `brenn-server` test suite. Three Gmail message-body tests searched for the
   largest body that fits one byte step at a time; they now bracket and bisect,
@@ -295,21 +319,23 @@ All notable changes to Brenn are documented here.
   still writes the client-only form keeps compiling, and now holds the topics
   its stamp's ceiling states for that client — a stamp whose ceiling states
   none is refused with the line to add. Applies to agents (`MqttSend`) and
-  components (`mqtt-publish`) alike; a refused topic is the existing
-  `not-permitted`, and its denial names the topic.
+  components (`mqtt-publish`) alike: a component's refused topic is the
+  existing `not-permitted`, an agent's is an error that says so, and either
+  denial names the topic.
 - **BREAKING for MqttSend callers:** `MqttSend` can send JSON, and raw bytes
   move to their own argument. `body: { binary_base64, content_type }` becomes
   the top-level arguments `body_base64` and `content_type`; the old object is
-  refused with a message naming them, never published. An object or array
-  `body` is now published as its JSON text (a serialization of the value, not
-  the caller's spelling); a string `body` is still published verbatim, and a
-  number, boolean or null `body` is refused. `content_type` also types a
-  `body`, and is refused beside an `attachment`, which publishes its own.
-- **For component authors:** `MqttPublishTransport` gained a `status_to`
-  field (absent on the wire when unset). A guest that builds or destructures
-  it exhaustively needs a source change; a component names a status port
-  through `mqtt-publish-tracked` (above), and its publish then carries the
-  wired channel as its `status_to`.
+  refused with a message naming them, never published. A string `body` is
+  still published verbatim. Any other object, an array, a number or a boolean
+  `body`, all refused until now, is published as its JSON text (`42`,
+  `true`): a serialization of the value, not the caller's spelling. A null
+  `body` is still refused; the error now says to send the text `null` as
+  base64 (`bnVsbA==`) in `body_base64`. A number with many digits can lose
+  some of them, on the way to Brenn or in Brenn's own parse, which holds at
+  most a 64-bit integer or an `f64`; to publish a number's exact digits, give
+  the base64 of its text in `body_base64`. `content_type` also types a
+  `body`, and is refused beside an `attachment`, which publishes its own. An
+  automation's `mqtt_publish` action (above) reads `body` the same way.
 - **BREAKING for component authors:** a component's `mqtt-publish` and
   `mqtt-publish-expiring` now go through the bus, like `MqttSend`, and never
   wait on the broker. The WIT shapes are unchanged and every existing component
@@ -343,34 +369,37 @@ All notable changes to Brenn are documented here.
   component repository not named there was not and could not be surveyed.
   Until this release is tagged the old behaviour can be restored without a new
   contract version; after it, restoring it needs one.
-- **For authors of host tests:** `brenn_wasm::MqttPublishProps` states a
-  `lifetime` (`MqttPublishLifetime`), a `status_to` and a `reply_topic` in
-  place of `message_expiry_s`, and no longer has a `Default`;
-  `brenn_wasm::MqttAdmission::Admitted` carries the admitted `response_topic`
-  and the enum gains `ReplyTopicNotPermitted` and `StatusChannelRefused`,
-  whose `cause` is a `brenn_wasm::StatusChannelRefusal`;
-  `brenn_wasm::ProcessorMqttPublish` gains `message_id` and `response_topic`;
-  and the `mqtt` host functions are trappable.
-- **For authors of host tests:** `brenn_wasm::MqttPublisher::publish` is
-  replaced by `admit`, which returns an `MqttAdmission`, and
-  `MqttPublishOutcome` is gone. A test reads what a component published from
-  `ProcessorOutcome::Ok`'s `publishes`, where an MQTT entry has `mqtt` set.
+- **For authors of host tests:** the `brenn_wasm` seam for a component's MQTT
+  publish is replaced. `MqttPublishFn` was a closure that published and
+  returned an `MqttPublishOutcome`; it is now an `Arc<dyn MqttPublisher>`, a
+  trait whose two methods decide and never publish: `resolve` parses the
+  guest's client and topic into an `MqttTarget`, and `admit` returns an
+  `MqttAdmission` — `Admitted { response_topic }`, `NotPermitted`,
+  `InvalidPayload`, `ReplyTopicNotPermitted` or `StatusChannelRefused`, whose
+  `cause` is a `StatusChannelRefusal`. `MqttPublishOutcome` is gone.
+  `MqttPublishProps` states a `lifetime` (`MqttPublishLifetime`), a
+  `status_to` and a `reply_topic` in place of `message_expiry_s`, and no
+  longer has a `Default`. A test reads what a component published from
+  `ProcessorOutcome::Ok`'s `publishes`, where an MQTT entry has `mqtt` set to
+  a `ProcessorMqttPublish` (`message_id`, `target`, `props`,
+  `response_topic`). The `mqtt` host functions are trappable.
 - A component's per-client publish rate limit now counts every publish that
   reaches the client, however the guest spelled the `client` string: `home:a`
   with topic `b` is charged to `home`.
 - **Fixed:** after an MQTT session's supervisor recovers from a panic, a
   message in flight on the dead connection is resolved by the rules for a
   lost connection, and is never taken for a later message's acknowledgement.
-- **Fixed:** an `MqttSend` to a client that a config reload is removing is
-  no longer answered "committed" and then silently lost. It is either
-  refused, as for a client that is not configured, or reported as dropped
+- An `MqttSend` to a client that a config reload is removing is never
+  answered "committed" and then silently lost. It is refused, as for a client
+  that is not configured, or it is committed and reported: a message the
+  client had already taken, as what became of it; one it had not, as dropped
   with cause `removed` — to the operator, and to its `status_to` when it
   names one. The report does not depend on the client's session still
-  running, so a server shutdown that has already stopped it changes nothing
-  reported, and any open alert for the client is closed with a summary that
-  names the removal. Still not
-  reported: messages left for a client deleted from the config while the
-  server was down.
+  running. Any open run of coalesced alerts for the client is closed, with a
+  summary that names the removal if it held any back. Still not reported:
+  messages left for a client deleted from the config while the server was
+  down, and whatever a server shutdown that overlaps the reload cuts off
+  (`shutdown-does-not-quiesce-reload`).
 - **BREAKING for operators:** `egress` is now a reserved channel name, for
   routing MQTT publishes through the message bus. A declared
   channel named `egress`, `egress.<x>` or `egress/<x>` no longer loads, and no
@@ -384,12 +413,19 @@ All notable changes to Brenn are documented here.
   component's `in` port may read a declared client's channel; nothing else may
   name it.
 - **For component authors:** the SDK's `TransportMeta` gains the variant
-  `MqttPublish { client_slug, topic, qos, retain, content_type, expires }`,
-  where `expires` is `{"at": "<rfc3339>"}` or `"never"`. A component that
-  matches the enum exhaustively needs an arm when it is rebuilt against this
-  release; one that uses the SDK's accessors needs nothing. A component reads
-  it only on a `brenn:egress/mqtt/<client>` channel its `in` port binds. No WIT
-  contract changes.
+  `MqttPublish`, which holds an `MqttPublishTransport` (defined in
+  `brenn-envelope`; `brenn-guest` re-exports the enum, not the struct) with
+  the fields `client_slug`, `topic`, `qos`, `retain`, `content_type`,
+  `expires`, `status_to` and `response_topic`. `expires` is
+  `{"at": "<rfc3339>"}` or `"never"`. `status_to` is the `brenn:` channel the
+  publish's delivery statuses go to, as its sender named it.
+  `response_topic` is the bare reply topic, sent as the MQTT 5 Response
+  Topic. `content_type`, `status_to` and `response_topic` are absent on the
+  wire when unset. A component that matches the enum exhaustively needs an
+  arm when it is rebuilt against this release; one that uses the SDK's
+  accessors needs nothing. A component reads it only on a
+  `brenn:egress/mqtt/<client>` channel its `in` port binds. The variant
+  changes no WIT contract.
 - Bumped url from 2.5.8 to 2.5.9, clearing RUSTSEC-2026-0592. A `^` in a URL
   path is now percent-encoded: file links carry `%5E`, `api-request` sends
   `%5E` for it, and a push `data.url`, redirector target or login return path

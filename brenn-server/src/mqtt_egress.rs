@@ -524,8 +524,11 @@ impl MqttEgressHub {
                     recording.state.counts.rejected += 1;
                     // TODO(mqtt-egress-operator-text-unsent-of-possibly-sent)
                     let detail = format!("the broker rejected it: {reason}");
-                    // A broker's rejection means Brenn's per-topic ACL admits
-                    // what the broker forbids, which only the operator can fix.
+                    // A broker's rejection usually means Brenn's per-topic ACL
+                    // admits what the broker forbids, which only the operator
+                    // can fix. Every rejection that carries a reason code is
+                    // alerted, a quota refusal and a refused QoS 2 completion
+                    // among them.
                     let broker_answered = code.is_some();
                     recording.failure(
                         FailureKind::Rejected,

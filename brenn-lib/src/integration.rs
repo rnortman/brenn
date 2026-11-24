@@ -1718,7 +1718,7 @@ fn mqtt_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
                 "was not sent, except when the status itself could not be published: then it ",
                 "may have been sent and the operator, not you, knows, so do not resend on a ",
                 "missing `handed` alone if a duplicate is worse than a loss. A message the ",
-                "client's channel window dropped, or one sent as its client was being removed, ",
+                "client's channel window dropped ",
                 "gets no status at all.\n\n",
                 "`reply_to` names a topic as `mqtt:<client>:<topic>`, on the same client as ",
                 "`to`, and is sent as the MQTT 5 Response Topic, so a responder knows where to ",

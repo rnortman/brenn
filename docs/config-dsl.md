@@ -2386,12 +2386,14 @@ Five more declarations, each a body of attrs:
   retained replay at each connection brings the rest of the client's retained
   topics up to date. A new process resumes the session with whatever filters
   an earlier process left in it, and cannot withdraw one it never holds
-  itself; a reload that removes the client ends the session, and one that
-  declares it again starts a clean one. An expiry above 0 adds a second way
-  for a retained topic published at more than one QoS to leave its channel on
-  an older value than the broker's — a value queued during the outage
-  arriving after the replay of a newer one — beside the way that needs no
-  kept session; the rule that avoids both, one QoS per retained topic, is in
+  itself; a reload that removes the client ends the session when the client
+  is connected, and one that declares it again starts a clean one on its
+  first connection (`docs/message-bus.md` §2.7.3, "Sessions that end and
+  start on purpose", has the limits of both). An expiry above 0 adds a second
+  way for a retained topic published at more than one QoS to leave its channel
+  on an older value than the broker's — a value queued during the outage
+  arriving after the replay of a newer one — beside the way that needs no kept
+  session; the rule that avoids both, one QoS per retained topic, is in
   `docs/message-bus.md`'s *Retained replay*.
 
   `stop_wait_secs` (default 60) is the longest a stop of the client's session
