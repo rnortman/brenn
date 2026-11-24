@@ -2487,7 +2487,7 @@ mqtt_client broker {
     reconnect_backoff_max_secs = 120;
     session_expiry_secs = 300;
     stop_wait_secs = 15;
-    qos = 2;
+    qos = 0;
     urgency = high;
 }
 "#,
@@ -2505,7 +2505,7 @@ mqtt_client broker {
                 last_will: None,
                 reconnect_backoff_initial_secs: 2,
                 reconnect_backoff_max_secs: 120,
-                qos: 2,
+                qos: 0,
                 urgency: Urgency::High,
                 session_expiry_secs: 300,
                 stop_wait_secs: 15,

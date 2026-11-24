@@ -1,5 +1,5 @@
 {
-  "checksum": "3f0b202b9f23242a439d0fb75571a21730698d8a78d81b7522d9688fabca5ceb",
+  "checksum": "b45f265a1a38e47c994f1b68eb15a1ceb1be7532fe16f868dfca491367b2dc93",
   "crates": {
     "addr2line 0.26.1": {
       "name": "addr2line",
@@ -4764,6 +4764,15 @@
             {
               "id": "uuid 1.24.0",
               "target": "uuid"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "tokio-rustls 0.26.4",
+              "target": "tokio_rustls"
             }
           ],
           "selects": {}

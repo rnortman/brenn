@@ -2180,7 +2180,10 @@ pub mod mqtt {
     /// `message_expiry_s` seconds from commit, and what is left of that when
     /// it is handed to the broker is sent as the MQTT 5 message-expiry
     /// interval. A message whose lifetime passes before it is sent is not
-    /// sent. Zero is refused as `invalid-payload`.
+    /// sent. A message already handed to the MQTT library when the
+    /// connection is lost may be sent after its lifetime, when the client
+    /// reconnects, with the expiry interval it was first sent with. Zero is
+    /// refused as `invalid-payload`.
     ///
     /// Imports `mqtt-publish-expiring`, which a host that predates it does not
     /// provide: a component calling this does not link there.

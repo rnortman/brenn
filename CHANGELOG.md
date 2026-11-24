@@ -4,6 +4,24 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Upgrade note:** `mqtt_client { qos = 2 }` no longer loads; set it to 1.
+  Brenn's MQTT client library forgets, on every lost connection, which QoS 2
+  messages it has received, so subscribing at 2 could deliver a message twice
+  or fail the connection on every reconnect. Publishes may still use QoS 2.
+- **Behaviour change:** an MQTT client keeps its session state across a lost
+  connection. With `session_expiry_secs` above 0, a publish in flight when the
+  connection drops is completed by the resumed session — QoS 1 is not sent as
+  a second publish, QoS 2 is delivered exactly once — instead of resent or
+  reported unknown. With the default of 0 outcomes are as before.
+- **Behaviour change:** an unsolicited acknowledgement from the broker (one
+  for a message the client has no record of) no longer reconnects an MQTT client forever; the client's session is discarded
+  once with an alert, and a second in a row stops the client with a critical
+  alert.
+- **Behaviour change:** an MQTT connection that is closed or reset during the
+  TLS handshake is retried like any other failed connect; before, it stopped
+  the MQTT client until its `mqtt_client` block was reloaded or the server
+  restarted. A certificate the client rejects, or any other refusal by TLS
+  itself, still stops it.
 - **Behaviour change: one QoS per MQTT topic filter, the client's.** An MQTT
   filter is now always subscribed at its client's configured `qos`, whether a
   config binding or an app's runtime `MessageSubscribe` subscribed it.

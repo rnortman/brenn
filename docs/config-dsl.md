@@ -2308,6 +2308,23 @@ Five more declarations, each a body of attrs:
   4294967295, refuses the document at load. `docs/message-bus.md` §2.7.2 has
   `MqttSend`'s contract.
 
+  `qos` — 0 or 1, default 1 — is the QoS of the broker SUBSCRIBE for every
+  filter of the client, and nothing else: a publish carries its own QoS, 0 to
+  2. `2` refuses the document at load: the client's MQTT library forgets, on
+  every lost connection, which QoS 2 messages it has received, so on a kept
+  session a message could arrive twice or the connection fail on every
+  reconnect (`docs/message-bus.md`, "An `mqtt:` filter is subscribed at its
+  client's QoS").
+
+  `session_expiry_secs` — default 0 — is how long the broker keeps the
+  client's session after the connection ends. At 0 every reconnect starts a
+  new session. Above 0, a reconnect within that time resumes the session: the
+  broker delivers what it queued for the client's filters at QoS 1 while Brenn
+  was away, and publishes that were in flight are completed rather than sent
+  again (`docs/message-bus.md` §2.7.3, "QoS across a reconnect"). It is a
+  maximum the broker may shorten; an outage longer than it ends as a new
+  session.
+
   `stop_wait_secs` (default 60) is the longest a stop of the client's session
   — a server shutdown, a reload that changes the client, or one that removes
   it — waits for the broker: first for the answers to messages already in

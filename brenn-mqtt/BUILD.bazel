@@ -88,6 +88,38 @@ rust_test(
     ],
 )
 
+# The kept-session suite: one client behind a TLS-terminating packet relay per
+# case, a loss staged at a chosen packet, and the resumed session judged on the
+# wire. Declared like `:mqtt_integration`, whose harness it shares; most cases
+# sit out a staged outage of a few seconds, so the budget is the same.
+rust_test(
+    name = "session_resume",
+    size = "medium",
+    srcs = ["tests/session_resume.rs"] + glob(["tests/common/*.rs"]),
+    crate_root = "tests/session_resume.rs",
+    data = glob(["tests/mqtt_assets/**"]) + ["//bazel/tools:mosquitto"],
+    edition = "2024",
+    env = {
+        "BRENN_MOSQUITTO_BIN": "$(rootpath //bazel/tools:mosquitto)",
+        "BRENN_MQTT_INTEGRATION": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-mqtt"},
+    tags = ["requires-network"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [
+        ":brenn-mqtt",
+        "//brenn-envelope",
+        "//brenn-lib",
+        "//brenn-messaging-store",
+    ],
+)
+
 rust_doc_test(
     name = "brenn-mqtt_doc_test",
     crate = ":brenn-mqtt",

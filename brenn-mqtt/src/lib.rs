@@ -20,7 +20,7 @@
 //! - `reader`     — the per-client egress reader (`start_egress_reader`) and the
 //!   `EgressBus` view of a client's egress channel it reads through.
 //! - `connection` — unified per-client supervisor (`spawn_client_supervisor`) plus
-//!   subscription helpers (`union_subscriptions`, `try_assert_ingress_subscription`).
+//!   the subscription helper `union_subscriptions`.
 //! - `test_support` — a `mosquitto` harness and its throwaway TLS material, for
 //!   this crate's integration suite and for the crates above that drive ingress
 //!   through a real broker. Behind the `testutils` feature.
@@ -45,7 +45,7 @@ pub use reader::{
 };
 pub use service::{
     InboundRouting, IngressSubscribeOutcome, IngressUnsubscribeOutcome, MqttEventRouter,
-    MqttService,
+    MqttService, SessionFault,
 };
 pub use state::{
     ConnectorHealthLabel, IngressSubscription, IngressSubscriptionSet, MqttClientHandle,

@@ -973,13 +973,13 @@ impl ActiveBridge {
         );
 
         // MqttService with a registered ingress handle for `home`, configured at
-        // QoS 2, holding the filter so the enrichment surfaces that QoS. The
+        // QoS 0, holding the filter so the enrichment surfaces that QoS. The
         // handle's `client` cell is `None` (no live broker in a unit test) →
         // health "disconnected".
         let mqtt_service = brenn_mqtt::MqttService::new();
         let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
         let mut config = crate::test_support::mqtt::test_client_config("home");
-        config.identity.qos = 2;
+        config.identity.qos = 0;
         let handle = brenn_mqtt::MqttClientHandle::new(Arc::new(config), vec![], stop_tx);
         handle.add_subscription("sensors/+/temp".to_string()).await;
         mqtt_service.add_client(handle);
@@ -1009,7 +1009,7 @@ impl ActiveBridge {
     ///   bridge's app (`testapp`) as a **singleton single-user** app (so
     ///   push-enabled subscribes pass the resolver invariants);
     /// - an `MqttService` with a registered ingress supervisor for client `home`,
-    ///   default `qos = 2` and `urgency = High` (deliberately non-default so
+    ///   default `qos = 0` and `urgency = High` (deliberately non-default so
     ///   qos-/urgency-resolution is observable), whose `client` cell is `None`
     ///   (no live broker in a unit test → SUBSCRIBE deferred);
     /// - a `MqttEventRouterImpl` wired via `set_state` with an `AppState` holding
@@ -1209,13 +1209,13 @@ impl ActiveBridge {
         .with_system_channel_tuning(system_channel_tuning);
 
         // MqttService with a registered `home` ingress supervisor. Non-default
-        // qos (2) / urgency (High) so qos-/urgency-resolution is observable; the
+        // qos (0) / urgency (High) so qos-/urgency-resolution is observable; the
         // `client` cell is None (no broker) → live SUBSCRIBE deferred.
         let mqtt_service = brenn_mqtt::MqttService::new();
         let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
         let mut config = crate::test_support::mqtt::test_client_config("home");
         config.identity.urgency = brenn_lib::messaging::Urgency::High;
-        config.identity.qos = 2;
+        config.identity.qos = 0;
         let handle = brenn_mqtt::MqttClientHandle::new(Arc::new(config), vec![], stop_tx);
         mqtt_service.add_client(handle);
 

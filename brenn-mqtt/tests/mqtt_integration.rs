@@ -10,15 +10,12 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use brenn_envelope::{MqttExpiry, MqttPublishTransport};
+use brenn_envelope::MqttExpiry;
 use brenn_lib::mqtt::config::TlsVersionMin;
 use brenn_lib::mqtt::subscription_identifier;
-use brenn_messaging_store::store::MessageSeq;
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::payload::InboundPayload;
-use brenn_mqtt::reader::{
-    EgressBus, EgressItem, EgressMessage, EgressReport, Sent, UnknownCause, start_egress_reader,
-};
+use brenn_mqtt::reader::{EgressReport, Sent, UnknownCause, start_egress_reader};
 use brenn_mqtt::service::{InboundRouting, MqttEventRouter};
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
@@ -26,12 +23,13 @@ use brenn_mqtt::state::IngressSubscription;
 use brenn_mqtt::test_support::client::wait_for_filter_acked;
 use brenn_mqtt::{ArrivingFilters, MqttClientHandle, MqttService, register_and_spawn};
 use common::{
-    AUTH_CREDENTIALS, BrokerHarness, CapturingRouter, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE,
-    SpawnedClient, TcpRelay, await_puback, broker_auth, broker_tls13, certs,
+    AUTH_CREDENTIALS, BrokerHarness, CapturingRouter, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, Egress,
+    MemBus, SpawnedClient, TcpRelay, await_puback, broker_auth, broker_tls13, certs,
     direct_publisher_acked, direct_subscriber, direct_subscriber_every, direct_subscriber_publish,
-    log_records_disconnect, log_records_disconnect_after, log_records_disconnect_before_reconnect,
-    log_records_publish_to_subscriber, log_records_subscribe_at, log_records_unsubscribe,
-    recv_delivery, session_client_id, spawn_client, spawn_client_tls13, spawn_client_with_config,
+    egress_message, log_records_disconnect, log_records_disconnect_after,
+    log_records_disconnect_before_reconnect, log_records_publish_to_subscriber,
+    log_records_subscribe_at, log_records_unsubscribe, next_report, recv_delivery,
+    session_client_id, spawn_client, spawn_client_tls13, spawn_client_with_config,
     subscribe_live_confirmed, test_client_config, wait_for_health,
 };
 use rumqttc::mqttbytes::QoS;
@@ -387,6 +385,7 @@ async fn self_publish_echoes_back_on_same_session() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client("echo", &harness, ca.clone(), vec![]).await;
 
     // A direct publisher drives the retained-barrier handshake that confirms the
@@ -449,6 +448,7 @@ async fn ingress_subscribe_filter_live_delivers() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client(
         "ingsub",
         &harness,
@@ -526,6 +526,7 @@ async fn ingress_unsubscribe_filter_live_stops_delivery() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client("ingunsub", &harness, ca.clone(), vec![]).await;
     let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca.clone()).await;
 
@@ -628,6 +629,7 @@ async fn overlapping_filters_attribute_each_copy_to_its_subscription() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client(
         "overlap",
         &harness,
@@ -740,6 +742,7 @@ async fn a_successor_at_a_new_qos_resubscribes_in_place() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client_with_config(Arc::new(config.clone()), vec![filter.to_string()]).await;
     wait_for_filter_acked(&svc, &client_slug, filter, 5, "qosmove filter granted at 0").await;
     let subscriber = session_client_id(&client_slug);
@@ -1031,6 +1034,7 @@ async fn reconnect_reasserts_filters() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client_with_config(config, vec![sub_filter.to_string()]).await;
 
     wait_for_health(
@@ -1168,6 +1172,10 @@ impl MqttEventRouter for PanicOnceRouter {
         // redelivery during teardown may find it gone.
         self.tx.send(payload.bytes.to_vec()).ok();
     }
+
+    async fn session_fault(&self, client_slug: &str, fault: brenn_mqtt::SessionFault) {
+        panic!("no test on this router provokes a session fault; got {fault:?} on {client_slug}");
+    }
 }
 
 /// A message handed on the connection of a supervisor body that panics is
@@ -1291,6 +1299,7 @@ async fn connect_with_more_filters_than_the_request_channel_holds_asserts_all() 
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client("many", &harness, ca.clone(), filters.clone()).await;
 
     let last = &filters[MANY_FILTERS - 1];
@@ -1339,6 +1348,7 @@ async fn live_subscribe_during_a_large_reassert_is_asserted() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client("many-live", &harness, ca.clone(), filters.clone()).await;
 
     let live = "brenn/itest/many/live/#";
@@ -1444,6 +1454,7 @@ async fn a_deferred_subscribe_is_sent_at_the_next_poll() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client(
         "deferred-drain",
         &harness,
@@ -1672,202 +1683,6 @@ fn a_config_the_broker_rejects_is_reported_with_its_stderr() {
 // ---------------------------------------------------------------------------
 // The egress reader against a live broker, over an in-memory bus
 // ---------------------------------------------------------------------------
-
-/// An in-memory egress channel with one position, forwarding every report but
-/// `Drained` to the test.
-struct MemBus {
-    entries: std::sync::Mutex<(Vec<EgressItem>, u64)>,
-    wake: tokio::sync::watch::Sender<u64>,
-    reports: tokio::sync::mpsc::UnboundedSender<EgressReport>,
-}
-
-impl MemBus {
-    fn holding(
-        messages: Vec<EgressMessage>,
-    ) -> (
-        Arc<Self>,
-        tokio::sync::mpsc::UnboundedReceiver<EgressReport>,
-    ) {
-        let (reports, rx) = tokio::sync::mpsc::unbounded_channel();
-        let bus = Arc::new(Self {
-            entries: std::sync::Mutex::new((
-                messages.into_iter().map(EgressItem::Message).collect(),
-                1,
-            )),
-            wake: tokio::sync::watch::channel(0).0,
-            reports,
-        });
-        (bus, rx)
-    }
-}
-
-impl MemBus {
-    /// Append `message` to the channel and raise the wake, as a commit does.
-    fn append(&self, message: EgressMessage) {
-        self.entries
-            .lock()
-            .unwrap()
-            .0
-            .push(EgressItem::Message(message));
-        self.wake.send_modify(|n| *n += 1);
-    }
-}
-
-/// A client's egress reader over an initially empty [`MemBus`], for a test that
-/// publishes through the session one message at a time. One handle takes one
-/// reader, so a test that publishes more than once appends to the same bus.
-struct Egress {
-    client_slug: String,
-    bus: Arc<MemBus>,
-    reports: tokio::sync::mpsc::UnboundedReceiver<EgressReport>,
-    next_seq: u64,
-}
-
-impl Egress {
-    fn start(handle: &Arc<MqttClientHandle>) -> Self {
-        let (bus, reports) = MemBus::holding(vec![]);
-        start_egress_reader(handle, bus.clone());
-        Self {
-            client_slug: handle.config.identity.slug.clone(),
-            bus,
-            reports,
-            next_seq: 1,
-        }
-    }
-
-    /// The next message for `topic` at `qos`: not retained, no content type,
-    /// no expiry.
-    fn message(&mut self, topic: &str, qos: u8, payload: &[u8]) -> EgressMessage {
-        let message = egress_message(self.next_seq, &self.client_slug, topic, qos, payload);
-        self.next_seq += 1;
-        message
-    }
-
-    /// Commit `message` to the channel and return the reader's next report.
-    async fn send(&mut self, message: EgressMessage) -> EgressReport {
-        self.bus.append(message);
-        next_report(&mut self.reports, 15, "the egress report").await
-    }
-
-    /// The next message for `topic` at `qos`, naming a `status_to` so the
-    /// reader reports it handed before it gives it to the library.
-    fn tracked(&mut self, topic: &str, qos: u8, payload: &[u8]) -> EgressMessage {
-        let mut message = self.message(topic, qos, payload);
-        message.publish.status_to = Some("brenn:itest-status".to_string());
-        message
-    }
-
-    /// Commit `message`, which names a `status_to`, and return its id once the
-    /// library holds it: a stop requested from here finds it in flight.
-    ///
-    /// Its `Handed` report comes before the reader submits it, and a stop that
-    /// lands between the two leaves it held, never sent. So a QoS 0 sentinel on
-    /// `sentinel_topic` is committed with it: the reader submits the two in
-    /// order in one pass, and the sentinel's delivery, which needs only the
-    /// write, says the message before it was accepted. The broker is expected
-    /// to be paused, so nothing answers the message itself.
-    async fn hand(&mut self, message: EgressMessage, sentinel_topic: &str) -> uuid::Uuid {
-        let id = message.id;
-        let sentinel = self.message(sentinel_topic, 0, b"sentinel");
-        let sentinel_id = sentinel.id;
-        self.bus.append(message);
-        self.bus.append(sentinel);
-        match next_report(&mut self.reports, 15, "the handed message").await {
-            EgressReport::Handed(meta) if meta.id == id => {}
-            other => panic!("expected {id} handed, got {other:?}"),
-        }
-        match next_report(&mut self.reports, 15, "the sentinel").await {
-            EgressReport::Delivered(meta) if meta.id == sentinel_id => id,
-            other => panic!("expected the sentinel {sentinel_id} delivered, got {other:?}"),
-        }
-    }
-
-    /// The report the reader has already made, if any: for after the reader
-    /// has exited, when every report it will make has been made.
-    fn made(&mut self) -> Option<EgressReport> {
-        match self.reports.try_recv() {
-            Ok(report) => Some(report),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-            Err(e) => panic!("report channel: {e}"),
-        }
-    }
-
-    /// Commit `message` and assert the reader reports it delivered.
-    async fn deliver(&mut self, message: EgressMessage) {
-        let id = message.id;
-        let report = self.send(message).await;
-        assert!(
-            matches!(&report, EgressReport::Delivered(meta) if meta.id == id),
-            "expected {id} delivered, got {report:?}"
-        );
-    }
-}
-
-#[async_trait::async_trait]
-impl EgressBus for MemBus {
-    async fn unhanded(&self, limit: usize) -> Vec<EgressItem> {
-        let entries = self.entries.lock().unwrap();
-        let (items, next_owed) = &*entries;
-        items
-            .iter()
-            .filter(|item| match item {
-                EgressItem::Message(message) => message.seq.0 >= *next_owed,
-                EgressItem::PayloadGone { seq, .. } => seq.0 >= *next_owed,
-            })
-            .take(limit)
-            .cloned()
-            .collect()
-    }
-
-    async fn advance(&self, seq: MessageSeq) {
-        self.entries.lock().unwrap().1 = seq.0 + 1;
-    }
-
-    fn wakes(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.wake.subscribe()
-    }
-
-    fn window_depth(&self) -> Option<usize> {
-        Some(256)
-    }
-
-    async fn report(&self, report: EgressReport) {
-        if report != EgressReport::Drained {
-            self.reports.send(report).ok();
-        }
-    }
-}
-
-fn egress_message(seq: u64, client: &str, topic: &str, qos: u8, payload: &[u8]) -> EgressMessage {
-    EgressMessage {
-        seq: MessageSeq(seq),
-        id: uuid::Uuid::from_u128(u128::from(seq)),
-        sender: "app:alice".to_string(),
-        publish: MqttPublishTransport {
-            client_slug: client.to_string(),
-            topic: topic.to_string(),
-            qos,
-            retain: false,
-            content_type: None,
-            expires: MqttExpiry::Never,
-            status_to: None,
-            response_topic: None,
-        },
-        payload: bytes::Bytes::copy_from_slice(payload),
-    }
-}
-
-/// The next report the reader makes, within `secs`.
-async fn next_report(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<EgressReport>,
-    secs: u64,
-    what: &str,
-) -> EgressReport {
-    tokio::time::timeout(Duration::from_secs(secs), rx.recv())
-        .await
-        .unwrap_or_else(|_| panic!("{what}: no report within {secs}s"))
-        .expect("report channel closed")
-}
 
 /// What the reader hands arrives as stated: topic, QoS, payload, content
 /// type, the remaining lifetime as the Message Expiry Interval, and the
@@ -2323,6 +2138,7 @@ async fn an_inbound_publish_during_the_wait_is_routed() {
         client_slug,
         handle,
         mut rx,
+        ..
     } = spawn_client("stopinbound", &harness, ca, vec![topic.to_string()]).await;
     wait_for_filter_acked(
         &svc,

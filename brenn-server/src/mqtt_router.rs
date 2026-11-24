@@ -36,7 +36,8 @@ use brenn_lib::mqtt::address::topic_name_has_wildcard;
 use brenn_lib::mqtt::topic_filter;
 use brenn_messaging::IngressMessage;
 use brenn_mqtt::payload::{InboundClass, InboundPayload, classify_inbound};
-use brenn_mqtt::service::{InboundRouting, MqttEventRouter};
+use brenn_mqtt::service::{InboundRouting, MqttEventRouter, SessionFault};
+use brenn_obs::alerting::AlertSeverity;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -429,6 +430,52 @@ impl MqttEventRouter for MqttEventRouterImpl {
                 )
                 .await;
         }
+    }
+
+    async fn session_fault(&self, client_slug: &str, fault: SessionFault) {
+        let (severity, title, body) = session_fault_alert(client_slug, &fault);
+        // The supervisors can run before boot wires the state in; the
+        // supervisor has already logged the fault, so this says only that the
+        // alert is not raised.
+        let Some(router_state) = self.inner.get() else {
+            tracing::error!(
+                client = client_slug,
+                ?fault,
+                "mqtt_router: AppState not yet initialized — the operator alert for this MQTT \
+                 session fault could not be raised"
+            );
+            return;
+        };
+        router_state
+            .app_state
+            .alert_dispatcher
+            .alert(severity, title, body);
+    }
+}
+
+/// The operator alert for a session fault on `client_slug`.
+fn session_fault_alert(client_slug: &str, fault: &SessionFault) -> (AlertSeverity, String, String) {
+    match fault {
+        SessionFault::SessionDiscarded { pkid } => (
+            AlertSeverity::Warning,
+            format!("MQTT session discarded: {client_slug}"),
+            format!(
+                "MQTT client '{client_slug}' had its broker session discarded after the broker \
+                 sent an unsolicited acknowledgement (packet identifier {pkid}). The broker's \
+                 queued messages for this client are lost, and publishes in flight are reported \
+                 as after a session reset. If the next connection fails the same way, the \
+                 client stops."
+            ),
+        ),
+        SessionFault::GaveUp { reason } => (
+            AlertSeverity::Critical,
+            format!("MQTT client stopped: {client_slug}"),
+            format!(
+                "MQTT client '{client_slug}' is stopped until its mqtt_client block is reloaded \
+                 or the server restarts: discarding its broker session did not cure an \
+                 unsolicited acknowledgement. {reason}"
+            ),
+        ),
     }
 }
 
@@ -1885,5 +1932,54 @@ mod tests {
                 r#"{{"client_slug":"broker","topic":"cam/front","payload":{{"text":"22.5"}},"received_at":"{received_at}","qos":1}}"#
             )
         );
+    }
+
+    // --- Session faults ---
+
+    /// Each fault raises one alert at its severity, naming the client.
+    #[tokio::test]
+    async fn a_session_fault_raises_one_alert_naming_the_client() {
+        use brenn_obs::alerting::make_capturing_alerter_with_severity;
+
+        let (alert_dispatcher, captured, handle) = make_capturing_alerter_with_severity();
+        let (mut state, _db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        state.alert_dispatcher = alert_dispatcher;
+        let router = MqttEventRouterImpl::new();
+        router.set_state(state, vec![]);
+
+        router
+            .session_fault("sensors", SessionFault::SessionDiscarded { pkid: 7 })
+            .await;
+        router
+            .session_fault(
+                "sensors",
+                SessionFault::GaveUp {
+                    reason: "unsolicited again".to_string(),
+                },
+            )
+            .await;
+        drop(router);
+        handle.await.expect("alert drainer");
+
+        let alerts = captured.lock().unwrap();
+        assert_eq!(alerts.len(), 2, "one alert per fault: {alerts:?}");
+        assert!(matches!(alerts[0].0, AlertSeverity::Warning));
+        assert!(alerts[0].1.contains("sensors") && alerts[0].2.contains("sensors"));
+        assert!(alerts[0].2.contains("packet identifier 7"));
+        assert!(matches!(alerts[1].0, AlertSeverity::Critical));
+        assert!(alerts[1].1.contains("sensors") && alerts[1].2.contains("sensors"));
+        assert!(alerts[1].2.contains("unsolicited again"));
+    }
+
+    /// Before boot wires the state in, a fault is logged and dropped: no
+    /// panic, and no alert.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_session_fault_before_the_state_is_set_raises_nothing() {
+        let router = MqttEventRouterImpl::new();
+        router
+            .session_fault("sensors", SessionFault::SessionDiscarded { pkid: 7 })
+            .await;
+        assert!(logs_contain("could not be raised"));
     }
 }

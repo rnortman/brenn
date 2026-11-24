@@ -765,7 +765,7 @@ mod tests {
         assert!(has_app_subscriber(&bridge, addr, "testapp"));
 
         // Durable row persisted, and the filter held by the client's session,
-        // whose configured qos is 2.
+        // whose configured qos is 0.
         let rows = dynamic_rows(&bridge).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -773,7 +773,7 @@ mod tests {
                 .mqtt_service()
                 .ingress_filter_qos("home", "sensors/+/temp")
                 .await,
-            Some(2),
+            Some(0),
             "the session holds the filter"
         );
 
@@ -1011,7 +1011,7 @@ mod tests {
     /// Replace the registered `home` session with a successor configured at
     /// `qos`, holding the predecessor's filters under the same identifiers —
     /// what a reload that edits the client's `qos` leaves in the registry. The
-    /// fixture's predecessor is at qos 2.
+    /// fixture's predecessor is at qos 0.
     async fn replace_home_at(bridge: &ActiveBridge, qos: u8) {
         let service = bridge.mqtt_service();
         let predecessor = service.get_client("home").expect("the configured client");
@@ -1053,7 +1053,7 @@ mod tests {
         .await
         .expect("the first app's subscribe");
 
-        replace_home_at(&bridge, 0).await;
+        replace_home_at(&bridge, 1).await;
 
         for filter in [static_filter, dynamic_filter] {
             let outcome = subscribe_dynamic_activated(
@@ -1067,7 +1067,7 @@ mod tests {
             assert_eq!(outcome, SubscribeActivation::MqttDeferredDisconnected);
             assert_eq!(
                 service.ingress_filter_qos("home", filter).await,
-                Some(0),
+                Some(1),
                 "{filter} is held by the successor"
             );
         }
@@ -1863,7 +1863,7 @@ mod tests {
                 .mqtt_service()
                 .ingress_filter_qos("home", "sensors/+/temp")
                 .await,
-            Some(2),
+            Some(0),
             "filter remains on the reconnect set"
         );
     }

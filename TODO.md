@@ -703,6 +703,48 @@ passing reliably under the full `make check`; a retry is not a fix.
 Code site (`TODO(mqtt-egress-shutdown-answers-test-flaky)`): the outcome
 assertion in the test.
 
+## `mqtt-expired-replay-not-stopped`
+
+A publish in flight when the connection is lost is replayed by the client
+library (`rumqttc-v5-next` 0.33.2) when the session resumes, however late,
+with the Message Expiry Interval it was first sent with; Brenn's lifetime
+check runs only at hand-off. The library offers no public way to stop one
+publish's replay: its pending queue is private and every public operation
+fails all of it. The work: a selective removal in the library (fail chosen
+pending publishes and drop their outgoing tracking) and a reader that uses
+it for a message whose lifetime passed while disconnected, reporting it as
+it reports an expired message that was possibly sent. A QoS 2 publish
+stopped after its PUBREC leaves an unfinished exchange at the broker that
+counts against its receive maximum; the work includes saying what becomes
+of it. Done = an in-flight message whose lifetime passed during an outage
+is not sent after the reconnect, with the session and the other in-flight
+publishes kept; or this is closed as not wanted. Code site
+(`TODO(mqtt-expired-replay-not-stopped)`): the egress reader's `InFlight`
+in `brenn-mqtt/src/reader/mod.rs`.
+
+## `mqtt-inbound-acked-before-routed`
+
+An inbound QoS 1 message is acknowledged to the broker by the client library
+(`rumqttc-v5-next` 0.33.2) when the library receives it, before Brenn has
+committed it to its channel. If the client ends between the two — a stop or
+reload, a client that fails for good, a crash — the broker believes the
+message delivered and Brenn has dropped it, so receiving is not
+at-least-once. A stop logs how many received messages went with the client;
+nothing recovers them. The work: acknowledge an inbound QoS 1 message only
+after it is committed to its channel — the library's manual acknowledgement
+mode (`MqttOptions::set_manual_acks`, `AsyncClient::try_ack`), or whatever
+that design finds right — so that a message the client drops is one the
+broker still owes. The work includes saying what becomes of an
+acknowledgement queued and not yet written when the connection is lost: the
+supervisor's sweep at a loss discards queued acknowledgement requests. What
+stays lost regardless: a QoS 0 message, and any message when the broker keeps
+no session (a session expiry of 0, an expired session, a broker restarted
+without persistence). Done = a stop or crash staged between receipt and
+routing leaves the message sent again by the broker on a kept session, pinned
+by a test against the real broker. Code site
+(`TODO(mqtt-inbound-acked-before-routed)`): the drop-time log in
+`drop_event_loop`, `brenn-mqtt/src/connection.rs`.
+
 ## `mqtt-publish-acl-ops-config`
 
 Per-topic MQTT publish ACLs exist (`acl publish [topic_filter …]`), but
@@ -743,6 +785,40 @@ build it; whether the client library ever surfaces this outside a session
 mismatch is part of the finding out. Done = a QoS 2 message whose PUBREC
 succeeded is never reported to the operator or to a `status_to` as
 rejected.
+
+## `mqtt-replay-over-smaller-receive-maximum-unverified`
+
+On a resumed session the client library (`rumqttc-v5-next` 0.33.2) replays
+in-flight publishes under their original packet ids. What it does when the
+new CONNACK states a Receive Maximum smaller than the number or the ids of
+those publishes has not been observed; mosquitto's value is constant. The
+work: stage it (a relay rewriting the CONNACK property, or a broker whose
+value changes) and fix or document what is seen. Done = the behaviour is
+pinned by a test, or this is closed as not reachable. Code site
+(`TODO(mqtt-replay-over-smaller-receive-maximum-unverified)`): the egress
+reader's `limit` in `brenn-mqtt/src/reader/mod.rs`.
+
+## `mqtt-replayed-subscribe-unverified`
+
+On a resumed session the MQTT supervisor keeps its queue of filters
+awaiting a SUBSCRIBE packet identifier (`pending_subscribes`), expecting the
+client library (`rumqttc-v5-next` 0.33.2) to re-send each SUBSCRIBE it held
+unsent at the connection loss, under a new packet identifier and ahead of
+anything new, and to discard them when the CONNACK reports no session, at
+which the supervisor clears the queue. This is known from reading the
+library only. The session-resume broker suite could not leave a SUBSCRIBE
+unsent at the loss: the library wrote every queued SUBSCRIBE to the dying
+connection before it read the error. The unit test of the bookkeeping feeds
+the supervisor events the test builds and does not run the library. If the
+library behaves otherwise, grants and refusals are recorded against the
+wrong filters for that connection, silently. The work: stage a SUBSCRIBE
+left unsent in the library at a loss, through the real library — a
+real-broker row if the staging can be made deterministic, otherwise the real
+event loop against a scripted MQTT peer, which the test support does not
+have — with and without a kept session, and fix or pin what is seen. Done =
+both cases are pinned by a test that runs the library, or this is closed as
+not reachable. Code site (`TODO(mqtt-replayed-subscribe-unverified)`):
+`subscribe_bookkeeping_at_connack` in `brenn-mqtt/src/connection.rs`.
 
 ## `mqtt-retained-replay-shortfall-cause-unconfirmed`
 
@@ -794,6 +870,25 @@ deleted in that same rewrite, so neither is ever published. Done = the
 stack has been pushed with the earlier wording in none of its commits.
 The comment sits beside `TODO(mqtt-publish-acl-ops-config)` in
 `family_admits` in `brenn-dsl/src/derive.rs`.
+
+## `mqtt-subscribe-qos2-not-offered`
+
+A client's `qos` is refused above 1, so Brenn never receives at QoS 2. The
+cause is the client library (`rumqttc-v5-next` 0.33.2): it clears its record
+of received QoS 2 packet ids on every connection loss, so on a resumed
+session a re-sent PUBREL is an `Unsolicited` error that ends the connection
+on every reconnect, and a re-sent QoS 2 PUBLISH is yielded a second time.
+The work: a library that keeps that record while the session may resume and
+clears it when the CONNACK reports no session, does not yield a QoS 2
+PUBLISH whose packet id it already holds, and answers an unknown PUBREL
+with PUBCOMP (Packet Identifier not found) — upstream, or a newer version
+that does it — then widen the `qos` range and run the incoming QoS 2 rows
+(PUBREL lost, client's PUBREC lost) against the real broker. Done = a client
+with `qos = 2` loads, and both rows yield the message once with the session
+kept; or this is closed as not wanted because a channel's window does not
+carry exactly-once to its readers. Code site
+(`TODO(mqtt-subscribe-qos2-not-offered)`): the `qos` assertion in
+`resolve_client_identities`, `brenn-lib/src/mqtt/config.rs`.
 
 ## `obs-log-capture-test-flaky`
 
@@ -5372,6 +5467,12 @@ removed static subscription), stays in the resumed session. The
 pending-withdrawals set above starts empty in the new process, so it does not
 cover this case; MQTT offers no way to list a session's filters, so withdrawing
 them needs the asserted set to outlive the process.
+
+A kept client adds a third way: on a resumed session the client library
+replays a SUBSCRIBE that was submitted and not yet written when the
+connection was lost, even if its filter was withdrawn during the outage, so
+the broker then holds a filter this process does not. The pending-withdrawals
+set must cover it.
 
 Code sites (`TODO(mqtt-deferred-unsubscribe-not-withdrawn)`):
 `brenn-mqtt/src/service.rs`, at `unsubscribe_filter`'s disconnected arm.

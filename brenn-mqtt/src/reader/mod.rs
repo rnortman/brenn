@@ -8,6 +8,16 @@
 //! in flight with the library or held for a resubmit — and learns each
 //! outcome from the library's publish notice.
 //!
+//! A message in flight belongs to the client's MQTT session, not to the
+//! connection it went out on: its notice stays live across a lost connection
+//! and resolves when the broker answers the library's replay on a resumed
+//! session. When the library reports instead that the session ended — the
+//! broker kept no session, or the client was dropped — a QoS 1 message is
+//! held and handed again ahead of anything newer, and a QoS 0 or QoS 2 message
+//! is reported unknown. A pass settles every notice that has already resolved
+//! before it hands anything, which is what keeps channel order across a
+//! session that did not survive.
+//!
 //! It reaches the bus only through [`EgressBus`], so this crate does not
 //! depend on the messaging crate; the implementation lives above both. A
 //! message may name a `status_to`; the reader then reports it handed before
@@ -104,7 +114,10 @@ impl EgressMeta {
 /// Why a handed message's outcome is unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownCause {
-    /// Its connection ended before the broker answered, and it is not resent.
+    /// Its session ended before the broker answered, so the answer can no
+    /// longer come; it is not resent. The broker reported no session at a
+    /// reconnect, the client stopped or failed while disconnected (the broker
+    /// may still hold the session), or a QoS 0 write failed.
     ConnectionLost,
     /// The session stopped while it was in flight.
     SessionStopped,
@@ -114,7 +127,7 @@ pub enum UnknownCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sent {
     /// Every submit of it was given back before the library held it: no
-    /// client, a newer connection, or a full request channel.
+    /// client, a connection newer than the pass's, or a full request channel.
     Never,
     /// The library accepted it; nothing the reader sees says whether a byte
     /// of it reached the broker.
@@ -237,12 +250,14 @@ pub fn start_egress_reader(handle: &Arc<MqttClientHandle>, bus: Arc<dyn EgressBu
 
 type NoticeResult = Result<rumqttc::PublishResult, rumqttc::PublishNoticeError>;
 
-/// A handed message the library holds, the connection it went out on, the
-/// wait for its notice, and whether the library had accepted it on an earlier
-/// submission.
+/// A handed message the library holds, the wait for its notice, and whether
+/// the library had accepted it on an earlier submission. It stays in flight
+/// across a lost connection: on a resumed session the library replays it,
+/// however late, with the Message Expiry Interval it was first sent with.
+// TODO(mqtt-expired-replay-not-stopped): stop the replay of a message whose
+// lifetime passed while the client was disconnected.
 struct InFlight {
     message: EgressMessage,
-    epoch: u64,
     earlier: Sent,
     notice: Pin<Box<dyn Future<Output = NoticeResult> + Send>>,
 }
@@ -370,6 +385,12 @@ impl Reader {
     /// message holds its payload in memory. A payload within the bus's body
     /// cap is a body. A larger one is a blob, and the blob store's budget
     /// already bounds those bytes across every client.
+    ///
+    /// What is in flight counts whatever connection it went out on, so a
+    /// connection whose Receive Maximum is below what a resumed session
+    /// carried over is handed nothing until enough of that resolves.
+    // TODO(mqtt-replay-over-smaller-receive-maximum-unverified): observe what
+    // the client library does with replays beyond a smaller Receive Maximum.
     fn limit(&self, receive_max: u16) -> usize {
         let limit = match self.window {
             Some(depth) => depth.min(usize::from(receive_max)),
@@ -391,8 +412,7 @@ impl Reader {
     /// pending names the wake that brings the next pass:
     ///
     /// - no client: the next connection's install;
-    /// - a notice of an older connection unresolved, or the limit reached:
-    ///   that notice, or the first in-flight notice, resolving;
+    /// - the limit reached: the first in-flight notice resolving;
     /// - a submit refused by a full request channel: the event loop taking a
     ///   request off it, which emits an outgoing event;
     /// - a submit that found a newer connection than the pass began on: that
@@ -402,6 +422,13 @@ impl Reader {
     ///
     /// A pass checks the session's stop before it hands each message, held or
     /// read, and returns at a stop with the rest unhanded.
+    ///
+    /// Before it hands anything a pass settles every in-flight notice that has
+    /// already resolved, oldest first. A session that did not survive a loss
+    /// has failed every notice it held before the next connection is
+    /// installed, so the first pass on that connection holds every QoS 1
+    /// message among them and hands them, in channel order, ahead of anything
+    /// newer.
     async fn pass(&mut self) {
         self.again = false;
         if self.stopping() {
@@ -410,13 +437,7 @@ impl Reader {
         let Some(connection) = connection(&self.handle).await else {
             return;
         };
-        if self
-            .in_flight
-            .values()
-            .any(|flight| flight.epoch < connection.epoch)
-        {
-            return;
-        }
+        self.resolve_ready().await;
         let limit = self.limit(connection.receive_max);
         if self.outstanding() >= limit && self.held.is_empty() {
             return;
@@ -603,7 +624,6 @@ impl Reader {
                     message.seq,
                     InFlight {
                         message,
-                        epoch,
                         earlier,
                         notice: Box::pin(notice.wait_async()),
                     },
@@ -618,9 +638,23 @@ impl Reader {
         }
     }
 
+    /// Resolve, oldest first, every in-flight message whose notice has
+    /// already resolved. Waits for none.
+    async fn resolve_ready(&mut self) {
+        loop {
+            let ready = poll_first_ready(
+                &mut self.in_flight,
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            );
+            let Poll::Ready((seq, result)) = ready else {
+                break;
+            };
+            self.resolve(seq, result).await;
+        }
+    }
+
     /// Settle the in-flight message at `seq` by its notice's result. Returns
-    /// whether the broker answered it; `false` when its connection ended
-    /// first.
+    /// whether the broker answered it; `false` when its session ended first.
     async fn resolve(&mut self, seq: MessageSeq, result: NoticeResult) -> bool {
         let InFlight {
             message, earlier, ..
@@ -639,7 +673,7 @@ impl Reader {
                 },
                 true,
             ),
-            NoticeOutcome::ConnectionEnded if message.publish.qos == 1 => {
+            NoticeOutcome::SessionEnded if message.publish.qos == 1 => {
                 self.held.insert(
                     seq,
                     Held {
@@ -649,7 +683,7 @@ impl Reader {
                 );
                 return false;
             }
-            NoticeOutcome::ConnectionEnded => (
+            NoticeOutcome::SessionEnded => (
                 EgressReport::Unknown {
                     message: EgressMeta::of(&message),
                     cause: UnknownCause::ConnectionLost,
@@ -691,7 +725,8 @@ impl Reader {
     /// on the channel stay there, and held messages stay held.
     ///
     /// Ends when nothing is in flight, when the deadline passes, or when the
-    /// connection ends, which resolves every remaining notice. The select
+    /// supervisor drops the client, which it does on every path that ends a
+    /// stopping session and which resolves every remaining notice. The select
     /// prefers the notices, so a notice already resolved is read even with a
     /// bound of zero or a deadline passed during a report.
     ///
@@ -707,7 +742,7 @@ impl Reader {
         let deadline = tokio::time::sleep_until(start + bound);
         tokio::pin!(deadline);
         let mut answered = 0usize;
-        let mut connection_ended = 0usize;
+        let mut session_ended = 0usize;
         while !self.in_flight.is_empty() {
             tokio::select! {
                 biased;
@@ -715,7 +750,7 @@ impl Reader {
                     if self.resolve(seq, result).await {
                         answered += 1;
                     } else {
-                        connection_ended += 1;
+                        session_ended += 1;
                     }
                 }
                 () = &mut deadline => break,
@@ -727,7 +762,7 @@ impl Reader {
             waited: start.elapsed(),
             began,
             answered,
-            connection_ended,
+            session_ended,
             left: self.in_flight.len(),
         };
         summary.log(&self.handle.config.identity.slug);
@@ -778,9 +813,9 @@ struct SettleSummary {
     began: usize,
     /// Messages the broker answered during the wait, delivered or rejected.
     answered: usize,
-    /// Messages whose connection ended during the wait before the broker
+    /// Messages whose session ended during the wait before the broker
     /// answered them; their outcome is not known.
-    connection_ended: usize,
+    session_ended: usize,
     /// Messages still in flight when the wait ended, reported unknown.
     left: usize,
 }
@@ -788,7 +823,7 @@ struct SettleSummary {
 impl SettleSummary {
     /// Messages in flight at the start whose outcome the wait did not learn.
     fn unknown(&self) -> usize {
-        self.connection_ended + self.left
+        self.session_ended + self.left
     }
 
     /// One line: `warn` when any message's outcome is not known, `info` when
@@ -805,10 +840,10 @@ impl SettleSummary {
                 in_flight = self.began,
                 answered = self.answered,
                 unknown = self.unknown(),
-                connection_ended = self.connection_ended,
+                session_ended = self.session_ended,
                 unanswered_at_bound = self.left,
                 "MQTT session ending: the broker did not answer every message in flight, because \
-                 its connection ended or the stop bound passed; their outcomes are not known",
+                 its session ended or the stop bound passed; their outcomes are not known",
             );
         } else {
             tracing::info!(
@@ -837,15 +872,22 @@ async fn connection(handle: &MqttClientHandle) -> Option<Connection> {
 /// The first in-flight notice to resolve, oldest first among those ready.
 /// Pending for as long as none has, and forever when nothing is in flight.
 async fn next_notice(in_flight: &mut BTreeMap<MessageSeq, InFlight>) -> (MessageSeq, NoticeResult) {
-    std::future::poll_fn(|cx| {
-        for (seq, flight) in in_flight.iter_mut() {
-            if let Poll::Ready(result) = flight.notice.as_mut().poll(cx) {
-                return Poll::Ready((*seq, result));
-            }
+    std::future::poll_fn(|cx| poll_first_ready(in_flight, cx)).await
+}
+
+/// Poll the in-flight notices oldest first and return the first that has
+/// resolved; `Pending` when none has. The caller removes the returned entry
+/// from `in_flight` before polling again.
+fn poll_first_ready(
+    in_flight: &mut BTreeMap<MessageSeq, InFlight>,
+    cx: &mut std::task::Context<'_>,
+) -> Poll<(MessageSeq, NoticeResult)> {
+    for (seq, flight) in in_flight.iter_mut() {
+        if let Poll::Ready(result) = flight.notice.as_mut().poll(cx) {
+            return Poll::Ready((*seq, result));
         }
-        Poll::Pending
-    })
-    .await
+    }
+    Poll::Pending
 }
 
 /// The Message Expiry Interval to send for a message whose lifetime ends at

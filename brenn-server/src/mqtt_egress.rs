@@ -431,7 +431,7 @@ impl MqttEgressHub {
                     recording.state.counts.unknown += 1;
                     let detail = match cause {
                         UnknownCause::ConnectionLost => {
-                            "the connection ended before the broker answered; it is not resent"
+                            "its session ended before the broker answered; it is not resent"
                         }
                         UnknownCause::SessionStopped => {
                             "the client session stopped before the broker answered"

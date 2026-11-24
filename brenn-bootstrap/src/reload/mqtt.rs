@@ -784,7 +784,7 @@ mod tests {
     fn a_qos_edit_is_a_changed_client_whose_qos_moved() {
         let running = client("ha", None);
         let mut edited = running.clone();
-        edited.identity.qos = 2;
+        edited.identity.qos = 0;
         let delta = mqtt_clients_delta(&live(&[running]), &candidate(&[edited]));
 
         assert_eq!(slugs(&delta.changed), vec!["ha".to_string()]);

@@ -1469,6 +1469,14 @@ at the lower of the QoS it was published at and the QoS the broker granted,
 which is at most the client's. Editing the client's `qos` restarts the client,
 and its first connect subscribes every filter it holds again at the new QoS.
 
+A client's `qos` is 0 or 1. Brenn does not subscribe at QoS 2: its MQTT client
+library forgets, on every lost connection, which QoS 2 messages it has
+received, so on a kept session a message could arrive twice, or a PUBREL the
+broker sends again could end the connection on every reconnect. A QoS 2
+message can still arrive, out of session state an earlier configuration
+subscribed at 2 left at the broker; it is delivered at least once, not exactly
+once. A publish keeps its own QoS, 0 to 2.
+
 ### 2.7.1 The two ingress shapes
 
 A `webhook:` or `mqtt:` channel takes what its transport receives in one of two
@@ -1923,7 +1931,10 @@ the wall clock: one whose `expires` has passed is stepped over and reported
 expired, never sent; otherwise what is left is sent as the Message Expiry
 Interval, rounded up. A message waits on its channel while the client is
 disconnected and is judged when the client is next connected, so an expired
-message is reported then, not at the instant it expired.
+message is reported then, not at the instant it expired. Lifetime is judged
+at hand-off only: a message already in flight when the connection is lost can
+be sent after its lifetime (*What the MQTT library decides across a
+reconnect*, below).
 
 **Outcomes and who hears of them.** The call answered at commit and reports
 none. A message that names a `status_to` has each outcome published there
@@ -1938,7 +1949,7 @@ the message's `status_to` and was not a broker's rejection:
 | delivered | the broker acknowledged it (QoS 1, 2), or it was written (QoS 0); logged at `debug` and counted, no alert |
 | rejected | the broker refused it with a reason code, or its packet is over the broker's Maximum Packet Size |
 | expired | its lifetime passed before the reader handed it over, or before it handed over again a message it held for resubmission |
-| unknown | it was in flight when the connection was lost (QoS 0, 2), or the session stopped and the broker did not answer within the client's `stop_wait_secs` |
+| unknown | its session ended before the broker answered (QoS 0, 2): the broker kept no session across a lost connection, or the client stopped or failed while disconnected; or the session stopped and the broker did not answer within the client's `stop_wait_secs` |
 | dropped | the session stopped, or its client was removed, with messages the reader held or still owed; reported as a count, and one by one for those naming a `status_to`. Nothing is handed or resent once a stop begins |
 
 A broker's rejection is always alerted, whether or not its sender was told:
@@ -1964,11 +1975,64 @@ excess, and one client serves many senders, so refused and published statuses
 interleave, and closing on either would raise an alert per alternation. A
 cause that outlasts the run alerts again in the next.
 
-**QoS across a reconnect.** A QoS 1 message in flight when the connection is
-lost is sent again as a new publish on the next connection, ahead of anything
-newer, so a subscriber may see it twice. A QoS 0 or QoS 2 message in flight at
-a loss is reported unknown and not resent. The reader hands nothing new until
-every message of the lost connection is resolved. When a client's
+**QoS across a reconnect.** A client keeps its MQTT session state across a
+lost connection and asks the broker to keep the broker's half for the client's
+`session_expiry_secs` (`docs/config-dsl.md`, `mqtt_client`). What becomes of a
+message in flight at the loss depends on whether the broker kept the session,
+which the next CONNACK says:
+
+| In flight at the loss | The broker kept the session | The broker kept no session (expiry 0, expired, or broker restarted) |
+|---|---|---|
+| QoS 0, already written | reported `delivered` at the write, as always | same |
+| QoS 0, accepted but not yet written | sent on the new connection | `unknown`, `connection_lost` |
+| QoS 1 | replayed by the MQTT library under its original packet identifier; `delivered` or `rejected` as the broker answers; a subscriber may see it twice if only the acknowledgement was lost | sent again as a new publish, ahead of anything newer, under its lifetime check; a subscriber may see it twice |
+| QoS 2 | the exchange is completed where it stopped; the subscriber sees it exactly once | `unknown`, `connection_lost`; not sent again |
+
+An inbound QoS 1 message can likewise arrive twice across a loss. Nothing new
+is handed while the client is disconnected. The in-flight limit counts what a
+resumed session carried over, so after a resume the reader hands a new message
+only once what is in flight is below the new connection's limit. The library's
+replay of a PUBLISH does not set the DUP flag, which MQTT 5 requires on a
+re-delivery (MQTT-3.3.1-1); it does not change what a subscriber receives, and
+Brenn cannot set it.
+
+**What the MQTT library decides across a reconnect.** Two limits of a kept
+client, stated here and only here:
+
+- *A replay is not recalled.* A message already in flight when the connection
+  is lost is replayed when the session resumes, however long that takes, with
+  the Message Expiry Interval it was first sent with. Brenn judges lifetime at
+  hand-off only and cannot recall one publish from the MQTT library without
+  giving up the session (`TODO(mqtt-expired-replay-not-stopped)`). A sender
+  for whom a late delivery is worse than none publishes with a lifetime the
+  broker will enforce and expects that an outage can stretch it.
+- *A received message waits for the next connection.* A message the library
+  had received when the connection failed and had not yet passed on is
+  delivered into its channel when the client next connects. If the client
+  ends before it connects again — the server stops, the client's
+  configuration is reloaded, or the client fails for good — that message is
+  dropped with the client, and the drop is logged at `warn` with the number of
+  received messages dropped. A crash logs nothing. At QoS 1 on a kept session
+  the broker sends it again to the next client unless its acknowledgement had
+  already gone out; at QoS 0, or with no kept session, it is lost, as a
+  message published while Brenn is down is. Brenn's MQTT library acknowledges
+  a QoS 1 message when it receives it, before the message is in its channel,
+  so an acknowledged message can be among those dropped
+  (`TODO(mqtt-inbound-acked-before-routed)`).
+
+**An unsolicited acknowledgement.** When the broker acknowledges or releases a
+packet identifier the client's session state does not hold, the MQTT library
+ends the connection, and on a kept session it would do so at every reconnect.
+Brenn discards the session once: it logs the fault at `error`, raises a
+`warning` alert, and connects with a clean start. The broker's queued messages
+for the client are lost, publishes in flight end as in the column above where
+the broker kept no session, and every filter is subscribed again. If the
+connection that clean start made ends the same way, the client stops — its
+health reads `failed` and a `critical` alert says so — until its
+`mqtt_client` block is reloaded or the server restarts. Any other ending of a
+connection in between rearms the single discard.
+
+When a client's
 configuration changes, its session is stopped and replaced: what was in
 flight is waited for, up to the client's `stop_wait_secs`, and reported as
 what it turned out to be; only what the broker had not answered within it is
@@ -2102,10 +2166,10 @@ the rest.
 | `delivered` | | the broker acknowledged it (QoS 1, 2), or it was written to the connection (QoS 0: a broker cannot refuse a QoS 0 message, and one that will not take it drops it unannounced) |
 | `rejected` | | the broker refused it, `reason` its reason string or its reason code's name; or its packet was over the broker's Maximum Packet Size, with no `reason_code`; no earlier copy of it had been accepted |
 | `expired` | | never sent: its lifetime passed before the MQTT library accepted it |
-| `unknown` | `connection_lost` | may have been sent: in flight when the connection was lost (QoS 0, 2), and not sent again |
-| `unknown` | `lifetime_ended` | may have been sent: the library accepted it, its connection ended before the broker answered (QoS 1), and its lifetime passed while it waited to be sent again |
-| `unknown` | `resend_refused` | may have been sent: the library accepted it, its connection ended before the broker answered (QoS 1), and when it was sent again the broker refused it (`reason_code` is the broker's) or its packet was over the new connection's Maximum Packet Size (no `reason_code`); the broker's reason string goes to the operator's log, not into the status |
-| `unknown` | `stopped` | may have been sent: in flight when the session stopped or its client began to be removed, and the broker did not answer within the client's `stop_wait_secs`; or, at QoS 1, accepted and waiting to be sent again, because its connection ended first, and not sent again |
+| `unknown` | `connection_lost` | may have been sent: its session ended before the broker answered (QoS 0, 2), and it is not sent again. The broker kept no session across a lost connection, the client stopped or failed while disconnected (the broker may still hold the session, and the exchange with it), or a QoS 0 write failed |
+| `unknown` | `lifetime_ended` | may have been sent: the library accepted it, its session ended before the broker answered (QoS 1), and its lifetime passed while it waited to be sent again |
+| `unknown` | `resend_refused` | may have been sent: the library accepted it, its session ended before the broker answered (QoS 1), and when it was sent again the broker refused it (`reason_code` is the broker's) or its packet was over the new connection's Maximum Packet Size (no `reason_code`); the broker's reason string goes to the operator's log, not into the status |
+| `unknown` | `stopped` | may have been sent: in flight when the session stopped or its client began to be removed, and the broker did not answer within the client's `stop_wait_secs`; or, at QoS 1, accepted and waiting to be sent again, because its session ended first, and not sent again |
 | `dropped` | `stopped` | never sent: the library never accepted it, and the session stopped or its client began to be removed while the reader held it; it is not handed during the stop |
 | `dropped` | `removed` | never sent: not yet read when its client was removed |
 | `dropped` | `left_retention` | its payload left the blob store before it was handed over |
@@ -2128,6 +2192,9 @@ the rest.
   (Packet Identifier not found) is the broker failing the last step of an
   exchange whose first step it had accepted: the broker took the message
   (`TODO(mqtt-qos2-completion-refusal-told-rejected)`).
+- With a session expiry above 0, a `handed` can be followed by its outcome
+  only after the client reconnects, however long that takes: a message in
+  flight at a loss waits for the resumed session's answer.
 - `delivered` at QoS 0 says the message was written to the connection, not
   that the broker took it. A sender that needs the broker's answer publishes
   at QoS 1 or 2.

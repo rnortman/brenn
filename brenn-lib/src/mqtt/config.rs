@@ -64,9 +64,10 @@ pub struct MqttClientConfigRaw {
     pub reconnect_backoff_initial_secs: u32,
     /// Reconnect backoff maximum delay in seconds. Default: 60.
     pub reconnect_backoff_max_secs: u32,
-    /// Broker SUBSCRIBE QoS for this client's ingress subscriptions
+    /// Broker SUBSCRIBE QoS for this client's ingress subscriptions, 0 or 1
     /// (per-connection default). Transport/sender-side feed property; applied to
-    /// every `[[app.mqtt_subscription]]` naming this client. Default: 1.
+    /// every `[[app.mqtt_subscription]]` naming this client. Publishes carry
+    /// their own QoS. Default: 1.
     pub qos: u8,
     /// Sender-side injection urgency stamped on every inbound message ingested
     /// via this client (distinct from the subscriber-side `wake_min`). Applied
@@ -228,7 +229,7 @@ pub struct MqttClientIdentity {
     pub last_will: Option<LastWillRaw>,
     pub reconnect_backoff_initial_secs: u32,
     pub reconnect_backoff_max_secs: u32,
-    /// Broker SUBSCRIBE QoS for this client's ingress subscriptions.
+    /// Broker SUBSCRIBE QoS for this client's ingress subscriptions: 0 or 1.
     pub qos: u8,
     /// Sender-side injection urgency stamped on inbound messages from this client.
     pub urgency: Urgency,
@@ -470,7 +471,7 @@ fn payload_cap_u32(slug: &str, key: &str, value: usize) -> u32 {
 /// - Duplicate client slugs.
 /// - Invalid `tls_version_min` value (must be `"1.2"` or `"1.3"`).
 /// - QoS on Last-Will out of range (must be 0, 1, or 2).
-/// - Ingress SUBSCRIBE QoS out of range (must be 0, 1, or 2).
+/// - Ingress SUBSCRIBE QoS out of range (must be 0 or 1).
 pub fn resolve_client_identities(
     raw_clients: &[MqttClientConfigRaw],
 ) -> IndexMap<String, MqttClientIdentity> {
@@ -535,9 +536,14 @@ pub fn resolve_client_identities(
         }
 
         // Ingress SUBSCRIBE QoS range.
+        // TODO(mqtt-subscribe-qos2-not-offered): allow 2 once the client
+        // library keeps its record of received QoS 2 messages across a loss.
         assert!(
-            raw.qos <= 2,
-            "config: [[mqtt_client]] {:?} qos must be 0, 1, or 2; got {}",
+            raw.qos <= 1,
+            "config: [[mqtt_client]] {:?} qos must be 0 or 1; got {}. Brenn does not subscribe \
+             at QoS 2: its MQTT client library forgets, on every lost connection, which QoS 2 \
+             messages it has received, so on a kept session a message can arrive twice or the \
+             connection can fail on every reconnect. Publishes may still use QoS 2.",
             raw.slug,
             raw.qos,
         );
@@ -1041,11 +1047,39 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "qos must be 0, 1, or 2")]
+    #[should_panic(expected = "qos must be 0 or 1; got 2. Brenn does not subscribe at QoS 2")]
+    fn client_qos_2_panics() {
+        let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
+        broker.qos = 2;
+        resolve_clients(&[broker]);
+    }
+
+    #[test]
+    #[should_panic(expected = "qos must be 0 or 1; got 3")]
     fn client_qos_out_of_range_panics() {
         let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
         broker.qos = 3;
         resolve_clients(&[broker]);
+    }
+
+    /// A client subscribes at 0 or 1; its Last-Will is a publish and keeps
+    /// the whole range.
+    #[test]
+    fn client_qos_0_and_1_and_last_will_qos_2_resolve() {
+        for qos in [0, 1] {
+            let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
+            broker.qos = qos;
+            assert_eq!(resolve_clients(&[broker])["ha"].identity.qos, qos);
+        }
+        let mut broker = raw_broker("ha", "mqtts://broker.example.com:8883");
+        broker.last_will = Some(LastWillRaw {
+            topic: "status".to_string(),
+            payload: "offline".to_string(),
+            qos: 2,
+            retain: true,
+        });
+        let resolved = resolve_clients(&[broker]);
+        assert_eq!(resolved["ha"].identity.last_will.as_ref().unwrap().qos, 2);
     }
 
     #[test]

@@ -126,8 +126,10 @@ pub enum NoticeOutcome {
     /// The broker answered with a failure reason: the packet's reason string
     /// when it carried one, else the reason code's name; and the code.
     Rejected { reason: String, code: u8 },
-    /// The connection the publish was submitted on ended before an answer.
-    ConnectionEnded,
+    /// The notice ended without the broker's answer: the broker reported no
+    /// session at a reconnect, the client was dropped, or a QoS 0 write
+    /// failed.
+    SessionEnded,
 }
 
 /// Map a resolved publish notice to its outcome.
@@ -173,7 +175,7 @@ pub fn notice_outcome(
             reason: reason_text(rec.properties.and_then(|p| p.reason_string), &rec.reason),
             code: rec.reason as u8,
         },
-        Err(E::Recv | E::SessionReset | E::Qos0NotFlushed) => NoticeOutcome::ConnectionEnded,
+        Err(E::Recv | E::SessionReset | E::Qos0NotFlushed) => NoticeOutcome::SessionEnded,
         Err(
             e @ (E::TopicAliasReplayUnavailable(_)
             | E::V5PubAck(_)
@@ -457,40 +459,39 @@ pub struct MqttClientHandle {
     /// wake, not a state: "connected" is the `client` cell alone.
     pub egress_wake: Notify,
 
-    /// Filters awaiting pkid binding (FIFO) — one entry per SUBSCRIBE packet,
-    /// for SubAck attribution.
+    /// Whether the inbound path has logged, on the current connection, a
+    /// PUBLISH delivered at QoS 2. Cleared when a connection is installed.
+    /// Written and read only by the supervisor task, so it takes no lock.
+    pub(crate) qos2_inbound_warned: AtomicBool,
+
+    /// Filters awaiting pkid binding (FIFO) — one entry per SUBSCRIBE the
+    /// event loop has been handed and has not yet reported written, in the
+    /// order it was handed them, for SubAck attribution.
     ///
-    /// The lock exists only to make a push onto this FIFO atomic with the
-    /// non-blocking submit of the matching SUBSCRIBE onto the session's request
-    /// channel, so the FIFO's order is the order the event loop receives the
-    /// requests. Nothing may hold it across an await: the request channel is
-    /// drained only by the supervisor's poll, and a holder parked on that
-    /// channel would make every other acquirer — the supervisor included — wait
-    /// on a poll that cannot happen. It is a `std::sync::Mutex` so that holding
-    /// it across an await makes the future `!Send`, which `tokio::spawn`
-    /// rejects. A sender that finds the request channel full releases it and
-    /// either polls (the supervisor) or hands the subscribe to the supervisor
-    /// through [`Self::deferred_subscribes`] (everyone else).
+    /// The supervisor task is its one writer: it is the only task that submits
+    /// a SUBSCRIBE, and it pushes each filter in the same synchronous section
+    /// as the submit, so the FIFO's order is the order the event loop takes the
+    /// requests. The entries outlive a connection: a SUBSCRIBE the library
+    /// keeps across a loss is replayed on a resumed session and binds its
+    /// entry then. The FIFO is cleared when the broker reports no session and
+    /// when a supervisor body starts. A `std::sync::Mutex`: every section is
+    /// synchronous.
     pub pending_subscribes: std::sync::Mutex<std::collections::VecDeque<String>>,
 
-    /// Subscribes a caller could not submit because the request channel was
-    /// full, handed to the supervisor, which takes them in its own loop before
-    /// each poll and sends them at the next free slot. See
-    /// [`Self::pending_subscribes`] for why a caller never waits for a slot
-    /// itself.
+    /// Subscribes another task hands to the supervisor, which takes them in
+    /// its own loop before each poll and sends them at the next free slot.
+    /// Other tasks touch only this queue, never [`Self::pending_subscribes`].
     ///
     /// A plain queue, not a channel: nothing awaits it. Callers push and the
     /// supervisor takes everything, both in short synchronous sections, so a
     /// `std::sync::Mutex` suffices and cannot be held across an await. It
     /// lives on the handle rather than in the supervisor task so a supervisor
     /// respawned after a panic drains the same queue.
-    ///
-    /// A caller holds this lock across its send and the push that follows, so
-    /// a drain cannot slip in between and leave the push for a poll that only
-    /// traffic or keepalive would end. It therefore takes this lock before
-    /// [`Self::pending_subscribes`]; nothing takes the two in the other order,
-    /// and the supervisor never holds both.
     pub deferred_subscribes: std::sync::Mutex<std::collections::VecDeque<IngressSubscription>>,
+
+    /// Notified after a push onto [`Self::deferred_subscribes`], so a
+    /// connected supervisor sends the subscribe without waiting for traffic.
+    pub subscribe_wake: Notify,
 
     /// Inflight subscribes (pkid → filter), resolved at SubAck by `ack.pkid`.
     pub inflight_subscribes: Mutex<HashMap<u16, String>>,
@@ -566,8 +567,10 @@ impl MqttClientHandle {
             missing_identifier_warned: AtomicBool::new(false),
             connection_epoch: AtomicU64::new(0),
             egress_wake: Notify::new(),
+            qos2_inbound_warned: AtomicBool::new(false),
             pending_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             deferred_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            subscribe_wake: Notify::new(),
             inflight_subscribes: Mutex::new(HashMap::new()),
             subscribe_outcomes: Mutex::new(HashMap::new()),
             stop_tx,
@@ -1174,7 +1177,7 @@ mod tests {
         );
 
         for e in [E::Recv, E::SessionReset, E::Qos0NotFlushed] {
-            assert_eq!(notice_outcome(Err(e)), NoticeOutcome::ConnectionEnded);
+            assert_eq!(notice_outcome(Err(e)), NoticeOutcome::SessionEnded);
         }
     }
 

@@ -2028,7 +2028,7 @@ mod tests {
         // the session's SupervisorState (never connected in a unit test →
         // disconnected, with the "unknown" last_error the Disconnected-without-a-
         // recorded-error state carries).
-        assert_eq!(mqtt["details"]["qos"], json!(2), "enriched qos: {mqtt}");
+        assert_eq!(mqtt["details"]["qos"], json!(0), "enriched qos: {mqtt}");
         assert_eq!(
             mqtt["details"]["health"],
             json!("disconnected"),

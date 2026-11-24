@@ -13,7 +13,9 @@ use tokio::sync::mpsc;
 
 use brenn_lib::mqtt::test_support::test_client_config;
 
-use crate::connection::{end_connected_session, install_connection, unpolled_client};
+use crate::connection::{
+    end_connected_session, install_connection, sweep_after_loss, unpolled_client,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
@@ -599,6 +601,10 @@ impl crate::service::MqttEventRouter for NoRoutes {
     ) {
         panic!("the in-process broker sends no inbound publish");
     }
+
+    async fn session_fault(&self, client_slug: &str, fault: crate::service::SessionFault) {
+        panic!("the in-process broker provokes no session fault; got {fault:?} on {client_slug}");
+    }
 }
 
 /// [`connect_fake`] under a stand-in supervisor recorded on `handle`: it polls
@@ -893,11 +899,12 @@ async fn the_in_flight_limit_is_the_smaller_of_receive_maximum_and_depth() {
     }
 }
 
-/// QoS 1 in flight at a loss is published again, first and in channel
-/// order, on the next connection; nothing is handed while a notice of the
-/// lost connection is unresolved.
+/// A message in flight stays in flight across a newer connection: the pass on
+/// that connection hands new messages beside it, up to the bound and no
+/// further. When the old client is dropped its QoS 1 messages are held and
+/// handed again, without a second advance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn qos1_lost_in_flight_goes_out_again_first_and_in_order() {
+async fn in_flight_stays_in_flight_across_a_newer_connection() {
     let handle = make_handle();
     let mut old = install_unpolled(&handle, 64, None, None).await;
     let bus = ScriptBus::new(Some(256));
@@ -907,34 +914,40 @@ async fn qos1_lost_in_flight_goes_out_again_first_and_in_order() {
     until("two submits", || bus.advances().len() == 2).await;
     assert_eq!(queued(&mut old), 2);
 
-    // A new connection while the old one's notices are still unresolved: the
-    // old event loop is alive, so its publishes have no answer yet.
+    // A new connection while the old loop is alive, as on a resumed session:
+    // the old notices have no answer yet and are not dead.
     let old_client = handle.client.lock().await.take().unwrap();
-    let broker = connect_fake(&handle, None, Answer::Success).await;
-    bus.commit(item(3, 1));
+    let mut new = install_unpolled(&handle, 64, None, Some(3)).await;
+    for seq in 3..=5 {
+        bus.commit(item(seq, 1));
+    }
+    until("the third advance", || bus.advances().len() == 3).await;
     settle().await;
     assert_eq!(
-        bus.reads(),
-        1,
-        "nothing is read while an older epoch is unresolved"
+        bus.advances(),
+        [1, 2, 3],
+        "the bound counts the old notices"
     );
-    assert!(broker.received().is_empty());
+    assert_eq!(queued(&mut new), 1);
+    assert!(bus.reports().is_empty(), "{:?}", bus.reports());
 
     drop(old_client);
     drop(old);
-    until("three deliveries", || bus.reports().len() == 3).await;
-    assert_eq!(broker.topics(), ["lights/1", "lights/2", "lights/3"]);
+    until("the resubmits", || queued(&mut new) == 3).await;
+    settle().await;
+    assert_eq!(queued(&mut new), 3, "held messages do not grow the bound");
     assert_eq!(
         bus.advances(),
         [1, 2, 3],
         "a resubmit does not advance again"
     );
+    assert!(bus.reports().is_empty(), "{:?}", bus.reports());
 }
 
 /// A connection installed while a pass is under way takes nothing from that
 /// pass: the message the pass was about to submit is held, and goes out on
-/// the new connection behind the lost connection's QoS 1 message, in channel
-/// order.
+/// the new connection with the one behind it, while the message the old
+/// connection carried stays in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connection_installed_mid_pass_takes_nothing_from_it() {
     let handle = make_handle();
@@ -951,23 +964,134 @@ async fn a_connection_installed_mid_pass_takes_nothing_from_it() {
     assert_eq!(bus.advances(), [1], "the pass waits on the second advance");
 
     // The connection is lost and a new one installed while the pass waits.
-    // The old event loop is alive, so the first message's notice has no
-    // answer yet.
-    let old_client = handle.client.lock().await.take().unwrap();
+    let _old_client = handle.client.lock().await.take().unwrap();
     let broker = connect_fake(&handle, None, Answer::Success).await;
     open.send(()).unwrap();
-    until("the second advance", || bus.advances().len() == 2).await;
-    settle().await;
-    assert!(
-        broker.received().is_empty(),
-        "nothing goes out on the new connection while the old one's notice is unresolved"
+    until("two deliveries", || bus.reports().len() == 2).await;
+    assert_eq!(broker.topics(), ["lights/2", "lights/3"]);
+    assert_eq!(bus.advances(), [1, 2, 3]);
+    assert_eq!(
+        bus.reports_by_id(),
+        vec![
+            EgressReport::Delivered(meta(2, 1)),
+            EgressReport::Delivered(meta(3, 1)),
+        ]
     );
+    assert_eq!(queued(&mut old), 1, "the first stays with the old loop");
+}
 
-    drop(old_client);
-    drop(old);
-    until("three deliveries", || bus.reports().len() == 3).await;
+/// A reader driven pass by pass, with no task: nothing resolves between
+/// passes unless the case makes it.
+fn driven(handle: &Arc<MqttClientHandle>, bus: &Arc<ScriptBus>) -> Reader {
+    let bus: Arc<dyn EgressBus> = bus.clone();
+    let window = bus.window_depth();
+    Reader::new(Arc::clone(handle), bus, window)
+}
+
+/// Fail every notice `eventloop` holds the way a CONNACK reporting no session
+/// does, with the library's own calls and no network.
+fn reset_session(eventloop: &mut rumqttc::EventLoop) {
+    eventloop.clean();
+    eventloop.reset_session_state();
+}
+
+/// Notices a session reset failed before the next connection was installed
+/// are settled by that connection's first pass before it hands anything: the
+/// QoS 2 message is reported unknown, and the QoS 1 message goes out ahead of
+/// the newer channel message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_reset_is_settled_before_the_first_hand_off() {
+    let handle = make_handle();
+    let mut old = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(item(1, 1));
+    bus.commit_quietly(item(2, 2));
+    let mut reader = driven(&handle, &bus);
+    reader.pass().await;
+    assert_eq!(reader.in_flight.len(), 2);
+
+    *handle.client.lock().await = None;
+    reset_session(&mut old);
+    bus.commit_quietly(item(3, 1));
+    reader.unread = true;
+    let broker = connect_fake(&handle, None, Answer::Success).await;
+    reader.pass().await;
+
+    assert_eq!(
+        bus.reports(),
+        vec![EgressReport::Unknown {
+            message: meta(2, 2),
+            cause: UnknownCause::ConnectionLost,
+        }]
+    );
+    assert!(reader.held.is_empty());
+    assert_eq!(
+        reader.in_flight.keys().map(|seq| seq.0).collect::<Vec<_>>(),
+        [1, 3]
+    );
+    until("two publishes", || broker.received().len() == 2).await;
+    assert_eq!(broker.topics(), ["lights/1", "lights/3"]);
+    assert_eq!(bus.advances(), [1, 2, 3]);
+}
+
+/// A message handed between the library's own sweep at a loss and the
+/// supervisor emptying the client cell is put with the session by the
+/// supervisor's sweep: when the next CONNACK reports no session both QoS 1
+/// messages are failed alike, and the first pass on the new connection sends
+/// them in channel order, ahead of the newer message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publish_handed_after_the_library_sweep_is_resent_in_channel_order() {
+    let handle = make_handle();
+    let mut old = install_unpolled(&handle, 64, None, None).await;
+    let bus = ScriptBus::new(Some(256));
+    bus.commit_quietly(item(1, 1));
+    let mut reader = driven(&handle, &bus);
+    reader.pass().await;
+
+    // The failing poll's own sweep, then a hand-off before the cell is emptied.
+    old.clean();
+    bus.commit_quietly(item(2, 1));
+    reader.unread = true;
+    reader.pass().await;
+    assert_eq!(reader.in_flight.len(), 2);
+
+    *handle.client.lock().await = None;
+    sweep_after_loss(&mut old);
+    old.reset_session_state();
+    bus.commit_quietly(item(3, 1));
+    reader.unread = true;
+    let broker = connect_fake(&handle, None, Answer::Success).await;
+    reader.pass().await;
+
+    until("three publishes", || broker.received().len() == 3).await;
     assert_eq!(broker.topics(), ["lights/1", "lights/2", "lights/3"]);
     assert_eq!(bus.advances(), [1, 2, 3]);
+}
+
+/// A connection whose Receive Maximum is below what is already in flight is
+/// handed nothing until enough of that resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_smaller_receive_maximum_hands_nothing_until_notices_resolve() {
+    let handle = make_handle();
+    let broker = connect_fake(&handle, Some(5), Answer::Withhold).await;
+    let bus = ScriptBus::new(Some(256));
+    for seq in 1..=3 {
+        bus.commit_quietly(item(seq, 1));
+    }
+    start_egress_reader(&handle, bus.clone());
+    until("three publishes", || broker.received().len() == 3).await;
+
+    let _old_client = handle.client.lock().await.take().unwrap();
+    let mut new = install_unpolled(&handle, 64, None, Some(2)).await;
+    bus.commit(item(4, 1));
+    settle().await;
+    assert_eq!(bus.reads(), 1, "nothing is read over the smaller bound");
+    assert_eq!(queued(&mut new), 0);
+
+    broker.release();
+    until("three deliveries", || bus.reports().len() == 3).await;
+    until("the next hand-off", || queued(&mut new) == 1).await;
+    assert_eq!(bus.advances(), [1, 2, 3, 4]);
 }
 
 /// A full read whose messages all expired leaves room, and the reader reads
@@ -2200,7 +2324,7 @@ async fn the_stop_summary_counts_the_wait() {
             waited: Duration::from_secs(5),
             began: 3,
             answered: 2,
-            connection_ended: 0,
+            session_ended: 0,
             left: 1,
         })
     );
@@ -2208,8 +2332,8 @@ async fn the_stop_summary_counts_the_wait() {
     assert_eq!(reader.settle(Ending::Retire).await, None);
 }
 
-/// Messages whose connection ends during the wait are counted unknown, not
-/// answered, so the summary warns.
+/// Messages whose session ends with a lost connection during the wait are
+/// counted unknown, not answered, so the summary warns.
 #[tokio::test(start_paused = true)]
 async fn the_stop_summary_counts_a_lost_connection_unknown() {
     let handle = make_handle_waiting(5);
@@ -2230,7 +2354,7 @@ async fn the_stop_summary_counts_a_lost_connection_unknown() {
         (
             summary.began,
             summary.answered,
-            summary.connection_ended,
+            summary.session_ended,
             summary.left
         ),
         (2, 0, 2, 0)

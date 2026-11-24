@@ -1016,6 +1016,36 @@ fn validate_unknown_client_subscription_panics() {
     );
 }
 
+/// A document whose `mqtt_client` subscribes at QoS 2 does not load: the
+/// lowered block is refused at resolution with the reason.
+#[test]
+#[should_panic(
+    expected = "config: [[mqtt_client]] \"broker\" qos must be 0 or 1; got 2. Brenn does not \
+                subscribe at QoS 2"
+)]
+fn validate_mqtt_client_qos_2_panics() {
+    let lowered = crate::config::config_from_dsl(
+        "mqtt_client broker { url = \"mqtts://broker.example.com:8883\"; qos = 2; }",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config = BrennConfig {
+        server: super::test_server_config(),
+        apps: vec![AppConfigRaw {
+            slug: "pa".to_string(),
+            working_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        }],
+        mqtt_clients: lowered.mqtt_clients,
+        ..Default::default()
+    };
+
+    validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        super::test_runtime_dir(),
+    );
+}
+
 /// Build a single `[[mqtt_client]]` raw with the given slug.
 #[cfg(test)]
 fn ingress_test_broker(slug: &str) -> crate::mqtt::config::MqttClientConfigRaw {

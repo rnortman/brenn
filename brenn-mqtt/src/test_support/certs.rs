@@ -96,3 +96,25 @@ pub fn server_cert_pem() -> &'static str {
 pub fn server_key_pem() -> &'static str {
     &test_certs().server_key_pem
 }
+
+/// A TLS server configuration presenting the generated server certificate,
+/// for a test peer that terminates TLS toward a client trusting
+/// [`ca_pem`]. Does not authenticate the client.
+pub fn server_config() -> std::sync::Arc<rustls::ServerConfig> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    let cert = CertificateDer::from_pem_slice(server_cert_pem().as_bytes())
+        .expect("the generated server certificate parses");
+    let key = PrivateKeyDer::from_pem_slice(server_key_pem().as_bytes())
+        .expect("the generated server key parses");
+    let config = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("default protocol versions are valid for the aws_lc_rs provider")
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], key)
+    .expect("the generated server certificate and key form a server identity");
+    std::sync::Arc::new(config)
+}

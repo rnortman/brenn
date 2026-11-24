@@ -2,9 +2,9 @@
 //
 // The broker itself, the throwaway TLS material and the raw publisher live in
 // `brenn_mqtt::test_support`, which the crates above this one use too. What
-// stays here is what only this suite needs: the capturing router, the TCP relay
-// that drops a connection mid-session, and the `spawn_client` family built on
-// them.
+// stays here is what only the broker suites need: the capturing router, the TCP
+// relay that drops a connection mid-session, the in-memory egress channel, and
+// the `spawn_client` family built on them.
 //
 // All public items are re-exported at module root so test functions can
 // `use common::*;` without multi-level path disambiguation.
@@ -14,6 +14,7 @@
 // (persistence=false eliminates bleed). If the harness is ever refactored to a
 // shared broker, verify that assertion still holds across test ordering.
 
+pub mod egress;
 pub mod relay;
 pub mod router;
 
@@ -27,8 +28,9 @@ pub use brenn_mqtt::test_support::client::{
     await_puback, direct_publisher_acked, drain_until_incoming, session_client_id, wait_for_health,
 };
 pub use brenn_mqtt::test_support::poll::poll_until;
+pub use egress::{Egress, MemBus, egress_message, next_report};
 pub use relay::TcpRelay;
-pub use router::{CapturingRouter, DeliveredMessage};
+pub use router::{CapturingRouter, DeliveredMessage, Faults, Hold};
 
 use std::sync::Arc;
 
@@ -83,6 +85,12 @@ pub struct SpawnedClient {
     pub client_slug: String,
     pub handle: Arc<MqttClientHandle>,
     pub rx: mpsc::UnboundedReceiver<DeliveredMessage>,
+    /// The session faults the supervisor reported.
+    #[allow(dead_code, reason = "read by the kept-session suite only")]
+    pub faults: Faults,
+    /// The hold the client's inbound deliveries pass through.
+    #[allow(dead_code, reason = "read by the kept-session suite only")]
+    pub hold: Arc<Hold>,
 }
 
 /// Build `MqttService` + `MqttClientHandle` + the unified supervisor for
@@ -233,6 +241,8 @@ pub async fn spawn_client_with_config(
 
     let svc = MqttService::new();
     let (router, rx) = CapturingRouter::new();
+    let faults = router.faults();
+    let hold = router.hold();
     let router_arc: Arc<dyn MqttEventRouter> = Arc::new(router);
     svc.set_router(router_arc.clone()).await;
 
@@ -244,6 +254,8 @@ pub async fn spawn_client_with_config(
         client_slug,
         handle,
         rx,
+        faults,
+        hold,
     }
 }
 
