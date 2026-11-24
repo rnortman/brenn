@@ -45,8 +45,9 @@ use brenn_envelope::addressing::{
     MATCHER_BOUNDARIES, NON_TEXT_FAMILY_REFUSAL, TOOL_REQUESTS_NAMESPACE, TUNING_BOUNDARIES,
     UNTYPED_CONTENT_TYPE_FAMILY_REFUSAL, ends_at_matcher_boundary, ends_at_tuning_boundary,
     in_a_tool_namespace, in_app_tool_results_namespace, in_the_device_location_family,
-    in_the_egress_namespace, is_auto_channel_name, is_device_location_prefix,
-    is_egress_segment_name, mqtt_egress_client, nondurable_channel_uuid,
+    in_the_egress_namespace, in_the_mqtt_connection_family, is_auto_channel_name,
+    is_device_location_prefix, is_egress_segment_name, is_mqtt_connection_prefix,
+    mqtt_connection_client, mqtt_egress_client, nondurable_channel_uuid,
 };
 use brenn_envelope::channel_model::{
     ChannelBlockRole, ChannelDepthKey, TUNING_DURABILITY_IGNORED, depth_required, sink_admitted,
@@ -108,8 +109,9 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
 /// The ingress families (`mqtt:`, `webhook:`), the tool substrate's
 /// (`brenn:tools/`, `brenn:tool-results/`, `brenn:tool-requests/`,
 /// `brenn:app-tool-results/`), the
-/// per-user location channels (`brenn:device-location.<username>`) and the
-/// host's outbound channels (`brenn:egress/`). Everything
+/// per-user location channels (`brenn:device-location.<username>`), the
+/// host's outbound channels (`brenn:egress/`) and the per-client MQTT
+/// connection-state channels (`brenn:mqtt-connection.<client>`). Everything
 /// else is an operator-declared channel's address. A total function of the
 /// address, which is what makes the declaring and tuning roles disjoint.
 fn is_system_minted(address: &str) -> bool {
@@ -119,6 +121,7 @@ fn is_system_minted(address: &str) -> bool {
             in_a_tool_namespace(name)
                 || in_the_device_location_family(name)
                 || in_the_egress_namespace(name)
+                || in_the_mqtt_connection_family(name)
         }
         _ => false,
     }
@@ -126,15 +129,25 @@ fn is_system_minted(address: &str) -> bool {
 
 /// Does this tuning prefix name a family the system mints?
 ///
-/// [`is_system_minted`] read on the prefix, plus `brenn:device-location.`,
-/// which names the whole location family although no user's channel is
+/// [`is_system_minted`] read on the prefix, plus `brenn:device-location.` and
+/// `brenn:mqtt-connection.`, which name a whole family although no member is
 /// spelled that way.
 fn is_system_minted_prefix(prefix: &str) -> bool {
     is_system_minted(prefix)
         || matches!(
             split_spellable(prefix),
-            Some((ChannelScheme::Brenn, name)) if is_device_location_prefix(name)
+            Some((ChannelScheme::Brenn, name))
+                if is_device_location_prefix(name) || is_mqtt_connection_prefix(name)
         )
+}
+
+/// Is this address, or the family a prefix names, inside the MQTT
+/// connection-state family (`brenn:mqtt-connection.…`)?
+fn is_mqtt_connection_reach(address: &str) -> bool {
+    matches!(
+        split_spellable(address),
+        Some((ChannelScheme::Brenn, name)) if is_mqtt_connection_prefix(name)
+    )
 }
 
 /// Is this address one user's location channel?
@@ -368,6 +381,14 @@ fn check_tuning_address(tuning: &RTuning, errors: &mut Vec<Diagnostic>) {
                 "`{address}` is in the provider request-inbox family, which no block tunes: \
                  an inbox holds every request that can be in flight at once, the sum of \
                  its class's `max_concurrency`, and that depth is the class's to state"
+            ),
+            span.clone(),
+        ));
+    } else if classify && is_mqtt_connection_reach(address) {
+        errors.push(Diagnostic::at(
+            format!(
+                "`{address}` is in the MQTT connection-state family, which no block tunes: \
+                 the connection-state channel's depth and send rate are the host's"
             ),
             span.clone(),
         ));
@@ -1973,6 +1994,17 @@ fn plain_entry(
             ));
             return None;
         }
+        Family::BrennPublish if is_mqtt_connection_prefix(&bare) => {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{bare}` reaches into the MQTT connection-state family, which no publish \
+                     entry may: only the host writes a client's connection state, and no \
+                     configuration may grant a publish there"
+                ),
+                span.clone(),
+            ));
+            return None;
+        }
         _ => DEntry::Chan(channel_matcher(kind, bare, span, errors)?),
     })
 }
@@ -3001,6 +3033,40 @@ fn bound_address(
                 "this {} of {} `{label}` names `{address}`, in the egress namespace, which \
                  is no declared client's egress channel: each `mqtt_client` has one, \
                  `brenn:egress/mqtt/<client>`",
+                bound.what,
+                kind.label(),
+            ),
+            bound.span.clone(),
+        ));
+        return None;
+    }
+    let mqtt_connection_family = scheme == ChannelScheme::Brenn && is_mqtt_connection_prefix(bare);
+    if mqtt_connection_family && bound.dir.outbound() {
+        errors.push(Diagnostic::at(
+            format!(
+                "this {} of {} `{label}` names `{address}`, in the MQTT connection-state \
+                 family: only Brenn writes a client's connection state, so no `out` or `io` \
+                 port publishes there",
+                bound.what,
+                kind.label(),
+            ),
+            bound.span.clone(),
+        ));
+        return None;
+    }
+    // A client's connection-state channel is minted by the system, never
+    // declared, and is read by ACL like any channel, so a component's `in`
+    // port may name it. An agent reads it by a runtime subscription, so its
+    // static `subscribe` falls to the undeclared-channel refusal below.
+    if mqtt_connection_family && kind != EntityKind::Agent {
+        if mqtt_connection_client(bare).is_some_and(|client| refs.clients.contains(client)) {
+            return Some((scheme, bare.to_string()));
+        }
+        errors.push(Diagnostic::at(
+            format!(
+                "this {} of {} `{label}` names `{address}`, which is no declared client's \
+                 connection-state channel: each `mqtt_client` has one, \
+                 `brenn:mqtt-connection.<client>`",
                 bound.what,
                 kind.label(),
             ),

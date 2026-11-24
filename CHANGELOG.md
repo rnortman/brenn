@@ -4,6 +4,40 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Breaking config:** boot now refuses an `[llm_chat] prefix` of
+  `mqtt-connection` or `device-location`. Either would place every chat
+  channel inside a channel family only the server itself may write, and give
+  the chat harness write access to it. A configuration using one must pick
+  another prefix.
+- **Feature:** MQTT connection state is now on the bus. Every declared
+  `mqtt_client` gets a server-written channel, `brenn:mqtt-connection.<client>`,
+  whose newest message says whether the client is connected, retrying (with
+  the last error) or stopped for good (with the reason), since when, and
+  whether the previous server process ended that client's session uncleanly.
+  It exists even for a client nothing is bound through. Nobody can read it
+  until the operator grants access — `acl subscribe [exact
+  "brenn:mqtt-connection.<client>"]` for an agent, an `in` port for a
+  component — and no configuration can write to it or resize it
+  (`docs/message-bus.md` §2.7, §2.7.3).
+- **Feature:** senders learn about crashes. A sender that asked for delivery
+  status (`status_to`) could be left holding `handed` with no outcome after
+  the server died. Now, after an unclean stop, the next server process first
+  sends one `restarted` status to every `status_to` named on a message the
+  old process may have handed, before sending anything new: "nobody knows
+  whether it arrived". A clean stop sends none, except one that overlaps a
+  configuration reload (`docs/message-bus.md`, *Delivery status*). A
+  `restarted` status has no `message_id`, so readers of delivery statuses
+  must check `kind` before reading `message_id`.
+- **Upgrade note:** the first boot of this version cannot know how the
+  previous version stopped, so it sends no `restarted` statuses and its
+  connection state reports no unclean end. A sender resolves an old
+  `handed` using the state's `found_at_ms` (`docs/message-bus.md`, "What a
+  sender may infer").
+- **Behaviour change:** every final stop of an MQTT client — the broker
+  rejecting its credentials, or ending a connected session for good — now
+  raises a `Critical` alert, "MQTT client stopped: <client>". Before, most
+  such stops were only a log line. A placeholder client with wrong
+  credentials will now alert at every boot.
 - **Behaviour change:** MQTT clients now handle a session the broker kept
   (`session_expiry_secs` above 0) correctly on the receiving side. Nothing
   changes for clients left at the default expiry of 0:
@@ -287,9 +321,10 @@ All notable changes to Brenn are documented here.
   no longer answered "committed" and then silently lost. It is either
   refused, as for a client that is not configured, or reported as dropped
   with cause `removed` — to the operator, and to its `status_to` when it
-  names one. A client removed by a reload while the server is shutting down
-  has its unsent messages reported the same way, and any open alert for the
-  client is closed with a summary that names the removal. Still not
+  names one. The report does not depend on the client's session still
+  running, so a server shutdown that has already stopped it changes nothing
+  reported, and any open alert for the client is closed with a summary that
+  names the removal. Still not
   reported: messages left for a client deleted from the config while the
   server was down.
 - **BREAKING for operators:** `egress` is now a reserved channel name, for

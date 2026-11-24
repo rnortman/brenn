@@ -149,6 +149,7 @@ async fn the_shutdown_waits_for_every_sessions_answers_before_it_returns() {
         active_bridges: booted.active_bridges.clone(),
         server_shutting_down: Arc::new(AtomicBool::new(false)),
         mqtt: service.clone(),
+        mqtt_connection: Some(booted.mqtt_connection.clone()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

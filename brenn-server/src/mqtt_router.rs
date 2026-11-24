@@ -497,6 +497,15 @@ fn session_fault_alert(client_slug: &str, fault: &SessionFault) -> (AlertSeverit
                  unsolicited acknowledgement. {reason}"
             ),
         ),
+        SessionFault::Failed { reason } => (
+            AlertSeverity::Critical,
+            format!("MQTT client stopped: {client_slug}"),
+            format!(
+                "MQTT client '{client_slug}' is stopped until its mqtt_client block is reloaded \
+                 or the server restarts: its broker connection ended with an authoritative \
+                 error. {reason}"
+            ),
+        ),
     }
 }
 
@@ -2011,17 +2020,34 @@ mod tests {
                 },
             )
             .await;
+        router
+            .session_fault(
+                "sensors",
+                SessionFault::Failed {
+                    reason: "connection refused: bad user name or password".to_string(),
+                },
+            )
+            .await;
         drop(router);
         handle.await.expect("alert drainer");
 
         let alerts = captured.lock().unwrap();
-        assert_eq!(alerts.len(), 2, "one alert per fault: {alerts:?}");
+        assert_eq!(alerts.len(), 3, "one alert per fault: {alerts:?}");
         assert!(matches!(alerts[0].0, AlertSeverity::Warning));
         assert!(alerts[0].1.contains("sensors") && alerts[0].2.contains("sensors"));
         assert!(alerts[0].2.contains("packet identifier 7"));
         assert!(matches!(alerts[1].0, AlertSeverity::Critical));
         assert!(alerts[1].1.contains("sensors") && alerts[1].2.contains("sensors"));
         assert!(alerts[1].2.contains("unsolicited again"));
+        assert!(matches!(alerts[2].0, AlertSeverity::Critical));
+        assert_eq!(alerts[2].1, "MQTT client stopped: sensors");
+        assert!(alerts[2].2.contains("'sensors'"));
+        assert!(alerts[2].2.contains("bad user name or password"));
+        assert!(
+            alerts[2]
+                .2
+                .contains("until its mqtt_client block is reloaded")
+        );
     }
 
     // --- a replayed retained message against the channel's newest row ---

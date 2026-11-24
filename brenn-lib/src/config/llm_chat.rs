@@ -10,6 +10,7 @@ use brenn_envelope::chat::{CHAT_SEGMENT_SEP, ChatLeaf, chat_leaf_prefix};
 
 use crate::access::AppPolicy;
 use crate::access::acl::ChannelMatcher;
+use crate::messaging::config::SystemChannelFamily;
 use crate::messaging::{ChannelScheme, WakeMin, is_unreserved_name};
 use brenn_envelope::grants::AppCapability;
 
@@ -77,9 +78,10 @@ impl LlmChatConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `prefix` is not a well-formed single bare-name segment, if
-    /// `retained_window` is zero or above [`MAX_RETAINED_WINDOW`], or if
-    /// `idle_timeout_secs` is zero or above [`MAX_IDLE_TIMEOUT_SECS`].
+    /// Panics if `prefix` is not a well-formed single bare-name segment, if it
+    /// roots a system-minted channel family, if `retained_window` is zero or above
+    /// [`MAX_RETAINED_WINDOW`], or if `idle_timeout_secs` is zero or above
+    /// [`MAX_IDLE_TIMEOUT_SECS`].
     pub fn validate(&self) {
         let prefix = self.prefix.as_str();
         assert!(
@@ -88,6 +90,15 @@ impl LlmChatConfig {
              (allowed: A-Za-z0-9_~-, non-empty, no {CHAT_SEGMENT_SEP:?}) — it roots every chat \
              channel address. Refusing to start (fail-fast on invalid config)."
         );
+        let rooted = format!("{prefix}{CHAT_SEGMENT_SEP}");
+        if let Some(family) = SystemChannelFamily::of_prefix(&rooted) {
+            panic!(
+                "boot: [llm_chat] prefix {prefix:?} roots the system-minted {family:?} channel \
+                 family — every chat channel would sit inside it, and the chat harness's publish \
+                 grant would reach channels only the host writes. Choose another prefix. \
+                 Refusing to start (fail-fast on invalid config)."
+            );
+        }
         assert!(
             (1..=MAX_RETAINED_WINDOW).contains(&self.retained_window),
             "boot: [llm_chat] retained_window = {} is out of range 1..={MAX_RETAINED_WINDOW} — \
@@ -378,6 +389,39 @@ mod tests {
             ..LlmChatConfig::default()
         }
         .validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "roots the system-minted MqttConnection channel family")]
+    fn mqtt_connection_prefix_panics() {
+        LlmChatConfig {
+            prefix: "mqtt-connection".to_string(),
+            ..LlmChatConfig::default()
+        }
+        .validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "roots the system-minted DeviceLocation channel family")]
+    fn device_location_prefix_panics() {
+        LlmChatConfig {
+            prefix: "device-location".to_string(),
+            ..LlmChatConfig::default()
+        }
+        .validate();
+    }
+
+    /// Families whose separator is `/` cannot be rooted by a single segment,
+    /// which never contains one.
+    #[test]
+    fn a_slash_family_root_word_is_an_ordinary_prefix() {
+        for prefix in ["egress", "tools", "tool-results"] {
+            LlmChatConfig {
+                prefix: prefix.to_string(),
+                ..LlmChatConfig::default()
+            }
+            .validate();
+        }
     }
 
     #[test]

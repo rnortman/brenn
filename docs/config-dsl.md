@@ -1218,7 +1218,13 @@ per `mqtt_client`, `brenn:egress/mqtt/<client>`, carrying that client's
 "brenn:egress/mqtt/" { … }` tunes every client's, and `channel at
 "brenn:egress/mqtt/<client>" { … }` tunes one and is refused unless the
 document declares an `mqtt_client` of that slug. Its window is the outage to
-survive in that client's publishes; a retune needs a restart. The four tool namespaces — `tools`, `tool-requests`, `tool-results`
+survive in that client's publishes; a retune needs a restart. One
+system-minted family takes no tuning at all: `brenn:mqtt-connection.`, one
+connection-state channel per `mqtt_client` (`docs/message-bus.md` §2.7). Its
+depths and its send rate are the host's, and a `channel at` block naming it —
+an exact address, the prefix `brenn:mqtt-connection.`, or any longer prefix —
+is refused: "the connection-state channel's depth and send rate are the
+host's". The four tool namespaces — `tools`, `tool-requests`, `tool-results`
 and `app-tool-results` — are reserved channel segments: no channel may be
 declared named `<segment>`, `<segment>.…` or `<segment>/…`. A handle and a
 literal address are disjoint spellings: a channel that is declared is referred
@@ -1663,7 +1669,9 @@ A binding names a port, an arrow, and a channel: `in port <- chan`,
 declaration exists and a literal address where none does (`local:` planes,
 system-minted `webhook:`/`mqtt:` channels, a user's
 `brenn:device-location.<username>` channel, a declared client's
-`brenn:egress/mqtt/<client>` channel, which only an `in` port may name). The
+`brenn:egress/mqtt/<client>` channel, which only an `in` port may name, and a
+declared client's `brenn:mqtt-connection.<client>` channel, which likewise only
+an `in` port may name; one naming no declared client is refused). The
 trailing block tunes *this subscription* — `push_depth` is what wakes this
 instance, `retain_depth` what it can see — and both are held at or under the channel's ceiling: its
 `standing_retain_depth` on a durable channel, its `retain_depth` on every other
@@ -2307,6 +2315,16 @@ Five more declarations, each a body of attrs:
   answers `invalid-payload`. `0`, or a value over
   4294967295, refuses the document at load. `docs/message-bus.md` §2.7.2 has
   `MqttSend`'s contract.
+  Every client also has a host-written connection-state channel,
+  `brenn:mqtt-connection.<client>`, whose newest message says whether the
+  client is connected and whether its previous session ended uncleanly
+  (`docs/message-bus.md` §2.7.3, *Connection state*). Nothing may read it
+  until granted: an agent by `acl subscribe [exact
+  "brenn:mqtt-connection.<client>"];` and a runtime `MessageSubscribe`, a
+  component by `in state <- "brenn:mqtt-connection.<client>" { … }`. Grant
+  the exact address; a prefix reaches every client whose slug continues it.
+  Nothing may write it: an `acl publish` entry reaching into
+  `brenn:mqtt-connection.`, and an `out` or `io` port on it, are refused.
 
   `qos` — 0 or 1, default 1 — is the QoS of the broker SUBSCRIBE for every
   filter of the client, and nothing else: a publish carries its own QoS, 0 to
@@ -3072,8 +3090,8 @@ What converges is components, surfaces and their wiring:
   **retune** a channel a dynamic subscription sits on, folded or dormant, and
   when it would **remove** one the subscription is still folded into, or one
   carrying a *dormant* subscription on a **system-minted** address — `mqtt:`,
-  `webhook:`, `brenn:tools/…`, `brenn:tool-results/…` or
-  `brenn:device-location.…`, the addresses a fresh
+  `webhook:`, `brenn:tools/…`, `brenn:tool-results/…`,
+  `brenn:device-location.…` or `brenn:mqtt-connection.…`, the addresses a fresh
   boot rebuilds from their stored rows without any `[[channel]]` block: the
   subscription is in no document, so nothing can re-derive it against the entry
   the reload would put there instead. Those pairings need a restart. Removing an

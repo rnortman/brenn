@@ -142,22 +142,18 @@ async fn execute_send(
         )
         .await;
     match result {
-        Ok(committed) => answer_committed(bridge, &address.client, committed).await,
+        Ok(committed) => answer_committed(bridge, &address.client, committed),
         Err(refused) => answer_refused(bridge, REJECTION_CONTEXT, tool_name, &to, refused),
     }
 }
 
 /// The answer to a committed publish, with whether its client is connected
 /// now. A client the registry no longer holds reads as not connected.
-async fn answer_committed(
-    bridge: &ActiveBridge,
-    client: &str,
-    committed: MqttCommitted,
-) -> ToolOutcome {
-    let health = match bridge.mqtt_service().get_client(client) {
-        Some(handle) => Some(handle.health_snapshot().await.0),
-        None => None,
-    };
+fn answer_committed(bridge: &ActiveBridge, client: &str, committed: MqttCommitted) -> ToolOutcome {
+    let health = bridge
+        .mqtt_service()
+        .get_client(client)
+        .map(|handle| handle.health_snapshot().0);
     let client_connected = health == Some(ConnectorHealthLabel::Connected);
     let note = (!client_connected).then(|| {
         let state = health.map_or("no longer registered", ConnectorHealthLabel::wire_str);

@@ -4390,6 +4390,71 @@ fn every_plan_mints_one_egress_channel_per_client_and_its_reader() {
     );
 }
 
+/// Every plan mints one connection-state channel per declared client, with
+/// no subscriber, and declares `system:mqtt-connection` with the same spec for
+/// every client set, none included.
+#[test]
+fn every_plan_mints_one_connection_state_channel_per_client_and_its_writer() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_messaging::mqtt_connection::{MQTT_CONNECTION_COMPONENT, mqtt_connection_spec};
+
+    let mut config = BrennConfig::default();
+    config.channels.push(surface_index_channel());
+    let plan_with = |config: &BrennConfig| {
+        let clients = brenn_lib::mqtt::config::resolve_client_identities(&config.mqtt_clients);
+        plan_messaging(&PlanInputs {
+            config,
+            apps: None,
+            mqtt_clients: &clients,
+            tool_registry: None,
+            replay_store_paths: &[],
+            device_location_users: &[],
+        })
+        .expect("a channel-declaring document configures messaging")
+    };
+    let writers = |plan: &MessagingPlan| -> Vec<_> {
+        plan.system_participants
+            .iter()
+            .filter(|spec| spec.component == MQTT_CONNECTION_COMPONENT)
+            .cloned()
+            .collect()
+    };
+
+    let none = plan_with(&config);
+    assert!(
+        none.directory
+            .list()
+            .iter()
+            .all(|e| !e.address.starts_with("brenn:mqtt-connection.")),
+        "no client, no connection-state channel"
+    );
+    assert_eq!(writers(&none), vec![mqtt_connection_spec()]);
+
+    config.mqtt_clients = vec![minimal_mqtt_client("home"), minimal_mqtt_client("away")];
+    let plan = plan_with(&config);
+    for slug in ["home", "away"] {
+        let address = format!("brenn:mqtt-connection.{slug}");
+        let entry = plan
+            .directory
+            .resolve(&address)
+            .expect("each declared client's connection-state channel is minted");
+        assert_eq!(
+            entry.uuid,
+            brenn_lib::messaging::mqtt_connection_channel_uuid(&address)
+        );
+        assert!(entry.capabilities().durable);
+        assert!(!entry.resolved_channel.non_text);
+        assert_eq!(entry.resolved_channel.retain_depth, Depth::Bounded(8));
+        assert_eq!(
+            entry.resolved_channel.send_rate,
+            brenn_lib::messaging::config::MQTT_CONNECTION_SEND_RATE
+        );
+        assert!(entry.subscribers.is_empty());
+    }
+    assert!(plan.directory.resolve("brenn:mqtt-connection.").is_none());
+    assert_eq!(writers(&plan), vec![mqtt_connection_spec()]);
+}
+
 /// A consumer output bound to a client's egress channel meets the egress
 /// refusal, not the unknown-channel one: the entry is in the directory
 /// consumer bindings resolve against.

@@ -811,7 +811,7 @@ async fn durable_rows(messenger: &Messenger) -> Vec<String> {
 /// selector keyed to one depth or one variant would silently drop a channel a
 /// deployment retuned.
 ///
-/// Bodies are compared verbatim, with three exclusions, each a value minted per
+/// Bodies are compared verbatim, with four exclusions, each a value minted per
 /// process at a named site and nowhere else:
 ///
 /// - `brenn:config.status`, whose whole purpose is to differ between a reloaded
@@ -825,6 +825,12 @@ async fn durable_rows(messenger: &Messenger) -> Vec<String> {
 ///   dimensions, the build line — stays.
 /// - The `ts` and `epoch` of a surface's `disconnected` stamp, minted from the
 ///   server clock and the process's own bus epoch as `resume_epoch` is.
+/// - Everything of an MQTT client's connection state but its client:
+///   `since_ms` and `previous_session.found_at_ms` are the process's clock,
+///   `previous_session.end` is how the process before it ended — a fresh boot
+///   over a copy of a running process's database finds that process
+///   unstopped — and `connection` with its `last_error` is whichever moment of
+///   the session's connect the snapshot caught.
 ///
 /// A comparison that fails is a convergence defect and is fixed in the commit
 /// step; this list is never widened to make one pass.
@@ -839,7 +845,13 @@ async fn retained_documents(
         .config
         .surface_description
         .prefix;
-    let families = description_families(prefix, booted.driver.baseline().surfaces());
+    let mut families = description_families(prefix, booted.driver.baseline().surfaces());
+    for client in booted.mqtt.0.client_slugs() {
+        families.insert(
+            brenn_lib::messaging::mqtt_connection_address(&client),
+            Family::MqttConnection,
+        );
+    }
     let mut lines = Vec::new();
     for entry in entries {
         if entry.address == brenn_messaging::config_reload::STATUS_ADDRESS {
@@ -881,6 +893,9 @@ enum Family {
     KindSchema,
     /// A surface's `disconnected` stamp, carrying `ts` and `epoch`.
     SurfaceStatus,
+    /// An MQTT client's connection state, carrying the process's clock and
+    /// how the process before it ended.
+    MqttConnection,
 }
 
 /// Every address whose body carries a per-process value, built with the same
@@ -943,6 +958,11 @@ fn narrowed(family: Option<Family>, body: &str) -> String {
                 "v={} session={:?} health={:?} reason={}",
                 stamp.v, stamp.session, stamp.health, stamp.reason,
             )
+        }
+        Some(Family::MqttConnection) => {
+            let state = brenn_envelope::mqtt_connection::decode(body)
+                .expect("a host-written connection state decodes");
+            format!("client={}", state.client)
         }
     }
 }

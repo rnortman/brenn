@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rumqttc::mqttbytes::QoS;
 use rumqttc::{
@@ -1009,6 +1009,10 @@ async fn supervisor_body(
     // First write wins; every exit path must set this before breaking.
     let mut terminal_reason: Option<SupervisorState> = None;
 
+    // The failure the next connect attempt follows: written into `Connecting`
+    // so an attempt does not blank the error a reader sees.
+    let mut last_failure: Option<String> = None;
+
     // A body the watchdog respawned inherits a handle whose previous event loop
     // is gone, and nothing of that loop will be replayed: no SUBSCRIBE recorded
     // for it can be answered on this body's loop.
@@ -1036,10 +1040,7 @@ async fn supervisor_body(
             // body, so there is no session to disconnect, only a handle to drop.
             *handle.client.lock().await = None;
             if terminal_reason.is_none() {
-                terminal_reason = Some(SupervisorState::Disconnected {
-                    last_error: None,
-                    next_attempt_at: Instant::now(),
-                });
+                terminal_reason = Some(SupervisorState::Disconnected { last_error: None });
             }
             drop_event_loop(&handle, client, eventloop);
             break;
@@ -1054,12 +1055,9 @@ async fn supervisor_body(
             "connecting to broker",
         );
 
-        {
-            let mut state = handle.supervisor_state.write().await;
-            *state = SupervisorState::Connecting {
-                since: Instant::now(),
-            };
-        }
+        handle.set_state(SupervisorState::Connecting {
+            last_error: last_failure.clone(),
+        });
 
         // Poll until ConnAck or error. `None` = stop requested before any
         // connection was made. The library connects inside `poll` when it
@@ -1102,10 +1100,7 @@ async fn supervisor_body(
                 // Stop before the library made a connection: there is no
                 // broker connection to end and no client installed.
                 if terminal_reason.is_none() {
-                    terminal_reason = Some(SupervisorState::Disconnected {
-                        last_error: None,
-                        next_attempt_at: Instant::now(),
-                    });
+                    terminal_reason = Some(SupervisorState::Disconnected { last_error: None });
                 }
                 drop_event_loop(&handle, client, eventloop);
                 break;
@@ -1122,17 +1117,15 @@ async fn supervisor_body(
                     // the same value.
                     let mut client_guard = handle.client.lock().await;
                     *client_guard = None;
-                    let mut state = handle.supervisor_state.write().await;
-                    *state = if authoritative {
+                    handle.set_state(if authoritative {
                         SupervisorState::Failed {
                             reason: error_str.clone(),
                         }
                     } else {
                         SupervisorState::Disconnected {
                             last_error: Some(error_str.clone()),
-                            next_attempt_at: Instant::now(),
                         }
-                    };
+                    });
                 }
                 if authoritative {
                     tracing::error!(
@@ -1141,6 +1134,14 @@ async fn supervisor_body(
                         error = %error_str,
                         "broker connection failed with authoritative error; stopping retry",
                     );
+                    router
+                        .session_fault(
+                            &client_slug,
+                            SessionFault::Failed {
+                                reason: error_str.clone(),
+                            },
+                        )
+                        .await;
                     // Dropped after the state that carries the reason is
                     // written, so a publish waiter woken by the drop reads it.
                     drop_event_loop(&handle, client, eventloop);
@@ -1158,6 +1159,7 @@ async fn supervisor_body(
                     error = %error_str,
                     "broker connection failed; will retry",
                 );
+                last_failure = Some(error_str);
                 let delay = backoff_duration(
                     attempt,
                     broker.identity.reconnect_backoff_initial_secs,
@@ -1181,10 +1183,7 @@ async fn supervisor_body(
         // list, unless an UNSUBACK or this CONNACK has said the broker does not
         // hold it.
         let unsettled = take_connection(&handle, client.clone(), facts).await;
-        {
-            let mut state = handle.supervisor_state.write().await;
-            *state = SupervisorState::Connected;
-        }
+        handle.set_state(SupervisorState::Connected);
         attempt = 0;
 
         tracing::info!(
@@ -1228,14 +1227,8 @@ async fn supervisor_body(
                     // the observable health transition does not gate on broker
                     // liveness.
                     if terminal_reason.is_none() {
-                        let disconnected = SupervisorState::Disconnected {
-                            last_error: None,
-                            next_attempt_at: Instant::now(),
-                        };
-                        {
-                            let mut state = handle.supervisor_state.write().await;
-                            *state = disconnected.clone();
-                        }
+                        let disconnected = SupervisorState::Disconnected { last_error: None };
+                        handle.set_state(disconnected.clone());
                         terminal_reason = Some(disconnected);
                     }
                     // From here no caller can start a publish, SUBSCRIBE or
@@ -1269,64 +1262,19 @@ async fn supervisor_body(
             // supervisor state is read as "will reconnect".
             let mut client_guard = handle.client.lock().await;
             *client_guard = None;
-            let mut state = handle.supervisor_state.write().await;
-            *state = if disconnect_authoritative {
+            handle.set_state(if disconnect_authoritative {
                 SupervisorState::Failed {
                     reason: disconnect_reason.clone(),
                 }
             } else {
                 SupervisorState::Disconnected {
                     last_error: Some(disconnect_reason.clone()),
-                    next_attempt_at: Instant::now(),
                 }
-            };
+            });
         }
         clear_connection_tracking(&handle).await;
 
-        match verdict {
-            LossVerdict::Reconnect => {}
-            LossVerdict::Authoritative => {
-                tracing::error!(
-                    client = %client_slug,
-                    broker = %broker.identity.slug,
-                    reason = %disconnect_reason,
-                    "broker connection lost with authoritative error; stopping retry",
-                );
-            }
-            LossVerdict::DiscardSession { pkid } => {
-                tracing::error!(
-                    client = %client_slug,
-                    broker = %broker.identity.slug,
-                    pkid,
-                    reason = %disconnect_reason,
-                    "the broker answered a packet identifier the client's session does not hold; \
-                     discarding the session: the next connect is a clean start, the broker's \
-                     queued messages for this client are lost, and publishes in flight end as \
-                     after a session reset",
-                );
-                router
-                    .session_fault(&client_slug, SessionFault::SessionDiscarded { pkid })
-                    .await;
-            }
-            LossVerdict::GiveUp { .. } => {
-                tracing::error!(
-                    client = %client_slug,
-                    broker = %broker.identity.slug,
-                    reason = %disconnect_reason,
-                    "discarding the MQTT session did not cure the unsolicited acknowledgement; \
-                     stopping the client until its configuration is reloaded or the server \
-                     restarts",
-                );
-                router
-                    .session_fault(
-                        &client_slug,
-                        SessionFault::GaveUp {
-                            reason: disconnect_reason.clone(),
-                        },
-                    )
-                    .await;
-            }
-        }
+        report_loss(router.as_ref(), &client_slug, &verdict, &disconnect_reason).await;
 
         if disconnect_authoritative {
             // Ends the session's publish notices after the state that carries
@@ -1350,6 +1298,7 @@ async fn supervisor_body(
             unsettled = settler.unsettled.len(),
             "broker connection lost; reconnecting",
         );
+        last_failure = Some(disconnect_reason);
 
         let delay = backoff_duration(
             attempt,
@@ -1364,20 +1313,13 @@ async fn supervisor_body(
         }
     }
 
-    // TODO(mqtt-idle-client-visibility): a `Failed` terminal state is the end
-    // of this client for the life of the process and reaches the operator
-    // through this task's log line and nothing else, except the give-up on an
-    // uncured `Unsolicited`, which the router also raises as an alert.
     // Terminal-state tail: every exit path must leave supervisor_state in a
     // terminal (non-Connected) state. Every path arrives here with its reason,
     // and the two authoritative-failure paths have already written that same
     // `Failed` beside clearing the client cell, so this write is idempotent
     // rather than exclusive.
     match terminal_reason {
-        Some(state) => {
-            let mut guard = handle.supervisor_state.write().await;
-            *guard = state;
-        }
+        Some(state) => handle.set_state(state),
         None => {
             panic!(
                 "MQTT supervisor for client '{client_slug}' exited without setting a terminal \
@@ -1890,6 +1832,66 @@ impl StopDisconnect {
             StopDisconnect::EndSession => {
                 "Session Expiry Interval 0: asks the broker to end the session"
             }
+        }
+    }
+}
+
+/// Log a connected session's ending and tell `router` of the faults the
+/// operator must hear about: an authoritative ending, a discarded session and
+/// the give-up.
+async fn report_loss(
+    router: &dyn MqttEventRouter,
+    client_slug: &str,
+    verdict: &LossVerdict,
+    reason: &str,
+) {
+    match *verdict {
+        LossVerdict::Reconnect => {}
+        LossVerdict::Authoritative => {
+            tracing::error!(
+                client = %client_slug,
+                reason = %reason,
+                "broker connection lost with authoritative error; stopping retry",
+            );
+            router
+                .session_fault(
+                    client_slug,
+                    SessionFault::Failed {
+                        reason: reason.to_string(),
+                    },
+                )
+                .await;
+        }
+        LossVerdict::DiscardSession { pkid } => {
+            tracing::error!(
+                client = %client_slug,
+                pkid,
+                reason = %reason,
+                "the broker answered a packet identifier the client's session does not hold; \
+                 discarding the session: the next connect is a clean start, the broker's \
+                 queued messages for this client are lost, and publishes in flight end as \
+                 after a session reset",
+            );
+            router
+                .session_fault(client_slug, SessionFault::SessionDiscarded { pkid })
+                .await;
+        }
+        LossVerdict::GiveUp { .. } => {
+            tracing::error!(
+                client = %client_slug,
+                reason = %reason,
+                "discarding the MQTT session did not cure the unsolicited acknowledgement; \
+                 stopping the client until its configuration is reloaded or the server \
+                 restarts",
+            );
+            router
+                .session_fault(
+                    client_slug,
+                    SessionFault::GaveUp {
+                        reason: reason.to_string(),
+                    },
+                )
+                .await;
         }
     }
 }
@@ -2462,6 +2464,74 @@ mod tests {
         }
     }
 
+    /// A router that keeps every session fault it is told of.
+    #[derive(Default)]
+    struct FaultRouter {
+        faults: std::sync::Mutex<Vec<(String, SessionFault)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MqttEventRouter for FaultRouter {
+        fn ready(&self) -> bool {
+            true
+        }
+
+        async fn deliver_inbound(
+            &self,
+            client_slug: &str,
+            topic: &str,
+            _payload: crate::payload::InboundPayload,
+            _qos: u8,
+            _retained: bool,
+            _routing: InboundRouting,
+        ) {
+            panic!("no test on this router delivers; got {topic:?} on {client_slug}");
+        }
+
+        async fn session_fault(&self, client_slug: &str, fault: SessionFault) {
+            self.faults
+                .lock()
+                .unwrap()
+                .push((client_slug.to_string(), fault));
+        }
+    }
+
+    /// An authoritative loss is reported as `Failed` with its reason; the
+    /// give-up keeps its own fault, a discarded session its own, and a loss
+    /// the supervisor reconnects after reports nothing.
+    #[tokio::test]
+    async fn a_loss_reports_the_fault_its_verdict_names() {
+        let cases = [
+            (LossVerdict::Reconnect, None),
+            (
+                LossVerdict::Authoritative,
+                Some(SessionFault::Failed {
+                    reason: "the reason".to_string(),
+                }),
+            ),
+            (
+                LossVerdict::DiscardSession { pkid: 7 },
+                Some(SessionFault::SessionDiscarded { pkid: 7 }),
+            ),
+            (
+                LossVerdict::GiveUp { pkid: 7 },
+                Some(SessionFault::GaveUp {
+                    reason: "the reason".to_string(),
+                }),
+            ),
+        ];
+        for (verdict, expected) in cases {
+            let router = FaultRouter::default();
+            report_loss(&router, "home", &verdict, "the reason").await;
+            let faults = router.faults.into_inner().unwrap();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|fault| ("home".to_string(), fault))
+                .collect();
+            assert_eq!(faults, expected, "{verdict:?}");
+        }
+    }
+
     /// A router that keeps each call's topic and routing, and its delivery QoS
     /// and RETAIN flag apart.
     #[derive(Default)]
@@ -2828,7 +2898,7 @@ mod tests {
         let (client, eventloop) = unpolled_client(1);
         drop(eventloop);
         *handle.client.lock().await = Some(client);
-        *handle.supervisor_state.write().await = SupervisorState::Connected;
+        handle.set_state(SupervisorState::Connected);
         let stop_rx = handle.stop_tx.subscribe();
         handle.stop_tx.send(true).expect("stop_rx is alive");
 
@@ -2840,13 +2910,10 @@ mod tests {
         .expect("the supervisor did not stop");
 
         assert!(handle.client.lock().await.is_none());
-        assert!(matches!(
-            *handle.supervisor_state.read().await,
-            SupervisorState::Disconnected {
-                last_error: None,
-                ..
-            }
-        ));
+        assert_eq!(
+            handle.state().state,
+            SupervisorState::Disconnected { last_error: None }
+        );
     }
 
     /// The watchdog's pause before a respawn ends at a stop: no fixed sleep is

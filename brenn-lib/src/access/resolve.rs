@@ -530,6 +530,11 @@ fn validate_mqtt_client(
 /// (`AppPolicy::allows_brenn_publish`), so such a matcher could never match and
 /// is a configuration error rather than a silent no-op. A subscribe list may
 /// name the namespace; reading it is by ACL like any channel.
+///
+/// Nor into the MQTT connection-state family: the host acts on a client's
+/// state channel at boot, so no configuration may grant a write there. A
+/// prefix matcher must end at `.` or `/` and the family prefix has no earlier
+/// boundary, so the only matchers that cover the family start with it.
 fn resolve_brenn_publish(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelMatcher {
     let (kind, value) = match raw {
         ChannelMatcherRaw::Exact(s) => ("exact", s),
@@ -540,6 +545,12 @@ fn resolve_brenn_publish(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> Ch
         "{owner}: {list} {kind} matcher {value:?} reaches into the reserved `egress/` \
          namespace — a channel there holds messages bound off the bus and only the host's \
          admission writes it; publish to an MQTT topic through its `mqtt:` address",
+    );
+    assert!(
+        !crate::messaging::is_mqtt_connection_prefix(value),
+        "{owner}: {list} {kind} matcher {value:?} reaches into the MQTT connection-state \
+         family — only the host writes a client's connection state, and no configuration \
+         may grant a publish there",
     );
     resolve_channel(owner, list, raw)
 }
@@ -1067,6 +1078,79 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    /// No publish list reaches the connection-state family, exact or prefix,
+    /// for any owner kind.
+    #[test]
+    fn mqtt_connection_publish_matchers_panic_for_every_owner() {
+        let refusal = |f: &mut dyn FnMut()| -> String {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+                .expect_err("a publish matcher into the family is refused");
+            *refused
+                .downcast::<String>()
+                .expect("the refusal is a formatted message")
+        };
+        for raw in [
+            ChannelMatcherRaw::Exact("mqtt-connection.home".to_string()),
+            ChannelMatcherRaw::Prefix("mqtt-connection.".to_string()),
+            ChannelMatcherRaw::Prefix("mqtt-connection.home.".to_string()),
+        ] {
+            let acl = AppAclRaw {
+                brenn_publish: vec![raw.clone()],
+                ..AppAclRaw::default()
+            };
+            let wasm_acl = [raw.clone()];
+            let attach_acl = [raw.clone()];
+            let messages = [
+                refusal(&mut || {
+                    build_app_policy("home", &[], &acl, &clients(&[]));
+                }),
+                refusal(&mut || {
+                    build_wasm_policy(
+                        "etl",
+                        [],
+                        WasmAclsRaw {
+                            publish: &wasm_acl,
+                            ..Default::default()
+                        },
+                    );
+                }),
+                refusal(&mut || {
+                    build_attach_policy(
+                        AttachOwner::Surface("deskbar"),
+                        [AttachGrant::Publish],
+                        AttachAclsRaw {
+                            publish: &attach_acl,
+                            ..Default::default()
+                        },
+                    );
+                }),
+            ];
+            for message in messages {
+                assert!(
+                    message.contains("reaches into the MQTT connection-state family"),
+                    "{raw:?}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mqtt_connection_subscribe_matchers_resolve() {
+        // Reading a client's state is by ordinary ACL.
+        let acl = AppAclRaw {
+            brenn_subscribe: vec![ChannelMatcherRaw::Exact("mqtt-connection.home".to_string())],
+            ..AppAclRaw::default()
+        };
+        let policy = build_app_policy(
+            "home",
+            &[AppCapability::MessagingSubscribe],
+            &acl,
+            &clients(&[]),
+        );
+        assert!(policy.allows_brenn_delivery("mqtt-connection.home"));
+        assert!(!policy.allows_brenn_delivery("mqtt-connection.away"));
     }
 
     #[test]

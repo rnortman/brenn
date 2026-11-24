@@ -173,6 +173,10 @@ pub(crate) struct ReloadEnv {
     /// for each client it adds or restarts and closes the one of each client
     /// it removes.
     pub mqtt_egress: Arc<brenn_server::mqtt_egress::MqttEgressHub>,
+    /// The connection-state writers. A reload begins one for each client it
+    /// adds, hands a restarted client's to its successor session, and writes
+    /// a removed client's `stopped`.
+    pub mqtt_connection: Arc<brenn_server::mqtt_connection::MqttConnectionHub>,
     pub max_payload_bytes: usize,
     /// The live Claude Code sessions. A reload condemns the ones whose agent's
     /// per-process view moved, or whose conversation belongs to a user the
@@ -2306,6 +2310,8 @@ channel scratch at "ephemeral:scratch" {{
             Arc<brenn_mqtt::MqttService>,
             Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
         ),
+        /// The connection-state writers, which a clean shutdown finishes.
+        pub(crate) mqtt_connection: Arc<brenn_server::mqtt_connection::MqttConnectionHub>,
         /// The endpoint table the reload's webhook steps walk — the same one
         /// the HTTP layer would be matching requests against. Built over the
         /// booted document's endpoints, with a real replay component per
@@ -2492,6 +2498,7 @@ channel scratch at "ephemeral:scratch" {{
         dynamic_ingress: &[brenn_messaging_boot::DynamicMqttIngress],
         db: &brenn_db::Db,
         messenger: &Arc<Messenger>,
+        alert_dispatcher: &AlertDispatcher,
     ) -> (
         Arc<brenn_mqtt::MqttService>,
         Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
@@ -2507,9 +2514,11 @@ channel scratch at "ephemeral:scratch" {{
         // The state the router delivers through must carry the messenger this
         // process publishes with: an inbound packet reaches the bus through it,
         // and a state without one panics the delivery path on the first
-        // message.
+        // message. Its alerts are the rig's, so a session fault the router
+        // raises is captured with the rest.
         let mut state = brenn_server::test_support::state::test_state(db);
         state.messenger = Some(messenger.clone());
+        state.alert_dispatcher = alert_dispatcher.clone();
         (
             result.service,
             result.event_router,
@@ -2770,6 +2779,7 @@ channel scratch at "ephemeral:scratch" {{
                 &result.dynamic_mqtt_ingress,
                 &db,
                 &messenger,
+                &alert_dispatcher,
             );
             (service, router, Some(wiring))
         } else {
@@ -2783,7 +2793,7 @@ channel scratch at "ephemeral:scratch" {{
             (service, router, None)
         };
         messenger.install_mqtt_clients(mqtt.0.clone());
-        let mqtt_egress = crate::mqtt::start_mqtt_egress(
+        let mqtt_hubs = crate::mqtt::start_mqtt_egress(
             &mqtt.0,
             messenger.clone(),
             alert_dispatcher.clone(),
@@ -2981,7 +2991,8 @@ channel scratch at "ephemeral:scratch" {{
                 attach_registry,
                 mqtt_service: mqtt.0.clone(),
                 mqtt_event_router: mqtt.1.clone(),
-                mqtt_egress: mqtt_egress.clone(),
+                mqtt_egress: mqtt_hubs.egress.clone(),
+                mqtt_connection: mqtt_hubs.connection.clone(),
                 max_payload_bytes: document.config.messaging.max_body_bytes,
                 active_bridges,
                 apps_swapped_tx: apps_swapped_tx.clone(),
@@ -3003,6 +3014,7 @@ channel scratch at "ephemeral:scratch" {{
             active_bridges: bridges_for_fixture,
             mounts,
             mqtt,
+            mqtt_connection: mqtt_hubs.connection,
             messenger,
             router,
             captured,
@@ -3638,9 +3650,9 @@ new sifter: Demo {{
         // A placeholder broker whose credentials are wrong: declared, dialled
         // at boot, rejected authoritatively, not retrying.
         let handle = service.get_client("spare").expect("a declared client");
-        *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {
+        handle.set_state(brenn_mqtt::state::SupervisorState::Failed {
             reason: "authoritative connect failure: bad user name or password".to_string(),
-        };
+        });
 
         tree.write(&document_with_two_brokers(&[
             ("ha", "home/state"),
@@ -3821,7 +3833,7 @@ agent Reader() {{
 
     /// The `mqtt_client` blocks and the bound consumer of
     /// [`document_with_clients_at_qos`], without the agent.
-    fn clients_and_bindings(
+    pub(crate) fn clients_and_bindings(
         clients: &[(&str, u16, Option<&std::path::Path>)],
         bindings: &[(&str, &str)],
         qos: u8,

@@ -1209,7 +1209,12 @@ pub async fn run_server(
     // holds stay alive, since dropping one stops that consumer's task.
     let mut consumer_registry = consumers::ConsumerRegistry::new();
     let mut reload_requests: Option<reload::doors::ReloadRequests> = None;
-    let mut mqtt_egress: Option<std::sync::Arc<brenn_server::mqtt_egress::MqttEgressHub>> = None;
+    let mut mqtt_hubs: Option<mqtt::MqttHubs> = None;
+    // The connection-state writers, held apart for the shutdown, which writes
+    // `stopped` for each client still open; `None` when messaging is off.
+    let mut mqtt_connection: Option<
+        std::sync::Arc<brenn_server::mqtt_connection::MqttConnectionHub>,
+    > = None;
     if let (Some(messenger), Some(router)) = (
         messaging_result.messenger.as_ref(),
         messaging_result.router.as_ref(),
@@ -1228,22 +1233,22 @@ pub async fn run_server(
 
         // Before anything can publish to an egress channel, for the reason the
         // executor's position is taken above.
-        mqtt_egress = Some(
-            mqtt::start_mqtt_egress(
-                &mqtt_result.service,
-                messenger.clone(),
-                guard.alert_dispatcher.clone(),
-                system_notifier(
-                    &system_notifiers,
-                    brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT,
-                )
-                .expect(
-                    "the MQTT egress spec is derived in every plan and always gets a parked-notify \
-                 binding",
-                ),
+        let hubs = mqtt::start_mqtt_egress(
+            &mqtt_result.service,
+            messenger.clone(),
+            guard.alert_dispatcher.clone(),
+            system_notifier(
+                &system_notifiers,
+                brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT,
             )
-            .await,
-        );
+            .expect(
+                "the MQTT egress spec is derived in every plan and always gets a parked-notify \
+                 binding",
+            ),
+        )
+        .await;
+        mqtt_connection = Some(hubs.connection.clone());
+        mqtt_hubs = Some(hubs);
 
         reload::status::attach_and_publish_booted(
             &messaging_result.system_participants,
@@ -1359,9 +1364,9 @@ pub async fn run_server(
         messaging_result.messenger.as_ref(),
         messaging_result.router.as_ref(),
     ) {
-        let mqtt_egress = mqtt_egress
+        let mqtt_hubs = mqtt_hubs
             .take()
-            .expect("the egress hub is started in the block above, on the same condition");
+            .expect("the MQTT hubs are started in the block above, on the same condition");
         // Last: the driver takes the consumer registry, so nothing may start
         // a consumer after this point.
         if let Some(notify) = reload_notify {
@@ -1386,7 +1391,8 @@ pub async fn run_server(
                 attach_registry: state.attach_registry.clone(),
                 mqtt_service: mqtt_result.service.clone(),
                 mqtt_event_router: mqtt_result.event_router.clone(),
-                mqtt_egress,
+                mqtt_egress: mqtt_hubs.egress,
+                mqtt_connection: mqtt_hubs.connection,
                 max_payload_bytes: config.messaging.max_body_bytes,
                 active_bridges: state.active_bridges.clone(),
                 apps_swapped_tx: state.apps_swapped_tx.clone(),
@@ -1508,6 +1514,7 @@ pub async fn run_server(
         active_bridges: state.active_bridges.clone(),
         server_shutting_down: state.server_shutting_down.clone(),
         mqtt: mqtt_result.service.clone(),
+        mqtt_connection,
     };
 
     // Warn if resized images will exceed the upload limit. Rough JPEG upper bound: long_edge² / 4 bytes.

@@ -1665,8 +1665,8 @@ async fn a_client_whose_credentials_changed_reconnects_and_keeps_receiving() {
 /// arrives from the broker afterwards, exactly as it would for a fresh boot of
 /// the same document. The rejection is authoritative — mosquitto answers the
 /// CONNACK with a bad-credentials reason code — so the supervisor stops
-/// retrying and the session's health is `Failed`, which is the only surface
-/// this state has (`TODO(mqtt-idle-client-visibility)`).
+/// retrying, the session's health is `Failed`, and the router raises a
+/// `Critical` alert naming the client.
 ///
 /// No document edit: the rotation is the password file's bytes alone, which is
 /// the shape an operator's own rotation takes and the one the status body reads

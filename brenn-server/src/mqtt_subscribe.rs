@@ -897,9 +897,9 @@ mod tests {
             .mqtt_service()
             .get_client("home")
             .expect("the configured client");
-        *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {
+        handle.set_state(brenn_mqtt::state::SupervisorState::Failed {
             reason: REASON.to_string(),
-        };
+        });
 
         let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only())
             .await

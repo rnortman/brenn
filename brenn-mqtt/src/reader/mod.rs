@@ -439,6 +439,9 @@ impl Reader {
         };
         self.resolve_ready().await;
         let limit = self.limit(connection.receive_max);
+        // TODO(mqtt-silent-broker-unsignalled): a broker that stays connected
+        // and never acknowledges keeps the reader here, handing nothing, until
+        // the egress window overflows; nothing reports it before then.
         if self.outstanding() >= limit && self.held.is_empty() {
             return;
         }

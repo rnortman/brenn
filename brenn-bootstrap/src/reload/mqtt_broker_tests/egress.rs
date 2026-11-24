@@ -5,6 +5,7 @@
 //! brenn sent that does not depend on a subscriber being connected at the
 //! instant it was sent.
 
+mod connection_state;
 mod stop;
 
 use std::time::Duration;
@@ -940,8 +941,12 @@ async fn statuses(booted: &Booted) -> Vec<DeliveryStatus> {
         .into_iter()
         .map(|(_, envelope)| {
             assert_eq!(envelope.sender, DELIVERY_STATUS_SENDER, "{envelope:?}");
-            delivery::decode(envelope.body.as_text().expect("a status is text"))
+            match delivery::decode(envelope.body.as_text().expect("a status is text"))
                 .expect("a v1 status")
+            {
+                delivery::StatusBody::Message(status) => status,
+                other => panic!("expected a message status, got {other:?}"),
+            }
         })
         .collect()
 }

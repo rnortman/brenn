@@ -592,6 +592,24 @@ traps the activation, false from that release. Done = both repositories
 are on the release with those changes. The comment sits at
 `MqttPublisher::admit` in `brenn-wasm/src/lib.rs`.
 
+## `mqtt-connection-state-ops-config`
+
+Each MQTT client has a host-written connection-state channel that says
+whether the client's previous session ended uncleanly. It is the fallback
+for a sender whose `status_to` could not be told of an unclean restart
+because its message had left the egress window. Nothing may read the
+channel until the operator grants it, and the production configuration
+grants it to no one, so in production that fallback reaches no sender. The
+production configuration is in the private ops annex, which the
+make-mqtt-great-again workflow may not change. The work: for each
+production app or component that publishes to MQTT with a `status_to`,
+grant it read on the state channel of the client it publishes through and
+give it a subscription, or decide it does not need one. Done = every
+production sender that sets `status_to` reads its client's state channel
+or is recorded as not needing to, or this is closed as not wanted. The
+comment sits on `mqtt_connection_spec` in
+`brenn-messaging/src/mqtt_connection.rs`.
+
 ## `mqtt-correlation-data-and-inbound-response-topic`
 
 An MQTT publish with a `reply_to` is sent with the MQTT 5 Response
@@ -643,7 +661,10 @@ the directory (`tool-registry-unregistered-tool-sweep` is the general case). A
 client added again under the same slug gets the same channel; its reader's new
 position skips whatever the channel still retains and logs the count. Done =
 removed channels are reaped under the general policy, or this channel family
-is reaped at removal.
+is reaped at removal. A removed client's connection-state channel
+(`brenn:mqtt-connection.<client>`) leaves its row and messages, the last of
+them `stopped`, in the database the same way; a client added again under the
+slug reads none of them as its record.
 
 A client deleted from the configuration while the server is down is never
 reported. Its channel is not in the directory at boot, no reader is started
@@ -912,6 +933,27 @@ expiry above 0, or this is closed as not wanted. Code site
 (`TODO(mqtt-session-expiry-ops-config)`): `session_expiry_secs` in
 `brenn-lib/src/mqtt/config.rs`.
 
+## `mqtt-silent-broker-unsignalled`
+
+A broker that stays connected and answers pings but never acknowledges a
+publish holds every QoS 1 and QoS 2 message in flight for as long as the
+connection lasts. Once the in-flight limit is reached the client's egress
+reader hands nothing more, the egress channel fills, and its window drops the
+oldest. Keep-alive does not end the connection, the client's connection state
+reads connected, and the only signal is the window-overflow alert, which comes
+after messages are lost and does not name the cause. Removing the per-message
+timeout made this the accepted cost; whether the operator should be told
+earlier is undecided. The work: decide what Brenn does about a client whose
+oldest in-flight message has waited longer than some bound. The responses to
+weigh: report it, in the client's connection state, by an alert, or both; end
+the connection and re-establish it, so that a kept session replays what was in
+flight; or nothing. Whatever is chosen, the bound has a stated reason and is
+configurable, and it is not a wait after which Brenn hands the next message
+having done nothing else. Done = a client in this condition is reported or
+recovered before its window overflows, or this is closed as not wanted. Code
+site (`TODO(mqtt-silent-broker-unsignalled)`): where the egress reader stops
+handing at the in-flight limit, `brenn-mqtt/src/reader/mod.rs`.
+
 ## `mqtt-stack-history-rewrite-before-push`
 
 Before any branch of the make-mqtt-great-again stack is pushed, the
@@ -981,6 +1023,27 @@ new in a trapped activation, or the kit reads a result again on the next
 one. Done = a real-host test in which an activation traps on a result and
 its caller is answered an error without waiting for the ceiling. The comment
 sits at `fail_delivered_requests` in `brenn-wasm-dispatch/src/lib.rs`.
+
+## `shutdown-does-not-quiesce-reload`
+
+Server shutdown does not stop the reload driver before it drains the MQTT
+registries. A reload that is mid-write when shutdown finishes can be cut
+off by process exit. For the MQTT connection-state channel the cost is
+concrete: a client whose `stopped` message did not commit is read as
+`unclean` at the next boot, which raises the "restarted uncleanly" alert
+and publishes a `restarted` status to its senders after a stop that was
+clean. The MQTT session registry covers its own side (a session a reload
+registers during shutdown is born stopped); what is exposed is every bus
+write a reload's commit makes for a client — a removed client's reports
+among them — and any later per-client host writer (the filter record of
+`mqtt-deferred-unsubscribe-not-withdrawn` would sit beside this one). The
+work: make shutdown stop the reload driver, and wait for a reload in
+progress to finish or be refused, before `join_mqtt` runs. Done = a reload
+overlapping shutdown either completes before the registries are drained or
+is refused, and a test shows a clean stop overlapping a reload is read as
+`clean` at the next boot; or this is closed as not wanted. Code site
+(`TODO(shutdown-does-not-quiesce-reload)`): the `join_mqtt` call in
+`serve_until_shutdown`, `brenn-bootstrap/src/shutdown.rs`.
 
 ## `tool-provide-attachment-count`
 
@@ -5339,50 +5402,6 @@ Code site (`TODO(webhook-crate-wasm-dep)`): `brenn-webhook/src/service.rs`, on
 Done = `brenn-webhook` builds and tests without wasmtime in its dependency
 graph, or the edge is recorded as deliberate with the link cost accepted.
 
-## `mqtt-idle-client-visibility`
-
-A declared `mqtt_client` that nothing is bound through holds a broker session,
-and no runtime surface reports it. The channel-listing enrichment
-(`enrich_mqtt_listing`, `brenn-server/src/messaging_intercept.rs`) decorates
-`mqtt:` channel entries with per-client health, and an unbound client has no
-entry. So a placeholder
-broker whose credentials are wrong looks exactly like a healthy one that nobody
-uses: the only trace is the supervisor's own log line.
-
-Needs a decision on the surface before the code: enumerate declared clients
-with no channels in the connector health the listing already renders, or report
-the session set and its per-client health on `brenn:config.status` / the health
-endpoint. The first changes an LLM-facing tool result shape; the second changes
-a retained channel a deploy script reads.
-
-The same exposure has an alerting half. A supervisor that gives up on an
-authoritative failure — bad credentials, a rejected TLS chain — writes
-`tracing::error!` and exits, and nothing in `brenn-mqtt` dispatches an alert,
-whereas a reload refusal mails one. Now that every declared client dials at
-boot, a broker that will never work is a routine boot condition with the
-weakest reporting in the subsystem. Needs the same decision as the read
-surface: whether the terminal `Failed` write dispatches an alert directly, or
-whether it is the health surface above that alerts on what it finds.
-
-A reload widened it. A client a reload added or restarted reports its filters as
-`mqtt_deferred` at commit — its supervisor was spawned microseconds earlier and
-has not connected yet — so a supervisor that then fails authoritatively has no
-status surface at all: the reload said `applied`, the status body says
-`mqtt_deferred`, and the only account of the rejection is that same `error!`.
-The operator's edit and the operator's answer are minutes and a journal apart.
-That is the same gap as a declared-and-idle failed client's at boot, and it
-closes the same way.
-
-Code sites (`TODO(mqtt-idle-client-visibility)`):
-`brenn-server/src/messaging_intercept.rs`, at `enrich_mqtt_listing`;
-`brenn-mqtt/src/connection.rs`, at the supervisor's terminal-state tail.
-
-Done = an operator (or the LLM) can read, from a runtime surface, that a
-declared client has a session and what state it is in, whether or not any
-channel is bound through it, and a client that failed authoritatively reaches
-the operator by the route a reload refusal does rather than by a log line
-alone.
-
 ## `reload-agent-lifecycle`
 
 A reload converges an agent's authority, its per-call settings and — at the
@@ -5529,11 +5548,16 @@ submitted for. It changes at three points, all on the supervisor: a filter
 joins it before its SUBSCRIBE is submitted, leaves it at the UNSUBACK that
 takes it out of the asserted set, and the set is replaced at a CONNACK that
 reports no session. A new handle's asserted set would be seeded with the
-record as well as with what it holds. The work includes deciding where the
-record lives on the bus (a host-minted per-client channel, or a declared
-state channel), what a set too large for one message and a rate-refused
-write do, what a session met with no record does (a clean start is the
-candidate), and removing the record with a removed client.
+record as well as with what it holds. The record would live on a host-minted
+per-client channel written only by the host, read back at boot with
+`retained_tail` and no subscription, as the connection-state record on
+`brenn:mqtt-connection.<client>` is read; not on that channel itself, whose
+newest message is the client's state, but on a second per-client channel
+under its own prefix, a further system-minted family or the connection-state
+family widened to a second prefix. The work includes what a set too large for
+one message and a rate-refused write do, what a session met with no record
+does (a clean start is the candidate), and removing the record with a removed
+client.
 
 Code site (`TODO(mqtt-deferred-unsubscribe-not-withdrawn)`): the
 session-present settle in `subscribe_bookkeeping_at_connack`,

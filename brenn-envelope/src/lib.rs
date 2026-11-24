@@ -34,6 +34,7 @@ pub mod channel_model;
 pub mod chat;
 pub mod delivery;
 pub mod grants;
+pub mod mqtt_connection;
 pub mod shape;
 #[cfg(feature = "testutils")]
 pub mod testutils;

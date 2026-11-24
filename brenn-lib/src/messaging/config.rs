@@ -28,8 +28,9 @@ use super::{
     AttachGrant, ChannelEntry, ChannelScheme, ComponentGrant, MessagingDirectory,
     SubscriberEntryKind, TOOL_RESULTS_NAMESPACE, WakeMin, canonicalize_channel_address,
     ends_at_tuning_boundary, in_a_tool_namespace, in_app_tool_results_namespace,
-    in_the_device_location_family, in_the_egress_namespace, is_device_location_prefix,
-    is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid, tuning_boundary_list,
+    in_the_device_location_family, in_the_egress_namespace, in_the_mqtt_connection_family,
+    is_device_location_prefix, is_mqtt_connection_prefix, is_reserved_channel_name,
+    is_unreserved_char, nondurable_channel_uuid, tuning_boundary_list,
 };
 use crate::config::AppConfigRaw;
 
@@ -2489,6 +2490,27 @@ pub const DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(2000);
 /// household's few hundred commands a day it is about a day of history.
 pub const EGRESS_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(256);
 
+/// Retained window, and standing buffer, of every
+/// `brenn:mqtt-connection.<client>` channel. No tuning block reaches the
+/// family, so this is the depth, not a default.
+///
+/// A state channel owes a reader one message, its newest; eight is resume
+/// slack, so a subscriber a few transitions behind resumes without a reported
+/// drop, and shallow enough that the channel never becomes a log. The standing
+/// buffer is what keeps the newest message on disk across a restart, where the
+/// host reads it back as the previous process's clean-stop record.
+pub const MQTT_CONNECTION_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(8);
+
+/// The send rate of `system:mqtt-connection` on every
+/// `brenn:mqtt-connection.<client>` channel, in place of the operator's
+/// `default_send_rate`; no tuning block reaches the family. An operator's rate
+/// must not be able to make the host's own record of a connection false.
+pub const MQTT_CONNECTION_SEND_RATE: SendRate = SendRate {
+    burst: 240,
+    refill_interval_secs: 1,
+    refill: 30,
+};
+
 /// The send rate of `system:device-location` on every `brenn:device-location.`
 /// channel, in place of the operator's `default_send_rate`; a tuning block
 /// carrying `send_rate` on the family is refused.
@@ -2525,6 +2547,10 @@ pub enum SystemChannelFamily {
     /// transport; the members are `brenn:egress/mqtt/<client>`, one per
     /// `[[mqtt_client]]`. Its bodies are payloads, so it is always `non_text`.
     Egress,
+    /// `brenn:mqtt-connection.<client>` — one per `[[mqtt_client]]`, written
+    /// only by `system:mqtt-connection`, whose newest message is the client's
+    /// connection state. No block tunes it.
+    MqttConnection,
 }
 
 impl SystemChannelFamily {
@@ -2547,6 +2573,8 @@ impl SystemChannelFamily {
             Some(Self::DeviceLocation)
         } else if in_the_egress_namespace(name) {
             Some(Self::Egress)
+        } else if in_the_mqtt_connection_family(name) {
+            Some(Self::MqttConnection)
         } else {
             None
         }
@@ -2554,9 +2582,10 @@ impl SystemChannelFamily {
 
     /// The family a tuning prefix names, or `None` if it names none.
     ///
-    /// [`Self::of`] read on the prefix as an address, plus the one prefix that
-    /// is not itself an address of its family: `brenn:device-location.`, whose
-    /// empty remainder names no user.
+    /// [`Self::of`] read on the prefix as an address, plus the two prefixes
+    /// that are not themselves addresses of their family:
+    /// `brenn:device-location.` and `brenn:mqtt-connection.`, whose empty
+    /// remainders name no user and no client.
     pub fn of_prefix(prefix: &str) -> Option<Self> {
         let bare = match ChannelScheme::split(prefix) {
             Some((ChannelScheme::Brenn, name)) => Some(name),
@@ -2565,6 +2594,7 @@ impl SystemChannelFamily {
         };
         match bare {
             Some(name) if is_device_location_prefix(name) => Some(Self::DeviceLocation),
+            Some(name) if is_mqtt_connection_prefix(name) => Some(Self::MqttConnection),
             _ => Self::of(prefix),
         }
     }
@@ -2578,6 +2608,7 @@ impl SystemChannelFamily {
             Self::Tool => TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH,
             Self::DeviceLocation => DEVICE_LOCATION_DEFAULT_RETAIN_DEPTH,
             Self::Egress => EGRESS_DEFAULT_RETAIN_DEPTH,
+            Self::MqttConnection => MQTT_CONNECTION_DEFAULT_RETAIN_DEPTH,
         }
     }
 }
@@ -2743,6 +2774,17 @@ pub fn build_system_channel_tuning(
             "config: [[channel]] {label} tunes the provider request-inbox family, which no \
              block tunes: an inbox holds every request that can be in flight at once, the \
              sum of its class's max_concurrency, and that depth is the class's to state",
+        );
+        // The connection-state family is sized and rated by the host alone, so
+        // no block, exact or prefix, reaches it; the bare family prefix arrives
+        // here because `of_prefix` classifies it.
+        assert!(
+            !matches!(
+                ChannelScheme::split(&entry_key),
+                Some((ChannelScheme::Brenn, name)) if is_mqtt_connection_prefix(name)
+            ),
+            "config: [[channel]] {label} tunes the MQTT connection-state family, which no \
+             block tunes: the connection-state channel's depth and send rate are the host's",
         );
 
         assert!(
@@ -5089,6 +5131,93 @@ channel demo at "ephemeral:protobar-demo" {
                 .expect("the refusal is a formatted message");
             assert!(
                 message.contains("tunes a location channel's `send_rate` — the rate is the host's"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_channel_is_in_the_mqtt_connection_family() {
+        for address in [
+            "brenn:mqtt-connection.home",
+            "mqtt-connection.home",
+            "brenn:mqtt-connection.home.v2",
+        ] {
+            assert_eq!(
+                SystemChannelFamily::of(address),
+                Some(SystemChannelFamily::MqttConnection),
+                "{address}"
+            );
+        }
+        for address in [
+            "brenn:mqtt-connection.",
+            "brenn:mqtt-connection",
+            "brenn:mqtt-connectionx",
+            "ephemeral:mqtt-connection.home",
+        ] {
+            assert_eq!(SystemChannelFamily::of(address), None, "{address}");
+        }
+        for prefix in [
+            "brenn:mqtt-connection.",
+            "mqtt-connection.",
+            "brenn:mqtt-connection.home.",
+        ] {
+            assert_eq!(
+                SystemChannelFamily::of_prefix(prefix),
+                Some(SystemChannelFamily::MqttConnection),
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            SystemChannelFamily::of_prefix("ephemeral:mqtt-connection."),
+            None
+        );
+        assert_eq!(
+            SystemChannelFamily::MqttConnection.default_retain_depth(),
+            Depth::Bounded(8)
+        );
+        assert_eq!(
+            channel_block_role("brenn:mqtt-connection.home"),
+            ChannelBlockRole::Tuning
+        );
+    }
+
+    #[test]
+    fn the_mqtt_connection_family_resolves_to_its_depth_and_text() {
+        let resolved = resolve_system_channel(
+            "brenn:mqtt-connection.home",
+            &tuning_of(&[]),
+            &global_defaults(),
+        );
+        assert_eq!(resolved.push_depth, SYSTEM_CHANNEL_DEFAULT_PUSH_DEPTH);
+        assert_eq!(resolved.retain_depth, MQTT_CONNECTION_DEFAULT_RETAIN_DEPTH);
+        assert_eq!(
+            resolved.standing_retain_depth,
+            MQTT_CONNECTION_DEFAULT_RETAIN_DEPTH
+        );
+        assert!(!resolved.non_text);
+    }
+
+    /// No block reaches the connection-state family: an exact address, the
+    /// bare family prefix and a longer prefix all get the family's own text.
+    #[test]
+    fn any_block_on_the_mqtt_connection_family_panics() {
+        for block in [
+            tuning_block("brenn:mqtt-connection.home", 1, 8, 8),
+            tuning_block("mqtt-connection.home", 1, 8, 8),
+            tuning_prefix("brenn:mqtt-connection.", 1, 8, 8),
+            tuning_prefix("brenn:mqtt-connection.home.", 1, 8, 8),
+        ] {
+            let refused = std::panic::catch_unwind(|| tuning_of(&[block]))
+                .expect_err("a block on the connection-state family is refused");
+            let message = refused
+                .downcast_ref::<String>()
+                .expect("the refusal is a formatted message");
+            assert!(
+                message.contains(
+                    "tunes the MQTT connection-state family, which no block tunes: the \
+                     connection-state channel's depth and send rate are the host's"
+                ),
                 "{message}"
             );
         }

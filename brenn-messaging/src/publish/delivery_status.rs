@@ -1,13 +1,13 @@
 //! The host's publish of a delivery status to the channel a message's sender
 //! named for it.
 //!
-//! The entry takes a typed [`DeliveryStatus`] and encodes it itself, so what
+//! The entry takes a typed [`StatusBody`] and encodes it itself, so what
 //! it publishes can only be a status, and it publishes only where the
 //! message's sender may publish at report time. It widens no policy: it runs
 //! every common gate under the sender's current authority, stamped with the
 //! one host identity, [`delivery::DELIVERY_STATUS_SENDER`].
 
-use brenn_envelope::delivery::{self, DeliveryStatus};
+use brenn_envelope::delivery::{self, StatusBody};
 use brenn_messaging_store::blob::HeldAttachments;
 
 use super::{PublishOrigin, PublishPrincipal, PublishResult};
@@ -45,8 +45,8 @@ pub enum DeliveryStatusRefusal {
 impl Messenger {
     /// Publish `status` to `status_to` as
     /// [`delivery::DELIVERY_STATUS_SENDER`], on the authority of
-    /// `concerning_sender`, the stored sender of the message the status is
-    /// about. The body is the encoded status, untyped text. No send
+    /// `concerning_sender`, the stored sender of a message that named
+    /// `status_to`. The body is the encoded status, untyped text. No send
     /// budget is drawn; the channel's send rate is, under the status sender.
     ///
     /// # Panics
@@ -58,7 +58,7 @@ impl Messenger {
         &self,
         concerning_sender: &str,
         status_to: &str,
-        status: &DeliveryStatus,
+        status: &StatusBody,
     ) -> DeliveryStatusPublish {
         assert!(
             ChannelScheme::of(status_to) == Some(ChannelScheme::Brenn),
@@ -96,13 +96,18 @@ impl Messenger {
             | PublishResult::BudgetExhausted
             | PublishResult::DeferredQuotaExceeded { .. }
             | PublishResult::ImpetusUnauthorized
-            | PublishResult::MqttRefused(_)) => panic!(
-                "publish_delivery_status: {unreachable:?} for a status to {status_to:?} about \
-                 {} from {concerning_sender:?}; the admission stores only well-formed \
-                 addresses, and the rest cannot arise for a System-origin status with no \
-                 options",
-                status.message_id
-            ),
+            | PublishResult::MqttRefused(_)) => {
+                let about = match status {
+                    StatusBody::Message(message) => format!("message {}", message.message_id),
+                    StatusBody::Restarted(_) => "a restart".to_owned(),
+                };
+                panic!(
+                    "publish_delivery_status: {unreachable:?} for a status to {status_to:?} \
+                     about {about} on the authority of {concerning_sender:?}; the admission \
+                     stores only well-formed addresses, and the rest cannot arise for a \
+                     System-origin status with no options"
+                )
+            }
         }
     }
 }

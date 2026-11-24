@@ -28,6 +28,7 @@ pub mod dispatcher;
 pub mod edit;
 pub mod format;
 pub mod live;
+pub mod mqtt_connection;
 pub mod mqtt_outbound;
 pub mod publish;
 pub mod query;

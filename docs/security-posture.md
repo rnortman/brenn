@@ -118,6 +118,23 @@ In rough order of severity if compromised:
   user and device ids and counts only. A position appears in a conversation's
   transcript only where the assistant called the tool, as any tool result
   does.
+- **MQTT connection state.** One durable channel per declared MQTT client,
+  `brenn:mqtt-connection.<client>`, written as `system:mqtt-connection`: whether
+  the client is connected, retrying or failed, since when, and whether the
+  previous process's session ended uncleanly. Its body carries the broker's or
+  the transport's error text, sanitized and capped at 256 bytes. No
+  configuration can grant a write: an `acl publish` matcher reaching into the
+  family is refused at resolution and at DSL compile time, and so is an `out`
+  or `io` port on it. That is stricter than device-location, and is so because
+  the host acts on the channel's newest message at boot — a forged `stopped`
+  would suppress the `restarted` marker senders are owed — and the boot read
+  panics on a newest message from any other sender. A principal reads it only
+  through an operator grant, an `exact "brenn:mqtt-connection.<client>"`
+  subscribe ACL or an `in` port on that address; nothing is granted by default,
+  and no read right follows from the right to publish to the client. A `prefix
+  "brenn:mqtt-connection."` grant reaches every client's state, and a prefix
+  ending in a client's slug and `.` reaches every client whose slug continues
+  it, so the grant is written exact.
 - **Delivery statuses.** An app that names a `status_to` on an MQTT publish
   has Brenn publish what became of the message to that `brenn:` channel as
   `system:delivery-status`. That sender is not a registered participant and
@@ -129,8 +146,14 @@ In rough order of severity if compromised:
   status only from `system:delivery-status`; anything else on the channel may
   be the app's own traffic. That sender says the host wrote a status, not
   whose message it concerns: any app that may write the channel may name it,
-  and conversations of one app publish as that app, so a reader matches the
-  status's `message_id` against the ids its own publishes returned.
+  and conversations of one app publish as that app, so a reader matches a
+  message status's `message_id` against the ids its own publishes returned.
+  The `restarted` kind carries no `message_id` and concerns a client, not a
+  message: after an unclean end it is published once per `status_to` named on
+  a message behind the egress reader's position, on the authority of the first
+  sender among those that named that channel whose policy admits it now —
+  which need not be the reader's own app. It still lands only where some such
+  sender could itself write, and its body can only be a status.
   `system:mqtt-outbound` still publishes nothing. A broker's rejection
   always alerts the operator, whether or not the message's `status_to` told
   its sender: it means Brenn's per-topic ACL admits a topic the broker's

@@ -351,10 +351,22 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
         )
     });
 
+    // One connection-state channel per declared MQTT client, minted beside
+    // its egress channel so a component's `in` port bound to one resolves
+    // against `pre_directory`.
+    let mqtt_connection_entries = inputs.mqtt_clients.keys().map(|client| {
+        brenn_messaging::mqtt_connection::mqtt_connection_entry(
+            client,
+            &system_channel_tuning,
+            global_defaults,
+        )
+    });
+
     let mut environment_entries = webhook_channel_entries;
     environment_entries.extend(mqtt_channel_entries);
     environment_entries.extend(device_location_entries);
     environment_entries.extend(mqtt_egress_entries);
+    environment_entries.extend(mqtt_connection_entries);
     let topology = lower_channel_topology(config, environment_entries);
 
     // Resolve WASM consumer subscriptions before finalizing the directory:
@@ -669,6 +681,7 @@ pub fn plan_messaging(inputs: &PlanInputs) -> Option<MessagingPlan> {
     system_participants.push(brenn_messaging::mqtt_outbound::mqtt_outbound_spec(
         inputs.mqtt_clients.keys().map(String::as_str),
     ));
+    system_participants.push(brenn_messaging::mqtt_connection::mqtt_connection_spec());
     // One roster channel per configured app, and the single identity that
     // writes them. Boot-declared rather than provisioned with a conversation:
     // apps are static config, and an app with no conversations still owes a

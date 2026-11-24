@@ -2,12 +2,15 @@
 
 use std::sync::Arc;
 
+use brenn_envelope::mqtt_connection::{PreviousEnd, PreviousSession};
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel};
-use brenn_mqtt::MqttService;
-use brenn_mqtt::{UnspawnedSession, register_client, union_subscriptions};
+use brenn_mqtt::reader::EgressBus;
+use brenn_mqtt::state::MqttClientHandle;
+use brenn_mqtt::{MqttService, UnspawnedSession, register_client, union_subscriptions};
 use indexmap::IndexMap;
 use tracing::info;
 
+use brenn_server::mqtt_connection::MqttConnectionHub;
 use brenn_server::mqtt_egress::MqttEgressHub;
 use brenn_server::mqtt_router::{IngressRoute, MqttEventRouterImpl};
 
@@ -174,13 +177,55 @@ pub(crate) async fn wire_and_spawn(
     );
 }
 
-/// Put every registered client's egress channel into service: build the hub,
-/// give each client its position and start its reader, and spawn the relay
-/// that turns the participant's one delivery wake into a wake for every
-/// reader.
+/// The bus side of the MQTT clients.
+pub(crate) struct MqttHubs {
+    pub(crate) egress: Arc<MqttEgressHub>,
+    pub(crate) connection: Arc<MqttConnectionHub>,
+}
+
+/// Do everything that must precede a client's first reader in this process,
+/// and return the bus its reader is started from:
+///
+/// 1. attach the client's egress position, learning whether it resumed;
+/// 2. read how the client's previous session ended;
+/// 3. if uncleanly, tell every status channel named behind the position;
+/// 4. publish the client's current connection state, which overwrites the
+///    record, and start following its state.
+///
+/// The order is the guarantee: the markers are committed before the record is
+/// overwritten, and the record is overwritten before anything is handed.
+/// `found_at_ms` is when this process opened the client.
+pub(crate) async fn prepare_client(
+    egress: &Arc<MqttEgressHub>,
+    connection: &MqttConnectionHub,
+    handle: &MqttClientHandle,
+    found_at_ms: i64,
+) -> Arc<dyn EgressBus> {
+    let client = handle.config.identity.slug.as_str();
+    let opened = egress.open(client).await;
+    let end = connection.previous_end(client, opened.resumed).await;
+    if end == PreviousEnd::Unclean {
+        let told = egress.tell_restarted(client, found_at_ms).await;
+        connection.report_unclean(client, told);
+    }
+    connection
+        .begin(
+            client,
+            handle.subscribe_state(),
+            PreviousSession { end, found_at_ms },
+        )
+        .await;
+    opened.bus
+}
+
+/// Put every registered client's egress channel into service: build the
+/// hubs, prepare each client and start its reader, and spawn the relay that
+/// turns the participant's one delivery wake into a wake for every reader.
 ///
 /// Must run before anything can publish to an egress channel, so a fresh
-/// position's skip covers only what an earlier client of the slug left.
+/// position's skip covers only what an earlier client of the slug left, and
+/// before any supervisor is spawned, so nothing is handed before a client's
+/// connection-state record is overwritten.
 ///
 /// The relay holds no timer: it waits on `notify` alone. A reader woken for
 /// another client's channel reads its own once and finds nothing.
@@ -195,8 +240,12 @@ pub(crate) async fn start_mqtt_egress(
     messenger: Arc<brenn_messaging::Messenger>,
     alerts: brenn_obs::alerting::AlertDispatcher,
     notify: Arc<tokio::sync::Notify>,
-) -> Arc<MqttEgressHub> {
-    let hub = MqttEgressHub::new(messenger, alerts);
+) -> MqttHubs {
+    let hubs = MqttHubs {
+        egress: MqttEgressHub::new(Arc::clone(&messenger), alerts.clone()),
+        connection: MqttConnectionHub::new(messenger, alerts),
+    };
+    let found_at_ms = chrono::Utc::now().timestamp_millis();
     // TODO(mqtt-egress-removed-client-rows): a client deleted from the
     // configuration while the server was down is not in this list, so no
     // reader is started for its channel; the messages it holds unread are
@@ -206,14 +255,15 @@ pub(crate) async fn start_mqtt_egress(
         let handle = service
             .get_client(&slug)
             .unwrap_or_else(|| panic!("MQTT client {slug:?} was listed and is not registered"));
-        brenn_mqtt::start_egress_reader(&handle, hub.open(&slug).await);
+        let bus = prepare_client(&hubs.egress, &hubs.connection, &handle, found_at_ms).await;
+        brenn_mqtt::start_egress_reader(&handle, bus);
         info!(client = %slug, "MQTT egress reader started");
     }
     // The relay does not keep the hub alive: a hub nothing else holds has no
     // reader to wake, and the relay ends at the first wake after it is gone.
     // The handle is dropped, as for the other drain tasks; a panic is process
     // death.
-    let relay = Arc::downgrade(&hub);
+    let relay = Arc::downgrade(&hubs.egress);
     drop(tokio::spawn(brenn_lib::panic_util::abort_on_panic(
         "MQTT egress wake relay panicked",
         async move {
@@ -226,7 +276,7 @@ pub(crate) async fn start_mqtt_egress(
             }
         },
     )));
-    hub
+    hubs
 }
 
 #[cfg(test)]

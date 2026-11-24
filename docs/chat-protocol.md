@@ -19,7 +19,8 @@ you are usually the channel model, not the chat protocol.
 
 A conversation is a set of channels derived from its owning app's slug and its
 own numeric id. The names are minted from one configured prefix (`[llm_chat]
-prefix`, `chat` by default):
+prefix`, `chat` by default). Boot refuses a prefix that roots a system-minted
+channel family (`device-location`, `mqtt-connection`):
 
 ```
 brenn:<prefix>.app.<app-slug>.in.<conversation-id>          commands to the conversation

@@ -10,16 +10,27 @@
 //!  "mqtt":{"client":"ha","topic":"lights/k/set","qos":1,"reason_code":135}}
 //! ```
 //!
-//! The top level is general: what happened to the message, not which
-//! transport it happened on. The transport's own detail rides in its member
-//! (`mqtt`), which a status need not carry. Kinds are closed: a new kind moves
-//! the version. Causes are open: an unknown cause word decodes to `Other`, so
-//! a transport adds causes without a version move. Unknown fields are ignored.
+//! One kind concerns a transport rather than a message: `restarted`, sent
+//! once per status channel when a new process finds that the transport's
+//! previous session ended uncleanly. It carries no `message_id`:
+//!
+//! ```json
+//! {"v":1,"kind":"restarted","found_at_ms":1795599990000,"mqtt":{"client":"ha"}}
+//! ```
+//!
+//! The top level is general: what happened, not which transport it happened
+//! on. The transport's own detail rides in its member (`mqtt`), which a
+//! status need not carry. Kinds are closed: a new kind moves the version. A
+//! reader matches on `kind` before reading `message_id`. Causes are open: an
+//! unknown cause word decodes to `Other`, so a transport adds causes without
+//! a version move. Unknown fields are ignored.
 //!
 //! Guest-safe: plain serde types, no clock, no I/O.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::versioned::TRUNCATION_MARKER_ALLOWANCE;
 
 /// Schema version stamped into every body. Moves when a kind is added or a
 /// body is reshaped so that a reader cannot absorb it.
@@ -29,17 +40,13 @@ pub const DELIVERY_STATUS_VERSION: u32 = 1;
 /// from this sender: a status channel is by rule one the original sender may
 /// publish to itself, so anything else on it may be the sender's own. The
 /// sender says the host wrote a status, not whose message it concerns: every
-/// publisher that may write a channel may name it, so a reader matches
-/// `message_id` against the ids its own publishes returned.
+/// publisher that may write a channel may name it, so a reader matches a
+/// message kind's `message_id` against the ids its own publishes returned.
 pub const DELIVERY_STATUS_SENDER: &str = "system:delivery-status";
 
 /// The cap a `rejected` status's `reason` is sanitized to, before the
 /// sanitizer's truncation marker.
 pub const DELIVERY_REASON_MAX_BYTES: usize = 256;
-
-/// Room [`max_encoded_len`] leaves past [`DELIVERY_REASON_MAX_BYTES`] for the
-/// truncation marker a sanitizer appends to a reason it cut short.
-pub const DELIVERY_REASON_MARKER_ALLOWANCE: usize = 16;
 
 /// One event in the life of a message a sender asked to hear about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,26 +139,96 @@ pub struct MqttDelivery {
     pub reason_code: Option<u8>,
 }
 
+/// The `kind` word of a [`TransportRestarted`] body.
+const RESTARTED_KIND: &str = "restarted";
+
+/// Everything a status channel carries from the host: a status about one
+/// message, or the news that a transport restarted uncleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusBody {
+    /// About one message.
+    Message(DeliveryStatus),
+    /// About a transport, not a message.
+    Restarted(TransportRestarted),
+}
+
+/// A transport's previous session ended uncleanly: any `handed` it sent this
+/// channel that has no outcome will never have one, and nobody knows whether
+/// that message arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportRestarted {
+    /// When the new process found the unclean end, Unix milliseconds.
+    pub found_at_ms: i64,
+    /// The MQTT detail of a restarted MQTT client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mqtt: Option<MqttRestarted>,
+}
+
+/// The MQTT detail of a `restarted` status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MqttRestarted {
+    /// The declared client whose previous session ended uncleanly.
+    pub client: String,
+}
+
+impl Serialize for StatusBody {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct RestartedWire<'a> {
+            kind: &'static str,
+            #[serde(flatten)]
+            body: &'a TransportRestarted,
+        }
+
+        match self {
+            Self::Message(status) => status.serialize(serializer),
+            Self::Restarted(body) => RestartedWire {
+                kind: RESTARTED_KIND,
+                body,
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("kind").and_then(serde_json::Value::as_str) == Some(RESTARTED_KIND) {
+            TransportRestarted::deserialize(value)
+                .map(Self::Restarted)
+                .map_err(D::Error::custom)
+        } else {
+            DeliveryStatus::deserialize(value)
+                .map(Self::Message)
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
 /// Why a body could not be decoded: the shared versioned codec's error.
 pub type DeliveryDecodeError = crate::versioned::VersionedDecodeError;
 
 /// Serialize a status, stamping `"v": DELIVERY_STATUS_VERSION`.
-pub fn encode(status: &DeliveryStatus) -> String {
+pub fn encode(status: &StatusBody) -> String {
     crate::versioned::encode(DELIVERY_STATUS_VERSION, status)
 }
 
 /// Parse a status, requiring `v` equal to [`DELIVERY_STATUS_VERSION`].
-pub fn decode(body: &str) -> Result<DeliveryStatus, DeliveryDecodeError> {
+pub fn decode(body: &str) -> Result<StatusBody, DeliveryDecodeError> {
     crate::versioned::decode(DELIVERY_STATUS_VERSION, body)
 }
 
 /// The length of the longest status [`encode`] can produce about a message
-/// published through `client` to `topic`: over every kind, with a reason of
-/// [`DELIVERY_REASON_MAX_BYTES`] plus [`DELIVERY_REASON_MARKER_ALLOWANCE`]
+/// published through `client` to `topic`, a `restarted` status about `client`
+/// included: over every kind, with a reason of
+/// [`DELIVERY_REASON_MAX_BYTES`] plus [`TRUNCATION_MARKER_ALLOWANCE`]
 /// bytes of the character JSON escapes widest among those a sanitized reason
 /// holds.
 pub fn max_encoded_len(client: &str, topic: &str) -> usize {
-    let reason = "\\".repeat(DELIVERY_REASON_MAX_BYTES + DELIVERY_REASON_MARKER_ALLOWANCE);
+    let reason = "\\".repeat(DELIVERY_REASON_MAX_BYTES + TRUNCATION_MARKER_ALLOWANCE);
     let kinds = [
         DeliveryKind::Handed,
         DeliveryKind::Delivered,
@@ -167,7 +244,7 @@ pub fn max_encoded_len(client: &str, topic: &str) -> usize {
     kinds
         .into_iter()
         .map(|kind| {
-            encode(&DeliveryStatus {
+            encode(&StatusBody::Message(DeliveryStatus {
                 message_id: Uuid::max(),
                 kind,
                 mqtt: Some(MqttDelivery {
@@ -176,7 +253,7 @@ pub fn max_encoded_len(client: &str, topic: &str) -> usize {
                     qos: 2,
                     reason_code: Some(u8::MAX),
                 }),
-            })
+            }))
             .len()
         })
         .max()
@@ -199,6 +276,19 @@ mod tests {
             qos: 1,
             reason_code,
         })
+    }
+
+    fn restarted_member() -> MqttRestarted {
+        MqttRestarted {
+            client: "ha".to_string(),
+        }
+    }
+
+    fn message(body: StatusBody) -> DeliveryStatus {
+        match body {
+            StatusBody::Message(status) => status,
+            StatusBody::Restarted(other) => panic!("expected a message status, got {other:?}"),
+        }
     }
 
     fn every_kind() -> Vec<DeliveryKind> {
@@ -238,11 +328,11 @@ mod tests {
     #[test]
     fn each_kind_has_the_general_fields_at_the_top_and_mqtt_beneath() {
         let wire = |kind: DeliveryKind, code: Option<u8>| -> Value {
-            serde_json::from_str(&encode(&DeliveryStatus {
+            serde_json::from_str(&encode(&StatusBody::Message(DeliveryStatus {
                 message_id: id(),
                 kind,
                 mqtt: mqtt(code),
-            }))
+            })))
             .unwrap()
         };
         let member = json!({"client": "ha", "topic": "lights/k/set", "qos": 1});
@@ -332,23 +422,30 @@ mod tests {
     fn every_kind_round_trips() {
         for kind in every_kind() {
             for member in [None, mqtt(None), mqtt(Some(151))] {
-                let status = DeliveryStatus {
+                let status = StatusBody::Message(DeliveryStatus {
                     message_id: id(),
                     kind: kind.clone(),
                     mqtt: member,
-                };
+                });
                 assert_eq!(decode(&encode(&status)), Ok(status));
             }
+        }
+        for mqtt in [None, Some(restarted_member())] {
+            let status = StatusBody::Restarted(TransportRestarted {
+                found_at_ms: 1_795_599_990_000,
+                mqtt,
+            });
+            assert_eq!(decode(&encode(&status)), Ok(status));
         }
     }
 
     #[test]
     fn a_body_without_mqtt_decodes_and_omits_it() {
-        let status = DeliveryStatus {
+        let status = StatusBody::Message(DeliveryStatus {
             message_id: id(),
             kind: DeliveryKind::Delivered,
             mqtt: None,
-        };
+        });
         let value: Value = serde_json::from_str(&encode(&status)).unwrap();
         assert!(value.get("mqtt").is_none());
         assert_eq!(
@@ -367,26 +464,33 @@ mod tests {
                 "mqtt":{{"client":"ha","topic":"t","qos":0,"also_later":true}}}}"#,
             id()
         );
-        let status = decode(&body).unwrap();
+        let status = message(decode(&body).unwrap());
         assert_eq!(status.kind, DeliveryKind::Expired);
         assert_eq!(status.mqtt.unwrap().topic, "t");
+        let restarted = decode(
+            r#"{"v":1,"kind":"restarted","found_at_ms":7,"added_later":3,
+                "mqtt":{"client":"ha","also_later":true}}"#,
+        );
+        assert_eq!(
+            restarted,
+            Ok(StatusBody::Restarted(TransportRestarted {
+                found_at_ms: 7,
+                mqtt: Some(restarted_member()),
+            }))
+        );
     }
 
     #[test]
     fn an_unknown_cause_is_other_and_an_unknown_kind_fails() {
         let with = |rest: &str| format!(r#"{{"v":1,"message_id":"{}",{rest}}}"#, id());
         assert_eq!(
-            decode(&with(r#""kind":"unknown","cause":"cosmic_ray""#))
-                .unwrap()
-                .kind,
+            message(decode(&with(r#""kind":"unknown","cause":"cosmic_ray""#)).unwrap()).kind,
             DeliveryKind::Unknown {
                 cause: DeliveryUnknownCause::Other
             }
         );
         assert_eq!(
-            decode(&with(r#""kind":"dropped","cause":"evicted""#))
-                .unwrap()
-                .kind,
+            message(decode(&with(r#""kind":"dropped","cause":"evicted""#)).unwrap()).kind,
             DeliveryKind::Dropped {
                 cause: DeliveryDropCause::Other
             }
@@ -419,9 +523,7 @@ mod tests {
         // A reason as a sanitizer leaves it: escapes are backslashes, the
         // widest a JSON string makes, then the truncation marker.
         let widest_reason = format!("{}…(truncated)", "\\".repeat(DELIVERY_REASON_MAX_BYTES));
-        assert!(
-            widest_reason.len() <= DELIVERY_REASON_MAX_BYTES + DELIVERY_REASON_MARKER_ALLOWANCE
-        );
+        assert!(widest_reason.len() <= DELIVERY_REASON_MAX_BYTES + TRUNCATION_MARKER_ALLOWANCE);
         for topic in &topics {
             let cap = max_encoded_len("ha", topic);
             let mut kinds = every_kind();
@@ -429,7 +531,7 @@ mod tests {
                 reason: widest_reason.clone(),
             });
             for kind in kinds {
-                let len = encode(&DeliveryStatus {
+                let len = encode(&StatusBody::Message(DeliveryStatus {
                     message_id: id(),
                     kind,
                     mqtt: Some(MqttDelivery {
@@ -438,16 +540,16 @@ mod tests {
                         qos: 2,
                         reason_code: Some(255),
                     }),
-                })
+                }))
                 .len();
                 assert!(len <= cap, "{len} > {cap} for topic {topic:?}");
             }
         }
         // The bound is tight: the widest reason at the allowance reaches it.
-        let at_bound = encode(&DeliveryStatus {
+        let at_bound = encode(&StatusBody::Message(DeliveryStatus {
             message_id: Uuid::max(),
             kind: DeliveryKind::Rejected {
-                reason: "\\".repeat(DELIVERY_REASON_MAX_BYTES + DELIVERY_REASON_MARKER_ALLOWANCE),
+                reason: "\\".repeat(DELIVERY_REASON_MAX_BYTES + TRUNCATION_MARKER_ALLOWANCE),
             },
             mqtt: Some(MqttDelivery {
                 client: "ha".to_string(),
@@ -455,7 +557,56 @@ mod tests {
                 qos: 2,
                 reason_code: Some(255),
             }),
-        });
+        }));
         assert_eq!(at_bound.len(), max_encoded_len("ha", "t"));
+    }
+
+    /// The marker's wire form, pinned whole: a reader matches on `kind`
+    /// before reading `message_id`, and this kind has none.
+    #[test]
+    fn restarted_has_no_message_id_and_names_its_client() {
+        let wire: Value =
+            serde_json::from_str(&encode(&StatusBody::Restarted(TransportRestarted {
+                found_at_ms: 1_795_599_990_000,
+                mqtt: Some(restarted_member()),
+            })))
+            .unwrap();
+        assert_eq!(
+            wire,
+            json!({"v": 1, "kind": "restarted", "found_at_ms": 1_795_599_990_000_i64,
+                   "mqtt": {"client": "ha"}})
+        );
+        let bare: Value =
+            serde_json::from_str(&encode(&StatusBody::Restarted(TransportRestarted {
+                found_at_ms: 1,
+                mqtt: None,
+            })))
+            .unwrap();
+        assert_eq!(bare, json!({"v": 1, "kind": "restarted", "found_at_ms": 1}));
+    }
+
+    #[test]
+    fn a_restarted_without_found_at_fails() {
+        assert!(matches!(
+            decode(r#"{"v":1,"kind":"restarted","mqtt":{"client":"ha"}}"#),
+            Err(DeliveryDecodeError::Payload(_))
+        ));
+    }
+
+    /// The admission sizes a publish's statuses by `max_encoded_len`, so the
+    /// marker about the same client must be within it.
+    #[test]
+    fn a_restarted_about_the_client_is_within_max_encoded_len() {
+        for client in ["ha", "quote\"and\\slash", &"c".repeat(200)] {
+            let len = encode(&StatusBody::Restarted(TransportRestarted {
+                found_at_ms: i64::MIN,
+                mqtt: Some(MqttRestarted {
+                    client: client.to_string(),
+                }),
+            }))
+            .len();
+            let cap = max_encoded_len(client, "t");
+            assert!(len <= cap, "{len} > {cap} for client {client:?}");
+        }
     }
 }

@@ -27,17 +27,18 @@ pub mod test_support;
 
 pub use brenn_envelope::addressing::{
     APP_TOOL_RESULTS_NAMESPACE, AUTO_CHANNEL_SEGMENT, DEVICE_LOCATION_PREFIX, EGRESS_NAMESPACE,
-    MQTT_EGRESS_PREFIX, TOOL_RESULTS_NAMESPACE, auto_channel_cid, auto_channel_name,
-    canonical_address, canonicalize_channel_address, chat_channel_uuid_from_address,
-    device_location_address, device_location_channel_uuid, device_location_user,
-    durable_auto_channel_uuid, egress_channel_uuid, ends_at_matcher_boundary,
+    MQTT_CONNECTION_PREFIX, MQTT_EGRESS_PREFIX, TOOL_RESULTS_NAMESPACE, auto_channel_cid,
+    auto_channel_name, canonical_address, canonicalize_channel_address,
+    chat_channel_uuid_from_address, device_location_address, device_location_channel_uuid,
+    device_location_user, durable_auto_channel_uuid, egress_channel_uuid, ends_at_matcher_boundary,
     ends_at_tuning_boundary, ephemeral_channel_uuid_from_name, in_a_tool_namespace,
     in_app_tool_results_namespace, in_the_device_location_family, in_the_egress_namespace,
-    is_auto_channel_name, is_device_location_prefix, is_reserved_channel, is_reserved_channel_name,
-    is_unreserved_char, is_unreserved_name, local_channel_uuid_from_name, matcher_boundary_list,
-    mqtt_channel_uuid_from_address, mqtt_egress_address, mqtt_egress_client,
-    nondurable_channel_uuid, tool_channel_uuid_from_address, tuning_boundary_list,
-    webhook_channel_uuid_from_slug,
+    in_the_mqtt_connection_family, is_auto_channel_name, is_device_location_prefix,
+    is_mqtt_connection_prefix, is_reserved_channel, is_reserved_channel_name, is_unreserved_char,
+    is_unreserved_name, local_channel_uuid_from_name, matcher_boundary_list,
+    mqtt_channel_uuid_from_address, mqtt_connection_address, mqtt_connection_channel_uuid,
+    mqtt_connection_client, mqtt_egress_address, mqtt_egress_client, nondurable_channel_uuid,
+    tool_channel_uuid_from_address, tuning_boundary_list, webhook_channel_uuid_from_slug,
 };
 pub use brenn_envelope::channel_model::ChannelBlockRole;
 

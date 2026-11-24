@@ -86,7 +86,6 @@ pub struct SpawnedClient {
     pub handle: Arc<MqttClientHandle>,
     pub rx: mpsc::UnboundedReceiver<DeliveredMessage>,
     /// The session faults the supervisor reported.
-    #[allow(dead_code, reason = "read by the kept-session suite only")]
     pub faults: Faults,
     /// The hold the client's inbound deliveries pass through.
     #[allow(dead_code, reason = "read by the kept-session suite only")]

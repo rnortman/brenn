@@ -11,6 +11,7 @@ const HOURLY_INTERVAL_SECS: u64 = 3600;
 const BUS_GC_STAGGER_SECS: u64 = 45 * 60;
 
 use brenn_server::active_bridge::ActiveBridges;
+use brenn_server::mqtt_connection::MqttConnectionHub;
 
 /// Handles [`serve_until_shutdown`] acts on at the shutdown signal and after
 /// the server returns. All three are cheap `Clone` (Arc-backed). `mqtt` is the
@@ -18,11 +19,14 @@ use brenn_server::active_bridge::ActiveBridges;
 /// of and is still stopping, is signalled at the signal and joined before the
 /// function returns, so each egress reader has reported what it had in flight
 /// and each supervisor has sent its DISCONNECT before the process exits. A
-/// client a reload adds after the signal is born stopped.
+/// client a reload adds after the signal is born stopped. `mqtt_connection`,
+/// `None` when messaging is off, writes `stopped` for each client it still
+/// holds open once every session is joined.
 pub(crate) struct ShutdownHandle {
     pub(crate) active_bridges: ActiveBridges,
     pub(crate) server_shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) mqtt: std::sync::Arc<brenn_mqtt::MqttService>,
+    pub(crate) mqtt_connection: Option<std::sync::Arc<MqttConnectionHub>>,
 }
 
 /// Resolve at the first SIGINT or SIGTERM.
@@ -42,7 +46,8 @@ pub(crate) async fn os_shutdown_signal() {
 
 /// Serve `app` on `listener` until `signal` resolves, then shut down: mark the
 /// process shutting down, signal every MQTT session to stop, let `axum` drain
-/// its in-flight requests, and join every MQTT session before returning.
+/// its in-flight requests, and join every MQTT session and write `stopped` for
+/// each client the connection hub still holds open before returning.
 ///
 /// The sessions' stops start at the signal and run beside the HTTP drain, so
 /// the whole takes the longer of the two, not their sum.
@@ -53,6 +58,7 @@ pub(crate) async fn serve_until_shutdown(
     signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
     let mqtt = handle.mqtt.clone();
+    let mqtt_connection = handle.mqtt_connection.clone();
     // TODO(surface-small-row-delivery-latency): small binary rows round-trip a
     // surface page's websocket about 20 ms slower than megabyte rows; the
     // listener's sockets keep Nagle's algorithm on.
@@ -67,9 +73,32 @@ pub(crate) async fn serve_until_shutdown(
     .await
     .expect("server error");
 
+    // TODO(shutdown-does-not-quiesce-reload): the reload driver is not stopped
+    // first, so any bus write a reload's commit is still making when this
+    // returns is cut off by process exit.
+    join_mqtt(&mqtt, mqtt_connection.as_deref()).await;
+}
+
+/// Join every MQTT session, then publish each open client's `stopped`
+/// connection state.
+///
+/// `join_all` returns only once every egress reader has exited, after its
+/// last report, so nothing is handed after a `stopped` is written; a
+/// `stopped` is what tells the next boot this process ended cleanly.
+///
+/// # Panics
+///
+/// If `mqtt.stop_all()` has not been called.
+pub(crate) async fn join_mqtt(
+    mqtt: &brenn_mqtt::MqttService,
+    connection: Option<&MqttConnectionHub>,
+) {
     let joined = mqtt.join_all().await;
     if joined > 0 {
         info!(count = joined, "joined MQTT sessions");
+    }
+    if let Some(connection) = connection {
+        connection.finish_all().await;
     }
 }
 

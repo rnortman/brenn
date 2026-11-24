@@ -12,6 +12,10 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+/// Room a family's size bound leaves past the cap its sanitized text is cut
+/// to, for the truncation marker the sanitizer appends to text it cut short.
+pub const TRUNCATION_MARKER_ALLOWANCE: usize = 16;
+
 /// Why a versioned body could not be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionedDecodeError {

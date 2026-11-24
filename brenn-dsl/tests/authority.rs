@@ -481,6 +481,35 @@ fn no_publish_entry_reaches_into_the_egress_namespace() {
 }
 
 #[test]
+fn no_publish_entry_reaches_into_the_mqtt_connection_family() {
+    for pattern in [
+        "exact \"brenn:mqtt-connection.bob_hub\"",
+        "prefix \"brenn:mqtt-connection.\"",
+        "prefix \"brenn:mqtt-connection.bob_hub.\"",
+    ] {
+        let refusal = derive_refusal(&consumer(
+            "ports",
+            &format!("    acl publish [{pattern}];\n"),
+        ));
+        assert!(
+            refusal.contains("reaches into the MQTT connection-state family, which no publish"),
+            "{pattern}: {refusal}"
+        );
+    }
+}
+
+#[test]
+fn a_subscribe_entry_may_name_a_connection_state_channel() {
+    let config = derived(&surface(
+        "    acl subscribe [exact \"brenn:mqtt-connection.bob_hub\"];\n",
+    ));
+    assert_eq!(
+        patterns(&config.surfaces[0].acl.brenn_subscribe),
+        ["mqtt-connection.bob_hub"]
+    );
+}
+
+#[test]
 fn a_subscribe_entry_may_name_the_egress_namespace() {
     let config = derived(&surface(
         "    acl subscribe [exact \"brenn:egress/mqtt\", prefix \"brenn:egress/\"];\n",
@@ -6075,4 +6104,78 @@ fn an_input_on_any_other_egress_name_is_refused_naming_the_per_client_form() {
             ),
         );
     }
+}
+
+// ── the MQTT connection-state channels ───────────────────────────────────────
+
+/// The connection-state channel of `INGRESS`'s client.
+const MQTT_CONNECTION: &str = "brenn:mqtt-connection.bob_hub";
+
+#[test]
+fn a_consumer_binds_a_declared_clients_connection_state_channel_as_an_input() {
+    let config = derived(&format!(
+        "{INGRESS}{}",
+        relay(&format!("    in inbound <- \"{MQTT_CONNECTION}\";\n"))
+    ));
+    let acl = &config.consumers[0].acl;
+    assert_eq!(patterns(&acl.brenn_subscribe), ["mqtt-connection.bob_hub"]);
+    assert!(acl.brenn_publish.is_empty(), "{:?}", acl.brenn_publish);
+}
+
+#[test]
+fn a_connection_state_channel_is_never_bound_outbound() {
+    for (port, body) in [
+        (
+            "out",
+            format!("    out outbound -> \"{MQTT_CONNECTION}\";\n"),
+        ),
+        ("io", format!("    io acks <-> \"{MQTT_CONNECTION}\";\n")),
+    ] {
+        let errors = derive_errors(&format!("{INGRESS}{}", relay_with("ports", &body)));
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [format!(
+                "this binding of consumer `alice_relay` names `{MQTT_CONNECTION}`, in the MQTT \
+                 connection-state family: only Brenn writes a client's connection state, so \
+                 no `out` or `io` port publishes there"
+            )
+            .as_str()],
+            "{port}"
+        );
+    }
+}
+
+#[test]
+fn an_input_on_an_undeclared_clients_connection_state_channel_is_refused() {
+    let address = "brenn:mqtt-connection.carol_hub";
+    let refusal = derive_refusal(&format!(
+        "{INGRESS}{}",
+        relay(&format!("    in inbound <- \"{address}\";\n"))
+    ));
+    assert_eq!(
+        refusal,
+        format!(
+            "this binding of consumer `alice_relay` names `{address}`, which is no declared \
+             client's connection-state channel: each `mqtt_client` has one, \
+             `brenn:mqtt-connection.<client>`"
+        ),
+    );
+}
+
+/// An agent reads a client's state by a runtime subscription; a static one
+/// names a channel the document does not declare.
+#[test]
+fn an_agents_static_subscribe_on_a_connection_state_channel_attaches_to_nothing() {
+    let refusal = derive_refusal(&format!(
+        "{INGRESS}{}",
+        agent_with(
+            "subscribe",
+            &format!("    subscribe \"{MQTT_CONNECTION}\";\n")
+        )
+    ));
+    assert!(
+        refusal.starts_with(&format!("`{MQTT_CONNECTION}` names no declared channel")),
+        "{refusal}"
+    );
 }

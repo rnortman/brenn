@@ -309,7 +309,7 @@ async fn a_committed_call_answers_its_message_id_and_spends_one_budget_unit() {
 async fn a_call_on_a_connected_client_says_so_with_no_note() {
     let bridge = bridge_with_bound(1024).await;
     let handle = bridge.mqtt_service().get_client("home").unwrap();
-    *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Connected;
+    handle.set_state(brenn_mqtt::state::SupervisorState::Connected);
     let Some(ToolOutcome::Ok(v)) = call(
         &bridge,
         json!({ "to": "mqtt:home:t", "body": "on", "lifetime_s": 60 }),
@@ -326,9 +326,9 @@ async fn a_call_on_a_connected_client_says_so_with_no_note() {
 async fn a_failed_client_is_named_in_the_note() {
     let bridge = bridge_with_bound(1024).await;
     let handle = bridge.mqtt_service().get_client("home").unwrap();
-    *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {
+    handle.set_state(brenn_mqtt::state::SupervisorState::Failed {
         reason: "bad credentials".to_string(),
-    };
+    });
     let Some(ToolOutcome::Ok(v)) = call(
         &bridge,
         json!({ "to": "mqtt:home:t", "body": "on", "lifetime_s": 60 }),

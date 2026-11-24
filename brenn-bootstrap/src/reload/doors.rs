@@ -132,7 +132,8 @@ pub(crate) fn spawn_driver_on(mut driver: ReloadDriver, mut rx: mpsc::Receiver<T
     // retained status that may name a document the process does not project.
     // So the panic is process death: systemd restarts, and the next boot reads
     // the document on disk and publishes its hash. `SIGTERM` mid-reload drops
-    // the task without a panic, which is the accepted case. The `catch_unwind`
+    // the task without a panic; the bus writes that drop cuts off are filed at
+    // shutdown's `join_mqtt` call. The `catch_unwind`
     // classifiers inside prepare catch beneath this and are unaffected.
     let driver_task = async move {
         // The one trigger carried over from the reload that just ran, standing

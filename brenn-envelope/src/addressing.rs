@@ -510,6 +510,57 @@ pub fn device_location_channel_uuid(address: &str) -> Uuid {
 }
 
 // ---------------------------------------------------------------------------
+// MQTT connection-state channels
+// ---------------------------------------------------------------------------
+
+/// Bare-name prefix of the per-client MQTT connection-state family:
+/// `brenn:mqtt-connection.<client>` holds, as its newest message, the
+/// connection state of the declared `mqtt_client` `<client>`. The separator is
+/// `.` because a system participant publishing by address is held to a name
+/// with no `/`. A client slug may itself contain `.`, so the client is the
+/// whole remainder.
+pub const MQTT_CONNECTION_PREFIX: &str = "mqtt-connection.";
+
+/// The canonical address of `client`'s connection-state channel,
+/// `brenn:mqtt-connection.<client>`.
+pub fn mqtt_connection_address(client: &str) -> String {
+    canonical_address(&format!("{MQTT_CONNECTION_PREFIX}{client}"))
+}
+
+/// The client a bare connection-state channel name (`mqtt-connection.<client>`)
+/// names: the whole non-empty remainder. `None` for any other name, including
+/// the prefix with nothing after it.
+pub fn mqtt_connection_client(bare: &str) -> Option<&str> {
+    bare.strip_prefix(MQTT_CONNECTION_PREFIX)
+        .filter(|client| !client.is_empty())
+}
+
+/// Is `bare` (a scheme-stripped `brenn:` name) one client's connection-state
+/// channel? The prefix followed by a non-empty remainder.
+pub fn in_the_mqtt_connection_family(bare: &str) -> bool {
+    mqtt_connection_client(bare).is_some()
+}
+
+/// Does `bare_prefix` (a scheme-stripped tuning or matcher prefix) reach only
+/// into the connection-state family? True for the family prefix itself and for
+/// anything longer that starts with it.
+pub fn is_mqtt_connection_prefix(bare_prefix: &str) -> bool {
+    bare_prefix.starts_with(MQTT_CONNECTION_PREFIX)
+}
+
+/// Derive a deterministic UUIDv5 for a connection-state channel from its full
+/// canonical address (`brenn:mqtt-connection.<client>`).
+///
+/// Every plan mints the same entry for a declared client, so every boot lands
+/// on the row an earlier one wrote, and the newest message read back at boot is
+/// the previous process's. The namespace seed
+/// (`"brenn.mqtt-connection-channel"`) is distinct from every other family's.
+pub fn mqtt_connection_channel_uuid(address: &str) -> Uuid {
+    let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.mqtt-connection-channel");
+    Uuid::new_v5(&ns, address.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
 // Segment boundaries
 // ---------------------------------------------------------------------------
 
@@ -1119,5 +1170,49 @@ mod tests {
         assert_ne!(client, tool_channel_uuid_from_address(&address));
         assert_ne!(client, chat_channel_uuid_from_address(&address));
         assert_ne!(client, durable_auto_channel_uuid(&address));
+    }
+
+    #[test]
+    fn mqtt_connection_address_is_well_formed_and_in_the_family() {
+        let address = mqtt_connection_address("home.v2");
+        assert_eq!(address, "brenn:mqtt-connection.home.v2");
+        let bare = address.strip_prefix(BRENN_ADDRESS_PREFIX).unwrap();
+        assert!(is_unreserved_name(bare));
+        assert!(in_the_mqtt_connection_family(bare));
+        assert_eq!(mqtt_connection_client(bare), Some("home.v2"));
+        assert!(!in_the_mqtt_connection_family("mqtt-connection"));
+        assert!(!in_the_mqtt_connection_family("mqtt-connection."));
+        assert!(!in_the_mqtt_connection_family("mqtt-connectionx"));
+        assert_eq!(mqtt_connection_client("mqtt-connection."), None);
+        assert_eq!(mqtt_connection_client("egress/mqtt/home"), None);
+    }
+
+    #[test]
+    fn an_mqtt_connection_prefix_starts_at_the_boundary() {
+        assert!(is_mqtt_connection_prefix("mqtt-connection."));
+        assert!(is_mqtt_connection_prefix("mqtt-connection.home."));
+        assert!(is_mqtt_connection_prefix("mqtt-connection.home"));
+        assert!(!is_mqtt_connection_prefix("mqtt-connection"));
+        assert!(!is_mqtt_connection_prefix("mqtt-"));
+    }
+
+    /// Pinned: every boot's plan must land on the row an earlier one wrote.
+    ///
+    /// **Do NOT change this test if the UUID changes.** Fix the derivation.
+    #[test]
+    fn mqtt_connection_channel_uuid_is_pinned_and_distinct() {
+        let address = mqtt_connection_address("home");
+        let u = mqtt_connection_channel_uuid(&address);
+        assert_eq!(u, mqtt_connection_channel_uuid(&address));
+        assert_eq!(u.to_string(), "1108b174-2242-594b-bec2-415e2fe9f955");
+        assert_ne!(
+            u,
+            mqtt_connection_channel_uuid(&mqtt_connection_address("away"))
+        );
+        assert_ne!(u, egress_channel_uuid(&address));
+        assert_ne!(u, device_location_channel_uuid(&address));
+        assert_ne!(u, tool_channel_uuid_from_address(&address));
+        assert_ne!(u, chat_channel_uuid_from_address(&address));
+        assert_ne!(u, durable_auto_channel_uuid(&address));
     }
 }

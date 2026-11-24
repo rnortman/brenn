@@ -638,8 +638,9 @@ async fn subscribe_tool_executor(
 }
 
 /// Put each client this reload adds into egress service: its position on its
-/// egress channel, the candidate plan's subscriber entry for the participant,
-/// and its reader on the session `start_added_clients` registered.
+/// egress channel and its connection-state writer (`prepare_client`), the
+/// candidate plan's subscriber entry for the participant, and its reader on
+/// the session `start_added_clients` registered.
 ///
 /// After `add_channels`, so the channel is in the directory; position before
 /// entry, for the reason `subscribe_tool_executor` gives. Before `swap_agents`,
@@ -672,10 +673,24 @@ async fn start_egress_readers(
             });
         arriving.insert(entry.0.uuid);
     }
+    let found_at_ms = chrono::Utc::now().timestamp_millis();
     let mut buses = Vec::new();
     for client in &delta.mqtt_clients.added {
         let slug = &client.identity.slug;
-        buses.push((slug, env.mqtt_egress.open(slug).await));
+        let handle = env.mqtt_service.get_client(slug).unwrap_or_else(|| {
+            panic!(
+                "reload commit: client {slug:?} is added but the registry holds no session for \
+                 it — `start_added_clients` registered one, so this is a host bug",
+            )
+        });
+        let bus = crate::mqtt::prepare_client(
+            &env.mqtt_egress,
+            &env.mqtt_connection,
+            &handle,
+            found_at_ms,
+        )
+        .await;
+        buses.push((slug, handle, bus));
     }
     planned.fold_onto(
         env.messenger.directory(),
@@ -683,13 +698,7 @@ async fn start_egress_readers(
         "system participant",
         &arriving,
     );
-    for (slug, bus) in buses {
-        let handle = env.mqtt_service.get_client(slug).unwrap_or_else(|| {
-            panic!(
-                "reload commit: client {slug:?} is added but the registry holds no session for \
-                 it — `start_added_clients` registered one, so this is a host bug",
-            )
-        });
+    for (slug, handle, bus) in buses {
         brenn_mqtt::start_egress_reader(&handle, bus);
         info!(client = %slug, "reload: MQTT egress reader started");
     }
@@ -703,7 +712,9 @@ async fn start_egress_readers(
 /// position is dropped and everything the channel held unread is taken, then
 /// reported `dropped`, `removed`. From then on a commit to the channel is
 /// refused. A reader that had already ended for the session's stop is closed
-/// the same way. The session stops later, after `swap_agents`.
+/// the same way. Then the client's connection-state writer is finished, so
+/// `stopped` is the last message on its state channel before that channel
+/// leaves. The session stops later, after `swap_agents`.
 ///
 /// The retires run concurrently, so the step waits up to the largest
 /// `stop_wait_secs` among the removed clients, not their sum; the directory
@@ -746,6 +757,7 @@ async fn retire_egress_readers(env: &ReloadEnv, delta: &PlanDelta) {
              entry for the egress participant — host bug",
         );
         env.mqtt_egress.close(slug).await;
+        env.mqtt_connection.finish(slug).await;
         info!(client = %slug, "reload: MQTT egress reader retired");
     }
 }
@@ -1076,6 +1088,7 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
     for new in &delta.mqtt_clients.changed {
         let service = env.mqtt_service.clone();
         let hub = env.mqtt_egress.clone();
+        let connection = env.mqtt_connection.clone();
         let router = router.clone();
         let new = Arc::clone(new);
         sessions.spawn(async move {
@@ -1091,8 +1104,11 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
             let successor =
                 register_and_spawn(&service, new, ArrivingFilters::Successor(&old), router).await;
             // The predecessor's reader was joined with its session; the
-            // successor resumes from the same position on the same channel.
-            brenn_mqtt::start_egress_reader(&successor, hub.open(&slug).await);
+            // successor resumes from the same position on the same channel,
+            // and its state is followed from here with the client's previous
+            // session unchanged.
+            connection.follow(&slug, successor.subscribe_state()).await;
+            brenn_mqtt::start_egress_reader(&successor, hub.open(&slug).await.bus);
             // The inherited set lands on the successor after the predecessor's
             // join, so a filter a concurrent subscribe added late is in this
             // count.
@@ -1213,7 +1229,7 @@ async fn mqtt_incoming(env: &ReloadEnv, delta: &PlanDelta) -> MqttCommitReport {
             &address_of(&client.client, first),
             "subscribed",
         );
-        let (health, _) = session.health_snapshot().await;
+        let (health, _) = session.health_snapshot();
         for filter in &client.resubscribe {
             let address = address_of(&client.client, filter);
             report.record(record_resubscribe(health, &address), address);

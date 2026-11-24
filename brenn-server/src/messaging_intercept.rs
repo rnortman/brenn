@@ -1219,9 +1219,6 @@ fn parse_message_uuid(
 /// and the message-injection path, not in any `MqttService` ingress structure, so
 /// surfacing it would require adding net-new ingress state. Non-`mqtt:` entries
 /// are untouched.
-// TODO(mqtt-idle-client-visibility): a declared client with no `mqtt:` channel
-// has no entry here, so its session — connected, failed or reconnecting
-// forever — is reported nowhere.
 async fn enrich_mqtt_listing(listing: &mut [ChannelListing], mqtt_svc: &brenn_mqtt::MqttService) {
     for entry in listing.iter_mut() {
         enrich_mqtt_details(&mut entry.details, mqtt_svc).await;
@@ -4024,9 +4021,9 @@ mod tests {
             .mqtt_service()
             .get_client("home")
             .expect("the configured client");
-        *handle.supervisor_state.write().await = brenn_mqtt::state::SupervisorState::Failed {
+        handle.set_state(brenn_mqtt::state::SupervisorState::Failed {
             reason: "authoritative connect failure: not authorized".to_string(),
-        };
+        });
 
         let v = subscribe_result(
             &bridge,

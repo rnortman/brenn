@@ -16,10 +16,10 @@ use brenn_lib::mqtt::subscription_identifier;
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::payload::InboundPayload;
 use brenn_mqtt::reader::{EgressReport, Sent, UnknownCause, start_egress_reader};
-use brenn_mqtt::service::{InboundRouting, MqttEventRouter};
+use brenn_mqtt::service::{InboundRouting, MqttEventRouter, SessionFault};
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
-use brenn_mqtt::state::ConnectorHealthLabel;
 use brenn_mqtt::state::IngressSubscription;
+use brenn_mqtt::state::{ConnectorHealthLabel, SupervisorState};
 use brenn_mqtt::test_support::broker::log_records_connack;
 use brenn_mqtt::test_support::client::wait_for_filter_acked;
 use brenn_mqtt::{ArrivingFilters, MqttClientHandle, MqttService, register_and_spawn};
@@ -1631,6 +1631,7 @@ async fn auth_bad_credentials_drives_failed_with_reason() {
         svc,
         client_slug,
         handle,
+        faults,
         ..
     } = spawn_client_with_config(Arc::new(config), vec![auth_filter.to_string()]).await;
 
@@ -1659,6 +1660,22 @@ async fn auth_bad_credentials_drives_failed_with_reason() {
     assert!(
         reason.is_some_and(|r| !r.is_empty()),
         "Failed session must surface a non-empty reason"
+    );
+    // The state is written before the fault is reported: wait for the report.
+    let SupervisorState::Failed { reason } = handle.state().state else {
+        panic!("the session is not Failed: {:?}", handle.state());
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while faults.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the authoritative failure was never reported as a session fault");
+    assert_eq!(
+        *faults.lock().unwrap(),
+        [(client_slug.clone(), SessionFault::Failed { reason })],
+        "one Failed fault naming the client and the state's reason",
     );
 
     handle.stop();

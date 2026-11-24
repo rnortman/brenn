@@ -11,6 +11,7 @@ use crate::testutils::test_channel_entry;
 use crate::{ChannelEntry, MessagingDirectory, WakeRouter};
 use brenn_envelope::delivery::{
     self, DELIVERY_STATUS_SENDER, DeliveryDropCause, DeliveryKind, DeliveryStatus, MqttDelivery,
+    MqttRestarted, StatusBody, TransportRestarted,
 };
 use brenn_envelope::grants::AppCapability;
 use brenn_lib::access::acl::ChannelMatcher;
@@ -80,8 +81,8 @@ async fn fixture() -> Fixture {
     .await
 }
 
-fn status(kind: DeliveryKind) -> DeliveryStatus {
-    DeliveryStatus {
+fn status(kind: DeliveryKind) -> StatusBody {
+    StatusBody::Message(DeliveryStatus {
         message_id: Uuid::from_u128(7),
         kind,
         mqtt: Some(MqttDelivery {
@@ -90,7 +91,7 @@ fn status(kind: DeliveryKind) -> DeliveryStatus {
             qos: 1,
             reason_code: None,
         }),
-    }
+    })
 }
 
 impl Fixture {
@@ -164,6 +165,30 @@ async fn a_published_status_is_on_the_channel_from_the_status_sender() {
     assert!(f.rate_drawn_by(DELIVERY_STATUS_SENDER));
     assert!(!f.rate_drawn_by(&sender()));
     assert_eq!(read_send_budget(&*f.m.db.lock().await, 1), None);
+}
+
+/// The marker, about a transport rather than a message, lands the same way.
+#[tokio::test]
+async fn a_restarted_status_lands_from_the_status_sender() {
+    let f = fixture().await;
+    let marker = StatusBody::Restarted(TransportRestarted {
+        found_at_ms: 1_795_599_990_000,
+        mqtt: Some(MqttRestarted {
+            client: "home".to_string(),
+        }),
+    });
+    assert_eq!(
+        f.m.publish_delivery_status(&sender(), STATUS, &marker)
+            .await,
+        DeliveryStatusPublish::Published
+    );
+    let rows = f.rows().await;
+    let [row] = rows.as_slice() else {
+        panic!("one row, got {}", rows.len());
+    };
+    assert_eq!(row.sender, DELIVERY_STATUS_SENDER);
+    let text = row.body.as_text().expect("a status is text");
+    assert_eq!(delivery::decode(text), Ok(marker));
 }
 
 #[tokio::test]

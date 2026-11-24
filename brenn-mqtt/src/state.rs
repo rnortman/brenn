@@ -9,8 +9,9 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 
 use brenn_lib::mqtt::config::MqttClientConfig;
@@ -89,21 +90,30 @@ pub enum SubAckOutcome {
 }
 
 /// The live connection state of a supervisor, as readable from outside.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
-    /// Not yet attempted, or in backoff between attempts.
+    /// Not yet attempted, in backoff between attempts, or stopped.
     Disconnected {
         /// Most recent failure reason, if any.
         last_error: Option<String>,
-        /// When the next connect attempt is scheduled.
-        next_attempt_at: Instant,
     },
     /// A connect is in progress.
-    Connecting { since: Instant },
+    Connecting {
+        /// The failure the attempt follows, if any.
+        last_error: Option<String>,
+    },
     /// Connected and subscriptions are active.
     Connected,
     /// Authoritative failure — supervisor has stopped retrying.
     Failed { reason: String },
+}
+
+/// A supervisor state and when its [`SupervisorState::health_label`] last
+/// changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateAt {
+    pub state: SupervisorState,
+    pub since: DateTime<Utc>,
 }
 
 /// Health label surfaced to the LLM (via `MessageChannelList` channel
@@ -515,8 +525,10 @@ pub struct MqttClientHandle {
     /// dynamic `mqtt:` subscribe adds an entry here.
     pub subscriptions: RwLock<IngressSubscriptionSet>,
 
-    /// Live supervisor state (shared with the supervisor task via `Arc`).
-    pub supervisor_state: RwLock<SupervisorState>,
+    /// Live supervisor state, written by the supervisor through
+    /// [`Self::set_state`] and read through [`Self::state`] and
+    /// [`Self::subscribe_state`].
+    supervisor_state: watch::Sender<StateAt>,
 
     /// The MQTT client handle, set by the supervisor on connect and cleared on
     /// disconnect. Wrapped in a Mutex so callers can snapshot client + state
@@ -689,9 +701,9 @@ impl MqttClientHandle {
         Arc::new(Self {
             config,
             subscriptions: RwLock::new(set),
-            supervisor_state: RwLock::new(SupervisorState::Disconnected {
-                last_error: None,
-                next_attempt_at: Instant::now(),
+            supervisor_state: watch::Sender::new(StateAt {
+                state: SupervisorState::Disconnected { last_error: None },
+                since: Utc::now(),
             }),
             client: Mutex::new(None),
             broker_max_packet_size: AtomicU32::new(0),
@@ -752,11 +764,34 @@ impl MqttClientHandle {
         Duration::from_secs(u64::from(self.config.identity.stop_wait_secs))
     }
 
-    /// Read the current health label + last_error without holding a long-lived lock.
-    pub async fn health_snapshot(&self) -> (ConnectorHealthLabel, Option<String>) {
-        let state = self.supervisor_state.read().await;
-        let label = state.health_label();
-        let err = state.last_error().map(|s| s.to_string());
+    /// Record the supervisor's state. `since` moves only when the health
+    /// label changes, so a retry's `Disconnected` and `Connecting` keep the
+    /// moment the client stopped being connected.
+    pub fn set_state(&self, state: SupervisorState) {
+        self.supervisor_state.send_modify(|current| {
+            if current.state.health_label() != state.health_label() {
+                current.since = Utc::now();
+            }
+            current.state = state;
+        });
+    }
+
+    /// The supervisor's current state.
+    pub fn state(&self) -> StateAt {
+        self.supervisor_state.borrow().clone()
+    }
+
+    /// A receiver that sees every state this handle records from now on,
+    /// newest only.
+    pub fn subscribe_state(&self) -> watch::Receiver<StateAt> {
+        self.supervisor_state.subscribe()
+    }
+
+    /// The current health label and last error.
+    pub fn health_snapshot(&self) -> (ConnectorHealthLabel, Option<String>) {
+        let state = self.supervisor_state.borrow();
+        let label = state.state.health_label();
+        let err = state.state.last_error().map(|s| s.to_string());
         (label, err)
     }
 
@@ -1064,27 +1099,116 @@ mod tests {
         }
     }
 
+    /// The LLM-facing projections: a connect attempt reads "reconnecting"
+    /// whatever error it follows, and a disconnected client with no error
+    /// reads "unknown".
     #[test]
-    fn health_label_mapping() {
-        let connected = SupervisorState::Connected;
-        assert_eq!(connected.health_label(), ConnectorHealthLabel::Connected);
+    fn health_label_and_last_error_for_every_state() {
+        let cases = [
+            (
+                SupervisorState::Connected,
+                ConnectorHealthLabel::Connected,
+                None,
+            ),
+            (
+                SupervisorState::Disconnected { last_error: None },
+                ConnectorHealthLabel::Disconnected,
+                Some("unknown"),
+            ),
+            (
+                SupervisorState::Disconnected {
+                    last_error: Some("timeout".to_string()),
+                },
+                ConnectorHealthLabel::Disconnected,
+                Some("timeout"),
+            ),
+            (
+                SupervisorState::Connecting { last_error: None },
+                ConnectorHealthLabel::Disconnected,
+                Some("reconnecting"),
+            ),
+            (
+                SupervisorState::Connecting {
+                    last_error: Some("timeout".to_string()),
+                },
+                ConnectorHealthLabel::Disconnected,
+                Some("reconnecting"),
+            ),
+            (
+                SupervisorState::Failed {
+                    reason: "bad credentials".to_string(),
+                },
+                ConnectorHealthLabel::Failed,
+                Some("bad credentials"),
+            ),
+        ];
+        for (state, label, last_error) in cases {
+            assert_eq!(state.health_label(), label, "{state:?}");
+            assert_eq!(state.last_error(), last_error, "{state:?}");
+        }
+    }
 
-        let disconnected = SupervisorState::Disconnected {
-            last_error: Some("timeout".to_string()),
-            next_attempt_at: Instant::now(),
-        };
-        assert_eq!(
-            disconnected.health_label(),
-            ConnectorHealthLabel::Disconnected
-        );
+    /// `since` is kept across a retry's `Disconnected` ↔ `Connecting` and
+    /// across a change of error, and moves when the health label changes.
+    #[test]
+    fn set_state_moves_since_only_when_the_label_changes() {
+        let handle = make_handle("broker");
+        let start = handle.state().since;
 
-        let connecting = SupervisorState::Connecting {
-            since: Instant::now(),
-        };
+        std::thread::sleep(Duration::from_millis(5));
+        handle.set_state(SupervisorState::Connecting { last_error: None });
+        handle.set_state(SupervisorState::Disconnected {
+            last_error: Some("refused".to_string()),
+        });
+        handle.set_state(SupervisorState::Connecting {
+            last_error: Some("refused".to_string()),
+        });
+        let retrying = handle.state();
         assert_eq!(
-            connecting.health_label(),
-            ConnectorHealthLabel::Disconnected
+            retrying.state,
+            SupervisorState::Connecting {
+                last_error: Some("refused".to_string())
+            }
         );
+        assert_eq!(retrying.since, start, "a retry keeps `since`");
+
+        std::thread::sleep(Duration::from_millis(5));
+        handle.set_state(SupervisorState::Connected);
+        let connected = handle.state();
+        assert!(connected.since > start, "connecting moves `since`");
+
+        std::thread::sleep(Duration::from_millis(5));
+        handle.set_state(SupervisorState::Disconnected {
+            last_error: Some("lost".to_string()),
+        });
+        let lost = handle.state();
+        assert!(lost.since > connected.since, "a loss moves `since`");
+
+        std::thread::sleep(Duration::from_millis(5));
+        handle.set_state(SupervisorState::Failed {
+            reason: "gone".to_string(),
+        });
+        let failed = handle.state();
+        assert!(failed.since > lost.since, "failing moves `since`");
+        handle.set_state(SupervisorState::Failed {
+            reason: "gone".to_string(),
+        });
+        assert_eq!(handle.state().since, failed.since);
+    }
+
+    /// A receiver taken before a write sees the newest state, and a burst of
+    /// writes between two reads is seen as its last.
+    #[tokio::test]
+    async fn subscribe_state_sees_the_newest_state() {
+        let handle = make_handle("broker");
+        let mut rx = handle.subscribe_state();
+        rx.borrow_and_update();
+
+        handle.set_state(SupervisorState::Connecting { last_error: None });
+        handle.set_state(SupervisorState::Connected);
+        rx.changed().await.expect("the handle holds the sender");
+        assert_eq!(rx.borrow_and_update().state, SupervisorState::Connected);
+        assert!(!rx.has_changed().expect("the handle holds the sender"));
     }
 
     #[test]

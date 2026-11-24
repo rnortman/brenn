@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use uuid::Uuid;
 
-use brenn_envelope::delivery::{self, DELIVERY_REASON_MARKER_ALLOWANCE, DELIVERY_STATUS_SENDER};
+use brenn_envelope::delivery::{self, DELIVERY_STATUS_SENDER};
 use brenn_envelope::grants::AppCapability;
 use brenn_envelope::{
     ChannelScheme, MessageBody, MessageEnvelope, MqttExpiry, MqttPublishTransport, TransportMeta,
@@ -45,6 +45,9 @@ const BOB_STATUS: &str = "brenn:bob-status";
 /// The app whose status channel is not declared, as after a reload removed it.
 const CAROL: &str = "pa-carol";
 const CAROL_STATUS: &str = "brenn:carol-status";
+/// A second app with a declared status channel of its own.
+const DAVE: &str = "pa-dave";
+const DAVE_STATUS: &str = "brenn:dave-status";
 
 /// An app with `MessagingPublish` and a `brenn:` publish ACL covering
 /// exactly `status`.
@@ -141,11 +144,13 @@ impl Fixture {
         entry.resolved_channel.standing_retain_depth = Depth::Bounded(WINDOW);
         let mut status = test_channel_entry(BOB_STATUS.strip_prefix("brenn:").unwrap(), vec![]);
         status.resolved_channel.send_rate = send_rate;
-        let mut entries = vec![entry, status];
+        let dave_status = test_channel_entry(DAVE_STATUS.strip_prefix("brenn:").unwrap(), vec![]);
+        let mut entries = vec![entry, status, dave_status];
         fold_spec_subscriptions(&mut entries, &[mqtt_outbound_spec([CLIENT])]);
         let mut apps = indexmap::IndexMap::new();
         apps.insert(BOB.to_string(), status_sender(BOB, BOB_STATUS));
         apps.insert(CAROL.to_string(), status_sender(CAROL, CAROL_STATUS));
+        apps.insert(DAVE.to_string(), status_sender(DAVE, DAVE_STATUS));
         let db = init_db_memory();
         upsert_channels(&*db.lock().await, &entries);
         let router = Arc::new(AlarmRouter::default());
@@ -239,9 +244,28 @@ impl Fixture {
     }
 
     /// Every status on Bob's status channel, oldest first, each checked to
-    /// come from the status sender.
+    /// come from the status sender and to be about a message.
     async fn statuses(&self) -> Vec<delivery::DeliveryStatus> {
-        let entry = self.messenger.directory().resolve(BOB_STATUS).unwrap();
+        self.bodies()
+            .await
+            .into_iter()
+            .map(|body| match body {
+                delivery::StatusBody::Message(status) => status,
+                other => panic!("expected a message status, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Every body on Bob's status channel, oldest first, each checked to come
+    /// from the status sender.
+    async fn bodies(&self) -> Vec<delivery::StatusBody> {
+        self.bodies_on(BOB_STATUS).await
+    }
+
+    /// Every body on the status channel `address`, oldest first, each checked
+    /// to come from the status sender.
+    async fn bodies_on(&self, address: &str) -> Vec<delivery::StatusBody> {
+        let entry = self.messenger.directory().resolve(address).unwrap();
         let conn = self.messenger.db().lock().await;
         load_channel_retained_tail(&conn, entry.uuid, Depth::Unbounded)
             .into_iter()
@@ -360,7 +384,7 @@ async fn a_fresh_position_skips_what_the_channel_already_retains() {
     let f = Fixture::new().await;
     f.commit_n(2).await;
 
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     assert!(
         bus.unhanded(10).await.is_empty(),
         "messages committed before the position existed are not handed"
@@ -373,14 +397,18 @@ async fn a_fresh_position_skips_what_the_channel_already_retains() {
 #[tokio::test]
 async fn an_existing_position_resumes_where_it_was() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let opened = f.hub.open(CLIENT).await;
+    assert!(!opened.resumed, "the first open creates the position");
+    let bus = opened.bus;
     let committed = f.commit_n(3).await;
     let head = bus.unhanded(1).await;
     assert_eq!(ids(&head), committed[..1]);
     bus.advance(message(&head[0]).seq).await;
 
     let restarted = MqttEgressHub::new(Arc::clone(&f.messenger), f.alerts.clone());
-    let bus = restarted.open(CLIENT).await;
+    let opened = restarted.open(CLIENT).await;
+    assert!(opened.resumed, "a later open resumes it");
+    let bus = opened.bus;
     assert_eq!(
         ids(&bus.unhanded(10).await),
         committed[1..],
@@ -391,7 +419,7 @@ async fn an_existing_position_resumes_where_it_was() {
 #[tokio::test]
 async fn the_head_read_hands_the_oldest_unhanded_with_their_payloads() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     let inline = f.commit(b"on", HeldAttachments::none()).await;
     let blob = seal_blob(&f.messenger, b"a payload carried as a blob");
     let attached = f.commit(b"", held(&[("payload", &blob)])).await;
@@ -422,7 +450,7 @@ async fn the_head_read_hands_the_oldest_unhanded_with_their_payloads() {
 #[tokio::test]
 async fn a_message_whose_blob_nothing_holds_is_payload_gone() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     f.commit_n(1).await;
     let head = f
         .messenger
@@ -460,7 +488,7 @@ async fn a_message_whose_blob_nothing_holds_is_payload_gone() {
 #[should_panic(expected = "not MQTT publish metadata")]
 async fn a_message_without_publish_metadata_is_a_panic() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     f.commit_n(1).await;
     let head = f
         .messenger
@@ -484,7 +512,7 @@ async fn a_message_without_publish_metadata_is_a_panic() {
 #[should_panic(expected = "carries 2 attachments")]
 async fn a_message_with_two_attachments_is_a_panic() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     f.commit_n(1).await;
     let head = f
         .messenger
@@ -514,7 +542,7 @@ async fn a_message_with_two_attachments_is_a_panic() {
 #[tokio::test]
 async fn an_advance_past_an_outrun_window_raises_the_overflow() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     let committed = f.commit_n(WINDOW as usize + 2).await;
 
     let head = bus.unhanded(1).await;
@@ -540,7 +568,7 @@ async fn an_advance_past_an_outrun_window_raises_the_overflow() {
 #[tokio::test]
 async fn an_eviction_raises_the_overflow_once() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     f.commit_n(WINDOW as usize + 3).await;
 
     f.evict().await;
@@ -577,7 +605,7 @@ async fn an_eviction_raises_the_overflow_once() {
 #[tokio::test]
 async fn close_reports_the_served_and_the_bus_raises_the_outrun() {
     let f = Fixture::new().await;
-    let _bus = f.hub.open(CLIENT).await;
+    let _bus = f.hub.open(CLIENT).await.bus;
     f.commit_n(WINDOW as usize + 1).await;
 
     f.hub.close(CLIENT).await;
@@ -604,7 +632,7 @@ async fn close_reports_the_served_and_the_bus_raises_the_outrun() {
 #[tokio::test]
 async fn close_detaches_the_position_and_forgets_the_counts() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     bus.report(EgressReport::Delivered(meta("t"))).await;
     assert_eq!(f.hub.counts(CLIENT).delivered, 1);
 
@@ -635,7 +663,7 @@ async fn closing_a_client_never_opened_panics() {
 #[tokio::test]
 async fn wake_all_wakes_every_reader() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     let mut first = bus.wakes();
     let mut second = bus.wakes();
     f.hub.wake_all();
@@ -647,7 +675,7 @@ async fn wake_all_wakes_every_reader() {
 #[tracing_test::traced_test]
 async fn every_failure_kind_is_logged_counted_and_alerted() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     bus.report(EgressReport::Delivered(meta("lights/a"))).await;
     bus.report(EgressReport::Rejected {
         message: meta("lights/b"),
@@ -705,7 +733,7 @@ async fn every_failure_kind_is_logged_counted_and_alerted() {
 #[tokio::test]
 async fn an_episode_alerts_once_and_closes_with_a_summary() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     for _ in 0..3 {
         bus.report(expired_never(meta("lights/a"))).await;
     }
@@ -741,11 +769,15 @@ async fn an_episode_alerts_once_and_closes_with_a_summary() {
     assert_eq!(alerts[5].0, "MQTT egress: dropped (home), summary");
     assert!(alerts[5].1.contains("3 more message(s)"), "{}", alerts[5].1);
 }
-/// The sanitizer's truncation marker fits in the room a status's size bound
-/// leaves for it, so the admission's size check holds for every reason.
+/// The sanitizer's truncation marker fits in the room the host bodies' size
+/// bounds leave for it, so each bound holds for every sanitized text: a
+/// status's reason and a connection state's error or reason alike.
 #[test]
-fn the_truncation_marker_fits_the_reason_allowance() {
-    assert!(brenn_common::TRUNCATION_MARKER.len() <= DELIVERY_REASON_MARKER_ALLOWANCE);
+fn the_truncation_marker_fits_the_allowance() {
+    assert!(
+        brenn_common::TRUNCATION_MARKER.len()
+            <= brenn_envelope::versioned::TRUNCATION_MARKER_ALLOWANCE
+    );
 }
 
 /// The operator is told a refused status's kind by the same word the encoded
@@ -773,11 +805,11 @@ fn the_kind_label_is_the_encoded_kind() {
     ];
     for kind in kinds {
         let label = kind_label(&kind);
-        let body = delivery::encode(&delivery::DeliveryStatus {
+        let body = delivery::encode(&delivery::StatusBody::Message(delivery::DeliveryStatus {
             message_id: Uuid::nil(),
             kind,
             mqtt: None,
-        });
+        }));
         let json: serde_json::Value = serde_json::from_str(&body).expect("a status is JSON");
         assert_eq!(json["kind"], label, "{body}");
     }
@@ -790,7 +822,7 @@ fn the_kind_label_is_the_encoded_kind() {
 async fn each_report_lands_its_status_by_the_mapping() {
     use delivery::{DeliveryDropCause as D, DeliveryKind as K, DeliveryUnknownCause as U};
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     let message = bob("lights/kitchen/set");
     let reports = [
         (EgressReport::Handed(message.clone()), K::Handed, None),
@@ -1024,7 +1056,8 @@ fn a_refused_resend_carries_no_reason_member() {
         let (_, status) =
             delivery_status(CLIENT, &HubReport::Reader(report)).expect("bob names a status_to");
         let body: serde_json::Value =
-            serde_json::from_str(&delivery::encode(&status)).expect("a status is JSON");
+            serde_json::from_str(&delivery::encode(&delivery::StatusBody::Message(status)))
+                .expect("a status is JSON");
         assert_eq!(body["kind"], "unknown", "{body}");
         assert_eq!(body["cause"], "resend_refused", "{body}");
         assert!(body.get("reason").is_none(), "{body}");
@@ -1046,7 +1079,7 @@ async fn the_operator_is_told_alike_whether_or_not_the_message_was_sent() {
     let mut seen = Vec::new();
     for sent in [Sent::Never, Sent::Possibly] {
         let f = Fixture::new().await;
-        let bus = f.hub.open(CLIENT).await;
+        let bus = f.hub.open(CLIENT).await.bus;
         for message in [&untold, &refused] {
             bus.report(EgressReport::Expired {
                 message: message.clone(),
@@ -1105,7 +1138,7 @@ async fn the_operator_is_told_alike_whether_or_not_a_rejection_was_a_resend() {
     let mut seen = Vec::new();
     for earlier in [Sent::Never, Sent::Possibly] {
         let f = Fixture::new().await;
-        let bus = f.hub.open(CLIENT).await;
+        let bus = f.hub.open(CLIENT).await.bus;
         for code in [Some(135), None] {
             for message in [&untold, &told, &refused] {
                 bus.report(EgressReport::Rejected {
@@ -1186,7 +1219,7 @@ async fn the_operator_is_told_alike_whether_or_not_a_rejection_was_a_resend() {
 #[tracing_test::traced_test]
 async fn a_broker_rejection_alerts_told_or_not() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     let rejected = |message: EgressMeta, code| EgressReport::Rejected {
         message,
         reason: "Not authorized".to_string(),
@@ -1271,7 +1304,7 @@ async fn a_broker_rejection_alerts_told_or_not() {
 #[tokio::test]
 async fn handed_is_committed_before_the_position_moves() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     let publish = MqttPublishTransport {
         status_to: Some(BOB_STATUS.to_string()),
         ..transport("lights/kitchen/set")
@@ -1304,7 +1337,7 @@ async fn handed_is_committed_before_the_position_moves() {
 #[tracing_test::traced_test]
 async fn a_told_failure_raises_nothing_and_a_refused_one_alerts() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     bus.report(expired_never(bob("lights/a"))).await;
     assert!(f.alerts().await.is_empty(), "told, so not raised");
     assert_eq!(f.hub.counts(CLIENT).expired, 1, "but counted");
@@ -1376,7 +1409,7 @@ fn assert_dropped_told(lines: &[&str], expected: &[&str]) -> Result<(), String> 
 #[tracing_test::traced_test]
 async fn a_dropped_message_alerts_only_when_its_status_is_refused() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     f.hub
         .record(CLIENT, HubReport::RemovedMessage(bob("lights/a")))
         .await;
@@ -1437,7 +1470,7 @@ async fn a_throttled_status_channel_alerts_once_per_run() {
         refill: 1,
     })
     .await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     for _ in 0..2 {
         bus.report(EgressReport::Handed(bob("lights/a"))).await;
     }
@@ -1456,7 +1489,7 @@ async fn a_throttled_status_channel_alerts_once_per_run() {
 #[tokio::test]
 async fn interleaved_senders_alert_once_per_run() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     for _ in 0..3 {
         bus.report(EgressReport::Handed(carol("lights/a"))).await;
         bus.report(EgressReport::Handed(bob("lights/b"))).await;
@@ -1472,7 +1505,7 @@ async fn interleaved_senders_alert_once_per_run() {
 #[tokio::test]
 async fn a_delivery_leaves_the_status_episode_open() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     for _ in 0..3 {
         bus.report(EgressReport::Rejected {
             message: carol("lights/a"),
@@ -1499,7 +1532,7 @@ async fn a_delivery_leaves_the_status_episode_open() {
 async fn close_tells_each_named_message_removed_and_refuses_later_commits() {
     use delivery::{DeliveryDropCause as D, DeliveryKind as K};
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     let head = f.commit_n(1).await;
     let publish = MqttPublishTransport {
         status_to: Some(BOB_STATUS.to_string()),
@@ -1563,11 +1596,7 @@ async fn close_tells_each_named_message_removed_and_refuses_later_commits() {
 async fn close_reports_the_count_then_each_named_message_in_channel_order() {
     use delivery::{DeliveryDropCause as D, DeliveryKind as K};
     let f = Fixture::new().await;
-    let _bus = f.hub.open(CLIENT).await;
-    let named = |topic: &str, status_to: &str| MqttPublishTransport {
-        status_to: Some(status_to.to_string()),
-        ..transport(topic)
-    };
+    let _bus = f.hub.open(CLIENT).await.bus;
     // The channel's window is four messages.
     let first = f
         .commit_publish_as(&identity(BOB), b"on", named("lights/a/set", BOB_STATUS))
@@ -1622,7 +1651,7 @@ async fn close_reports_the_count_then_each_named_message_in_channel_order() {
 #[tokio::test]
 async fn a_removal_withheld_by_an_open_drop_episode_is_summarised_at_close() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     bus.report(EgressReport::Dropped { count: 1 }).await;
     f.commit_n(3).await;
 
@@ -1656,7 +1685,7 @@ async fn a_removal_withheld_by_an_open_drop_episode_is_summarised_at_close() {
 #[tokio::test]
 async fn a_removal_whose_status_is_refused_alerts_the_refusal() {
     let f = Fixture::new().await;
-    let _bus = f.hub.open(CLIENT).await;
+    let _bus = f.hub.open(CLIENT).await.bus;
     let publish = MqttPublishTransport {
         status_to: Some(CAROL_STATUS.to_string()),
         ..transport("lights/hall/set")
@@ -1752,7 +1781,7 @@ fn poll_pending<F: std::future::Future + ?Sized>(fut: std::pin::Pin<&mut F>, wha
 #[tokio::test]
 async fn a_parked_message_is_handed_only_after_its_release() {
     let f = Fixture::new().await;
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     let later = f
         .park_as(
             "app:pa-bob",
@@ -1782,7 +1811,7 @@ async fn a_parked_message_is_handed_only_after_its_release() {
 async fn close_reports_parked_messages_after_the_unread_and_removes_them() {
     use delivery::{DeliveryDropCause as D, DeliveryKind as K};
     let f = Fixture::new().await;
-    let _bus = f.hub.open(CLIENT).await;
+    let _bus = f.hub.open(CLIENT).await.bus;
     let named = |topic: &str| MqttPublishTransport {
         status_to: Some(BOB_STATUS.to_string()),
         ..transport(topic)
@@ -1824,7 +1853,7 @@ async fn close_reports_parked_messages_after_the_unread_and_removes_them() {
     );
     assert_eq!(f.parked_count().await, 0, "the parked rows are gone");
 
-    let _bus = f.hub.open(CLIENT).await;
+    let _bus = f.hub.open(CLIENT).await.bus;
     assert_eq!(f.release_due().await, 0, "nothing old to release");
 }
 
@@ -1848,7 +1877,7 @@ async fn a_fresh_position_deletes_what_is_still_parked() {
     .await;
     f.commit_n(1).await;
 
-    let bus = f.hub.open(CLIENT).await;
+    let bus = f.hub.open(CLIENT).await.bus;
     assert_eq!(f.parked_count().await, 0, "the parked rows are deleted");
     assert_eq!(f.release_due().await, 0);
     assert!(bus.unhanded(10).await.is_empty());
@@ -1880,7 +1909,7 @@ async fn a_release_between_the_attach_and_the_take_is_skipped() {
         "the open attaches and waits at its take, behind the release",
     );
     assert_eq!(release.await.released.len(), 1, "released before the take");
-    let bus = open.await;
+    let bus = open.await.bus;
     assert!(
         bus.unhanded(10).await.is_empty(),
         "the skip passed the released message"
@@ -1925,7 +1954,164 @@ async fn a_release_between_the_take_and_the_skip_finds_nothing() {
         release.await.released.is_empty(),
         "the take ran before the release"
     );
-    let bus = open.await;
+    let bus = open.await.bus;
     assert!(bus.unhanded(10).await.is_empty(), "nothing is handed");
     assert_eq!(f.parked_count().await, 0);
+}
+
+/// A message published as `sender` through the client, naming `status_to`.
+fn named(topic: &str, status_to: &str) -> MqttPublishTransport {
+    MqttPublishTransport {
+        status_to: Some(status_to.to_string()),
+        ..transport(topic)
+    }
+}
+
+impl Fixture {
+    /// Hand every message the channel holds ahead of the position, oldest
+    /// first, up to `n`, and move the position past them.
+    async fn hand(&self, bus: &Arc<dyn EgressBus>, n: usize) {
+        let head = bus.unhanded(n).await;
+        assert_eq!(head.len(), n);
+        bus.advance(message(head.last().unwrap()).seq).await;
+    }
+}
+
+fn restarted_marker(found_at_ms: i64) -> delivery::StatusBody {
+    delivery::StatusBody::Restarted(delivery::TransportRestarted {
+        found_at_ms,
+        mqtt: Some(delivery::MqttRestarted {
+            client: CLIENT.to_string(),
+        }),
+    })
+}
+
+/// One marker per status channel named behind the position, however many
+/// messages named it; nothing for a message naming none or one still ahead.
+#[tokio::test]
+async fn the_restart_pass_tells_each_status_channel_behind_the_position_once() {
+    let f = Fixture::new().await;
+    let bus = f.hub.open(CLIENT).await.bus;
+    f.commit_publish_as(&identity(BOB), b"on", named("lights/a/set", BOB_STATUS))
+        .await;
+    f.commit_n(1).await;
+    f.commit_publish_as(&identity(BOB), b"on", named("lights/b/set", BOB_STATUS))
+        .await;
+    f.hand(&bus, 3).await;
+    // Ahead of the position: the reader hands it as usual.
+    f.commit_publish_as(&identity(CAROL), b"on", named("lights/c/set", CAROL_STATUS))
+        .await;
+
+    assert_eq!(f.hub.tell_restarted(CLIENT, 1_795_599_990_000).await, 1);
+    assert_eq!(f.bodies().await, [restarted_marker(1_795_599_990_000)]);
+    assert!(f.alerts().await.is_empty(), "Carol's channel was not tried");
+    assert_eq!(f.hub.counts(CLIENT).status_unpublished, 0);
+}
+
+/// Two status channels behind the position, their messages interleaved:
+/// each is told once, by its own sender.
+#[tokio::test]
+async fn the_restart_pass_tells_every_status_channel_named() {
+    let f = Fixture::new().await;
+    let bus = f.hub.open(CLIENT).await.bus;
+    f.commit_publish_as(&identity(BOB), b"on", named("lights/a/set", BOB_STATUS))
+        .await;
+    f.commit_publish_as(&identity(DAVE), b"on", named("lights/b/set", DAVE_STATUS))
+        .await;
+    f.commit_publish_as(&identity(BOB), b"on", named("lights/c/set", BOB_STATUS))
+        .await;
+    f.hand(&bus, 3).await;
+
+    assert_eq!(f.hub.tell_restarted(CLIENT, 11).await, 2);
+    assert_eq!(f.bodies().await, [restarted_marker(11)]);
+    assert_eq!(f.bodies_on(DAVE_STATUS).await, [restarted_marker(11)]);
+    assert!(f.alerts().await.is_empty());
+    assert_eq!(f.hub.counts(CLIENT).status_unpublished, 0);
+}
+
+/// A refused channel tried first does not keep a later channel from being
+/// told, and a told channel does not hide the refused one: one alert, naming
+/// only the refused channel.
+#[tokio::test]
+async fn the_restart_pass_refuses_one_channel_and_tells_the_others() {
+    let f = Fixture::new().await;
+    let bus = f.hub.open(CLIENT).await.bus;
+    f.commit_publish_as(&identity(BOB), b"on", named("lights/a/set", BOB_STATUS))
+        .await;
+    f.commit_publish_as(&identity(DAVE), b"on", named("lights/b/set", DAVE_STATUS))
+        .await;
+    // The newest, so its channel is tried first; it is not declared.
+    f.commit_publish_as(&identity(CAROL), b"on", named("lights/c/set", CAROL_STATUS))
+        .await;
+    f.hand(&bus, 3).await;
+
+    assert_eq!(f.hub.tell_restarted(CLIENT, 13).await, 2);
+    assert_eq!(f.bodies().await, [restarted_marker(13)]);
+    assert_eq!(f.bodies_on(DAVE_STATUS).await, [restarted_marker(13)]);
+    assert_eq!(f.hub.counts(CLIENT).status_unpublished, 1);
+    let alerts = f.alerts().await;
+    let [(_, body)] = alerts.as_slice() else {
+        panic!("one alert, got {alerts:?}");
+    };
+    assert!(body.contains(CAROL_STATUS), "{body}");
+    assert!(!body.contains(BOB_STATUS), "{body}");
+    assert!(!body.contains(DAVE_STATUS), "{body}");
+}
+
+/// Nothing behind the position names a status channel: nobody is told.
+#[tokio::test]
+async fn the_restart_pass_over_nothing_named_tells_nobody() {
+    let f = Fixture::new().await;
+    let bus = f.hub.open(CLIENT).await.bus;
+    f.commit_n(2).await;
+    f.hand(&bus, 2).await;
+    assert_eq!(f.hub.tell_restarted(CLIENT, 7).await, 0);
+    assert!(f.bodies().await.is_empty());
+}
+
+/// The newest sender naming a channel is tried first; when its publish is
+/// refused, an older sender's authority carries the marker, and nothing is
+/// raised.
+#[tokio::test]
+async fn the_restart_pass_falls_back_to_an_older_senders_authority() {
+    let f = Fixture::new().await;
+    let bus = f.hub.open(CLIENT).await.bus;
+    f.commit_publish_as(&identity(BOB), b"on", named("lights/a/set", BOB_STATUS))
+        .await;
+    // Carol may not write Bob's channel; her message is the newer.
+    f.commit_publish_as(&identity(CAROL), b"on", named("lights/b/set", BOB_STATUS))
+        .await;
+    f.hand(&bus, 2).await;
+
+    assert_eq!(f.hub.tell_restarted(CLIENT, 9).await, 1);
+    assert_eq!(f.bodies().await, [restarted_marker(9)]);
+    assert!(f.alerts().await.is_empty());
+    assert_eq!(f.hub.counts(CLIENT).status_unpublished, 0);
+}
+
+/// Every sender refused: the refusal is counted and raised as a status not
+/// published, naming the marker and no message.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_refused_restart_marker_is_counted_and_alerted_without_a_message_id() {
+    let f = Fixture::new().await;
+    let bus = f.hub.open(CLIENT).await.bus;
+    let id = f
+        .commit_publish_as(&identity(CAROL), b"on", named("lights/a/set", CAROL_STATUS))
+        .await;
+    f.hand(&bus, 1).await;
+
+    assert_eq!(f.hub.tell_restarted(CLIENT, 9).await, 0);
+    assert_eq!(f.hub.counts(CLIENT).status_unpublished, 1);
+    let alerts = f.alerts().await;
+    let [(title, body)] = alerts.as_slice() else {
+        panic!("one alert, got {alerts:?}");
+    };
+    assert_eq!(title, "MQTT egress: status not published (home)");
+    assert!(body.contains("\"restarted\" status"), "{body}");
+    assert!(body.contains(CAROL_STATUS), "{body}");
+    assert!(body.contains("unclean restart"), "{body}");
+    assert!(!body.contains(&id.to_string()), "{body}");
+    assert!(logs_contain("status=\"restarted\""));
+    assert!(!logs_contain(&id.to_string()));
 }

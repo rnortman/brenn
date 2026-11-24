@@ -1249,8 +1249,9 @@ webhook ingress channels (`webhook:<slug>`), the MQTT ingress channels
 (`mqtt:<client>:<topic>`), the async-tool substrate's request and result
 channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`,
 `brenn:app-tool-results/<app-slug>`), the per-user
-device-location channels (`brenn:device-location.<username>`), and the MQTT
-egress channels (`brenn:egress/mqtt/<client>`, §2.7.3). Nothing in config
+device-location channels (`brenn:device-location.<username>`), the MQTT
+egress channels (`brenn:egress/mqtt/<client>`, §2.7.3), and the MQTT
+connection-state channels (`brenn:mqtt-connection.<client>`, §2.7.3). Nothing in config
 brings these into existence as channels — an endpoint block, a subscription, a
 registered tool, a registered user or an `mqtt_client` block does — so there
 is no declaring `[[channel]]` block to carry their depths.
@@ -1265,6 +1266,7 @@ a bounded in-code default:
 | `brenn:tools/<tool>`, `brenn:tool-results/<slug>`, `brenn:app-tool-results/<app-slug>` | 1 | 16 | 16 |
 | `brenn:device-location.<username>` | 1 | 2000 | 2000 |
 | `brenn:egress/mqtt/<client>` | 1 | 256 | 256 |
+| `brenn:mqtt-connection.<client>` | 1 | 8 | 8 |
 
 Ingress channels are fact channels; at their arrival rates a hundred messages is
 a horizon of days to months, which is what "sized for the outage you intend to
@@ -1327,6 +1329,31 @@ publish` matcher can let any component write to a user's channel, and the
 `DeviceLocation` tool skips and logs anything else. The body has **no
 compatibility guarantee**: it may change between releases, and a reader
 outside this repository is built against the release it runs with.
+
+A `brenn:mqtt-connection.<client>` channel holds one declared `mqtt_client`'s
+connection state; its newest message is the state, and each message subsumes
+the one before. Brenn mints one per declared client — one nothing is bound
+through included — at boot and when a reload adds the client, and writes it
+only as the system participant `system:mqtt-connection`. Its depths and its send
+rate are the host's: retain 8, which owes a reader the newest message and gives
+a subscriber a few transitions behind room to resume without a reported drop,
+and 240 in a burst and 30 a second sustained, whatever `[messaging]
+default_send_rate` says. A `[[channel]]` block that names the family — an exact
+address, the prefix `brenn:mqtt-connection.`, or any longer prefix — is refused:
+"the connection-state channel's depth and send rate are the host's". **No
+configuration can grant a write**: an `acl publish` matcher reaching into
+`brenn:mqtt-connection.` is refused at start and at DSL compile time, and so is
+an `out` or `io` port on it, because the host reads the newest message back at
+boot to decide whether the previous process stopped the client cleanly (§2.7.3,
+*Connection state*). Nothing may read it until the operator grants it: an agent
+by `acl subscribe [exact "brenn:mqtt-connection.<client>"]` and a runtime
+`MessageSubscribe`, a component by an `in` port bound to the address, which
+must name a declared client. Grant the exact address: a client slug may contain
+`.`, so a prefix ending in one client's slug and `.` also reaches every client
+whose slug continues it, and `prefix "brenn:mqtt-connection."` reaches every
+client's state. A runtime subscription on the channel makes a reload that
+removes its client answer `NEEDS_RESTART`, as for every system-minted channel
+(below). The body is in §2.7.3.
 
 A consumer's `brenn:tool-results/<slug>` inbox feeds its reserved `tool-results`
 input port: the substrate subscribes the consumer to its own inbox at that
@@ -1392,7 +1419,8 @@ three depths are required — a block that tunes states every number. `noise`,
 `wake_min`, `sink` and `send_rate` are optional and inherit the `[messaging]`
 globals, exactly as on a declaring block — except `send_rate` on a
 `brenn:tool-results/` or `brenn:app-tool-results/` inbox, which is the host's
-and refused in the block. An app's result inbox is tuned by its exact address,
+and refused in the block — and the MQTT connection-state family, which no block
+may name at all. An app's result inbox is tuned by its exact address,
 which must name an app holding an asynchronous tool grant, or by the prefix
 `brenn:app-tool-results/`; a block over `brenn:tool-results/` sizes component
 inboxes only. An
@@ -1445,7 +1473,7 @@ sits on it — folded or dormant — is refused instead, and needs a restart; so
 one that **removes** a channel the subscription is still folded into, or one
 carrying a dormant subscription on a system-minted address — `mqtt:`,
 `webhook:`, `brenn:tools/…`, `brenn:tool-results/…`,
-`brenn:device-location.…` — whose channel a fresh boot
+`brenn:device-location.…`, `brenn:mqtt-connection.…` — whose channel a fresh boot
 rebuilds from its stored row with no block declaring it. Removing an
 operator-declared channel — one a fresh boot cannot rebuild that way — under a
 *dormant* subscription is applied and leaves it as a restart leaves it: dormant,
@@ -2127,7 +2155,11 @@ when nothing is in flight, when the connection ends, or after the client's
 unanswered then is reported unknown. Only after the reader's last report has
 committed is the DISCONNECT sent. A stop with nothing in flight does not
 wait. A server shutdown stops every session at once and does not exit until
-each has finished.
+each has finished; then it writes `stopped` on the connection-state channel
+(*Connection state*, below) of every client it still holds open — one a
+configuration reload is adding, changing or removing at that moment gets its
+`stopped` from the reload instead — which is how the next process knows the
+stop finished.
 
 **Overflow.** The egress channel is a window like any other: an outage longer
 than the window drops the oldest. Window overflow is the bus's to report, not
@@ -2162,8 +2194,8 @@ it `dropped`, `removed` — by count to the operator, and to each message's
 release order. A release before the close lands among the unread; a park after
 it is answered as for an unknown client. The subscriber entry is removed, and the
 channel leaves the directory. The close is the same whether or not the reader
-was still running, so a removal that races a server shutdown is reported the
-same way. A reload that removes or changes a client waits for that
+was still running, so a server shutdown that has already stopped the reader
+changes nothing it reports. A reload that removes or changes a client waits for that
 client's stop (Stopping, above): the removed clients' readers are retired
 together, each waiting up to its client's `stop_wait_secs`, and then the
 changed clients' sessions are stopped together, under the same rule. A reload
@@ -2177,6 +2209,15 @@ channel's stored row and retained messages stay in the database
 (`TODO(mqtt-egress-removed-client-rows)`). One that changes a client keeps the
 channel and the cursor and starts a reader on the successor session.
 
+The client's connection-state channel follows the same steps. A reload that
+adds a client mints it and writes the client's first state before the reader
+starts. One that removes a client writes `stopped` on it once the reader is
+retired and the egress channel closed, and then the channel leaves the
+directory. One that changes a client writes no `stopped`: the predecessor's
+stop is published as `disconnected`, the successor's states follow it, and
+`previous_session` is unchanged, since a replaced session is neither a restart
+nor an unclean end.
+
 **A fresh position.** A position created on a channel that already retains
 messages — a client added again under a slug that was removed — skips them:
 they were committed for the earlier client and are not published. Each was
@@ -2189,6 +2230,76 @@ the new client's broker. The deletion comes before the skip, so a release
 racing the open is either skipped or finds nothing to release. Both are logged at
 `warn` with their counts, and neither is reported to a sender. A restart resumes an existing position and
 hands off exactly what was not handed.
+
+#### Connection state
+
+Every `[[mqtt_client]]` also has one connection-state channel,
+`brenn:mqtt-connection.<client>` (§2.7 says who writes it, its sizing and how
+the operator grants it). Its newest message is the client's state; a reader
+needs nothing older.
+
+```json
+{"v":1,"client":"ha","connection":"disconnected","last_error":"connection refused",
+ "since_ms":1795600000000,
+ "previous_session":{"end":"unclean","found_at_ms":1795599990000}}
+```
+
+`connection` is one of:
+
+| `connection` | meaning |
+|---|---|
+| `connected` | the client holds a connection to its broker |
+| `disconnected` | not connected: the client is connecting or will retry; `last_error`, when present, is the last failure's text, and survives the attempt that follows it |
+| `failed` | stopped for good after an authoritative failure (wrong credentials, a broker that refuses the client), until its `mqtt_client` block is reloaded or the server restarts; `reason` is the failure's text, and a `Critical` alert says the same |
+| `stopped` | the session has stopped and hands nothing more: the server is shutting down, or the client was removed |
+
+`since_ms` is when `connection` last changed word, in Unix milliseconds; a
+retry whose error text differs publishes a new message with the same
+`since_ms`. `last_error` and `reason` are the broker's or the transport's
+words, sanitized and capped at 256 bytes. A state is published only when the
+body changes, so a broker that stays down is one `disconnected` message, and
+another only when its error text changes. A client that flaps faster than the
+writer publishes the newest state and skips the ones between, which is the
+rule for a signal.
+
+`previous_session` is fixed when this process opens the client — at boot, or at
+the reload that adds it — and repeated on every message:
+
+| `end` | when |
+|---|---|
+| `none` | there is no session to speak of: the client's egress position was created now (a database's first boot, a client added while the server was down, a slug removed and added again), or the position resumed and the state channel held nothing (the first boot of this version over an older database) |
+| `clean` | the previous process wrote `stopped` on the channel, so it finished stopping the client, and every `handed` it published has its outcome |
+| `unclean` | the previous process held the client and did not write `stopped`: it crashed or was killed, during the stop wait included, or it stopped and the write did not commit (*A refused write*, below; the `restarted` marker's limits in *Delivery status*); or the record could not be read, which the operator is told at `error` with a `Critical` alert. Every sender that may hold an unanswered `handed` is sent a `restarted` status (*Delivery status*, below), and a `Warning` alert names the client and how many status channels were told |
+
+`found_at_ms` is when this process opened the client and read the record, in
+Unix milliseconds. Every hand-off of this process is later, and every session
+that handed anything earlier has ended. `end` speaks only of the session
+immediately before this process: a crash followed by a clean restart reads
+`clean`. `found_at_ms` is what survives any number of restarts, and what a
+sender resolves a silence by (*What a sender may infer*, below).
+
+The `connection` and `end` words are closed in v1: a new one moves `v`.
+Unknown fields are ignored. A reader believes only `sender`
+`system:mqtt-connection`; no configuration can grant anyone else a write, and
+the host panics at boot if the newest message has any other sender.
+
+**A refused write.** The first state of a client must commit before its reader
+hands anything, and a refusal of it stops the boot (or the reload): it can
+only be a host bug, or `[messaging] max_body_bytes` set below a state body,
+which the panic names. A later state refused by the send rate is retried at the
+next change or after one second, whichever is first, publishing the newest
+state then, and one `Warning` alert is raised per run of refusals; the channel
+is wrong for at most a second past the end of a flap, and the rate is far
+above what a client's backoff allows. A refused `stopped` is logged at `error`
+and alerted; the record then does not say `stopped`, so the next boot reads
+`unclean` and tells senders who did not need it — the failure is in the
+telling direction.
+
+**A removed client's channel** leaves the directory; its stored row and its
+messages, the last of them `stopped`, stay in the database
+(`TODO(mqtt-egress-removed-client-rows)`). If the slug returns, its egress
+position is created, `end` is `none`, and the new client's first message
+subsumes the old ones for every reader.
 
 #### Delivery status
 
@@ -2221,7 +2332,19 @@ The top level is general: `v`, `message_id` (the id the publish answered),
 `kind`, and `reason` (`rejected`) or `cause` (`unknown`, `dropped`). `mqtt` is
 the transport's member — client, topic, QoS, and the broker's MQTT 5 reason
 code when a broker refused the message, on `rejected` and on `unknown` with
-cause `resend_refused` — and a status need not carry it. Kinds are closed
+cause `resend_refused` — and a status need not carry it.
+
+One kind concerns a transport, not a message, and has no `message_id`:
+
+```json
+{"v":1,"kind":"restarted","found_at_ms":1795599990000,"mqtt":{"client":"ha"}}
+```
+
+`restarted` says that the new process read the client's previous session as
+`unclean` (`previous_session`, above), and `found_at_ms` is when it did, the
+same instant its connection-state channel carries as
+`previous_session.found_at_ms`. A reader matches on `kind` before it reads
+`message_id`. Kinds are closed
 in v1: a new kind moves `v`. Causes are open: a reader treats a cause word it
 does not know as some other cause. Unknown fields are ignored.
 
@@ -2230,8 +2353,12 @@ rule one the publishing app may itself write, so anything else on it may be
 the app's own traffic. The sender says the host wrote a status, not whose
 message it concerns. Every app whose `brenn_publish` ACL admits a channel may
 name it, and every conversation of one app publishes as that app, so a reader
-matches `message_id` against the ids its own publishes returned and ignores
-the rest.
+matches a message kind's `message_id` against the ids its own publishes
+returned and ignores the rest. A `restarted` names no message: it is published
+on the authority of the first sender, among those that named the channel on a
+message the previous process may have handed, whose policy admits it now —
+which need not be the reader's own app — and it concerns every unanswered
+`handed` on that channel for its client.
 
 | kind | cause | meaning |
 |---|---|---|
@@ -2246,6 +2373,24 @@ the rest.
 | `dropped` | `stopped` | never sent: the library never accepted it, and the session stopped or its client began to be removed while the reader held it; it is not handed during the stop |
 | `dropped` | `removed` | never sent: not yet read when its client was removed |
 | `dropped` | `left_retention` | its payload left the blob store before it was handed over |
+| `restarted` | | about the client in `mqtt.client`, not a message: its previous session ended uncleanly, and a `handed` from before it with no outcome will never have one |
+
+**The `restarted` marker.** When a client's previous session ended uncleanly,
+the new process reads what the client's egress channel still holds behind the
+reader's position — the messages the previous process handed or stepped over —
+and publishes one `restarted` to each distinct `status_to` named there, before
+the client's reader hands anything. So on one status channel a sender reads
+`handed`, no outcome, `restarted`, and only then statuses of the new process.
+It is sent only for a record that reads `unclean`: a deploy whose `stopped`
+committed wakes nobody. Its limits: a sender all of whose messages had finished
+is told too; a crash during the marker pass sends it again at the next boot, so
+a sender may see it twice; a clean stop that overlaps a configuration reload
+can be read as unclean at the next boot, so a sender may receive a `restarted`
+after a stop in which every `handed` had its outcome
+(`TODO(shutdown-does-not-quiesce-reload)`); a `status_to` whose message has left the egress window is not
+told; and the first boot of a version that has the marker announces no crash
+of the process before it. A marker no sender's authority admits is logged,
+counted and alerted as *status not published*, naming the marker.
 
 **What a sender may infer.**
 
@@ -2271,9 +2416,30 @@ the rest.
 - `delivered` at QoS 0 says the message was written to the connection, not
   that the broker took it. A sender that needs the broker's answer publishes
   at QoS 1 or 2.
-- `handed` with no outcome after a server restart means the server did not
-  stop cleanly — it crashed or was killed — and nobody knows. A clean stop
-  commits an outcome for every `handed` before the process exits.
+- `handed` with no outcome, then `restarted` for its client: the server did
+  not stop cleanly — it crashed or was killed — and nobody knows whether the
+  message arrived. A clean stop commits an outcome for every `handed` before
+  the process exits.
+- `handed` with no outcome and no `restarted`: either it is still in flight,
+  or a restart the marker missed (the message had left the egress window, the
+  marker was refused, or the restart was the first boot of a version that has
+  the marker). The client's connection-state channel settles which by one
+  comparison: **a `handed` whose envelope `publish_ts` is earlier than the
+  newest state message's `previous_session.found_at_ms`, and that has no
+  outcome, will never have one — nobody knows whether the message arrived —
+  whatever `end` says**; a `handed` later than `found_at_ms` is still in
+  flight. Only the session that handed a message reports its outcome, and
+  `found_at_ms` is when this process opened the client, so every session that
+  handed anything earlier has ended — cleanly, having committed every outcome
+  it could, or not. `end` is not part of the rule: it describes only the
+  session immediately before this process, so after a crash and then a clean
+  restart it reads `clean` while the crash's `handed` is still unanswered. The
+  rule holds where `end` is `none` too, and a reload that replaces a session
+  does not disturb it: the replaced session reports what it had in flight and
+  `found_at_ms` is unchanged. A sender relying on `status_to` therefore needs
+  a read grant on `brenn:mqtt-connection.<client>`: `acl subscribe [exact
+  "brenn:mqtt-connection.<client>"]` for an agent, an `in` port bound to the
+  address for a component (§2.7). Nothing is granted by default.
 - No `handed` by the end of the lifetime means the message was not sent —
   except when the `handed` status itself could not be published, in which
   case the message may have been sent and the operator, not the sender,
@@ -2286,16 +2452,20 @@ the rest.
 - Silences. A message the egress channel's window dropped before the
   reader reached it gets no status: the store reports overflow as a count. A
   message in flight when the server crashed has a `handed` and never an
-  outcome, and a server that dies while a removal is being reported leaves
-  the rest of that removal unreported. And nothing is published while the client has no connection: `expired`
+  outcome — the `restarted` marker and the connection state's `found_at_ms`
+  (above) are how a sender learns that — and a server that dies while a removal is being reported, or
+  that stops cleanly while a configuration reload is still reporting one
+  (`TODO(shutdown-does-not-quiesce-reload)`), leaves the rest of that removal
+  unreported. And nothing is published while the client has no connection: `expired`
   comes when a connection next lets the reader reach the message — hours
   later if the client is down that long, never if it stays down or the window
   drops the message first. What a removed client's channel still holds
   unread or parked is told nothing when the client is deleted from the configuration
   while the server is down (Reload, above;
   `TODO(mqtt-egress-removed-client-rows)`); a message sent with `lifetime_s`
-  `"forever"` then has no end of lifetime to infer from. A clean shutdown is not a silence: it waits for every session's
-  reader and commits every status before the process exits.
+  `"forever"` then has no end of lifetime to infer from. A clean shutdown is not a silence for what a session's reader
+  had taken: it waits for every session's reader and commits every status the
+  readers owe before the process exits.
 
 **When a status is not published.** A status is published at report time on
 the sender's authority as it stands then: the app named in the stored sender

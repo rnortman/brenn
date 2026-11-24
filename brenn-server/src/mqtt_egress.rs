@@ -9,6 +9,8 @@
 //! settles a removed client's channel: it gives up the position and reports
 //! every message the channel held unread or parked `dropped`, `removed`,
 //! whether or not the client's reader was still running.
+//! [`MqttEgressHub::tell_restarted`] tells every status channel named behind a
+//! resumed position that the client's previous session ended uncleanly.
 //!
 //! Every report but `Delivered`, `Drained`, `Handed` and `PayloadGone` is
 //! logged and counted. One whose message names a `status_to` is first
@@ -36,7 +38,7 @@ use uuid::Uuid;
 use brenn_common::sanitize_untrusted_str;
 use brenn_envelope::delivery::{
     DELIVERY_REASON_MAX_BYTES, DeliveryDropCause, DeliveryKind, DeliveryStatus,
-    DeliveryUnknownCause, MqttDelivery,
+    DeliveryUnknownCause, MqttDelivery, MqttRestarted, StatusBody, TransportRestarted,
 };
 use brenn_envelope::{MessageEnvelope, MqttPublishTransport, TransportMeta};
 use brenn_lib::messaging::config::Depth;
@@ -127,6 +129,15 @@ enum DropCause {
     Removed,
 }
 
+/// What a refused status was about.
+#[derive(Debug, Clone, Copy)]
+enum Concerning {
+    /// One message, by id, and the status's kind word.
+    Message { id: Uuid, kind: &'static str },
+    /// The client's unclean restart.
+    Restart,
+}
+
 /// Whether a report's message was told of it on its `status_to`.
 #[derive(Debug)]
 enum Told {
@@ -135,11 +146,19 @@ enum Told {
     Published,
     /// The bus refused the status: what the operator is told of it.
     Refused {
-        message_id: Uuid,
+        concerning: Concerning,
         status_to: String,
-        kind: &'static str,
         refusal: DeliveryStatusRefusal,
     },
+}
+
+/// A client's egress channel as [`MqttEgressHub::open`] left it.
+pub struct OpenedEgress {
+    /// The reader's view of the participant's position.
+    pub bus: Arc<dyn EgressBus>,
+    /// Whether the position already existed and resumed, rather than being
+    /// created here.
+    pub resumed: bool,
 }
 
 /// One client's tallies and open episodes.
@@ -183,7 +202,7 @@ impl MqttEgressHub {
     }
 
     /// Attach the participant's position on `client`'s egress channel and
-    /// return the reader's view of it.
+    /// return the reader's view of it, with whether the position resumed.
     ///
     /// An existing position resumes, so a restart or a successor session
     /// hands off exactly what was not handed. A position created here first
@@ -195,7 +214,7 @@ impl MqttEgressHub {
     /// # Panics
     ///
     /// If the channel is not in the directory.
-    pub async fn open(self: &Arc<Self>, client: &str) -> Arc<dyn EgressBus> {
+    pub async fn open(self: &Arc<Self>, client: &str) -> OpenedEgress {
         let address = mqtt_egress_address(client);
         let push_depth = self.channel_depth(&address);
         let bus = Arc::new(ClientEgress {
@@ -213,7 +232,11 @@ impl MqttEgressHub {
                 push_depth,
             )
             .await;
-        if matches!(attached, Attached::Created) {
+        let resumed = match attached {
+            Attached::Existing => true,
+            Attached::Created => false,
+        };
+        if !resumed {
             // Only the counts are logged: every skipped or deleted message has
             // had its report, an outcome while its client ran or `dropped`,
             // `removed` when the client was removed, except what a client
@@ -237,7 +260,99 @@ impl MqttEgressHub {
             .expect(HUB_POISONED)
             .entry(client.to_string())
             .or_default();
-        bus
+        OpenedEgress { bus, resumed }
+    }
+
+    /// Tell every status channel named by a message behind the participant's
+    /// position on `client`'s egress channel that the client's previous
+    /// session ended uncleanly, found at `found_at_ms`, and return how many
+    /// were told.
+    ///
+    /// One `restarted` per distinct `status_to`, published on the authority
+    /// of the newest sender that named it whose publish is admitted; when
+    /// every such sender is refused, the last refusal is logged, counted and
+    /// alerted as a status not published. Messages ahead of the position are
+    /// not consulted: the reader hands them as usual.
+    ///
+    /// # Panics
+    ///
+    /// If the channel is not in the directory or `open` has not attached the
+    /// participant's position on it.
+    pub async fn tell_restarted(&self, client: &str, found_at_ms: i64) -> u64 {
+        let address = mqtt_egress_address(client);
+        let depth = self.channel_depth(&address);
+        let window = self
+            .messenger
+            .store_for_address(&address)
+            .window(&self.participant, depth, depth)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "MQTT egress: the restart pass of client {client:?} found no position on \
+                     {address}"
+                )
+            });
+        // Each status channel with its senders, newest message first.
+        let mut named: Vec<(String, Vec<String>)> = Vec::new();
+        for (_, envelope) in window.entries[..window.new_from].iter().rev() {
+            let Some(status_to) = egress_publish(&address, envelope).status_to.as_deref() else {
+                continue;
+            };
+            let senders = match named.iter_mut().find(|(to, _)| to == status_to) {
+                Some((_, senders)) => senders,
+                None => {
+                    named.push((status_to.to_owned(), Vec::new()));
+                    &mut named.last_mut().expect("just pushed").1
+                }
+            };
+            if !senders.contains(&envelope.sender) {
+                senders.push(envelope.sender.clone());
+            }
+        }
+        let marker = StatusBody::Restarted(TransportRestarted {
+            found_at_ms,
+            mqtt: Some(MqttRestarted {
+                client: client.to_owned(),
+            }),
+        });
+        let mut told = 0u64;
+        for (status_to, senders) in named {
+            let mut refused = None;
+            for sender in &senders {
+                match self
+                    .messenger
+                    .publish_delivery_status(sender, &status_to, &marker)
+                    .await
+                {
+                    DeliveryStatusPublish::Published => {
+                        refused = None;
+                        told += 1;
+                        break;
+                    }
+                    DeliveryStatusPublish::Refused(refusal) => refused = Some(refusal),
+                }
+            }
+            if let Some(refusal) = refused {
+                let mut alerts = Vec::new();
+                {
+                    let mut clients = self.clients.lock().expect(HUB_POISONED);
+                    let state = clients.get_mut(client).unwrap_or_else(|| {
+                        panic!(
+                            "MQTT egress: the restart pass of client {client:?}, whose channel \
+                             is not open"
+                        )
+                    });
+                    Recording {
+                        client,
+                        state,
+                        alerts: &mut alerts,
+                    }
+                    .status_refused(Concerning::Restart, &status_to, &refusal);
+                }
+                self.raise(alerts);
+            }
+        }
+        told
     }
 
     /// Settle a removed client's egress channel: give up the participant's
@@ -363,13 +478,12 @@ impl MqttEgressHub {
                 alerts: &mut alerts,
             };
             if let Told::Refused {
-                message_id,
+                concerning,
                 status_to,
-                kind,
                 refusal,
             } = &told
             {
-                recording.status_refused(*message_id, status_to, kind, refusal);
+                recording.status_refused(*concerning, status_to, refusal);
             }
             let told = matches!(told, Told::Published);
             match report {
@@ -471,16 +585,23 @@ impl MqttEgressHub {
             .status_to
             .as_deref()
             .expect("only a message naming a status_to has a status");
+        let kind = kind_label(&status.kind);
         match self
             .messenger
-            .publish_delivery_status(&message.sender, status_to, status)
+            .publish_delivery_status(
+                &message.sender,
+                status_to,
+                &StatusBody::Message(status.clone()),
+            )
             .await
         {
             DeliveryStatusPublish::Published => Told::Published,
             DeliveryStatusPublish::Refused(refusal) => Told::Refused {
-                message_id: message.id,
+                concerning: Concerning::Message {
+                    id: message.id,
+                    kind,
+                },
                 status_to: status_to.to_string(),
-                kind: kind_label(&status.kind),
                 refusal,
             },
         }
@@ -651,33 +772,49 @@ struct Recording<'a> {
 }
 
 impl Recording<'_> {
-    /// Log the `kind` status about message `message_id` that the bus refused
-    /// on `status_to`, count it, and open the "status not published" episode
-    /// with an alert or count it as withheld.
+    /// Log the status `concerning` a message or the restart that the bus
+    /// refused on `status_to`, count it, and open the "status not published"
+    /// episode with an alert or count it as withheld.
     fn status_refused(
         &mut self,
-        message_id: Uuid,
+        concerning: Concerning,
         status_to: &str,
-        kind: &str,
         refusal: &DeliveryStatusRefusal,
     ) {
         let client = self.client;
         self.state.counts.status_unpublished += 1;
         let address = sanitize_untrusted_str(status_to, UNTRUSTED_TEXT_MAX);
         let why = refusal_text(refusal);
-        tracing::warn!(
-            mqtt_client = client,
-            message_id = %message_id,
-            status = kind,
-            status_to = %address,
-            refusal = %why,
-            "MQTT egress: a delivery status was not published"
-        );
-        let body = format!(
-            "MQTT client {client:?}: the {kind:?} status of message {} could not be published \
-             to {address}: {why}. Its sender was not told.",
-            message_id
-        );
+        let body = match concerning {
+            Concerning::Message { id, kind } => {
+                tracing::warn!(
+                    mqtt_client = client,
+                    message_id = %id,
+                    status = kind,
+                    status_to = %address,
+                    refusal = %why,
+                    "MQTT egress: a delivery status was not published"
+                );
+                format!(
+                    "MQTT client {client:?}: the {kind:?} status of message {id} could not be \
+                     published to {address}: {why}. Its sender was not told."
+                )
+            }
+            Concerning::Restart => {
+                tracing::warn!(
+                    mqtt_client = client,
+                    status = "restarted",
+                    status_to = %address,
+                    refusal = %why,
+                    "MQTT egress: a delivery status was not published"
+                );
+                format!(
+                    "MQTT client {client:?}: the \"restarted\" status could not be published to \
+                     {address}: {why}. Senders that name that channel were not told of the \
+                     unclean restart."
+                )
+            }
+        };
         self.open_or_withhold(FailureKind::StatusUnpublished, 1, body);
     }
 

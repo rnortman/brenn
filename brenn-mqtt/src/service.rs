@@ -48,6 +48,10 @@ pub enum SessionFault {
     /// is stopped until its `mqtt_client` block is reloaded or the server
     /// restarts.
     GaveUp { reason: String },
+    /// The broker refused the connection, or ended a connected session, with
+    /// an authoritative error. The client is stopped until its `mqtt_client`
+    /// block is reloaded or the server restarts.
+    Failed { reason: String },
 }
 
 /// Inbound delivery surface implemented by the binary crate, and the way the
@@ -410,7 +414,7 @@ impl MqttService {
                 ConnectorHealthLabel::Disconnected,
                 Some(NO_CLIENT_SESSION.to_string()),
             ),
-            Some(h) => h.health_snapshot().await,
+            Some(h) => h.health_snapshot(),
         }
     }
 
@@ -479,7 +483,7 @@ impl MqttService {
             .await
             .get(topic_filter)
             .map(|_| handle.config.identity.qos);
-        let (label, last_error) = handle.health_snapshot().await;
+        let (label, last_error) = handle.health_snapshot();
         (qos, label, last_error)
     }
 
@@ -535,10 +539,8 @@ impl MqttService {
         };
         let connected = handle.client.lock().await.is_some();
         let outcome = if !connected {
-            match &*handle.supervisor_state.read().await {
-                SupervisorState::Failed { reason } => {
-                    IngressSubscribeOutcome::ClientFailed(reason.clone())
-                }
+            match handle.state().state {
+                SupervisorState::Failed { reason } => IngressSubscribeOutcome::ClientFailed(reason),
                 _ => IngressSubscribeOutcome::DeferredDisconnected,
             }
         } else if let Some(e) = unsendable_filter(&sub.topic_filter) {
@@ -1066,9 +1068,9 @@ mod tests {
             let handle = make_handle("home");
             handle.add_subscription("sensors/#".to_string()).await;
             if failed {
-                *handle.supervisor_state.write().await = SupervisorState::Failed {
+                handle.set_state(SupervisorState::Failed {
                     reason: "bad credentials".to_string(),
-                };
+                });
             }
             svc.add_client(handle.clone());
 
@@ -1088,9 +1090,9 @@ mod tests {
         let svc = MqttService::new();
         let handle = make_handle("home");
         // Supervisor gave up permanently: the terminal state wins over the client cell.
-        *handle.supervisor_state.write().await = crate::state::SupervisorState::Failed {
+        handle.set_state(crate::state::SupervisorState::Failed {
             reason: "authoritative connect failure: boom".to_string(),
-        };
+        });
         svc.add_client(handle);
 
         let (label, err) = svc.ingress_health("home").await;
@@ -1106,9 +1108,9 @@ mod tests {
         // Register a filter so qos is a fact, then drive the session to Failed.
         svc.subscribe_filter("home", "sensors/+/temp".to_string())
             .await;
-        *handle.supervisor_state.write().await = crate::state::SupervisorState::Failed {
+        handle.set_state(crate::state::SupervisorState::Failed {
             reason: "authoritative disconnect: gone".to_string(),
-        };
+        });
 
         let (qos, label, err) = svc.ingress_filter_status("home", "sensors/+/temp").await;
         // The configured filter's QoS is still reported on a failed session.
@@ -1134,9 +1136,9 @@ mod tests {
             Some(IngressSubscribeOutcome::DeferredDisconnected)
         );
 
-        *handle.supervisor_state.write().await = SupervisorState::Failed {
+        handle.set_state(SupervisorState::Failed {
             reason: "authoritative connect failure: bad user name or password".to_string(),
-        };
+        });
         assert_eq!(
             svc.subscribe_filter("home", "sensors/other".to_string())
                 .await,

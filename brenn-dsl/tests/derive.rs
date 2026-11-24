@@ -2023,6 +2023,26 @@ fn a_block_tuning_a_request_inbox_is_refused() {
     }
 }
 
+/// The connection-state family's depth and rate are the host's, so no block
+/// tunes it: an exact address, the bare family prefix, or a longer prefix.
+#[test]
+fn a_block_tuning_the_mqtt_connection_family_is_refused() {
+    for block in [
+        tuning("brenn:mqtt-connection.bob_hub"),
+        prefix_tuning("brenn:mqtt-connection."),
+        prefix_tuning("brenn:mqtt-connection.bob_hub."),
+    ] {
+        let refusal = derive_refusal(&block);
+        assert!(
+            refusal.contains(
+                "is in the MQTT connection-state family, which no block tunes: the \
+                 connection-state channel's depth and send rate are the host's"
+            ),
+            "{refusal}"
+        );
+    }
+}
+
 /// The request inbox is the substrate's to mint, and the refusal does not
 /// point at a tuning block that would be refused in turn.
 #[test]
