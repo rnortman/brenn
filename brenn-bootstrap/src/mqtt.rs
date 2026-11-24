@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel};
 use brenn_mqtt::MqttService;
-use brenn_mqtt::{ArrivingFilters, register_and_spawn, union_subscriptions};
+use brenn_mqtt::{UnspawnedSession, register_client, union_subscriptions};
 use indexmap::IndexMap;
 use tracing::info;
 
@@ -59,9 +59,11 @@ pub(crate) fn boot_ingress(
     ingress
 }
 
-/// Build the MQTT service and spawn one unified supervisor per **declared**
-/// `[[mqtt_client]]`. Each session carries both the publish path and the
-/// ingress delivery + reconnect re-assert path.
+/// Build the MQTT service and its router, and register one client handle per
+/// **declared** `[[mqtt_client]]`. Each session will carry both the publish
+/// path and the ingress delivery + reconnect re-assert path. Nothing connects:
+/// the returned sessions are spawned by [`wire_and_spawn`], once the router
+/// has its state.
 ///
 /// The service and its router are built whether or not any client is declared;
 /// a document with none gets an empty registry.
@@ -71,18 +73,15 @@ pub(crate) fn boot_ingress(
 /// declaration, and an idle session costs a keepalive. That is what lets a
 /// reload converge the first `mqtt:` binding a document ever puts on a broker.
 ///
-/// `AppState` injection (`set_state` + `set_router`) must happen after
-/// `AppState` construction — same deferred-state pattern as `WakeRouterImpl`.
-///
 /// # Panics
 ///
 /// Panics if an ingress channel names a client this map does not declare. Such
 /// a channel would get a router route and no subscription — a channel that
 /// exists and can never receive.
-pub(crate) async fn start_mqtt(
+pub(crate) fn build_mqtt(
     mqtt_ingress_channels: &[ResolvedMqttIngressChannel],
     clients: &IndexMap<String, MqttClientConfig>,
-) -> MqttResult {
+) -> (MqttResult, Vec<UnspawnedSession>) {
     // The subscription union below silently skips a channel whose client is
     // not the one being built, so an ingress channel on an undeclared client
     // would subscribe nothing and still be routed — a channel that exists and
@@ -99,24 +98,21 @@ pub(crate) async fn start_mqtt(
 
     let svc = MqttService::new();
     let router = Arc::new(MqttEventRouterImpl::new());
-    let router_trait: Arc<dyn brenn_mqtt::MqttEventRouter> = router.clone();
 
-    // One unified supervisor per declared client, in the map's order — which
-    // nothing observes: `client_slugs` sorts, and the handles are reached by
-    // slug. A client's subscription set is
-    // the deduplicated union of its ingress-channel filters (empty for a client
-    // nothing receives through — a connected publisher with zero
-    // subscriptions).
+    // One handle per declared client, in the map's order — which nothing
+    // observes: `client_slugs` sorts, and the handles are reached by slug. A
+    // client's subscription set is the deduplicated union of its
+    // ingress-channel filters (empty for a client nothing receives through — a
+    // connected publisher with zero subscriptions).
+    let mut sessions = Vec::with_capacity(clients.len());
     for (client_slug, broker_cfg) in clients {
         let subscriptions = union_subscriptions(client_slug, mqtt_ingress_channels);
         let subscription_count = subscriptions.len();
-        register_and_spawn(
+        sessions.push(register_client(
             &svc,
             Arc::new(broker_cfg.clone()),
-            ArrivingFilters::Declared(subscriptions),
-            router_trait.clone(),
-        )
-        .await;
+            subscriptions,
+        ));
 
         // Per client, because a declared client with no binding is otherwise
         // invisible: the channel listing decorates `mqtt:` channel entries and
@@ -127,27 +123,33 @@ pub(crate) async fn start_mqtt(
             host = %broker_cfg.identity.host,
             port = broker_cfg.identity.port,
             subscriptions = subscription_count,
-            "MQTT client supervisor spawned"
+            "MQTT client registered"
         );
     }
 
-    MqttResult {
-        service: svc,
-        event_router: router,
-    }
+    (
+        MqttResult {
+            service: svc,
+            event_router: router,
+        },
+        sessions,
+    )
 }
 
-/// Inject AppState into the MQTT event router and service.
+/// Give the MQTT event router its `AppState` and route table, install it on
+/// the service, then spawn the supervisor of every session [`build_mqtt`]
+/// registered. The one place boot spawns a supervisor, so that none can hand
+/// the router a message before it can route it.
 ///
 /// # Panics
 ///
-/// Panics if called more than once (the `OnceCell` inside `MqttEventRouterImpl`
-/// does not allow re-setting).
-pub(crate) async fn wire_mqtt_state(
+/// Panics if called more than once.
+pub(crate) async fn wire_and_spawn(
     service: &Arc<MqttService>,
     router: &Arc<MqttEventRouterImpl>,
     state: brenn_server::state::AppState,
     mqtt_ingress_channels: &[ResolvedMqttIngressChannel],
+    sessions: Vec<UnspawnedSession>,
 ) {
     // Build the router's routing table from the distinct ingress channels, one
     // route per channel. The router fans inbound deliveries out to every
@@ -158,13 +160,17 @@ pub(crate) async fn wire_mqtt_state(
         .collect();
     let route_count = routes.len();
     router.set_state(state, routes);
-    service
-        .set_router(router.clone() as Arc<dyn brenn_mqtt::MqttEventRouter>)
-        .await;
+    let router_trait: Arc<dyn brenn_mqtt::MqttEventRouter> = router.clone();
+    service.set_router(router_trait.clone()).await;
+    let spawned = sessions.len();
+    for session in sessions {
+        session.spawn(router_trait.clone()).await;
+    }
     info!(
         clients = service.client_slugs().len(),
+        spawned,
         routes = route_count,
-        "MQTT service started; supervisors running"
+        "MQTT router wired; supervisors spawned"
     );
 }
 
@@ -251,43 +257,69 @@ mod tests {
         }
     }
 
-    // --- start_mqtt activation ---
+    // --- build_mqtt registration ---
 
     #[tokio::test]
     async fn activates_with_ingress_only_no_connectors() {
-        let result = start_mqtt(
+        let (result, sessions) = build_mqtt(
             &[test_ingress_channel("cl", "sensors/#")],
             &client_map(&["cl"]),
-        )
-        .await;
+        );
 
         assert_eq!(result.service.client_slugs(), vec!["cl".to_string()]);
+        assert_eq!(sessions.len(), 1);
         assert_eq!(result.service.stop_all(), 1);
     }
 
     #[tokio::test]
     async fn activates_for_a_declared_client_nothing_references() {
-        let result = start_mqtt(&[], &client_map(&["cl"])).await;
+        let (result, sessions) = build_mqtt(&[], &client_map(&["cl"]));
 
         assert_eq!(result.service.client_slugs(), vec!["cl".to_string()]);
+        assert_eq!(sessions.len(), 1);
         assert_eq!(result.service.stop_all(), 1);
     }
 
+    /// Every declared client is registered and none has a supervisor; after
+    /// `wire_and_spawn` every one has.
     #[tokio::test]
-    async fn spawns_one_session_per_declared_client() {
+    async fn build_registers_every_client_unspawned_and_wire_and_spawn_spawns_each() {
         // Declared in non-alphabetical order, so the sorted `client_slugs`
         // below is a statement about the set and not about the map's order.
-        let result = start_mqtt(
-            &[test_ingress_channel("ha", "home/state")],
-            &client_map(&["spare", "ha"]),
-        )
-        .await;
+        let ingress = [test_ingress_channel("ha", "home/state")];
+        let (result, sessions) = build_mqtt(&ingress, &client_map(&["spare", "ha"]));
 
         assert_eq!(
             result.service.client_slugs(),
             vec!["ha".to_string(), "spare".to_string()]
         );
+        for slug in ["ha", "spare"] {
+            let handle = result.service.get_client(slug).expect("registered");
+            assert!(
+                !handle.supervisor_spawned().await,
+                "{slug} has no supervisor before the router is wired",
+            );
+        }
+        assert!(!brenn_mqtt::MqttEventRouter::ready(&*result.event_router));
+
+        let db = brenn_server::test_support::init_db_memory();
+        wire_and_spawn(
+            &result.service,
+            &result.event_router,
+            brenn_server::test_support::state::test_state(&db),
+            &ingress,
+            sessions,
+        )
+        .await;
+
+        assert!(brenn_mqtt::MqttEventRouter::ready(&*result.event_router));
+        assert_eq!(result.event_router.route_uuids().len(), 1);
+        for slug in ["ha", "spare"] {
+            let handle = result.service.get_client(slug).expect("registered");
+            assert!(handle.supervisor_spawned().await, "{slug} is spawned");
+        }
         assert_eq!(result.service.stop_all(), 2);
+        assert_eq!(result.service.join_all().await, 2);
     }
 
     /// A route with no subscription behind it is a channel that exists and can
@@ -296,19 +328,19 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "which no `[[mqtt_client]]` declares")]
     async fn an_ingress_channel_on_an_undeclared_client_panics() {
-        start_mqtt(
+        let _ = build_mqtt(
             &[test_ingress_channel("ghost", "sensors/#")],
             &client_map(&["cl"]),
-        )
-        .await;
+        );
     }
 
     /// A document declaring no client still gets a service and a router, both
     /// with an empty registry.
     #[tokio::test]
     async fn an_empty_declaration_set_builds_an_empty_registry() {
-        let result = start_mqtt(&[], &IndexMap::new()).await;
+        let (result, sessions) = build_mqtt(&[], &IndexMap::new());
 
+        assert!(sessions.is_empty());
         assert!(result.service.client_slugs().is_empty());
         assert_eq!(result.service.stop_all(), 0);
         assert!(result.event_router.route_uuids().is_empty());

@@ -76,6 +76,8 @@ pub struct MqttClientConfigRaw {
     /// Broker-side session expiry in seconds for this client's single shared
     /// session. `0` (default) = ephemeral: the broker discards session state on
     /// disconnect.
+    // TODO(mqtt-session-expiry-ops-config): both production clients are
+    // declared with expiry 0.
     pub session_expiry_secs: u32,
     /// The longest a stop of this client's session waits for the broker: for
     /// the outcomes of messages in flight, then for the socket to take the

@@ -53,7 +53,7 @@ pub struct ResolvedConfig {
     pub webhook_endpoints: IndexMap<String, Arc<crate::webhook::ResolvedWebhookEndpoint>>,
     /// Resolved `[[mqtt_client]]` map, keyed by slug, with secret files
     /// (`password_file`/`ca_file`) read exactly once during startup. Threaded to
-    /// the bootstrap layer so the ingress-supervisor wiring (`start_mqtt`) looks
+    /// the bootstrap layer so the ingress-supervisor wiring (`build_mqtt`) looks
     /// up each client's config here instead of re-resolving (which would
     /// re-read every secret from disk a second time). Empty when no
     /// `[[mqtt_client]]` is declared.

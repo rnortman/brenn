@@ -71,12 +71,8 @@ impl From<&PlanDelta> for StatusDelta {
             // these filters can come back deferred at commit, and commit
             // narrows the list to the ones that did. Narrowing only shrinks the
             // body, so the size prepare proved publishable stands.
-            mqtt_deferred: delta
-                .mqtt
-                .subscribed()
-                .into_iter()
-                .chain(delta.mqtt.unsubscribed())
-                .collect(),
+            mqtt_deferred: delta.mqtt.subscribed(),
+            mqtt_unsubscribe_deferred: delta.mqtt.unsubscribed(),
             // The same worst case for the list of filters no reconnect will
             // assert: only a joining filter can land there, and any of them
             // can. Commit sorts each moved filter into exactly one of the two.
@@ -301,6 +297,7 @@ mod tests {
         // or — a joining one — on a client that has stopped retrying, and
         // commit narrows each list to the filters that landed there.
         assert_eq!(status.mqtt_deferred, vec!["mqtt:chef:a/b".to_string()]);
+        assert!(status.mqtt_unsubscribe_deferred.is_empty());
         assert_eq!(status.mqtt_failed, vec!["mqtt:chef:a/b".to_string()]);
         assert_eq!(status.mqtt_clients_added, vec!["spare".to_string()]);
         assert_eq!(status.mqtt_clients_removed, vec!["retired".to_string()]);

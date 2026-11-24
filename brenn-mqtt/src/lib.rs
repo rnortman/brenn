@@ -19,8 +19,10 @@
 //! - `service`    — `MqttService`, `MqttEventRouter` trait.
 //! - `reader`     — the per-client egress reader (`start_egress_reader`) and the
 //!   `EgressBus` view of a client's egress channel it reads through.
-//! - `connection` — unified per-client supervisor (`spawn_client_supervisor`) plus
-//!   the subscription helper `union_subscriptions`.
+//! - `connection` — unified per-client supervisor, brought up by
+//!   `register_client` then `UnspawnedSession::spawn` (or `register_and_spawn`
+//!   for both with a predecessor's handover), plus the subscription helper
+//!   `union_subscriptions`.
 //! - `test_support` — a `mosquitto` harness and its throwaway TLS material, for
 //!   this crate's integration suite and for the crates above that drive ingress
 //!   through a real broker. Behind the `testutils` feature.
@@ -34,7 +36,7 @@ pub mod state;
 pub mod test_support;
 
 pub use connection::{
-    ArrivingFilters, register_and_spawn, spawn_client_supervisor, union_subscriptions,
+    ArrivingFilters, UnspawnedSession, register_and_spawn, register_client, union_subscriptions,
 };
 pub use payload::{
     InboundClass, InboundPayload, OutboundArg, OutboundPayload, classify_inbound, decode_outbound,

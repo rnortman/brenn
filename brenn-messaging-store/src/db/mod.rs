@@ -107,14 +107,15 @@ pub(crate) use bus::LOAD_DISPATCHABLE_INGRESS_SQL;
 #[cfg(any(test, feature = "testutils"))]
 pub use bus::message_retained_seq;
 pub use bus::{
-    BusGcEviction, EditFieldsApplied, InsertedMessage, MessageLookup, RetainedByUuid,
-    bus_gc_evict_channel, channel_last_retained_seq, channel_resume_epoch,
+    BusGcEviction, EditFieldsApplied, InsertedMessage, MessageLookup, RETAINED_REPLAY_SCAN_ROWS,
+    RetainedByUuid, bus_gc_evict_channel, channel_last_retained_seq, channel_resume_epoch,
     channel_retained_count_after_seq, channel_retention_frontier, insert_message,
     insert_message_in_tx, list_pending_messages_for_sender, load_channel_messages_after_seq,
     load_channel_retained_from_seq, load_channel_retained_tail, load_channel_retained_window_seq,
     load_dispatchable_ingress_pushes, load_envelope_by_uuid, lookup_message_for_authorship,
-    mark_pending_pushes_delivered, primed_position, retained_message_by_uuid,
-    retained_tail_floor_seq, update_parked_message, withdraw_parked_message,
+    mark_pending_pushes_delivered, newest_retained_for_mqtt_topic, primed_position,
+    retained_message_by_uuid, retained_tail_floor_seq, update_parked_message,
+    withdraw_parked_message,
 };
 
 mod cursors;

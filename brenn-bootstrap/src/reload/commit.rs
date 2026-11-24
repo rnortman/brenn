@@ -65,16 +65,18 @@ use crate::reload::mqtt::address_of;
 use crate::reload::subscribers::PlannedSubscribers;
 use crate::reload::surfaces::{Arrival, SurfaceDocs};
 
-/// What the broker did not take during the walk, split by whether anything in
-/// this process will take it later.
+/// What the broker did not take during the walk, split by direction and by
+/// whether anything in this process will take it later.
 ///
-/// Both lists are addresses of moved filters and both are reported in the
-/// status body; the split is the whole point, because `deferred` converges by
-/// waiting and `failed` converges only after an operator fixes the client
-/// declaration and restarts.
+/// Every list holds addresses of moved filters and each is reported in the
+/// status body. `deferred` converges by waiting and `failed` converges only
+/// after an operator fixes the client declaration and restarts;
+/// `unsubscribe_deferred` holds the withdrawals that wait for the client's next
+/// connection.
 #[derive(Debug, Default)]
 pub(crate) struct MqttCommitReport {
     pub(crate) deferred: Vec<String>,
+    pub(crate) unsubscribe_deferred: Vec<String>,
     pub(crate) failed: Vec<String>,
 }
 
@@ -190,8 +192,8 @@ pub(crate) async fn apply(
     describe_channels(env, delta).await;
     start_added_clients(env, delta).await;
     let mut report = MqttCommitReport {
-        deferred: mqtt_outgoing(env, delta).await,
-        failed: Vec::new(),
+        unsubscribe_deferred: mqtt_outgoing(env, delta).await,
+        ..MqttCommitReport::default()
     };
     retire_egress_readers(env, delta).await;
     remove_channels(env, delta);
@@ -205,7 +207,7 @@ pub(crate) async fn apply(
     start_agent_subscriptions(env, delta, &planned).await;
     restart_changed_and_stop_removed_clients(env, delta).await;
     let incoming = mqtt_incoming(env, delta).await;
-    report.deferred.extend(incoming.deferred);
+    report.deferred = incoming.deferred;
     report.failed = incoming.failed;
     refresh_surface_roots(env, surfaces.roots.clone());
     swap_surface_registrations(env, surfaces.docs);
@@ -982,6 +984,11 @@ async fn start_agent_subscriptions(
 /// moves unreported. The end state is a fresh boot's — the same filter set on
 /// the handle and at the broker.
 ///
+/// Its first connection is a clean start ([`ArrivingFilters::Added`]): a
+/// session the broker kept under the slug belongs to an earlier declaration,
+/// and its backlog would arrive before the incoming step has added a filter to
+/// route it by.
+///
 /// Between here and the incoming step the handle is registered and connecting,
 /// so a publish through it is a normal not-connected outcome.
 async fn start_added_clients(env: &ReloadEnv, delta: &PlanDelta) {
@@ -990,7 +997,7 @@ async fn start_added_clients(env: &ReloadEnv, delta: &PlanDelta) {
         register_and_spawn(
             &env.mqtt_service,
             Arc::clone(client),
-            ArrivingFilters::Declared(Vec::new()),
+            ArrivingFilters::Added,
             router.clone(),
         )
         .await;
@@ -999,7 +1006,7 @@ async fn start_added_clients(env: &ReloadEnv, delta: &PlanDelta) {
             host = %client.identity.host,
             port = client.identity.port,
             subscriptions = 0,
-            "reload: mqtt client supervisor spawned"
+            "reload: mqtt client supervisor spawned; its first connection is a clean start"
         );
     }
 }
@@ -1047,8 +1054,9 @@ fn what_moved(old: &MqttClientConfig, new: &MqttClientConfig) -> &'static str {
 /// id and `clean_start(false)`, so the persistent session resumes and the new
 /// supervisor re-asserts every filter on its first connect.
 ///
-/// A removed client's session lingers at the broker until its session expiry
-/// elapses, exactly as it would after a fresh boot of the new document.
+/// A removed client ends its session at the broker
+/// ([`brenn_mqtt::MqttClientHandle::end_session_and_join`]); one with no
+/// connection at the stop leaves the session at the broker until it expires.
 ///
 /// One task per client, all in flight together: a changed client's stop waits
 /// up to its `stop_wait_secs` for the outcomes of what its reader has in
@@ -1103,8 +1111,8 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
         let service = env.mqtt_service.clone();
         let slug = slug.clone();
         sessions.spawn(async move {
-            service.remove_client(&slug).stop_and_join().await;
-            info!(client = %slug, "reload: mqtt client supervisor stopped");
+            service.remove_client(&slug).end_session_and_join().await;
+            info!(client = %slug, "reload: removed mqtt client's supervisor stopped");
         });
     }
     join_set_reraising(
@@ -1116,7 +1124,8 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
 
 /// The outgoing MQTT step, between the descriptions and the channel removals.
 ///
-/// UNSUBSCRIBE before the route goes. On a broker that returns Subscription
+/// The filter leaves the held set, and its UNSUBSCRIBE is handed to the
+/// supervisor, before the route goes. On a broker that returns Subscription
 /// Identifiers, a copy already in flight for a withdrawn filter is dropped
 /// whether or not the route is still there: its identifier left the client's
 /// set with the filter. On a broker that does not, such a copy is routed by
@@ -1126,7 +1135,8 @@ async fn restart_changed_and_stop_removed_clients(env: &ReloadEnv, delta: &PlanD
 /// A `qos` edit is not a withdrawal: the restarted client re-subscribes each
 /// filter in place.
 ///
-/// Returns the filters the broker did not take now, for the status body.
+/// Returns the filters whose withdrawal waits for the client's next
+/// connection, for the status body.
 async fn mqtt_outgoing(env: &ReloadEnv, delta: &PlanDelta) -> Vec<String> {
     let mut deferred = Vec::new();
     for client in &delta.mqtt.clients {
@@ -1383,17 +1393,13 @@ pub(crate) fn refresh_surface_roots(env: &ReloadEnv, roots: brenn_surface_server
     }
 }
 
-/// Log one UNSUBSCRIBE outcome and say whether the filter is still at the
-/// broker after it.
+/// Log one UNSUBSCRIBE outcome and say whether its withdrawal waits for the
+/// client's next connection: the status body's `mqtt_unsubscribe_deferred`.
 ///
-/// Every outcome is a success *in this process*: the filter is out of the
-/// reconnect-survival set in all three, so brenn's own ingress set is the
-/// planned one. On the two deferred outcomes the packet never went out, and
-/// the session is persistent, so the broker keeps the filter and keeps
-/// publishing on it until the session expires — see
-/// `TODO(mqtt-deferred-unsubscribe-not-withdrawn)`. `SendFailed` is a `warn!`
-/// and a `deferred` entry, never a refusal and never a panic, because the walk
-/// is past the point where anything may decline.
+/// Both outcomes are a success *in this process*: the filter is out of the
+/// held set, so brenn's own ingress set is the planned one. On the deferred
+/// one the client has no connection; the filter stays asserted and the next
+/// connection that finds the broker's session withdraws it.
 fn record_unsubscribe(outcome: &IngressUnsubscribeOutcome, address: &str) -> bool {
     match outcome {
         IngressUnsubscribeOutcome::UnsubscribedLive => {
@@ -1401,14 +1407,10 @@ fn record_unsubscribe(outcome: &IngressUnsubscribeOutcome, address: &str) -> boo
             false
         }
         IngressUnsubscribeOutcome::DeferredDisconnected => {
-            // No packet went out. The filter left the reconnect-survival set,
-            // so nothing re-asserts it, but the broker's copy of the persistent
-            // session still holds it.
-            info!(address = %address, "reload: mqtt filter not withdrawn at the broker");
-            true
-        }
-        IngressUnsubscribeOutcome::SendFailed(error) => {
-            warn!(address = %address, %error, "reload: mqtt UNSUBSCRIBE send failed");
+            info!(
+                address = %address,
+                "reload: mqtt filter withdrawn at the client's next connection"
+            );
             true
         }
     }
@@ -2331,12 +2333,11 @@ mod tests {
         let _ = what_moved(&config, &config.clone());
     }
 
-    /// The same for the outgoing direction. `SendFailed` in particular must be
-    /// a `deferred` entry and not an abort: the walk is past the point where
-    /// anything may decline, and the filter is out of the reconnect-survival
-    /// set either way.
+    /// The same for the outgoing direction: a withdrawal made while the client
+    /// is disconnected is reported as a deferred withdrawal, and a live one is
+    /// not.
     #[test]
-    fn a_live_unsubscribe_is_not_deferred_and_the_other_two_are() {
+    fn a_live_unsubscribe_is_not_deferred_and_a_disconnected_one_is() {
         assert!(!record_unsubscribe(
             &IngressUnsubscribeOutcome::UnsubscribedLive,
             "mqtt:ha:a/b"
@@ -2344,10 +2345,6 @@ mod tests {
         assert!(record_unsubscribe(
             &IngressUnsubscribeOutcome::DeferredDisconnected,
             "mqtt:ha:a/b"
-        ));
-        assert!(record_unsubscribe(
-            &IngressUnsubscribeOutcome::SendFailed("the request channel is closed".to_string()),
-            "mqtt:ha:a/b",
         ));
     }
 

@@ -250,6 +250,34 @@ async fn publish_transport_ingress_panics_on_malformed_envelope() {
             "key1",
             IngressMessage::Wrapped("not-valid-json-at-all".to_owned()),
             Urgency::Low,
+            crate::IngressAppend::Always,
+        )
+        .await;
+}
+
+/// A conditional append is for an `mqtt:` channel only; on a webhook channel
+/// it is a host bug.
+#[tokio::test]
+#[should_panic(expected = "which is not an mqtt: channel")]
+async fn a_conditional_append_on_a_webhook_channel_panics() {
+    let (messenger, channel, _, _) = build_webhook_messenger(true, false).await;
+    let body = serde_json::to_string(&crate::WebhookEnvelope {
+        endpoint_slug: "wh-test".to_owned(),
+        headers: vec![],
+        body: "{}".to_owned(),
+        key_id: "key1".to_owned(),
+        client_ip: "192.0.2.7".to_owned(),
+        received_at: chrono::Utc::now(),
+    })
+    .unwrap();
+    messenger
+        .publish_transport_ingress(
+            channel,
+            "webhook:wh-test",
+            "key1",
+            IngressMessage::Wrapped(body),
+            Urgency::Low,
+            crate::IngressAppend::UnlessRepeatsNewestForTopic,
         )
         .await;
 }
@@ -279,6 +307,7 @@ async fn publish_transport_ingress_commits_without_inline_dispatch() {
             "k",
             IngressMessage::Wrapped(valid_body.to_owned()),
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
 
@@ -314,6 +343,7 @@ async fn publish_transport_ingress_panics_on_malformed_mqtt_envelope() {
             "homeassistant",
             IngressMessage::Wrapped("not-valid-json-at-all".to_owned()),
             Urgency::Low,
+            crate::IngressAppend::Always,
         )
         .await;
 }
@@ -332,6 +362,7 @@ async fn publish_transport_ingress_mqtt_stores_typed_row_and_pending_push() {
             "homeassistant",
             IngressMessage::Wrapped(VALID_MQTT_BODY.to_owned()),
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
 
@@ -438,6 +469,7 @@ async fn raw_on_a_non_text_mqtt_channel_stores_body_type_and_transport() {
                 transport: mqtt_transport(),
             },
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
     let (body, content_type, transport) = stored_row(&db).await;
@@ -464,6 +496,7 @@ async fn raw_on_a_non_text_webhook_channel_stores_body_type_and_transport() {
                 transport: webhook_transport(),
             },
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
     let (body, content_type, transport) = stored_row(&db).await;
@@ -485,6 +518,7 @@ async fn wrapped_stores_untyped_text_with_no_transport() {
             "homeassistant",
             IngressMessage::Wrapped(VALID_MQTT_BODY.to_owned()),
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
     let (body, content_type, transport) = stored_row(&db).await;
@@ -506,6 +540,7 @@ async fn ingress_on_a_brenn_channel_panics() {
             "homeassistant",
             IngressMessage::Wrapped(VALID_MQTT_BODY.to_owned()),
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
 }
@@ -521,6 +556,7 @@ async fn wrapped_on_a_non_text_channel_panics() {
             "homeassistant",
             IngressMessage::Wrapped(VALID_MQTT_BODY.to_owned()),
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
 }
@@ -539,6 +575,7 @@ async fn raw_on_a_text_only_channel_panics() {
                 transport: mqtt_transport(),
             },
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
 }
@@ -557,6 +594,7 @@ async fn raw_with_another_schemes_transport_panics() {
                 transport: webhook_transport(),
             },
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
 }
@@ -576,6 +614,7 @@ async fn raw_over_the_body_cap_panics() {
                 transport: mqtt_transport(),
             },
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
 }
@@ -606,6 +645,48 @@ async fn publish_transport_ingress_panics_on_outbound_mqtt_metadata() {
                 }),
             },
             Urgency::Normal,
+            crate::IngressAppend::Always,
         )
         .await;
+}
+
+/// A stored row the topic lookup found that does not read as the current
+/// `MqttEnvelope` — one written before a change to the envelope — is not a
+/// repeat, so the retained message is appended; one that reads is compared.
+#[test]
+fn an_unreadable_stored_wrapped_row_is_not_a_repeat() {
+    let wrapper: crate::MqttEnvelope = serde_json::from_str(VALID_MQTT_BODY).unwrap();
+    let body = crate::MessageBody::from(VALID_MQTT_BODY);
+    let stored = |stored_body: &str| crate::MessageEnvelope {
+        message_id: uuid::Uuid::new_v4(),
+        source: "mqtt:homeassistant:home/+/state".into(),
+        channel: "mqtt:homeassistant:home/+/state".into(),
+        sender: "homeassistant".into(),
+        publish_ts: chrono::Utc::now(),
+        body: stored_body.into(),
+        reply_to: None,
+        delivery_deadline: None,
+        deliver_after: None,
+        impetus: None,
+        urgency: Urgency::Low,
+        envelope_type: ChannelScheme::Mqtt,
+        transport: None,
+        attachments: Default::default(),
+    };
+    let channel = "mqtt:homeassistant:home/+/state";
+    assert!(repeats_newest(
+        channel,
+        &body,
+        None,
+        Some(&wrapper),
+        &stored(VALID_MQTT_BODY),
+    ));
+    let drifted = r#"{"client_slug":"homeassistant","topic":"home/kitchen/state","value":"22.5"}"#;
+    assert!(!repeats_newest(
+        channel,
+        &body,
+        None,
+        Some(&wrapper),
+        &stored(drifted),
+    ));
 }

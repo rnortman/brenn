@@ -763,6 +763,56 @@ pub fn load_channel_retained_tail(
     .collect()
 }
 
+/// The most rows [`newest_retained_for_mqtt_topic`] scans, whatever the
+/// channel's depth. A topic whose newest row lies further back is reported as
+/// not held.
+pub const RETAINED_REPLAY_SCAN_ROWS: u64 = 1024;
+
+/// Among the newest `min(depth, RETAINED_REPLAY_SCAN_ROWS)` retained rows of
+/// `channel_uuid`, the newest whose MQTT topic is `topic`, or `None`.
+///
+/// A row's topic is read from its `transport` metadata when it carries one
+/// (the raw shape, `{"mqtt": {"topic": …}}`), and otherwise from the wrapper in
+/// its body (`{"topic": …}`) when the body is stored as text and is valid
+/// JSON. A row that is neither has no topic and matches nothing. The caller
+/// decides what the returned row's value means; this read only locates it.
+///
+/// Each row walked on a wrapped channel has its whole body parsed as JSON.
+// TODO(efficiency-replay-compare-parses-every-window-body-under-db-lock): find
+// the row by an indexed topic instead of parsing every body in the window.
+pub fn newest_retained_for_mqtt_topic(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    depth: brenn_lib::messaging::config::Depth,
+    topic: &str,
+) -> Option<MessageEnvelope> {
+    let scan = match depth {
+        brenn_lib::messaging::config::Depth::Unbounded => RETAINED_REPLAY_SCAN_ROWS,
+        brenn_lib::messaging::config::Depth::Bounded(n) => n.min(RETAINED_REPLAY_SCAN_ROWS),
+    };
+    let sql = retained_window_sql(
+        "AND m.id IN (
+             SELECT w.id FROM messaging_messages w
+             WHERE w.channel_uuid = ?1 AND w.retained_seq IS NOT NULL
+             ORDER BY w.retained_seq DESC LIMIT ?2)
+         AND (CASE
+                WHEN m.transport IS NOT NULL THEN json_extract(m.transport, '$.mqtt.topic')
+                WHEN typeof(m.body) = 'text' AND json_valid(m.body)
+                    THEN json_extract(m.body, '$.topic')
+              END) = ?3",
+        "1",
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .expect("prepare newest_retained_for_mqtt_topic");
+    read_retained_rows(
+        &mut stmt,
+        rusqlite::params![channel_uuid.as_bytes().to_vec(), scan as i64, topic],
+    )
+    .pop()
+    .map(|row| row.envelope)
+}
+
 /// The highest retention sequence this channel ever assigned — its persisted
 /// resume high-water, carried on the channel row and surviving eviction of every
 /// retained message. `0` means nothing was ever retained.

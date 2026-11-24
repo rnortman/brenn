@@ -23,6 +23,10 @@
 //! alone, into every channel on the client whose filter covers it. A copy that
 //! reaches no channel is logged and dropped, not panicked — untrusted broker
 //! input must not crash the host.
+//!
+//! A replayed retained message — the PUBLISH's RETAIN flag set — is not stored
+//! in a channel whose newest row for its topic already holds the same value; a
+//! live message is stored unread.
 
 use std::sync::RwLock;
 
@@ -34,7 +38,7 @@ use brenn_lib::messaging::{
 };
 use brenn_lib::mqtt::address::topic_name_has_wildcard;
 use brenn_lib::mqtt::topic_filter;
-use brenn_messaging::IngressMessage;
+use brenn_messaging::{IngressAppend, IngressMessage};
 use brenn_mqtt::payload::{InboundClass, InboundPayload, classify_inbound};
 use brenn_mqtt::service::{InboundRouting, MqttEventRouter, SessionFault};
 use brenn_obs::alerting::AlertSeverity;
@@ -113,8 +117,9 @@ impl MqttEventRouterImpl {
     }
 
     /// Fill in the `AppState` and the ingress routing table. Must be called
-    /// before any inbound message can reach this router (before supervisors are
-    /// spawned, or at least before they have a live connection).
+    /// before any supervisor delivering through this router is spawned: until
+    /// then [`MqttEventRouter::ready`] is false, a spawn against the router
+    /// panics, and so does a delivery or a fault report reaching it.
     pub fn set_state(&self, state: AppState, routes: Vec<IngressRoute>) {
         self.inner
             .set(RouterState {
@@ -212,30 +217,30 @@ impl MqttEventRouterImpl {
 
 #[async_trait::async_trait]
 impl MqttEventRouter for MqttEventRouterImpl {
+    /// Whether [`Self::set_state`] has run.
+    fn ready(&self) -> bool {
+        self.inner.get().is_some()
+    }
+
     async fn deliver_inbound(
         &self,
         client_slug: &str,
         topic: &str,
         payload: InboundPayload,
         qos: u8,
+        retained: bool,
         routing: InboundRouting,
     ) {
-        // Use `get()` rather than `expect()` so a fast-broker startup race (broker
-        // connects and delivers a retained message before AppState is wired in) drops
-        // the message with a log rather than panicking the process.
-        let router_state = match self.inner.get() {
-            Some(s) => s,
-            None => {
-                tracing::error!(
-                    client = client_slug,
-                    topic,
-                    qos,
-                    "mqtt_router: AppState not yet initialized — dropping inbound message. \
-                     This is a startup race; if it persists after the process is up, it is a bug."
-                );
-                return;
-            }
-        };
+        // A supervisor is spawned only against a ready router, so a delivery
+        // with no state means one ran before the router had it: a wiring bug,
+        // and the message would be lost after the broker was told it arrived.
+        let router_state = self.inner.get().unwrap_or_else(|| {
+            panic!(
+                "mqtt_router: inbound message on client '{client_slug}' (topic {topic:?}) \
+                 reached the router before set_state — a supervisor ran before the router \
+                 had its state"
+            )
+        });
         let state = &router_state.app_state;
 
         // A PUBLISH topic name holding `+` or `#` is malformed MQTT, and the match
@@ -419,33 +424,49 @@ impl MqttEventRouter for MqttEventRouterImpl {
                 IngressMessage::Wrapped(json.clone())
             };
 
+            // A replay repeats nothing the channel holds as the newest value for
+            // its topic; a live message is appended unread.
+            // TODO(mqtt-retained-replay-repeated-on-resubscribe): a non-text
+            // payload on a wrapped channel is a placeholder with no value to
+            // compare, so its replay is appended every time.
+            let append = if retained {
+                IngressAppend::UnlessRepeatsNewestForTopic
+            } else {
+                IngressAppend::Always
+            };
             // source == "mqtt:<client>:<topic>", sender == client_slug (provenance).
-            messenger
+            let written = messenger
                 .publish_transport_ingress(
                     channel,
                     &route.channel_address,
                     client_slug,
                     message,
                     route.urgency,
+                    append,
                 )
                 .await;
+            if !written {
+                tracing::debug!(
+                    client = client_slug,
+                    topic,
+                    channel = %route.channel_address,
+                    "mqtt_router: replayed retained message repeats the channel's newest value \
+                     for its topic — no row written"
+                );
+            }
         }
     }
 
     async fn session_fault(&self, client_slug: &str, fault: SessionFault) {
         let (severity, title, body) = session_fault_alert(client_slug, &fault);
-        // The supervisors can run before boot wires the state in; the
-        // supervisor has already logged the fault, so this says only that the
-        // alert is not raised.
-        let Some(router_state) = self.inner.get() else {
-            tracing::error!(
-                client = client_slug,
-                ?fault,
-                "mqtt_router: AppState not yet initialized — the operator alert for this MQTT \
-                 session fault could not be raised"
-            );
-            return;
-        };
+        // A supervisor is spawned only against a ready router, so a fault
+        // reported with no state means one ran before the router had it.
+        let router_state = self.inner.get().unwrap_or_else(|| {
+            panic!(
+                "mqtt_router: session fault {fault:?} on client '{client_slug}' reached the \
+                 router before set_state — a supervisor ran before the router had its state"
+            )
+        });
         router_state
             .app_state
             .alert_dispatcher
@@ -784,6 +805,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("22.5", None),
                 1,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -847,6 +869,7 @@ mod tests {
                     Some("application/octet-stream".to_string()),
                 ),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -907,6 +930,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("22.5", None),
                 1,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -960,6 +984,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("22.5", None),
                 1,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1010,6 +1035,7 @@ mod tests {
                     "home/kitchen/state",
                     InboundPayload::new(reading.to_string(), None),
                     1,
+                    false,
                     InboundRouting::ByTopic,
                 )
                 .await;
@@ -1075,6 +1101,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("x", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1154,6 +1181,7 @@ mod tests {
                 topic,
                 InboundPayload::new("x", None),
                 1,
+                false,
                 InboundRouting::BySubscription(filters.iter().map(|f| f.to_string()).collect()),
             )
             .await;
@@ -1209,6 +1237,7 @@ mod tests {
                 "a/b",
                 InboundPayload::new("x", None),
                 1,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1236,6 +1265,7 @@ mod tests {
                 "a/b",
                 InboundPayload::new("x", None),
                 1,
+                false,
                 InboundRouting::BySubscription(vec!["a/b".to_string()]),
             )
             .await;
@@ -1265,6 +1295,7 @@ mod tests {
                 "home/kitchen/state/extra",
                 InboundPayload::new("x", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1310,6 +1341,7 @@ mod tests {
                     topic,
                     InboundPayload::new("x", None),
                     0,
+                    false,
                     InboundRouting::ByTopic,
                 )
                 .await;
@@ -1322,6 +1354,7 @@ mod tests {
                 "home/kitchen",
                 InboundPayload::new("x", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1355,6 +1388,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("x", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1397,6 +1431,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("pre", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1415,6 +1450,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("post", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1461,6 +1497,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("x", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1512,6 +1549,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("pre", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1530,6 +1568,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("post", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1552,14 +1591,12 @@ mod tests {
         router.remove_route(Uuid::new_v4());
     }
 
-    /// Startup race: `set_state` not yet called → drop with a log, no panic, no row.
+    /// A delivery before `set_state` means a supervisor ran before the router
+    /// had its state: the router panics rather than drop a message the broker
+    /// was already told arrived.
     #[tokio::test]
-    async fn deliver_inbound_before_set_state_drops() {
-        // Build a state-with-db but deliberately do NOT call `set_state`, so the
-        // router's state guard fires. The db lets us assert the dropped delivery
-        // writes zero rows (a regression that moved the guard below the row-write
-        // path would otherwise pass silently).
-        let (_state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+    #[should_panic(expected = "reached the router before set_state")]
+    async fn deliver_inbound_before_set_state_panics() {
         let router = MqttEventRouterImpl::new();
         router
             .deliver_inbound(
@@ -1567,16 +1604,30 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("x", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
+    }
 
-        let count: i64 = {
-            let conn = db.lock().await;
-            conn.query_row("SELECT COUNT(*) FROM messaging_messages", [], |r| r.get(0))
-                .expect("count query")
-        };
-        assert_eq!(count, 0, "before-set_state delivery must store no row");
+    /// A session fault before `set_state` is the same wiring bug.
+    #[tokio::test]
+    #[should_panic(expected = "reached the router before set_state")]
+    async fn session_fault_before_set_state_panics() {
+        let router = MqttEventRouterImpl::new();
+        router
+            .session_fault("broker1", SessionFault::SessionDiscarded { pkid: 7 })
+            .await;
+    }
+
+    /// `ready` answers whether `set_state` has run.
+    #[tokio::test]
+    async fn ready_is_false_before_set_state_and_true_after() {
+        let (state, _db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        let router = MqttEventRouterImpl::new();
+        assert!(!router.ready());
+        router.set_state(state, Vec::new());
+        assert!(router.ready());
     }
 
     /// End-to-end: a matched delivery enqueues a pending-push row for the
@@ -1607,6 +1658,7 @@ mod tests {
                 "home/kitchen/state",
                 InboundPayload::new("22.5", None),
                 1,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1702,6 +1754,7 @@ mod tests {
                 "cam/front",
                 InboundPayload::new(bytes.to_vec(), content_type.map(str::to_owned)),
                 1,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1971,15 +2024,243 @@ mod tests {
         assert!(alerts[1].2.contains("unsolicited again"));
     }
 
-    /// Before boot wires the state in, a fault is logged and dropped: no
-    /// panic, and no alert.
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn a_session_fault_before_the_state_is_set_raises_nothing() {
+    // --- a replayed retained message against the channel's newest row ---
+
+    const WRAPPED: &str = "mqtt:broker:cam/#";
+    const RAW: &str = "mqtt:broker:cam/+";
+
+    /// One router over a wrapped channel on `cam/#` and a raw one on `cam/+`,
+    /// both on client `broker` and both with `retain_depth`.
+    fn replay_router(retain_depth: Depth) -> (MqttEventRouterImpl, brenn_db::Db) {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        let mut wrapped = mqtt_channel_entry(WRAPPED, None);
+        wrapped.resolved_channel.retain_depth = retain_depth;
+        let mut raw = raw_mqtt_channel_entry(RAW, None);
+        raw.resolved_channel.retain_depth = retain_depth;
+        state.messenger = Some(messenger_with_channels(
+            db.clone(),
+            vec![wrapped, raw],
+            None,
+        ));
         let router = MqttEventRouterImpl::new();
+        router.set_state(
+            state,
+            vec![
+                route("broker", "cam/#", Urgency::Normal),
+                route("broker", "cam/+", Urgency::Normal),
+            ],
+        );
+        (router, db)
+    }
+
+    /// Deliver `bytes` on `topic` to every covering channel, with its RETAIN
+    /// flag.
+    async fn on_topic(
+        router: &MqttEventRouterImpl,
+        topic: &str,
+        bytes: &[u8],
+        content_type: Option<&str>,
+        retained: bool,
+    ) {
         router
-            .session_fault("sensors", SessionFault::SessionDiscarded { pkid: 7 })
+            .deliver_inbound(
+                "broker",
+                topic,
+                InboundPayload::new(bytes.to_vec(), content_type.map(str::to_owned)),
+                1,
+                retained,
+                InboundRouting::ByTopic,
+            )
             .await;
-        assert!(logs_contain("could not be raised"));
+    }
+
+    /// The number of rows on the wrapped and on the raw channel.
+    async fn row_counts(db: &brenn_db::Db) -> (usize, usize) {
+        (
+            stored_rows(db, WRAPPED).await.len(),
+            stored_rows(db, RAW).await.len(),
+        )
+    }
+
+    /// A replay equal to its channel's newest row for the topic stores nothing,
+    /// on either shape; one that differs is stored on both.
+    #[tokio::test]
+    async fn a_replay_repeating_the_newest_row_for_its_topic_stores_nothing() {
+        let (router, db) = replay_router(Depth::Bounded(100));
+        on_topic(&router, "cam/front", b"on", None, false).await;
+        assert_eq!(row_counts(&db).await, (1, 1));
+
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(
+            row_counts(&db).await,
+            (1, 1),
+            "a repeated replay adds no row"
+        );
+
+        on_topic(&router, "cam/front", b"off", None, true).await;
+        assert_eq!(row_counts(&db).await, (2, 2), "a changed replay is stored");
+
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(
+            row_counts(&db).await,
+            (3, 3),
+            "compared with the newest row, not with any row"
+        );
+    }
+
+    /// A live message is stored whatever the channel holds.
+    #[tokio::test]
+    async fn a_live_message_repeating_the_newest_row_is_stored() {
+        let (router, db) = replay_router(Depth::Bounded(100));
+        on_topic(&router, "cam/front", b"on", None, false).await;
+        on_topic(&router, "cam/front", b"on", None, false).await;
+        assert_eq!(row_counts(&db).await, (2, 2));
+    }
+
+    /// A replay into a channel that holds nothing for its topic is stored.
+    #[tokio::test]
+    async fn a_replay_into_a_channel_holding_nothing_for_its_topic_is_stored() {
+        let (router, db) = replay_router(Depth::Bounded(100));
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(row_counts(&db).await, (1, 1));
+        on_topic(&router, "cam/back", b"on", None, true).await;
+        assert_eq!(
+            row_counts(&db).await,
+            (2, 2),
+            "another topic's row is no match"
+        );
+    }
+
+    /// A replay whose topic's newest row has left the channel's window is
+    /// stored.
+    #[tokio::test]
+    async fn a_replay_whose_topics_row_left_the_window_is_stored() {
+        let (router, db) = replay_router(Depth::Bounded(2));
+        on_topic(&router, "cam/front", b"on", None, false).await;
+        on_topic(&router, "cam/back", b"x", None, false).await;
+        on_topic(&router, "cam/side", b"y", None, false).await;
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(row_counts(&db).await, (4, 4));
+    }
+
+    /// A newer row for another topic between the two does not hide the match.
+    #[tokio::test]
+    async fn a_newer_row_for_another_topic_does_not_hide_the_match() {
+        let (router, db) = replay_router(Depth::Bounded(100));
+        on_topic(&router, "cam/front", b"on", None, false).await;
+        on_topic(&router, "cam/back", b"x", None, false).await;
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(row_counts(&db).await, (2, 2));
+    }
+
+    /// A non-text payload is a placeholder on the wrapped channel and always
+    /// stored there; on the raw channel its bytes are compared.
+    #[tokio::test]
+    async fn a_non_text_replay_is_always_stored_on_a_wrapped_channel() {
+        let (router, db) = replay_router(Depth::Bounded(100));
+        let octets = Some("application/octet-stream");
+        on_topic(&router, "cam/front", NOT_UTF8, octets, false).await;
+        on_topic(&router, "cam/front", NOT_UTF8, octets, true).await;
+        assert_eq!(row_counts(&db).await, (2, 1));
+    }
+
+    /// On the raw channel the same bytes under another content type are a
+    /// different value.
+    #[tokio::test]
+    async fn a_raw_replay_equal_in_bytes_and_not_in_content_type_is_stored() {
+        let (router, db) = replay_router(Depth::Bounded(100));
+        on_topic(&router, "cam/front", b"on", Some("text/plain"), false).await;
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(
+            row_counts(&db).await,
+            (1, 2),
+            "the wrapped channel compares the text alone"
+        );
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(row_counts(&db).await, (1, 2));
+    }
+
+    /// A newest row of the other shape — a channel whose shape was changed
+    /// holds both — is not equal.
+    #[tokio::test]
+    async fn a_newest_row_of_the_other_shape_is_not_equal() {
+        use brenn_messaging_store::blob::HeldAttachments;
+        use brenn_messaging_store::db::{insert_message_in_tx, utc_to_ns};
+
+        let (router, db) = replay_router(Depth::Bounded(100));
+        let received_at = chrono::Utc::now();
+        let wrapper = serde_json::to_string(&MqttEnvelope {
+            client_slug: "broker".to_string(),
+            topic: "cam/front".to_string(),
+            payload: MqttPayloadBody::Text {
+                text: "on".to_string(),
+            },
+            received_at,
+            qos: 1,
+        })
+        .unwrap();
+        let raw_meta = TransportMeta::Mqtt(MqttTransport {
+            client_slug: "broker".to_string(),
+            topic: "cam/front".to_string(),
+            qos: 1,
+            received_at,
+        });
+        {
+            let conn = db.lock().await;
+            let tx = conn.unchecked_transaction().unwrap();
+            for (address, body, transport) in [
+                (RAW, MessageBody::text(wrapper.clone()), None),
+                (WRAPPED, MessageBody::text("on"), Some(&raw_meta)),
+            ] {
+                insert_message_in_tx(
+                    &tx,
+                    mqtt_channel_uuid_from_address(address),
+                    address,
+                    "broker",
+                    &body,
+                    Urgency::Normal,
+                    ChannelScheme::Mqtt,
+                    None,
+                    None,
+                    None,
+                    None,
+                    transport,
+                    &HeldAttachments::none(),
+                    utc_to_ns(received_at),
+                );
+            }
+            tx.commit().unwrap();
+        }
+        assert_eq!(row_counts(&db).await, (1, 1));
+
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(row_counts(&db).await, (2, 2));
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(
+            row_counts(&db).await,
+            (2, 2),
+            "now each holds its own shape"
+        );
+    }
+
+    /// Routed into two channels, a replay is compared with each channel's own
+    /// rows.
+    #[tokio::test]
+    async fn a_replay_is_compared_per_channel() {
+        let (router, db) = replay_router(Depth::Bounded(100));
+        router
+            .deliver_inbound(
+                "broker",
+                "cam/front",
+                InboundPayload::new("on", None),
+                1,
+                false,
+                InboundRouting::BySubscription(vec!["cam/#".to_string()]),
+            )
+            .await;
+        assert_eq!(row_counts(&db).await, (1, 0));
+
+        on_topic(&router, "cam/front", b"on", None, true).await;
+        assert_eq!(row_counts(&db).await, (1, 1));
     }
 }

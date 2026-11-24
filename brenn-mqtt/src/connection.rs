@@ -4,7 +4,9 @@
 //! `rumqttc::AsyncClient` + `EventLoop` for its life and keeps polling that
 //! loop across lost connections, so the library resumes the client's half of a
 //! broker session that survived; it reconnects with jittered exponential
-//! backoff, re-asserts subscriptions on every successful connect, records the
+//! backoff, settles every filter with the broker on every successful connect —
+//! a SUBSCRIBE for each held, and an UNSUBSCRIBE for each asserted and no
+//! longer held when the broker kept the session — records the
 //! facts of each connection a publish needs, and routes every inbound PUBLISH
 //! to the bridge router. One session per
 //! client carries both the publish and the ingress-delivery paths.
@@ -24,8 +26,9 @@ use rustls_pki_types::pem::PemObject as _;
 use crate::payload::InboundPayload;
 use crate::service::{InboundRouting, MqttEventRouter, MqttService, SessionFault, qos_of};
 use crate::state::{
-    DEFAULT_RECEIVE_MAXIMUM, DEFERRED_SUBSCRIBES_POISONED, IngressSubscription, MqttClientHandle,
-    PENDING_SUBSCRIBES_POISONED, SupervisorState,
+    DEFAULT_RECEIVE_MAXIMUM, FILTER_REQUESTS_POISONED, IngressSubscription, IngressSubscriptionSet,
+    MqttClientHandle, PENDING_SUBSCRIBES_POISONED, PENDING_UNSUBSCRIBES_POISONED, PendingRequest,
+    REQUEST_ORDER_POISONED, SupervisorState,
 };
 use brenn_lib::mqtt::config::{MqttClientConfig, ResolvedMqttIngressChannel, TlsVersionMin};
 
@@ -94,8 +97,6 @@ fn subscribe_request(
         qos: rumq_qos,
         nolocal: false,
         preserve_retain: false,
-        // TODO(mqtt-retained-replay-repeated-on-resubscribe): every reconnect
-        // and every repeated SUBSCRIBE replays the filter's retained messages.
         retain_forward_rule: RetainForwardRule::OnEverySubscribe,
     };
     let props = SubscribeProperties {
@@ -112,10 +113,10 @@ pub(crate) fn unsendable_filter(topic_filter: &str) -> Option<String> {
         .then(|| format!("invalid topic filter {topic_filter:?}"))
 }
 
-/// What [`try_assert_ingress_subscription`] did with a SUBSCRIBE.
+/// What the supervisor did with one request it tried to submit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubscribeSend {
-    /// The SUBSCRIBE is on the session's request channel.
+    /// The request is on the session's request channel.
     Sent,
     /// The request channel had no free slot (or its receiver is gone; the send
     /// cannot tell the two apart). Nothing was queued or recorded.
@@ -128,10 +129,11 @@ enum SubscribeSend {
 /// Only the supervisor calls this. It is the only task that polls the event
 /// loop, and only a poll frees a slot, so it must never wait for one: on
 /// [`SubscribeSend::ChannelFull`] its push loop keeps the filter and polls. The
-/// filter is pushed onto `handle.pending_subscribes` in the same synchronous
-/// section as the submit, and no other task submits a SUBSCRIBE, so the FIFO's
-/// order is the order the event loop takes SUBSCRIBE requests and the
-/// `Outgoing::Subscribe` arm binds pkid → filter correctly.
+/// filter is pushed onto `handle.pending_subscribes`, with the current
+/// connection epoch, in the same synchronous section as the submit, and no
+/// other task submits a SUBSCRIBE, so the FIFO's order is the order the event
+/// loop takes SUBSCRIBE requests and the `Outgoing::Subscribe` arm binds pkid →
+/// filter correctly. A sent request is counted in `handle.request_order`.
 ///
 /// A filter rumqttc would reject is refused up front, without touching the
 /// FIFO: rumqttc reports it with the same error as a full channel, and a
@@ -141,8 +143,12 @@ enum SubscribeSend {
 /// `with_identifier` is whether the current connection accepts a
 /// Subscription Identifier; see [`subscribe_request`].
 ///
-/// Returns `Err(message)` for a send that failed for any other reason; there is
-/// no SUBACK wait.
+/// Returns `Err(message)` for a filter rumqttc would refuse; there is no
+/// SUBACK wait.
+///
+/// # Panics
+///
+/// As [`submit_request`].
 fn try_assert_ingress_subscription(
     handle: &MqttClientHandle,
     client: &AsyncClient,
@@ -158,37 +164,216 @@ fn try_assert_ingress_subscription(
         handle.config.identity.qos,
         with_identifier,
     );
-    let mut pending = handle
-        .pending_subscribes
-        .lock()
-        .expect(PENDING_SUBSCRIBES_POISONED);
-    pending.push_back(sub.topic_filter.clone());
-    match client.try_subscribe_many_with_properties(std::iter::once(filter), props) {
-        Ok(()) => Ok(SubscribeSend::Sent),
-        Err(rumqttc::ClientError::TryRequest(_)) => {
-            pending.pop_back();
-            Ok(SubscribeSend::ChannelFull)
+    Ok(submit_request(
+        handle,
+        RequestKind::Subscribe,
+        &sub.topic_filter,
+        || client.try_subscribe_many_with_properties(std::iter::once(filter), props),
+    ))
+}
+
+/// Submit a single broker UNSUBSCRIBE for `topic_filter` without waiting for
+/// room on the request channel: the UNSUBSCRIBE counterpart of
+/// [`try_assert_ingress_subscription`], under the same rules, recording the
+/// filter on `handle.pending_unsubscribes`. There is no UNSUBACK wait.
+///
+/// # Panics
+///
+/// As [`submit_request`].
+fn try_withdraw_ingress_subscription(
+    handle: &MqttClientHandle,
+    client: &AsyncClient,
+    topic_filter: &str,
+) -> SubscribeSend {
+    submit_request(handle, RequestKind::Unsubscribe, topic_filter, || {
+        client.try_unsubscribe(topic_filter)
+    })
+}
+
+/// Which filter request a FIFO entry, a submit or a written packet is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    Subscribe,
+    Unsubscribe,
+}
+
+impl RequestKind {
+    /// The packet's name, for logs.
+    fn packet(self) -> &'static str {
+        match self {
+            Self::Subscribe => "SUBSCRIBE",
+            Self::Unsubscribe => "UNSUBSCRIBE",
         }
-        Err(e) => {
-            pending.pop_back();
-            Err(e.to_string())
+    }
+
+    /// The FIFO that binds this kind's packet identifiers to filters, locked.
+    fn fifo(
+        self,
+        handle: &MqttClientHandle,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<PendingRequest>> {
+        match self {
+            Self::Subscribe => handle
+                .pending_subscribes
+                .lock()
+                .expect(PENDING_SUBSCRIBES_POISONED),
+            Self::Unsubscribe => handle
+                .pending_unsubscribes
+                .lock()
+                .expect(PENDING_UNSUBSCRIBES_POISONED),
         }
     }
 }
 
-/// Issue a single broker UNSUBSCRIBE for one ingress topic filter on a live
-/// `AsyncClient`. There is no UNSUBACK wait.
+/// Submit one `kind` request for `topic_filter` through `submit`, a
+/// non-blocking rumqttc call, with the filter pushed onto `kind`'s FIFO, tagged
+/// with the current connection epoch, in the same synchronous section. A sent
+/// request is counted in `handle.request_order`; a refused one leaves the FIFO
+/// as it was.
 ///
-/// This waits for room on the request channel, so it must never be called from
-/// the supervisor task, which is the only task that drains that channel.
-pub async fn assert_ingress_unsubscribe(
-    client: &AsyncClient,
+/// # Panics
+///
+/// If `submit` fails other than by [`rumqttc::ClientError::TryRequest`]:
+/// rumqttc's non-blocking SUBSCRIBE and UNSUBSCRIBE calls report every refusal
+/// — a full channel, a gone receiver, an invalid filter — that way, so any
+/// other error means the library no longer behaves as this binding reads it.
+fn submit_request(
+    handle: &MqttClientHandle,
+    kind: RequestKind,
     topic_filter: &str,
-) -> Result<(), String> {
-    client
-        .unsubscribe(topic_filter.to_string())
-        .await
-        .map_err(|e| e.to_string())
+    submit: impl FnOnce() -> Result<(), rumqttc::ClientError>,
+) -> SubscribeSend {
+    let mut pending = kind.fifo(handle);
+    pending.push_back(PendingRequest {
+        topic_filter: topic_filter.to_string(),
+        epoch: handle.connection_epoch.load(Ordering::Relaxed),
+    });
+    match submit() {
+        Ok(()) => {
+            count_request(handle, topic_filter);
+            SubscribeSend::Sent
+        }
+        Err(rumqttc::ClientError::TryRequest(_)) => {
+            pending.pop_back();
+            SubscribeSend::ChannelFull
+        }
+        Err(e) => panic!(
+            "mqtt client {}: rumqttc refused a {} for {topic_filter:?} with an error its \
+             non-blocking submit does not report: {e:?}",
+            handle.config.identity.slug,
+            kind.packet(),
+        ),
+    }
+}
+
+/// Take the filter a `kind` request the library reported written as `pkid`
+/// was submitted for: the head of `kind`'s FIFO. An empty FIFO is logged and
+/// gives `None`.
+fn take_written_request(
+    handle: &MqttClientHandle,
+    kind: RequestKind,
+    pkid: u16,
+) -> Option<PendingRequest> {
+    let entry = kind.fifo(handle).pop_front();
+    if entry.is_none() {
+        tracing::warn!(
+            client = %handle.config.identity.slug,
+            pkid,
+            packet = kind.packet(),
+            "request written with no pending filter — possible session resend",
+        );
+    }
+    entry
+}
+
+/// Count a request for `filter` seen written on a live connection and return
+/// its number. One the library replays from an earlier connection — its FIFO
+/// entry carries an older `epoch` — names its filter for settling again, since
+/// the held set may have changed since it was submitted.
+fn written_on_live_connection(handle: &MqttClientHandle, filter: &str, epoch: u64) -> u64 {
+    let seq = count_request(handle, filter);
+    if replayed(handle, epoch) {
+        handle.request_settle(filter.to_string());
+    }
+    seq
+}
+
+/// Log a `kind` request for `filter` seen written on a lost connection: no
+/// answer to it will be read.
+fn written_on_lost_connection(
+    handle: &MqttClientHandle,
+    kind: RequestKind,
+    pkid: u16,
+    filter: &str,
+) {
+    tracing::debug!(
+        client = %handle.config.identity.slug,
+        pkid,
+        topic = %filter,
+        packet = kind.packet(),
+        "request written on a lost connection; it will not be answered",
+    );
+}
+
+/// Count one request for `topic_filter` on the current connection and return
+/// its number.
+fn count_request(handle: &MqttClientHandle, topic_filter: &str) -> u64 {
+    handle
+        .request_order
+        .lock()
+        .expect(REQUEST_ORDER_POISONED)
+        .bump(topic_filter)
+}
+
+/// What settling one filter did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// A SUBSCRIBE was submitted: the filter is held.
+    Subscribed,
+    /// An UNSUBSCRIBE was submitted: the filter is asserted and not held.
+    Unsubscribed,
+    /// Nothing is owed: the filter is neither held nor asserted, or it is not
+    /// held and the library could never have subscribed it.
+    Nothing,
+    /// The request channel had no free slot; nothing was submitted.
+    ChannelFull,
+}
+
+/// Settle `topic_filter`: submit what makes the broker's session agree with
+/// `set` for it, deciding against `set` as it is now. Only the supervisor
+/// calls this, with `set` locked for writing, so the decision and the submit
+/// are one step against the set.
+///
+/// A filter that is not held and that the library would refuse is taken out
+/// of the asserted filters without a packet: no SUBSCRIBE for it was ever
+/// written, so the broker cannot hold it.
+fn settle_filter(
+    handle: &MqttClientHandle,
+    client: &AsyncClient,
+    set: &mut IngressSubscriptionSet,
+    topic_filter: &str,
+    with_identifier: bool,
+) -> Result<Settled, String> {
+    if let Some(sub) = set.get(topic_filter) {
+        return Ok(
+            match try_assert_ingress_subscription(handle, client, sub, with_identifier)? {
+                SubscribeSend::Sent => Settled::Subscribed,
+                SubscribeSend::ChannelFull => Settled::ChannelFull,
+            },
+        );
+    }
+    if !set.is_asserted(topic_filter) {
+        return Ok(Settled::Nothing);
+    }
+    if unsendable_filter(topic_filter).is_some() {
+        set.withdraw_asserted(topic_filter);
+        return Ok(Settled::Nothing);
+    }
+    Ok(
+        match try_withdraw_ingress_subscription(handle, client, topic_filter) {
+            SubscribeSend::Sent => Settled::Unsubscribed,
+            SubscribeSend::ChannelFull => Settled::ChannelFull,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +399,6 @@ pub(crate) fn client_id_of_slug(slug: &str) -> String {
 /// wrapper on every reconnect attempt, avoiding repeated disk I/O and crypto-provider
 /// allocation on the reconnect hot path.
 fn build_mqtt_options(broker: &MqttClientConfig, transport: Transport) -> MqttOptions {
-    // TODO(mqtt-receive-maximum-unset): no Receive Maximum is set on CONNECT.
     let mut opts = MqttOptions::new(
         client_id(broker),
         (broker.identity.host.clone(), broker.identity.port),
@@ -401,8 +585,11 @@ pub(crate) fn backoff_duration(
 /// The returned join handle resolves when the supervisor has exited — on the
 /// stop signal or on an authoritative give-up. Callers must hand it to
 /// `MqttClientHandle::set_supervisor`.
+///
+/// Reached only through [`UnspawnedSession::spawn`], which checks the router
+/// is ready first.
 #[must_use]
-pub fn spawn_client_supervisor(
+fn spawn_client_supervisor(
     handle: Arc<MqttClientHandle>,
     router: Arc<dyn MqttEventRouter>,
     stop_rx: tokio::sync::watch::Receiver<bool>,
@@ -448,19 +635,80 @@ async fn respawn_pause(stop_rx: &mut tokio::sync::watch::Receiver<bool>) {
 
 /// Where an arriving session's filter set comes from.
 pub enum ArrivingFilters<'a> {
-    /// The set the caller derived: a boot's static union, or the empty list an
-    /// arriving client is registered with so the incoming step can report every
-    /// one of its filters as a move.
+    /// The set the caller derived: a boot's static union.
     Declared(Vec<IngressSubscription>),
+    /// A client a reload adds: an empty set, so the incoming step can report
+    /// every one of its filters as a move, and a clean start on every CONNECT
+    /// up to the first CONNACK. A session the broker kept under the slug was
+    /// asserted for an earlier declaration, and its backlog would arrive
+    /// before the incoming step has added a filter to route it by.
+    Added,
     /// The predecessor this session replaces. Its filter set is inherited, and
-    /// its supervisor is stopped and joined as part of the handover.
+    /// its supervisor is stopped and joined as part of the handover. A clean
+    /// start the predecessor still owed is inherited with it.
     Successor(&'a MqttClientHandle),
 }
 
-/// Bring one client session up on `service`: build the handle, register it,
-/// hand the broker client id and the filter set over from a predecessor if
-/// there is one, spawn the supervisor, and record its join handle. Returns the
-/// registered handle.
+/// A client session that is registered on its service and has no supervisor
+/// yet: its slug resolves — for the bus's `mqtt:` admission and for the egress
+/// reader — and nothing connects until [`Self::spawn`].
+#[must_use = "a registered session connects nothing until it is spawned"]
+pub struct UnspawnedSession {
+    handle: Arc<MqttClientHandle>,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl UnspawnedSession {
+    /// The registered handle.
+    pub fn handle(&self) -> &Arc<MqttClientHandle> {
+        &self.handle
+    }
+
+    /// Spawn the session's supervisor, delivering through `router`, and record
+    /// its join handle. Returns the handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics, before anything is spawned, if `router` is not
+    /// [`MqttEventRouter::ready`]. A supervisor connects at once, the broker
+    /// may hand it a retained or queued message straight away, and the
+    /// library acknowledges every message on receipt: a router that cannot
+    /// route it then loses it. The check does not wait for such a message, so
+    /// a misordered boot dies at the spawn every time.
+    pub async fn spawn(self, router: Arc<dyn MqttEventRouter>) -> Arc<MqttClientHandle> {
+        assert!(
+            router.ready(),
+            "MQTT supervisor for client {:?} spawned against a router that cannot deliver yet \
+             — the router must have its state before any supervisor delivering through it runs",
+            self.handle.config.identity.slug,
+        );
+        let join = spawn_client_supervisor(self.handle.clone(), router, self.stop_rx);
+        self.handle.set_supervisor(join).await;
+        self.handle
+    }
+}
+
+/// Build a client's handle with `filters` as its filter set and register it on
+/// `service`. Nothing connects: the returned session is spawned by
+/// [`UnspawnedSession::spawn`].
+///
+/// A handle registered here replaces any handle of the same slug in the
+/// registry; [`register_and_spawn`] is the form that hands over from that
+/// predecessor.
+pub fn register_client(
+    service: &MqttService,
+    config: Arc<MqttClientConfig>,
+    filters: Vec<IngressSubscription>,
+) -> UnspawnedSession {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let handle = MqttClientHandle::new(config, filters, stop_tx);
+    service.add_client(handle.clone());
+    UnspawnedSession { handle, stop_rx }
+}
+
+/// Bring one client session up on `service`: [`register_client`], hand the
+/// broker client id and the filter set over from a predecessor if there is
+/// one, then [`UnspawnedSession::spawn`]. Returns the registered handle.
 ///
 /// The order is the protocol, and it lives here rather than at each caller
 /// because every part of it is load-bearing:
@@ -494,31 +742,39 @@ pub enum ArrivingFilters<'a> {
 ///
 /// Callers log; nothing is logged here, because what an operator needs to read
 /// off a boot, an arrival and a restart differs.
+///
+/// # Panics
+///
+/// As [`UnspawnedSession::spawn`]: if `router` is not ready.
 pub async fn register_and_spawn(
     service: &MqttService,
     config: Arc<MqttClientConfig>,
     filters: ArrivingFilters<'_>,
     router: Arc<dyn MqttEventRouter>,
 ) -> Arc<MqttClientHandle> {
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let declared = match &filters {
         ArrivingFilters::Declared(subs) => subs.clone(),
-        ArrivingFilters::Successor(_) => Vec::new(),
+        ArrivingFilters::Added | ArrivingFilters::Successor(_) => Vec::new(),
     };
-    let handle = MqttClientHandle::new(config, declared, stop_tx);
-    service.add_client(handle.clone());
-    if let ArrivingFilters::Successor(old) = filters {
-        // The successor's set is claimed before the predecessor is stopped and
-        // held until the inherit has been written, so a filter edit on this
-        // slug queues behind the inherit instead of being overwritten by it.
-        let mut arriving = handle.subscriptions.write().await;
-        old.stop_and_join().await;
-        *arriving = old.subscriptions.read().await.clone();
-        drop(arriving);
+    let session = register_client(service, config, declared);
+    match filters {
+        ArrivingFilters::Declared(_) => {}
+        ArrivingFilters::Added => session.handle.require_clean_start(),
+        ArrivingFilters::Successor(old) => {
+            // The successor's set is claimed before the predecessor is stopped
+            // and held until the inherit has been written, so a filter edit on
+            // this slug queues behind the inherit instead of being overwritten
+            // by it.
+            let mut arriving = session.handle.subscriptions.write().await;
+            old.stop_and_join().await;
+            *arriving = old.subscriptions.read().await.clone();
+            drop(arriving);
+            if old.clean_start_pending() {
+                session.handle.require_clean_start();
+            }
+        }
     }
-    let join = spawn_client_supervisor(handle.clone(), router, stop_rx);
-    handle.set_supervisor(join).await;
-    handle
+    session.spawn(router).await
 }
 
 /// Whether the supervisor has been asked to stop, right now.
@@ -558,9 +814,9 @@ enum ConnectedWait<T> {
     Polled(T),
 }
 
-/// Await `poll`, one `EventLoop::poll`, to its end, calling `serve_subscribes`
-/// before it is first polled and again at each wake on `subscribe_wake`. Only
-/// a stop request ends the wait before `poll` finishes.
+/// Await `poll`, one `EventLoop::poll`, to its end, serving `serve_filters`
+/// before it is first polled and again at each wake on `filter_wake`. Only a
+/// stop request ends the wait before `poll` finishes.
 ///
 /// `poll` is never dropped for a wake: the library's `poll` is not
 /// cancel-safe. When it takes a SUBSCRIBE off the client's control channel and
@@ -568,22 +824,130 @@ enum ConnectedWait<T> {
 /// that SUBSCRIBE unsent and unreported, and every later SUBSCRIBE binds to the
 /// wrong filter of `pending_subscribes`. A write that waits on a full socket
 /// buffer is lost the same way. At a stop the connection is ended and its
-/// SUBSCRIBE bookkeeping cleared, so a request lost there misattributes
-/// nothing that outlives the stop.
+/// request bookkeeping cleared, so a request lost there misattributes nothing
+/// that outlives the stop. `poll` is not polled while `serve_filters` runs,
+/// which takes the subscription set's lock and submits without waiting.
 async fn await_connected_poll<F: Future>(
     poll: F,
     stop_rx: &mut tokio::sync::watch::Receiver<bool>,
-    subscribe_wake: &tokio::sync::Notify,
-    mut serve_subscribes: impl FnMut(),
+    filter_wake: &tokio::sync::Notify,
+    serve_filters: &mut impl ServeFilters,
 ) -> ConnectedWait<F::Output> {
     let mut poll = std::pin::pin!(poll);
     loop {
-        serve_subscribes();
+        serve_filters.serve().await;
         tokio::select! {
             biased;
             _ = stop_requested(stop_rx) => return ConnectedWait::Stop,
-            () = subscribe_wake.notified() => {}
+            () = filter_wake.notified() => {}
             output = &mut poll => return ConnectedWait::Polled(output),
+        }
+    }
+}
+
+/// The step [`await_connected_poll`] runs between polls.
+trait ServeFilters {
+    fn serve(&mut self) -> impl Future<Output = ()> + Send;
+}
+
+/// The connected phase's filter settling: the filters this connection still
+/// owes the broker a request for, and what settling them has done so far.
+struct FilterSettler<'a> {
+    handle: &'a Arc<MqttClientHandle>,
+    client: &'a AsyncClient,
+    /// Filters to settle, in order; the head is retried after a full channel.
+    unsettled: std::collections::VecDeque<String>,
+    /// Whether the connection's broker accepts Subscription Identifiers.
+    with_identifier: bool,
+    /// How many filters the CONNACK left owed, and whether settling them has
+    /// been logged.
+    connack_owed: usize,
+    logged: bool,
+    failed: usize,
+    withdrawals: usize,
+}
+
+impl<'a> FilterSettler<'a> {
+    fn new(
+        handle: &'a Arc<MqttClientHandle>,
+        client: &'a AsyncClient,
+        unsettled: std::collections::VecDeque<String>,
+        with_identifier: bool,
+    ) -> Self {
+        let connack_owed = unsettled.len();
+        Self {
+            handle,
+            client,
+            unsettled,
+            with_identifier,
+            connack_owed,
+            logged: connack_owed == 0,
+            failed: 0,
+            withdrawals: 0,
+        }
+    }
+}
+
+impl ServeFilters for FilterSettler<'_> {
+    /// Take the filters other tasks named, then submit as many requests as the
+    /// request channel will take now. A full channel is non-empty, so the
+    /// running poll takes a request off it (or fails and ends the connection)
+    /// and this runs again with the next poll.
+    async fn serve(&mut self) {
+        let handle = self.handle;
+        let client_slug = handle.config.identity.slug.as_str();
+        self.unsettled.extend(
+            handle
+                .filter_requests
+                .lock()
+                .expect(FILTER_REQUESTS_POISONED)
+                .drain(..),
+        );
+        if self.unsettled.is_empty() {
+            return;
+        }
+        let mut set = handle.subscriptions.write().await;
+        while let Some(filter) = self.unsettled.front() {
+            match settle_filter(handle, self.client, &mut set, filter, self.with_identifier) {
+                Ok(Settled::ChannelFull) => break,
+                Ok(Settled::Unsubscribed) => {
+                    self.withdrawals += 1;
+                    self.unsettled.pop_front();
+                }
+                Ok(Settled::Subscribed | Settled::Nothing) => {
+                    self.unsettled.pop_front();
+                }
+                Err(e) => {
+                    tracing::error!(
+                        client = %client_slug,
+                        topic = %filter,
+                        error = %e,
+                        "failed to send subscribe — filter not asserted; channel will \
+                         receive nothing until the next reconnect",
+                    );
+                    self.unsettled.pop_front();
+                    self.failed += 1;
+                }
+            }
+        }
+        drop(set);
+        if !self.logged && self.unsettled.is_empty() {
+            if self.failed == 0 {
+                tracing::info!(
+                    client = %client_slug,
+                    filters = self.connack_owed,
+                    withdrawals = self.withdrawals,
+                    "settled all ingress filters",
+                );
+            } else {
+                tracing::warn!(
+                    client = %client_slug,
+                    filters = self.connack_owed,
+                    failed = self.failed,
+                    "settling finished with ingress filters not asserted",
+                );
+            }
+            self.logged = true;
         }
     }
 }
@@ -656,7 +1020,7 @@ async fn supervisor_body(
     // on the client's bounded request channels. So every request this task
     // submits on `client` is a non-blocking `try_*` send interleaved with
     // `poll` — `try_assert_ingress_subscription` in the connected phase. The
-    // stop path's `try_disconnect_now` goes through the library's unbounded
+    // stop path's DISCONNECT goes through the library's unbounded
     // immediate channel instead. The awaiting forms are for other tasks only.
     // The bound is kept so a stalled broker turns into a prompt `NotConnected`
     // on the publish path rather than unbounded growth.
@@ -681,8 +1045,14 @@ async fn supervisor_body(
             break;
         }
 
-        tracing::info!(client = %client_slug, attempt, "connecting to broker");
-        cure.before_connect(&mut eventloop.options);
+        let clean_start = clean_start_before_connect(cure, &handle, &mut eventloop.options);
+        tracing::info!(
+            client = %client_slug,
+            attempt,
+            clean_start = eventloop.options.clean_start(),
+            clean_start_reason = clean_start.map_or("none", CleanStartReason::as_str),
+            "connecting to broker",
+        );
 
         {
             let mut state = handle.supervisor_state.write().await;
@@ -803,26 +1173,14 @@ async fn supervisor_body(
             }
             Some(Ok(sp)) => sp,
         };
-        cure.at_connack(&mut eventloop.options);
+        clean_start_at_connack(&mut cure, &handle, &mut eventloop.options);
 
-        subscribe_bookkeeping_at_connack(&handle, facts.session_present).await;
-        // Deferred subscribes left from a previous connection are dropped: each
-        // was added to `handle.subscriptions` before it was enqueued, so the
-        // snapshot taken below covers it.
-        handle
-            .deferred_subscribes
-            .lock()
-            .expect(DEFERRED_SUBSCRIBES_POISONED)
-            .clear();
-
-        install_connection(
-            &handle,
-            client.clone(),
-            facts.max_packet_size,
-            facts.receive_max,
-            facts.sub_ids_available,
-        )
-        .await;
+        // Every filter this connection owes the broker a request for. Filter
+        // requests left from a previous connection are dropped: each names a
+        // filter that was held when it was made, so it is asserted and in this
+        // list, unless an UNSUBACK or this CONNACK has said the broker does not
+        // hold it.
+        let unsettled = take_connection(&handle, client.clone(), facts).await;
         {
             let mut state = handle.supervisor_state.write().await;
             *state = SupervisorState::Connected;
@@ -845,81 +1203,19 @@ async fn supervisor_body(
             );
         }
 
-        // Re-assert all union subscriptions (static config union plus any
-        // runtime-added dynamic `mqtt:` subscriptions) from inside the main
-        // loop: as many SUBSCRIBEs as the request channel takes before each
-        // poll and at each subscribe wake while it runs, the rest once a poll
-        // frees room. Snapshot under a brief read-lock.
-        let mut unasserted: std::collections::VecDeque<IngressSubscription> =
-            handle.subscriptions.read().await.to_vec().into();
-        let reassert_count = unasserted.len();
-        let mut reasserted_logged = reassert_count == 0;
-        let mut reassert_failed = 0usize;
-
-        let mut serve_subscribes = || {
-            unasserted.extend(
-                handle
-                    .deferred_subscribes
-                    .lock()
-                    .expect(DEFERRED_SUBSCRIBES_POISONED)
-                    .drain(..),
-            );
-            // Push as many SUBSCRIBEs as the request channel will take now. A
-            // full channel is non-empty, so the running poll takes a request
-            // off it (or fails and ends the connection) and this runs again
-            // with the next poll.
-            while let Some(sub) = unasserted.front() {
-                match try_assert_ingress_subscription(
-                    &handle,
-                    &client,
-                    sub,
-                    facts.sub_ids_available,
-                ) {
-                    Ok(SubscribeSend::Sent) => {
-                        unasserted.pop_front();
-                    }
-                    Ok(SubscribeSend::ChannelFull) => break,
-                    Err(e) => {
-                        tracing::error!(
-                            client = %client_slug,
-                            broker = %broker.identity.slug,
-                            topic = %sub.topic_filter,
-                            error = %e,
-                            "failed to send subscribe — filter not asserted; channel will \
-                             receive nothing until the next reconnect",
-                        );
-                        unasserted.pop_front();
-                        reassert_failed += 1;
-                    }
-                }
-            }
-            if !reasserted_logged && unasserted.is_empty() {
-                if reassert_failed == 0 {
-                    tracing::info!(
-                        client = %client_slug,
-                        broker = %broker.identity.slug,
-                        filters = reassert_count,
-                        "re-asserted all ingress filters",
-                    );
-                } else {
-                    tracing::warn!(
-                        client = %client_slug,
-                        broker = %broker.identity.slug,
-                        filters = reassert_count,
-                        failed = reassert_failed,
-                        "re-assert finished with ingress filters not asserted",
-                    );
-                }
-                reasserted_logged = true;
-            }
-        };
+        // Settle every filter the CONNACK left owed — a SUBSCRIBE for each
+        // held filter, and with the session present an UNSUBSCRIBE for each
+        // asserted filter no longer held — from inside the main loop: as many
+        // requests as the request channel takes before each poll and at each
+        // filter wake while it runs, the rest once a poll frees room.
+        let mut settler = FilterSettler::new(&handle, &client, unsettled, facts.sub_ids_available);
 
         let lost = loop {
             let wait = await_connected_poll(
                 eventloop.poll(),
                 &mut stop_rx,
-                &handle.subscribe_wake,
-                &mut serve_subscribes,
+                &handle.filter_wake,
+                &mut settler,
             )
             .await;
             match wait {
@@ -1051,7 +1347,7 @@ async fn supervisor_body(
             client = %client_slug,
             broker = %broker.identity.slug,
             reason = %disconnect_reason,
-            unasserted = unasserted.len(),
+            unsettled = settler.unsettled.len(),
             "broker connection lost; reconnecting",
         );
 
@@ -1153,8 +1449,10 @@ fn drop_event_loop(handle: &MqttClientHandle, client: AsyncClient, eventloop: ru
 /// If the connection fails meanwhile it has ended: no DISCONNECT is owed, and
 /// dropping the event loop resolves every notice still outstanding, which
 /// ends the reader's wait. Otherwise the DISCONNECT is requested through the
-/// library's immediate channel, which waits for no acknowledgement, and the
-/// event loop is polled until it reports the request done or until the
+/// library's immediate channel — with Session Expiry Interval 0 when the stop
+/// came from [`MqttClientHandle::end_session_and_join`] and the client's
+/// expiry is above 0, plain otherwise ([`StopDisconnect`]) — which waits for
+/// no acknowledgement, and the event loop is polled until it reports the request done or until the
 /// client's stop bound, counted from this call, has passed with a poll still
 /// pending. The poll is tried before the deadline, so a socket that takes the
 /// packet gets it even when the reader's wait used the whole bound.
@@ -1196,10 +1494,12 @@ pub(crate) async fn end_connected_session(
             }
         }
     };
+    let packet = StopDisconnect::of(handle);
+    let mut written = false;
     let disconnect = if connection_ended {
         "not owed: the connection ended"
     } else {
-        client.try_disconnect_now().unwrap_or_else(|e| {
+        packet.send(&client).unwrap_or_else(|e| {
             panic!(
                 "MQTT client {client_slug:?}: the immediate DISCONNECT could not be queued \
                  although its event loop is alive: {e}"
@@ -1212,7 +1512,13 @@ pub(crate) async fn end_connected_session(
                 biased;
                 event = eventloop.poll() => match event {
                     Ok(event) => handle_event(event, handle, router, ConnectionPhase::Live).await,
-                    Err(ConnectionError::RequestsDone) => break "written",
+                    Err(ConnectionError::RequestsDone) => {
+                        if packet == StopDisconnect::EndSession {
+                            handle.record_session_end_written();
+                        }
+                        written = true;
+                        break "written";
+                    }
                     Err(e) => {
                         tracing::warn!(
                             client = %client_slug,
@@ -1240,49 +1546,125 @@ pub(crate) async fn end_connected_session(
     // with it. rumqttc offers no read-to-EOF after `RequestsDone`.
     drop_event_loop(handle, client, eventloop);
     clear_connection_tracking(handle).await;
-    tracing::info!(
-        client = %client_slug,
-        disconnect,
-        "MQTT session stopped: connection closed",
-    );
-}
-
-/// Clear the per-connection SUBSCRIBE bookkeeping: the pkid → filter bindings
-/// of SUBSCRIBEs written on a connection and the broker's answers.
-///
-/// A SUBSCRIBE written on a connection that ended is never answered — Brenn's
-/// SUBSCRIBEs are untracked, so the library does not replay one it has
-/// written — and a SUBACK belongs to the connection that carried it. The next
-/// connection's answers arrive when its own SUBSCRIBEs are acked.
-async fn clear_connection_tracking(handle: &MqttClientHandle) {
-    handle.inflight_subscribes.lock().await.clear();
-    handle.clear_outcomes().await;
-}
-
-/// The SUBSCRIBE bookkeeping a CONNACK leaves. The previous connection's
-/// SUBACK answers are void. With no session, the library has discarded every
-/// SUBSCRIBE it kept, so none of the FIFO's entries will be written; with a
-/// session, the FIFO holds exactly the SUBSCRIBEs the library replays next, in
-/// order, and is kept to bind them.
-async fn subscribe_bookkeeping_at_connack(handle: &MqttClientHandle, session_present: bool) {
-    clear_connection_tracking(handle).await;
-    // TODO(mqtt-replayed-subscribe-unverified): both branches rest on the
-    // library replaying a SUBSCRIBE it held unsent at the loss (first, in
-    // order) with a session and discarding it without one; no test runs the
-    // library through either.
-    if !session_present {
-        clear_subscribe_fifo(handle);
+    if written {
+        tracing::info!(
+            client = %client_slug,
+            disconnect,
+            packet = packet.label(),
+            "MQTT session stopped: connection closed",
+        );
+    } else {
+        tracing::info!(
+            client = %client_slug,
+            disconnect,
+            unsent_packet = packet.label(),
+            "MQTT session stopped: connection closed without the DISCONNECT",
+        );
     }
 }
 
-/// Clear the FIFO of SUBSCRIBEs the event loop holds unwritten, when nothing
-/// in it will be written: the broker reported no session, so the library
-/// discarded them, or a new body starts on a new event loop.
+/// Clear the per-connection request bookkeeping: the pkid → filter bindings
+/// of SUBSCRIBEs and UNSUBSCRIBEs written on a connection, the order of the
+/// requests for each filter, and the broker's SUBSCRIBE answers.
+///
+/// A request written on a connection that ended is never answered — Brenn's
+/// requests are untracked, so the library does not replay one it has
+/// written — and an acknowledgement belongs to the connection that carried it.
+/// The next connection's answers arrive when its own requests are acked.
+async fn clear_connection_tracking(handle: &MqttClientHandle) {
+    handle.inflight_subscribes.lock().await.clear();
+    handle.inflight_unsubscribes.lock().await.clear();
+    handle
+        .request_order
+        .lock()
+        .expect(REQUEST_ORDER_POISONED)
+        .clear();
+    handle.clear_outcomes().await;
+}
+
+/// The CONNACK's request bookkeeping, then `client` installed, then the
+/// filters the connection owes the broker a request for.
+///
+/// The list is read after the install, so a filter added concurrently is
+/// settled on this connection either way: added before the read, it is in the
+/// list; added after it, its caller finds the client and names the filter to
+/// the supervisor. A filter added between the install and the read may be
+/// settled twice.
+async fn take_connection(
+    handle: &MqttClientHandle,
+    client: AsyncClient,
+    facts: ConnackFacts,
+) -> std::collections::VecDeque<String> {
+    subscribe_bookkeeping_at_connack(handle, facts.session_present).await;
+    install_connection(
+        handle,
+        client,
+        facts.max_packet_size,
+        facts.receive_max,
+        facts.sub_ids_available,
+    )
+    .await;
+    owed_at_connack(handle).await
+}
+
+/// The request bookkeeping a CONNACK leaves.
+///
+/// The previous connection's acknowledgements are void, and so are the filter
+/// requests queued for the supervisor, since every filter is settled from
+/// [`owed_at_connack`]. With no session, the broker holds nothing and the
+/// library has discarded every request it kept: both FIFOs are cleared and
+/// the asserted filters become the held ones. With a session, the FIFOs hold
+/// exactly the requests the library replays next, in order, and are kept to
+/// bind them.
+async fn subscribe_bookkeeping_at_connack(handle: &MqttClientHandle, session_present: bool) {
+    clear_connection_tracking(handle).await;
+    handle
+        .filter_requests
+        .lock()
+        .expect(FILTER_REQUESTS_POISONED)
+        .clear();
+    // TODO(mqtt-replayed-subscribe-unverified): both branches rest on the
+    // library replaying a request it held unsent at the loss (first, in order)
+    // with a session and discarding it without one; no test runs the library
+    // through either.
+    if !session_present {
+        clear_subscribe_fifo(handle);
+    }
+    if !session_present {
+        handle.subscriptions.write().await.reset_asserted();
+    }
+}
+
+/// The filters a connection owes the broker a request for after its CONNACK's
+/// bookkeeping, held filters first: a SUBSCRIBE for each held filter, and an
+/// UNSUBSCRIBE for each asserted filter no longer held. Without a session the
+/// bookkeeping has made the asserted filters the held ones, so none is owed an
+/// UNSUBSCRIBE.
+async fn owed_at_connack(handle: &MqttClientHandle) -> std::collections::VecDeque<String> {
+    let set = handle.subscriptions.read().await;
+    // TODO(mqtt-deferred-unsubscribe-not-withdrawn): a filter an earlier
+    // process left in the session it resumes is not asserted here, so it is
+    // never withdrawn.
+    let mut owed: std::collections::VecDeque<String> =
+        set.iter().map(|e| e.topic_filter.clone()).collect();
+    owed.extend(set.withdrawn());
+    owed
+}
+
+/// Clear the FIFOs of SUBSCRIBEs and UNSUBSCRIBEs the event loop holds
+/// unwritten, when nothing in them will be written: the broker reported no
+/// session, so the library discarded them, or a new body starts on a new event
+/// loop.
 fn clear_subscribe_fifo(handle: &MqttClientHandle) {
     handle
         .pending_subscribes
         .lock()
         .expect(PENDING_SUBSCRIBES_POISONED)
+        .clear();
+    handle
+        .pending_unsubscribes
+        .lock()
+        .expect(PENDING_UNSUBSCRIBES_POISONED)
         .clear();
 }
 
@@ -1397,6 +1779,121 @@ impl SessionCure {
     }
 }
 
+/// Why a CONNECT asks for a clean start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanStartReason {
+    /// The handle requires one: a client a reload added
+    /// ([`ArrivingFilters::Added`]), before its first CONNACK.
+    Added,
+    /// A [`SessionCure`] is armed: the resumed session provoked `Unsolicited`.
+    Cure,
+}
+
+impl CleanStartReason {
+    /// The reason's name on the `connecting to broker` line.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Cure => "cure",
+        }
+    }
+}
+
+/// Set the clean-start flag of the next CONNECT from both of its sources — the
+/// armed `cure` and the handle's requirement — and return why it is set, or
+/// `None` for a CONNECT that asks for the kept session. When both hold,
+/// `Added` is returned.
+///
+/// The flag stays set across connect attempts that fail before a CONNACK, and
+/// a body respawned before the first CONNACK reads the handle's requirement
+/// again; the library reads the flag afresh for each CONNECT and for the
+/// CONNACK's session check.
+fn clean_start_before_connect(
+    cure: SessionCure,
+    handle: &MqttClientHandle,
+    options: &mut MqttOptions,
+) -> Option<CleanStartReason> {
+    cure.before_connect(options);
+    if handle.clean_start_pending() {
+        options.set_clean_start(true);
+        return Some(CleanStartReason::Added);
+    }
+    (cure == SessionCure::Armed).then_some(CleanStartReason::Cure)
+}
+
+/// At a CONNACK: whichever clean start made this connection is spent — an
+/// armed `cure` becomes applied, the handle's requirement is cleared — and the
+/// kept session is asked for from the next CONNECT on. A source that did not
+/// set the flag leaves it alone.
+fn clean_start_at_connack(
+    cure: &mut SessionCure,
+    handle: &MqttClientHandle,
+    options: &mut MqttOptions,
+) {
+    cure.at_connack(options);
+    if handle.clear_clean_start() {
+        options.set_clean_start(false);
+    }
+}
+
+/// The DISCONNECT a stop sends on a live connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopDisconnect {
+    /// No properties: the broker keeps the session for its expiry.
+    KeepSession,
+    /// Session Expiry Interval 0: the broker discards the session.
+    EndSession,
+}
+
+impl StopDisconnect {
+    /// The DISCONNECT `handle`'s stop sends: one that ends the session when
+    /// the stop asks for that and the client asked the broker to keep its
+    /// session past the connection. A client declared with expiry 0 has a
+    /// session that ends with the connection, so it sends the plain one.
+    fn of(handle: &MqttClientHandle) -> Self {
+        if handle.session_end_requested() && handle.config.identity.session_expiry_secs > 0 {
+            StopDisconnect::EndSession
+        } else {
+            StopDisconnect::KeepSession
+        }
+    }
+
+    /// The DISCONNECT's properties: `None` for the plain packet.
+    fn properties(self) -> Option<rumqttc::DisconnectProperties> {
+        match self {
+            StopDisconnect::KeepSession => None,
+            StopDisconnect::EndSession => Some(rumqttc::DisconnectProperties {
+                session_expiry_interval: Some(0),
+                reason_string: None,
+                user_properties: Vec::new(),
+                server_reference: None,
+            }),
+        }
+    }
+
+    /// Queue the DISCONNECT on `client`'s immediate channel.
+    fn send(self, client: &AsyncClient) -> Result<(), rumqttc::ClientError> {
+        match self.properties() {
+            None => client.try_disconnect_now(),
+            Some(properties) => client.try_disconnect_now_with_properties(
+                rumqttc::DisconnectReasonCode::NormalDisconnection,
+                properties,
+            ),
+        }
+    }
+
+    /// The closing log line's word for the packet, true whether or not it was
+    /// written.
+    fn label(self) -> &'static str {
+        match self {
+            StopDisconnect::KeepSession => "plain: asks the broker to keep the session",
+            StopDisconnect::EndSession => {
+                "Session Expiry Interval 0: asks the broker to end the session"
+            }
+        }
+    }
+}
+
 /// What the supervisor does about a connected session that ended in error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LossVerdict {
@@ -1447,10 +1944,10 @@ fn classify_loss(err: &ConnectionError, cure: &mut SessionCure) -> LossVerdict {
 /// connection being serviced or to one that failed before handing it out.
 ///
 /// An inbound PUBLISH is routed in either phase: it was received, and the
-/// broker cannot be relied on to send it again. SUBSCRIBE attribution differs:
-/// a SUBSCRIBE written on a lost connection is never answered, so its
-/// `Outgoing::Subscribe` takes its filter off the FIFO and binds nothing, and
-/// a SUBACK of a lost connection records nothing.
+/// broker cannot be relied on to send it again. Request attribution differs:
+/// a SUBSCRIBE or UNSUBSCRIBE written on a lost connection is never answered,
+/// so its outgoing event takes its filter off the FIFO and binds nothing, and
+/// a SUBACK or UNSUBACK of a lost connection records nothing.
 async fn handle_event(
     event: Event,
     handle: &Arc<MqttClientHandle>,
@@ -1479,8 +1976,10 @@ async fn handle_event(
         // only, each after checking that its filter covers the topic. A copy
         // whose identifiers name no subscription this client holds is dropped
         // here. A copy with no identifier is routed by topic.
-        // TODO(mqtt-inbound-retain-flag-not-on-envelope): `p.retain` is not
-        // carried to the subscriber.
+        // `p.retain` reaches the router, which reads it to tell a replay from a
+        // forwarded message.
+        // TODO(mqtt-inbound-retain-flag-not-on-envelope): the router does not
+        // carry it to the subscriber.
         Event::Incoming(Incoming::Publish(p)) => {
             let topic_str = String::from_utf8_lossy(&p.topic).into_owned();
 
@@ -1525,39 +2024,81 @@ async fn handle_event(
                     &topic_str,
                     inbound_payload,
                     delivery_qos,
+                    p.retain,
                     routing,
                 )
                 .await;
         }
 
         // --- Outgoing subscribe: bind pkid → pending filter (FIFO) ---
+        //
+        // A SUBSCRIBE written puts its filter back among the asserted ones in
+        // either phase: the broker may hold it from now on, whatever an
+        // UNSUBACK said before. One the library replays from an earlier
+        // connection is settled again, since the held set may have changed
+        // since it was submitted.
         Event::Outgoing(Outgoing::Subscribe(pkid)) => {
-            let filter = handle
-                .pending_subscribes
-                .lock()
-                .expect(PENDING_SUBSCRIBES_POISONED)
-                .pop_front();
-            if let Some(filter) = filter {
-                match phase {
-                    ConnectionPhase::Live => {
-                        handle.inflight_subscribes.lock().await.insert(pkid, filter);
-                    }
-                    ConnectionPhase::Lost => {
-                        tracing::debug!(
-                            client = %client_slug,
-                            pkid,
-                            topic = %filter,
-                            "SUBSCRIBE written on a lost connection; it will not be answered",
-                        );
-                    }
+            let kind = RequestKind::Subscribe;
+            let Some(PendingRequest {
+                topic_filter: filter,
+                epoch,
+            }) = take_written_request(handle, kind, pkid)
+            else {
+                return;
+            };
+            handle.subscriptions.write().await.mark_asserted(&filter);
+            match phase {
+                ConnectionPhase::Live => {
+                    written_on_live_connection(handle, &filter, epoch);
+                    handle.inflight_subscribes.lock().await.insert(pkid, filter);
                 }
-            } else {
+                ConnectionPhase::Lost => written_on_lost_connection(handle, kind, pkid, &filter),
+            }
+        }
+
+        // --- Outgoing unsubscribe: bind pkid → pending filter (FIFO) ---
+        Event::Outgoing(Outgoing::Unsubscribe(pkid)) => {
+            let kind = RequestKind::Unsubscribe;
+            let Some(PendingRequest {
+                topic_filter: filter,
+                epoch,
+            }) = take_written_request(handle, kind, pkid)
+            else {
+                return;
+            };
+            match phase {
+                ConnectionPhase::Live => {
+                    let seq = written_on_live_connection(handle, &filter, epoch);
+                    handle
+                        .inflight_unsubscribes
+                        .lock()
+                        .await
+                        .insert(pkid, (filter, seq));
+                }
+                ConnectionPhase::Lost => written_on_lost_connection(handle, kind, pkid, &filter),
+            }
+        }
+
+        // --- UnsubAck: take the filter out of the asserted set if withdrawn ---
+        Event::Incoming(Incoming::UnsubAck(ack)) if phase == ConnectionPhase::Lost => {
+            tracing::debug!(
+                client = %client_slug,
+                pkid = ack.pkid,
+                "UNSUBACK of a lost connection; its outcomes are void",
+            );
+        }
+        Event::Incoming(Incoming::UnsubAck(ack)) => {
+            let attributed = handle.inflight_unsubscribes.lock().await.remove(&ack.pkid);
+            let Some((filter, seq)) = attributed else {
                 tracing::warn!(
                     client = %client_slug,
-                    pkid,
-                    "Outgoing::Subscribe with no pending filter — possible session resend",
+                    pkid = ack.pkid,
+                    reasons = ?ack.reasons,
+                    "UNSUBACK for a packet identifier no UNSUBSCRIBE was bound to",
                 );
-            }
+                return;
+            };
+            unsuback_resolved(handle, &filter, seq, &ack.reasons).await;
         }
 
         // --- SubAck: record and log the broker's answer for the attributed filter ---
@@ -1632,6 +2173,69 @@ async fn handle_event(
         }
 
         _ => {}
+    }
+}
+
+/// Whether a request submitted on connection `epoch` and seen written now was
+/// replayed by the library from an earlier connection. Read on the supervisor
+/// task, the epoch's one writer, so it takes no lock.
+fn replayed(handle: &MqttClientHandle, epoch: u64) -> bool {
+    epoch != handle.connection_epoch.load(Ordering::Relaxed)
+}
+
+/// Act on the broker's answer to the UNSUBSCRIBE numbered `seq` for `filter`.
+///
+/// Success and No subscription existed take the filter out of the asserted
+/// set when that UNSUBSCRIBE is still the newest request for the filter on
+/// this connection and the filter is not held; otherwise it stays asserted.
+/// Any other answer is logged at `error` and the filter stays asserted, to be
+/// withdrawn again at the next connection that finds the session. Each
+/// UNSUBSCRIBE carries one filter, so an UNSUBACK with any other number of
+/// reason codes is a broker protocol violation; the process is not taken down
+/// for a peer's malformed packet.
+async fn unsuback_resolved(
+    handle: &MqttClientHandle,
+    filter: &str,
+    seq: u64,
+    reasons: &[rumqttc::UnsubAckReason],
+) {
+    use rumqttc::UnsubAckReason;
+    let client_slug = handle.config.identity.slug.as_str();
+    match reasons {
+        [reason @ (UnsubAckReason::Success | UnsubAckReason::NoSubscriptionExisted)] => {
+            let newest = handle
+                .request_order
+                .lock()
+                .expect(REQUEST_ORDER_POISONED)
+                .is_newest(filter, seq);
+            let withdrawn = newest && handle.subscriptions.write().await.withdraw_asserted(filter);
+            tracing::debug!(
+                client = %client_slug,
+                topic = %filter,
+                reason = ?reason,
+                withdrawn,
+                "UNSUBACK: the broker holds no subscription for the filter",
+            );
+        }
+        [other] => {
+            tracing::error!(
+                client = %client_slug,
+                topic = %filter,
+                reason = ?other,
+                "UNSUBACK: the broker refused to withdraw the filter; it stays asserted and is \
+                 withdrawn again at the next connection that finds the session",
+            );
+        }
+        codes => {
+            tracing::error!(
+                client = %client_slug,
+                topic = %filter,
+                reason_codes = ?codes,
+                "UNSUBACK carries {} reason codes for a one-filter UNSUBSCRIBE — protocol \
+                 violation; the filter stays asserted",
+                codes.len(),
+            );
+        }
     }
 }
 
@@ -1824,15 +2428,29 @@ mod tests {
         MqttClientHandle::new(config, vec![], stop_tx)
     }
 
+    /// A FIFO entry for `topic_filter` submitted on connection epoch 0, the
+    /// epoch of a handle no connection has been installed on.
+    fn pending(topic_filter: &str) -> PendingRequest {
+        PendingRequest {
+            topic_filter: topic_filter.to_string(),
+            epoch: 0,
+        }
+    }
+
     struct NullRouter;
     #[async_trait::async_trait]
     impl MqttEventRouter for NullRouter {
+        fn ready(&self) -> bool {
+            true
+        }
+
         async fn deliver_inbound(
             &self,
             _client_slug: &str,
             _topic: &str,
             _payload: crate::payload::InboundPayload,
             _qos: u8,
+            _retained: bool,
             _routing: InboundRouting,
         ) {
         }
@@ -1845,11 +2463,12 @@ mod tests {
     }
 
     /// A router that keeps each call's topic and routing, and its delivery QoS
-    /// apart.
+    /// and RETAIN flag apart.
     #[derive(Default)]
     struct RecordingRouter {
         calls: std::sync::Mutex<Vec<(String, InboundRouting)>>,
         qos: std::sync::Mutex<Vec<u8>>,
+        retained: std::sync::Mutex<Vec<bool>>,
     }
 
     impl RecordingRouter {
@@ -1860,19 +2479,29 @@ mod tests {
         fn take_qos(&self) -> Vec<u8> {
             std::mem::take(&mut *self.qos.lock().unwrap())
         }
+
+        fn take_retained(&self) -> Vec<bool> {
+            std::mem::take(&mut *self.retained.lock().unwrap())
+        }
     }
 
     #[async_trait::async_trait]
     impl MqttEventRouter for RecordingRouter {
+        fn ready(&self) -> bool {
+            true
+        }
+
         async fn deliver_inbound(
             &self,
             _client_slug: &str,
             topic: &str,
             _payload: crate::payload::InboundPayload,
             qos: u8,
+            retained: bool,
             routing: InboundRouting,
         ) {
             self.qos.lock().unwrap().push(qos);
+            self.retained.lock().unwrap().push(retained);
             self.calls
                 .lock()
                 .unwrap()
@@ -2152,7 +2781,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .cloned()
+                .map(|p| p.topic_filter.clone())
                 .collect::<Vec<_>>(),
             vec!["home/a".to_string()],
         );
@@ -2167,7 +2796,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .cloned()
+                .map(|p| p.topic_filter.clone())
                 .collect::<Vec<_>>(),
             vec!["home/a".to_string()],
             "the unsent SUBSCRIBE left no attribution entry behind",
@@ -2266,12 +2895,12 @@ mod tests {
             .pending_subscribes
             .lock()
             .unwrap()
-            .push_back("home/+/state".to_string());
+            .push_back(pending("home/+/state"));
         handle
             .pending_subscribes
             .lock()
             .unwrap()
-            .push_back("sensors/#".to_string());
+            .push_back(pending("sensors/#"));
 
         handle_event(
             Event::Outgoing(Outgoing::Subscribe(10)),
@@ -2350,12 +2979,12 @@ mod tests {
             .pending_subscribes
             .lock()
             .unwrap()
-            .push_back("home/+/state".to_string());
+            .push_back(pending("home/+/state"));
         handle
             .pending_subscribes
             .lock()
             .unwrap()
-            .push_back("sensors/#".to_string());
+            .push_back(pending("sensors/#"));
         handle_event(
             Event::Outgoing(Outgoing::Subscribe(10)),
             &handle,
@@ -2424,7 +3053,7 @@ mod tests {
             .pending_subscribes
             .lock()
             .unwrap()
-            .push_back("home/+/state".to_string());
+            .push_back(pending("home/+/state"));
         handle_event(
             Event::Outgoing(Outgoing::Subscribe(10)),
             &handle,
@@ -2458,7 +3087,7 @@ mod tests {
             .pending_subscribes
             .lock()
             .unwrap()
-            .push_back("home/+/state".to_string());
+            .push_back(pending("home/+/state"));
         handle_event(
             Event::Outgoing(Outgoing::Subscribe(10)),
             &handle,
@@ -2923,7 +3552,7 @@ mod tests {
                 .pending_subscribes
                 .lock()
                 .unwrap()
-                .push_back(filter.to_string());
+                .push_back(pending(filter));
         }
         lost(Event::Outgoing(Outgoing::Subscribe(10)), &handle, &router).await;
         assert!(handle.inflight_subscribes.lock().await.is_empty());
@@ -2933,7 +3562,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .cloned()
+                .map(|p| p.topic_filter.clone())
                 .collect::<Vec<_>>(),
             vec!["a/b".to_string()],
         );
@@ -2985,7 +3614,7 @@ mod tests {
                     .pending_subscribes
                     .lock()
                     .unwrap()
-                    .push_back(filter.to_string());
+                    .push_back(pending(filter));
             }
 
             subscribe_bookkeeping_at_connack(&handle, session_present).await;
@@ -2997,7 +3626,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .cloned()
+                .map(|p| p.topic_filter.clone())
                 .collect();
             if !session_present {
                 assert!(fifo.is_empty(), "no session: nothing will be replayed");
@@ -3028,6 +3657,28 @@ mod tests {
             );
             assert!(handle.is_granted("b/+").await);
             assert_eq!(handle.subscribe_outcome("c/d").await, None);
+        }
+    }
+
+    /// An inbound PUBLISH's RETAIN flag reaches the router as received, on a
+    /// live connection's events and on a lost one's.
+    #[tokio::test]
+    async fn the_retain_flag_reaches_the_router_on_live_and_lost_events() {
+        let (handle, _eventloop) = routing_handle(false).await;
+        let recording = Arc::new(RecordingRouter::default());
+        let router: Arc<dyn MqttEventRouter> = recording.clone();
+        let publish = |retain: bool| {
+            let mut publish = rumqttc::Publish::new("a/b", QoS::AtLeastOnce, "v", None);
+            publish.pkid = 1;
+            publish.retain = retain;
+            Event::Incoming(Incoming::Publish(publish))
+        };
+
+        for phase in [ConnectionPhase::Live, ConnectionPhase::Lost] {
+            handle_event(publish(true), &handle, &router, phase).await;
+            handle_event(publish(false), &handle, &router, phase).await;
+            assert_eq!(recording.take_retained(), [true, false], "{phase:?}");
+            assert_eq!(recording.take().len(), 2, "{phase:?}");
         }
     }
 
@@ -3128,16 +3779,25 @@ mod tests {
         assert_eq!(queued_incoming_publishes(&mixed), 2);
     }
 
-    /// A new body clears the SUBSCRIBE FIFO a previous body left: nothing of
-    /// that body's event loop is replayed on the new one.
+    /// A new body clears both FIFOs a previous body left: nothing of that
+    /// body's event loop is replayed on the new one. The asserted filters are
+    /// kept, so the new body's first connection that finds the session
+    /// withdraws what the old one could not.
     #[tokio::test]
     async fn a_new_body_starts_with_no_subscribe_bookkeeping() {
         let handle = test_handle();
+        handle.add_subscription("a/x".to_string()).await;
+        handle.remove_subscription("a/x").await;
         handle
             .pending_subscribes
             .lock()
             .unwrap()
-            .push_back("a/b".to_string());
+            .push_back(pending("a/b"));
+        handle
+            .pending_unsubscribes
+            .lock()
+            .unwrap()
+            .push_back(pending("a/x"));
         handle
             .inflight_subscribes
             .lock()
@@ -3154,7 +3814,380 @@ mod tests {
         .expect("the supervisor did not stop");
 
         assert!(handle.pending_subscribes.lock().unwrap().is_empty());
+        assert!(handle.pending_unsubscribes.lock().unwrap().is_empty());
         assert!(handle.inflight_subscribes.lock().await.is_empty());
+        assert_eq!(handle.subscriptions.read().await.withdrawn(), ["a/x"]);
+    }
+
+    // --- Settling filters ---
+
+    /// The filters of `queue`, front first.
+    fn fifo(queue: &std::sync::Mutex<std::collections::VecDeque<PendingRequest>>) -> Vec<String> {
+        queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.topic_filter.clone())
+            .collect()
+    }
+
+    /// A handle registered with `filters`, none of them connected yet.
+    fn handle_with(filters: &[&str]) -> Arc<MqttClientHandle> {
+        let (stop_tx, _rx) = tokio::sync::watch::channel(false);
+        let config = Arc::new(brenn_lib::mqtt::test_support::test_client_config("broker"));
+        MqttClientHandle::new(config, filters.iter().map(|f| sub(f)).collect(), stop_tx)
+    }
+
+    /// Serve `unsettled` and the queued filter requests once, as the connected
+    /// phase does, and return what that submitted: the SUBSCRIBEs' filters and
+    /// the UNSUBSCRIBEs'.
+    async fn serve_from(
+        handle: &Arc<MqttClientHandle>,
+        unsettled: std::collections::VecDeque<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        let subs_before = fifo(&handle.pending_subscribes).len();
+        let unsubs_before = fifo(&handle.pending_unsubscribes).len();
+        let (client, _eventloop) = unpolled_client(64);
+        FilterSettler::new(handle, &client, unsettled, true)
+            .serve()
+            .await;
+        (
+            fifo(&handle.pending_subscribes)[subs_before..].to_vec(),
+            fifo(&handle.pending_unsubscribes)[unsubs_before..].to_vec(),
+        )
+    }
+
+    /// What a CONNACK makes the supervisor submit: the bookkeeping it leaves,
+    /// the connection installed, then one serve.
+    async fn connack_submits(
+        handle: &Arc<MqttClientHandle>,
+        session_present: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        subscribe_bookkeeping_at_connack(handle, session_present).await;
+        handle.connection_epoch.fetch_add(1, Ordering::Relaxed);
+        let owed = owed_at_connack(handle).await;
+        serve_from(handle, owed).await
+    }
+
+    /// A filter added after the CONNACK's bookkeeping, by a caller that reads
+    /// the client before the install makes it visible and so names nothing to
+    /// the supervisor, is owed by that connection.
+    #[tokio::test]
+    async fn a_filter_added_while_the_connection_is_installed_is_owed() {
+        for session_present in [false, true] {
+            let handle = handle_with(&["held/1"]);
+            handle.request_settle("stale/1".to_string());
+            let caller_view = handle.client.lock().await;
+            let (client, _eventloop) = unpolled_client(8);
+            let facts = ConnackFacts {
+                session_present,
+                max_packet_size: None,
+                receive_max: None,
+                sub_ids_available: true,
+            };
+            let connecting = tokio::spawn({
+                let handle = handle.clone();
+                async move { take_connection(&handle, client, facts).await }
+            });
+            // The bookkeeping clears the queued request, and the install then
+            // waits on the client guard held here.
+            while !handle.filter_requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            handle.add_subscription("late/1".into()).await;
+            assert!(caller_view.is_none(), "the caller finds no client");
+            drop(caller_view);
+
+            let owed = connecting.await.unwrap();
+            assert!(
+                owed.contains(&"late/1".to_string()),
+                "session present: {session_present}; owed: {owed:?}",
+            );
+            assert!(owed.contains(&"held/1".to_string()));
+            assert!(handle.client.lock().await.is_some());
+        }
+    }
+
+    async fn live(event: Event, handle: &Arc<MqttClientHandle>) {
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        handle_event(event, handle, &router, ConnectionPhase::Live).await;
+    }
+
+    fn unsuback(pkid: u16, reason: rumqttc::UnsubAckReason) -> Event {
+        Event::Incoming(Incoming::UnsubAck(rumqttc::UnsubAck {
+            pkid,
+            reasons: vec![reason],
+            properties: None,
+        }))
+    }
+
+    async fn asserted(handle: &MqttClientHandle, filter: &str) -> bool {
+        handle.subscriptions.read().await.is_asserted(filter)
+    }
+
+    /// A filter withdrawn while disconnected — here one the handle was
+    /// registered with, before its first connection — is withdrawn at a
+    /// CONNACK that finds the session, and at one that finds none nothing is
+    /// withdrawn and the asserted filters become the held ones.
+    #[tokio::test]
+    async fn a_withdrawal_while_disconnected_waits_for_a_connack_with_the_session() {
+        for session_present in [true, false] {
+            let handle = handle_with(&["a/1", "a/2"]);
+            handle.remove_subscription("a/2").await;
+
+            let (subs, unsubs) = connack_submits(&handle, session_present).await;
+
+            assert_eq!(subs, ["a/1"], "session present: {session_present}");
+            if session_present {
+                assert_eq!(unsubs, ["a/2"]);
+                assert!(asserted(&handle, "a/2").await, "until the UNSUBACK");
+            } else {
+                assert!(unsubs.is_empty());
+                assert!(!asserted(&handle, "a/2").await);
+                assert!(handle.subscriptions.read().await.withdrawn().is_empty());
+            }
+        }
+    }
+
+    /// A successor inherits the asserted filters with the held ones, so a
+    /// filter its never-connected predecessor was registered with and withdrew
+    /// is withdrawn at the successor's first CONNACK that finds the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_successor_withdraws_what_its_never_connected_predecessor_withdrew() {
+        let service = MqttService::new();
+        let old = handle_with(&["s/1", "s/2"]);
+        old.remove_subscription("s/2").await;
+        old.set_supervisor(stand_in_supervisor(&old)).await;
+        service.add_client(old.clone());
+
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        let successor = register_and_spawn(
+            &service,
+            old.config.clone(),
+            ArrivingFilters::Successor(&old),
+            router,
+        )
+        .await;
+        successor.stop_and_join().await;
+        assert_eq!(successor.subscriptions.read().await.withdrawn(), ["s/2"]);
+
+        let (subs, unsubs) = connack_submits(&successor, true).await;
+        assert_eq!(subs, ["s/1"]);
+        assert_eq!(unsubs, ["s/2"]);
+    }
+
+    /// A filter added and withdrawn between two connections was never
+    /// subscribed, and is still withdrawn at the next CONNACK that finds the
+    /// session; the broker's No subscription existed takes it out.
+    #[tokio::test]
+    async fn a_filter_never_subscribed_is_withdrawn_and_taken_out_by_its_unsuback() {
+        let handle = handle_with(&[]);
+        connack_submits(&handle, false).await;
+        handle.add_subscription("b/1".to_string()).await;
+        handle.remove_subscription("b/1").await;
+
+        let (subs, unsubs) = connack_submits(&handle, true).await;
+        assert!(subs.is_empty());
+        assert_eq!(unsubs, ["b/1"]);
+
+        live(Event::Outgoing(Outgoing::Unsubscribe(5)), &handle).await;
+        assert!(handle.pending_unsubscribes.lock().unwrap().is_empty());
+        live(
+            unsuback(5, rumqttc::UnsubAckReason::NoSubscriptionExisted),
+            &handle,
+        )
+        .await;
+        assert!(!asserted(&handle, "b/1").await);
+        assert!(handle.inflight_unsubscribes.lock().await.is_empty());
+    }
+
+    /// An UNSUBACK that arrives after the filter is held again — before the
+    /// supervisor has taken the request that names it — leaves the filter
+    /// asserted, and that request then subscribes it.
+    #[tokio::test]
+    async fn an_unsuback_for_a_filter_held_again_leaves_it_asserted() {
+        let handle = handle_with(&["c/1"]);
+        handle.remove_subscription("c/1").await;
+        let (_, unsubs) = connack_submits(&handle, true).await;
+        assert_eq!(unsubs, ["c/1"]);
+        live(Event::Outgoing(Outgoing::Unsubscribe(5)), &handle).await;
+
+        handle.add_subscription("c/1".to_string()).await;
+        handle.request_settle("c/1".to_string());
+        live(unsuback(5, rumqttc::UnsubAckReason::Success), &handle).await;
+        assert!(asserted(&handle, "c/1").await);
+
+        let (subs, unsubs) = serve_from(&handle, Default::default()).await;
+        assert_eq!(subs, ["c/1"]);
+        assert!(unsubs.is_empty());
+    }
+
+    /// A filter withdrawn and held again while disconnected gets a SUBSCRIBE
+    /// and no UNSUBSCRIBE at a CONNACK that finds the session.
+    #[tokio::test]
+    async fn a_filter_withdrawn_and_held_again_is_only_subscribed() {
+        let handle = handle_with(&["d/1"]);
+        handle.remove_subscription("d/1").await;
+        handle.add_subscription("d/1".to_string()).await;
+
+        let (subs, unsubs) = connack_submits(&handle, true).await;
+        assert_eq!(subs, ["d/1"]);
+        assert!(unsubs.is_empty());
+    }
+
+    /// A subscribe and an unsubscribe of one filter racing: in each order, and
+    /// whether the supervisor serves between them or after both, the last
+    /// request it submits agrees with the held set.
+    #[tokio::test]
+    async fn a_racing_subscribe_and_unsubscribe_end_on_the_held_set() {
+        for subscribe_first in [true, false] {
+            for serve_between in [true, false] {
+                let handle = handle_with(&[]);
+                connack_submits(&handle, false).await;
+                if !subscribe_first {
+                    handle.add_subscription("r/1".to_string()).await;
+                    serve_from(&handle, ["r/1".to_string()].into()).await;
+                }
+                let change = async |subscribe: bool| {
+                    if subscribe {
+                        handle.add_subscription("r/1".to_string()).await;
+                    } else {
+                        handle.remove_subscription("r/1").await;
+                    }
+                    handle.request_settle("r/1".to_string());
+                };
+                change(subscribe_first).await;
+                if serve_between {
+                    serve_from(&handle, Default::default()).await;
+                }
+                change(!subscribe_first).await;
+                let (subs, unsubs) = serve_from(&handle, Default::default()).await;
+
+                let held = handle.subscriptions.read().await.get("r/1").is_some();
+                assert_eq!(held, !subscribe_first);
+                let case =
+                    format!("subscribe first: {subscribe_first}, serve between: {serve_between}");
+                if held {
+                    assert!(!subs.is_empty() && unsubs.is_empty(), "{case}");
+                } else {
+                    assert!(subs.is_empty() && !unsubs.is_empty(), "{case}");
+                }
+            }
+        }
+    }
+
+    /// Success and No subscription existed take the filter out of the
+    /// asserted set; a refusal keeps it, and so does a success for an
+    /// UNSUBSCRIBE that a later SUBSCRIBE of the filter has overtaken.
+    #[tokio::test]
+    async fn an_unsuback_takes_the_filter_out_only_when_it_withdrew_it() {
+        use rumqttc::UnsubAckReason as R;
+        for (reason, taken_out) in [
+            (R::Success, true),
+            (R::NoSubscriptionExisted, true),
+            (R::NotAuthorized, false),
+            (R::UnspecifiedError, false),
+        ] {
+            let handle = handle_with(&["e/1"]);
+            handle.remove_subscription("e/1").await;
+            connack_submits(&handle, true).await;
+            live(Event::Outgoing(Outgoing::Unsubscribe(5)), &handle).await;
+            live(unsuback(5, reason), &handle).await;
+            assert_eq!(!asserted(&handle, "e/1").await, taken_out, "{reason:?}");
+        }
+
+        let handle = handle_with(&["e/1"]);
+        handle.remove_subscription("e/1").await;
+        connack_submits(&handle, true).await;
+        live(Event::Outgoing(Outgoing::Unsubscribe(5)), &handle).await;
+        handle.add_subscription("e/1".to_string()).await;
+        let (subs, _) = serve_from(&handle, ["e/1".to_string()].into()).await;
+        assert_eq!(subs, ["e/1"]);
+        handle.remove_subscription("e/1").await;
+        live(unsuback(5, R::Success), &handle).await;
+        assert!(
+            asserted(&handle, "e/1").await,
+            "the SUBSCRIBE submitted after the UNSUBSCRIBE may stand at the broker",
+        );
+    }
+
+    /// A SUBSCRIBE the library replays from an earlier connection for a filter
+    /// no longer held is followed by an UNSUBSCRIBE, whether it is seen written
+    /// before or after the CONNACK's settling; and a replayed UNSUBSCRIBE of a
+    /// filter held again is followed by a SUBSCRIBE.
+    #[tokio::test]
+    async fn a_replayed_request_settles_its_filter_again() {
+        for replay_first in [true, false] {
+            let handle = handle_with(&["g/1"]);
+            handle
+                .pending_subscribes
+                .lock()
+                .unwrap()
+                .push_back(pending("g/1"));
+            handle.remove_subscription("g/1").await;
+
+            subscribe_bookkeeping_at_connack(&handle, true).await;
+            handle.connection_epoch.fetch_add(1, Ordering::Relaxed);
+            let owed = owed_at_connack(&handle).await;
+            let unsubs = if replay_first {
+                live(Event::Outgoing(Outgoing::Subscribe(3)), &handle).await;
+                serve_from(&handle, owed).await.1
+            } else {
+                let mut unsubs = serve_from(&handle, owed).await.1;
+                assert_eq!(unsubs, ["g/1"]);
+                live(Event::Outgoing(Outgoing::Subscribe(3)), &handle).await;
+                unsubs.extend(serve_from(&handle, Default::default()).await.1);
+                unsubs
+            };
+            assert_eq!(unsubs, ["g/1", "g/1"], "replay first: {replay_first}");
+            assert!(asserted(&handle, "g/1").await);
+        }
+
+        let handle = handle_with(&["h/1"]);
+        handle
+            .pending_unsubscribes
+            .lock()
+            .unwrap()
+            .push_back(pending("h/1"));
+        let (subs, _) = connack_submits(&handle, true).await;
+        assert_eq!(subs, ["h/1"]);
+        live(Event::Outgoing(Outgoing::Unsubscribe(4)), &handle).await;
+        let (subs, unsubs) = serve_from(&handle, Default::default()).await;
+        assert_eq!(subs, ["h/1"]);
+        assert!(unsubs.is_empty());
+    }
+
+    /// An UNSUBSCRIBE written on a lost connection takes its filter off the
+    /// FIFO and binds nothing, and an UNSUBACK of a lost connection resolves
+    /// nothing.
+    #[tokio::test]
+    async fn unsubscribe_events_of_a_lost_connection_record_nothing() {
+        let handle = handle_with(&["x/1"]);
+        handle.remove_subscription("x/1").await;
+        let router: Arc<dyn MqttEventRouter> = Arc::new(NullRouter);
+        handle
+            .pending_unsubscribes
+            .lock()
+            .unwrap()
+            .push_back(pending("x/1"));
+        lost(Event::Outgoing(Outgoing::Unsubscribe(9)), &handle, &router).await;
+        assert!(handle.pending_unsubscribes.lock().unwrap().is_empty());
+        assert!(handle.inflight_unsubscribes.lock().await.is_empty());
+
+        let seq = count_request(&handle, "x/1");
+        handle
+            .inflight_unsubscribes
+            .lock()
+            .await
+            .insert(9, ("x/1".to_string(), seq));
+        lost(
+            unsuback(9, rumqttc::UnsubAckReason::Success),
+            &handle,
+            &router,
+        )
+        .await;
+        assert!(asserted(&handle, "x/1").await);
+        assert_eq!(handle.inflight_unsubscribes.lock().await.len(), 1);
     }
 
     // --- The connected phase's wait on a poll ---
@@ -3182,25 +4215,33 @@ mod tests {
         (finish, poll)
     }
 
+    /// A serve step that counts its runs.
+    struct CountServes<'a>(&'a std::sync::atomic::AtomicUsize);
+
+    impl ServeFilters for CountServes<'_> {
+        async fn serve(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Poll `wait` once, with a waker that does nothing.
     fn poll_once<F: Future>(wait: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
         wait.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
     }
 
-    /// A subscribe wake runs the SUBSCRIBE pushes again without dropping the
+    /// A filter wake runs the serve step again without dropping the
     /// poll, however often it comes, and the wait ends with the poll's own
     /// output.
     #[tokio::test]
-    async fn a_subscribe_wake_serves_subscribes_and_keeps_the_poll() {
+    async fn a_filter_wake_serves_filters_and_keeps_the_poll() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let dropped = Arc::new(AtomicBool::new(false));
         let (finish, poll) = watched_poll(&dropped);
         let (_stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         let wake = tokio::sync::Notify::new();
         let served = AtomicUsize::new(0);
-        let wait = await_connected_poll(poll, &mut stop_rx, &wake, || {
-            served.fetch_add(1, Ordering::SeqCst);
-        });
+        let mut counter = CountServes(&served);
+        let wait = await_connected_poll(poll, &mut stop_rx, &wake, &mut counter);
         let mut wait = std::pin::pin!(wait);
 
         assert!(poll_once(wait.as_mut()).is_pending());
@@ -3240,7 +4281,9 @@ mod tests {
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         let wake = tokio::sync::Notify::new();
         {
-            let wait = await_connected_poll(poll, &mut stop_rx, &wake, || {});
+            let unused = std::sync::atomic::AtomicUsize::new(0);
+            let mut counter = CountServes(&unused);
+            let wait = await_connected_poll(poll, &mut stop_rx, &wake, &mut counter);
             let mut wait = std::pin::pin!(wait);
             assert!(poll_once(wait.as_mut()).is_pending());
             wake.notify_one();
@@ -3697,5 +4740,321 @@ Lu2jWbIqZrx0\n\
         let (store, added) = load_ca_cert_pem("test-broker", &pem);
         assert_eq!(added, 1);
         assert_eq!(store.len(), 1);
+    }
+
+    // --- registration and the spawn's readiness check ---
+
+    /// A router that cannot deliver yet.
+    struct UnreadyRouter;
+    #[async_trait::async_trait]
+    impl MqttEventRouter for UnreadyRouter {
+        fn ready(&self) -> bool {
+            false
+        }
+
+        async fn deliver_inbound(
+            &self,
+            client_slug: &str,
+            topic: &str,
+            _payload: crate::payload::InboundPayload,
+            _qos: u8,
+            _retained: bool,
+            _routing: InboundRouting,
+        ) {
+            panic!("an unready router was handed {topic:?} on {client_slug}");
+        }
+
+        async fn session_fault(&self, client_slug: &str, fault: SessionFault) {
+            panic!("an unready router was handed {fault:?} on {client_slug}");
+        }
+    }
+
+    fn test_config() -> Arc<MqttClientConfig> {
+        Arc::new(brenn_lib::mqtt::test_support::test_client_config("broker"))
+    }
+
+    /// Registration makes the slug resolve with its filters and spawns nothing.
+    #[tokio::test]
+    async fn register_client_registers_the_handle_without_a_supervisor() {
+        let service = MqttService::new();
+        let session = register_client(
+            &service,
+            test_config(),
+            vec![IngressSubscription::new("home/state".to_string())],
+        );
+        let registered = service.get_client("broker").expect("the slug resolves");
+        assert!(Arc::ptr_eq(&registered, session.handle()));
+        assert!(!registered.supervisor_spawned().await);
+        assert!(
+            registered
+                .subscriptions
+                .read()
+                .await
+                .get("home/state")
+                .is_some()
+        );
+    }
+
+    /// `spawn` over a ready router records the supervisor it spawned.
+    #[tokio::test]
+    async fn spawn_over_a_ready_router_records_the_supervisor() {
+        let service = MqttService::new();
+        let handle = register_client(&service, test_config(), Vec::new())
+            .spawn(Arc::new(NullRouter))
+            .await;
+        assert!(handle.supervisor_spawned().await);
+        handle.stop_and_join().await;
+    }
+
+    /// `spawn` against a router that cannot deliver panics, and no supervisor
+    /// is spawned or recorded.
+    #[tokio::test]
+    async fn spawn_against_an_unready_router_panics_and_spawns_nothing() {
+        let service = MqttService::new();
+        let session = register_client(&service, test_config(), Vec::new());
+        let handle = session.handle().clone();
+        let spawned = tokio::spawn(async move {
+            session.spawn(Arc::new(UnreadyRouter)).await;
+        })
+        .await;
+        let panic = spawned.expect_err("the spawn panics").into_panic();
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("the panic carries a formatted message");
+        assert!(
+            message.contains("spawned against a router that cannot deliver yet"),
+            "{message}",
+        );
+        assert!(!handle.supervisor_spawned().await);
+        assert!(
+            handle.client.lock().await.is_none(),
+            "nothing connected for the handle",
+        );
+    }
+
+    /// `register_and_spawn` goes through the same check.
+    #[tokio::test]
+    async fn register_and_spawn_against_an_unready_router_panics_and_spawns_nothing() {
+        let service = MqttService::new();
+        let task_service = service.clone();
+        let spawned = tokio::spawn(async move {
+            register_and_spawn(
+                &task_service,
+                test_config(),
+                ArrivingFilters::Declared(Vec::new()),
+                Arc::new(UnreadyRouter),
+            )
+            .await;
+        })
+        .await;
+        let panic = spawned.expect_err("the spawn panics").into_panic();
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("the panic carries a formatted message");
+        assert!(
+            message.contains("spawned against a router that cannot deliver yet"),
+            "{message}",
+        );
+        let handle = service
+            .get_client("broker")
+            .expect("registered before the spawn");
+        assert!(!handle.supervisor_spawned().await);
+    }
+
+    // --- sessions that end and start on purpose ---
+
+    fn config_with_expiry(session_expiry_secs: u32) -> Arc<MqttClientConfig> {
+        let mut config = brenn_lib::mqtt::test_support::test_client_config("broker");
+        config.identity.session_expiry_secs = session_expiry_secs;
+        Arc::new(config)
+    }
+
+    /// A handle with a stand-in supervisor that has already ended, so a stop
+    /// joins at once.
+    async fn handle_with_ended_supervisor(config: Arc<MqttClientConfig>) -> Arc<MqttClientHandle> {
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        let handle = MqttClientHandle::new(config, Vec::new(), stop_tx);
+        handle.set_supervisor(tokio::spawn(async {})).await;
+        handle
+    }
+
+    /// An `Added` arrival's CONNECTs are clean starts up to the first CONNACK,
+    /// across failed attempts and across a body respawned before it; the
+    /// CONNECT after that CONNACK asks for the kept session.
+    #[test]
+    fn a_required_clean_start_lasts_until_the_first_connack() {
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        let handle = MqttClientHandle::new(test_config(), Vec::new(), stop_tx);
+        let mut cure = SessionCure::None;
+        let mut options = MqttOptions::new("c", ("127.0.0.1", 1));
+        options.set_clean_start(false);
+
+        let reason = clean_start_before_connect(cure, &handle, &mut options);
+        assert_eq!(reason, None, "a handle that requires nothing");
+        assert!(!options.clean_start());
+
+        handle.require_clean_start();
+        let reason = clean_start_before_connect(cure, &handle, &mut options);
+        assert_eq!(reason, Some(CleanStartReason::Added), "the first CONNECT");
+        assert!(options.clean_start());
+        // A connect attempt that fails before a CONNACK leaves it set.
+        clean_start_before_connect(cure, &handle, &mut options);
+        assert!(options.clean_start(), "a retried first CONNECT");
+
+        // A respawned body builds its options afresh, with the kept session.
+        let mut respawned = MqttOptions::new("c", ("127.0.0.1", 1));
+        respawned.set_clean_start(false);
+        clean_start_before_connect(cure, &handle, &mut respawned);
+        assert!(
+            respawned.clean_start(),
+            "a body respawned before the CONNACK"
+        );
+
+        clean_start_at_connack(&mut cure, &handle, &mut respawned);
+        assert!(!respawned.clean_start(), "cleared at the CONNACK");
+        assert!(!handle.clean_start_pending());
+        assert_eq!(cure, SessionCure::None, "no cure was armed");
+        let reason = clean_start_before_connect(cure, &handle, &mut respawned);
+        assert_eq!(reason, None, "the CONNECT after the first CONNACK");
+        assert!(!respawned.clean_start());
+
+        // A body respawned after the CONNACK resumes.
+        let mut later = MqttOptions::new("c", ("127.0.0.1", 1));
+        later.set_clean_start(false);
+        clean_start_before_connect(cure, &handle, &mut later);
+        assert!(!later.clean_start(), "a body respawned after the CONNACK");
+    }
+
+    /// The required clean start and the `Unsolicited` cure each clear only
+    /// what they set.
+    #[test]
+    fn a_connack_without_a_required_clean_start_leaves_the_flag() {
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        let handle = MqttClientHandle::new(test_config(), Vec::new(), stop_tx);
+        let mut options = MqttOptions::new("c", ("127.0.0.1", 1));
+        options.set_clean_start(true);
+        for start in [SessionCure::None, SessionCure::Applied] {
+            let mut cure = start;
+            clean_start_at_connack(&mut cure, &handle, &mut options);
+            assert!(options.clean_start());
+            assert_eq!(cure, start);
+        }
+    }
+
+    /// The `connecting to broker` reason names the source that made the
+    /// CONNECT clean: the cure alone gives `Cure`, and a handle requirement
+    /// held at the same time gives `Added`. One CONNACK spends both.
+    #[test]
+    fn the_clean_start_reason_names_its_source() {
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        let handle = MqttClientHandle::new(test_config(), Vec::new(), stop_tx);
+        let mut options = MqttOptions::new("c", ("127.0.0.1", 1));
+        options.set_clean_start(false);
+
+        let mut cure = SessionCure::Armed;
+        let reason = clean_start_before_connect(cure, &handle, &mut options);
+        assert_eq!(reason, Some(CleanStartReason::Cure));
+        assert!(options.clean_start());
+
+        handle.require_clean_start();
+        let reason = clean_start_before_connect(cure, &handle, &mut options);
+        assert_eq!(reason, Some(CleanStartReason::Added));
+
+        clean_start_at_connack(&mut cure, &handle, &mut options);
+        assert!(!options.clean_start());
+        assert_eq!(cure, SessionCure::Applied);
+        assert!(!handle.clean_start_pending());
+        assert_eq!(
+            clean_start_before_connect(cure, &handle, &mut options),
+            None
+        );
+    }
+
+    /// `register_and_spawn` marks an `Added` arrival for a clean start and a
+    /// `Declared` one not; a successor inherits a clean start its predecessor
+    /// still owed.
+    #[tokio::test]
+    async fn an_added_arrival_requires_a_clean_start_and_its_successor_inherits_it() {
+        let service = MqttService::new();
+        let declared = register_and_spawn(
+            &service,
+            test_config(),
+            ArrivingFilters::Declared(Vec::new()),
+            Arc::new(NullRouter),
+        )
+        .await;
+        assert!(!declared.clean_start_pending());
+        declared.stop_and_join().await;
+
+        let added = register_and_spawn(
+            &service,
+            test_config(),
+            ArrivingFilters::Added,
+            Arc::new(NullRouter),
+        )
+        .await;
+        assert!(
+            added.clean_start_pending(),
+            "no broker answers, so no CONNACK clears it"
+        );
+        assert!(added.subscriptions.read().await.is_empty());
+
+        let successor = register_and_spawn(
+            &service,
+            test_config(),
+            ArrivingFilters::Successor(&added),
+            Arc::new(NullRouter),
+        )
+        .await;
+        assert!(successor.clean_start_pending());
+        successor.stop_and_join().await;
+    }
+
+    /// The DISCONNECT a stop builds: Session Expiry Interval 0 for an ended
+    /// session of a client with expiry above 0, plain for an ended session of a
+    /// client with expiry 0, plain for a stop that keeps the session.
+    #[tokio::test]
+    async fn the_disconnect_a_stop_builds() {
+        let kept = handle_with_ended_supervisor(config_with_expiry(3600)).await;
+        kept.stop_and_join().await;
+        assert_eq!(StopDisconnect::of(&kept), StopDisconnect::KeepSession);
+        assert_eq!(StopDisconnect::of(&kept).properties(), None);
+
+        let ended = handle_with_ended_supervisor(config_with_expiry(3600)).await;
+        ended.end_session_and_join().await;
+        assert_eq!(StopDisconnect::of(&ended), StopDisconnect::EndSession);
+        let properties = StopDisconnect::of(&ended)
+            .properties()
+            .expect("the session-ending DISCONNECT carries properties");
+        assert_eq!(properties.session_expiry_interval, Some(0));
+        assert_eq!(properties.reason_string, None);
+        assert!(properties.user_properties.is_empty());
+        assert_eq!(properties.server_reference, None);
+
+        let expiry_zero = handle_with_ended_supervisor(config_with_expiry(0)).await;
+        expiry_zero.end_session_and_join().await;
+        assert_eq!(
+            StopDisconnect::of(&expiry_zero),
+            StopDisconnect::KeepSession
+        );
+        assert_eq!(StopDisconnect::of(&expiry_zero).properties(), None);
+    }
+
+    /// `end_session_and_join` stops the session as `stop_and_join` does.
+    #[tokio::test]
+    async fn end_session_and_join_stops_and_joins_the_supervisor() {
+        let service = MqttService::new();
+        let handle = register_and_spawn(
+            &service,
+            config_with_expiry(3600),
+            ArrivingFilters::Declared(Vec::new()),
+            Arc::new(NullRouter),
+        )
+        .await;
+        handle.end_session_and_join().await;
+        assert!(*handle.stop_tx.borrow());
+        assert!(handle.client.lock().await.is_none());
+        // A second stop finds the session joined.
+        handle.end_session_and_join().await;
     }
 }

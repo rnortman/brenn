@@ -84,6 +84,10 @@ impl ReloadRequests {
 /// Process-lifetime, and not one of the tasks whose death is tolerated: it runs
 /// under [`abort_on_panic`], so a panic anywhere in it takes the process down for
 /// systemd to restart rather than leaving a facility that converges nothing.
+///
+/// # Panics
+///
+/// As [`spawn_driver_on`]: if the driver's MQTT router cannot deliver yet.
 pub(crate) fn spawn_driver(driver: ReloadDriver) -> ReloadRequests {
     let (requests, rx) = trigger_channel();
     spawn_driver_on(driver, rx);
@@ -102,7 +106,23 @@ pub(crate) fn trigger_channel() -> (ReloadRequests, mpsc::Receiver<TriggerSource
 }
 
 /// Run one driver over an existing trigger queue.
+///
+/// # Panics
+///
+/// Panics, on the caller's task and before the driver task exists, if the
+/// driver's MQTT event router cannot deliver yet. The driver task is the one
+/// caller of the router's `add_route` and `remove_route` and of the commit's
+/// `stop_and_join`, and every reload request reaches it through this queue; a
+/// router that is ready has had its state set by `wire_and_spawn`, which
+/// spawns every boot supervisor before it returns. So the doors open only
+/// after that step, and a boot that opens them earlier dies here whether or
+/// not a reload request ever arrives.
 pub(crate) fn spawn_driver_on(mut driver: ReloadDriver, mut rx: mpsc::Receiver<TriggerSource>) {
+    assert!(
+        driver.mqtt_router_ready(),
+        "the reload doors were opened before the MQTT event router had its state: \
+         `wire_and_spawn` must run before `spawn_driver`"
+    );
     // The driver never survives a panic. Every panic it can reach is a host bug
     // — prepare turns the panics a *document* can provoke into refusals, and
     // commit is past everything that could decline — and a panicking task

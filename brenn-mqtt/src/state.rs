@@ -6,9 +6,9 @@
 //! anything is bound through it, and held on `MqttService` in a
 //! `client_slug`-keyed registry.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, RwLock, watch};
@@ -25,9 +25,53 @@ use crate::reader::ReaderSlot;
 pub(crate) const PENDING_SUBSCRIBES_POISONED: &str =
     "pending_subscribes lock poisoned: a holder panicked inside its critical section";
 
-/// Poisoning message for [`MqttClientHandle::deferred_subscribes`].
-pub(crate) const DEFERRED_SUBSCRIBES_POISONED: &str =
-    "deferred_subscribes lock poisoned: a holder panicked inside its critical section";
+/// Poisoning message for [`MqttClientHandle::pending_unsubscribes`].
+pub(crate) const PENDING_UNSUBSCRIBES_POISONED: &str =
+    "pending_unsubscribes lock poisoned: a holder panicked inside its critical section";
+
+/// Poisoning message for [`MqttClientHandle::filter_requests`].
+pub(crate) const FILTER_REQUESTS_POISONED: &str =
+    "filter_requests lock poisoned: a holder panicked inside its critical section";
+
+/// Poisoning message for [`MqttClientHandle::request_order`].
+pub(crate) const REQUEST_ORDER_POISONED: &str =
+    "request_order lock poisoned: a holder panicked inside its critical section";
+
+/// One SUBSCRIBE or UNSUBSCRIBE the event loop has been handed and has not yet
+/// reported written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRequest {
+    /// The request's one topic filter.
+    pub topic_filter: String,
+    /// The connection epoch the request was submitted on.
+    pub epoch: u64,
+}
+
+/// The order of the SUBSCRIBE and UNSUBSCRIBE requests for each filter on the
+/// current connection, each submit and each request seen written counted.
+#[derive(Debug, Default)]
+pub(crate) struct RequestOrder {
+    next: u64,
+    newest: HashMap<String, u64>,
+}
+
+impl RequestOrder {
+    /// Count a request for `topic_filter` and return its number.
+    pub(crate) fn bump(&mut self, topic_filter: &str) -> u64 {
+        self.next += 1;
+        self.newest.insert(topic_filter.to_string(), self.next);
+        self.next
+    }
+
+    /// Whether `seq` is the newest request counted for `topic_filter`.
+    pub(crate) fn is_newest(&self, topic_filter: &str, seq: u64) -> bool {
+        self.newest.get(topic_filter) == Some(&seq)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.newest.clear();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Supervisor state (visible to the registry for health reporting)
@@ -171,6 +215,8 @@ pub fn notice_outcome(
                 }
             }
         }
+        // TODO(mqtt-quota-exceeded-told-rejected): a Quota exceeded refusal is
+        // "not now", and is told as a rejection.
         Ok(R::Qos2PubRecRejected(rec)) => NoticeOutcome::Rejected {
             reason: reason_text(rec.properties.and_then(|p| p.reason_string), &rec.reason),
             code: rec.reason as u8,
@@ -242,9 +288,18 @@ impl IngressSubscription {
 /// [`Self::filters_for`] gives a copy carrying it to those of them whose filter
 /// covers its topic. A message both cover therefore reaches each of the two
 /// channels twice, which is what routing by topic gives.
+///
+/// Beside the held filters the set keeps the **asserted** filters: every filter
+/// the broker's session may hold for the client, as far as this process knows.
+/// It holds every filter this set, or a set it was cloned from, has held since
+/// the last CONNACK that reported no session — since construction if there has
+/// been none — less the filters an UNSUBACK has taken out. It is a superset of
+/// the held filters at all times: [`Self::new`] and [`Self::add`] insert into
+/// both, and [`Self::remove`] leaves it alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngressSubscriptionSet {
     entries: Vec<IngressSubscription>,
+    asserted: BTreeSet<String>,
 }
 
 /// What [`IngressSubscriptionSet::filters_for`] resolved a PUBLISH's
@@ -282,21 +337,62 @@ impl IngressSubscriptionSet {
                 );
             }
         }
-        Self { entries }
+        let asserted = entries.iter().map(|e| e.topic_filter.clone()).collect();
+        Self { entries, asserted }
     }
 
     /// The entry for `topic_filter`, adding one with the filter's derived
-    /// identifier if the set does not hold the filter.
+    /// identifier if the set does not hold the filter. The filter is asserted
+    /// from then on.
     pub fn add(&mut self, topic_filter: String) -> IngressSubscription {
         if let Some(existing) = self.get(&topic_filter) {
             return existing.clone();
         }
         let entry = IngressSubscription::new(topic_filter);
+        self.asserted.insert(entry.topic_filter.clone());
         self.entries.push(entry.clone());
         entry
     }
 
+    /// Whether the broker's session may hold `topic_filter`.
+    pub fn is_asserted(&self, topic_filter: &str) -> bool {
+        self.asserted.contains(topic_filter)
+    }
+
+    /// The asserted filters the set does not hold: those whose withdrawal the
+    /// broker may not have seen yet, in filter order.
+    pub fn withdrawn(&self) -> Vec<String> {
+        self.asserted
+            .iter()
+            .filter(|f| self.get(f).is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Make the asserted filters the held ones: the broker reported no
+    /// session, so it holds nothing.
+    pub(crate) fn reset_asserted(&mut self) {
+        self.asserted = self
+            .entries
+            .iter()
+            .map(|e| e.topic_filter.clone())
+            .collect();
+    }
+
+    /// Count `topic_filter` as asserted: a SUBSCRIBE for it was written.
+    pub(crate) fn mark_asserted(&mut self, topic_filter: &str) {
+        self.asserted.insert(topic_filter.to_string());
+    }
+
+    /// Take `topic_filter` out of the asserted filters, unless the set holds
+    /// it, returning whether it was taken out: the broker answered its
+    /// UNSUBSCRIBE with Success or No subscription existed.
+    pub(crate) fn withdraw_asserted(&mut self, topic_filter: &str) -> bool {
+        self.get(topic_filter).is_none() && self.asserted.remove(topic_filter)
+    }
+
     /// Remove the entry for `topic_filter`, returning whether one was held.
+    /// The filter stays asserted.
     pub fn remove(&mut self, topic_filter: &str) -> bool {
         let before = self.entries.len();
         self.entries.retain(|e| e.topic_filter != topic_filter);
@@ -401,18 +497,22 @@ fn warn_shared_identifier(client: &str, entry: &IngressSubscription, other: &str
 ///
 /// This single handle serves both directions on one session: the publish path
 /// (`client` and the facts of its connection) and the ingress delivery +
-/// reconnect re-assert path (`subscriptions`, `pending_subscribes`/
-/// `inflight_subscribes` for SubAck filter attribution).
+/// filter settling path (`subscriptions` with its asserted filters,
+/// `filter_requests`, and the pending and inflight maps that attribute SUBACKs
+/// and UNSUBACKs).
 pub struct MqttClientHandle {
     /// Resolved per-client config — the single source of truth for per-client
     /// constants (slug, QoS, urgency, session expiry, broker coordinates,
     /// backoff). Shared with the connection supervisor.
     pub config: Arc<MqttClientConfig>,
 
-    /// The deduplicated union subscription set for this client — the
-    /// reconnect-survival set the supervisor re-asserts on every connect, and
-    /// the table the inbound path resolves Subscription Identifiers against.
-    /// Runtime-mutable: a dynamic `mqtt:` subscribe adds an entry here.
+    /// The deduplicated union subscription set for this client — the held
+    /// filters, which the supervisor subscribes on every connect, with the
+    /// asserted filters beside them, which a connection that finds the session
+    /// withdraws when not held — and the table the inbound path resolves
+    /// Subscription Identifiers against. Lives in memory only: a new process
+    /// starts with the filters it is registered with. Runtime-mutable: a
+    /// dynamic `mqtt:` subscribe adds an entry here.
     pub subscriptions: RwLock<IngressSubscriptionSet>,
 
     /// Live supervisor state (shared with the supervisor task via `Arc`).
@@ -464,7 +564,7 @@ pub struct MqttClientHandle {
     /// Written and read only by the supervisor task, so it takes no lock.
     pub(crate) qos2_inbound_warned: AtomicBool,
 
-    /// Filters awaiting pkid binding (FIFO) — one entry per SUBSCRIBE the
+    /// Requests awaiting pkid binding (FIFO) — one entry per SUBSCRIBE the
     /// event loop has been handed and has not yet reported written, in the
     /// order it was handed them, for SubAck attribution.
     ///
@@ -473,28 +573,47 @@ pub struct MqttClientHandle {
     /// as the submit, so the FIFO's order is the order the event loop takes the
     /// requests. The entries outlive a connection: a SUBSCRIBE the library
     /// keeps across a loss is replayed on a resumed session and binds its
-    /// entry then. The FIFO is cleared when the broker reports no session and
-    /// when a supervisor body starts. A `std::sync::Mutex`: every section is
-    /// synchronous.
-    pub pending_subscribes: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// entry then, and its epoch tells it from one submitted on the connection
+    /// that writes it. The FIFO is cleared when the broker reports no session
+    /// and when a supervisor body starts. A `std::sync::Mutex`: every section
+    /// is synchronous.
+    pub pending_subscribes: std::sync::Mutex<VecDeque<PendingRequest>>,
 
-    /// Subscribes another task hands to the supervisor, which takes them in
-    /// its own loop before each poll and sends them at the next free slot.
-    /// Other tasks touch only this queue, never [`Self::pending_subscribes`].
+    /// The UNSUBSCRIBE counterpart of [`Self::pending_subscribes`], under the
+    /// same rules, for UNSUBACK attribution.
+    pub pending_unsubscribes: std::sync::Mutex<VecDeque<PendingRequest>>,
+
+    /// Filters another task asks the supervisor to settle: to bring the
+    /// broker's session into agreement with [`Self::subscriptions`] for that
+    /// filter. The supervisor takes them in its own loop before each poll and
+    /// decides at its next free slot, against the held set at that moment,
+    /// whether a SUBSCRIBE, an UNSUBSCRIBE or nothing is owed. Only the
+    /// supervisor submits either request.
     ///
     /// A plain queue, not a channel: nothing awaits it. Callers push and the
     /// supervisor takes everything, both in short synchronous sections, so a
     /// `std::sync::Mutex` suffices and cannot be held across an await. It
     /// lives on the handle rather than in the supervisor task so a supervisor
-    /// respawned after a panic drains the same queue.
-    pub deferred_subscribes: std::sync::Mutex<std::collections::VecDeque<IngressSubscription>>,
+    /// respawned after a panic drains the same queue. Cleared at each CONNACK,
+    /// which settles every asserted filter.
+    pub filter_requests: std::sync::Mutex<VecDeque<String>>,
 
-    /// Notified after a push onto [`Self::deferred_subscribes`], so a
-    /// connected supervisor sends the subscribe without waiting for traffic.
-    pub subscribe_wake: Notify,
+    /// Notified after a push onto [`Self::filter_requests`], so a connected
+    /// supervisor settles the filter without waiting for traffic.
+    pub filter_wake: Notify,
 
     /// Inflight subscribes (pkid → filter), resolved at SubAck by `ack.pkid`.
     pub inflight_subscribes: Mutex<HashMap<u16, String>>,
+
+    /// Inflight unsubscribes (pkid → filter and its number in
+    /// [`Self::request_order`]), resolved at UNSUBACK by `ack.pkid`.
+    pub(crate) inflight_unsubscribes: Mutex<HashMap<u16, (String, u64)>>,
+
+    /// The order of the requests for each filter on the current connection,
+    /// so an UNSUBACK that a later request for its filter has overtaken takes
+    /// nothing out of the asserted set. Written only by the supervisor and
+    /// cleared with the rest of the per-connection bookkeeping.
+    pub(crate) request_order: std::sync::Mutex<RequestOrder>,
 
     /// What the broker answered for each topic filter on the *current* session,
     /// as the SubAck arm attributed the answers by pkid.
@@ -524,6 +643,20 @@ pub struct MqttClientHandle {
     /// its task is spawned, and `false` by the task as its last act, after its
     /// last report has committed. Every wait for the reader's exit reads this.
     pub(crate) egress_reader_live: watch::Sender<bool>,
+
+    /// Whether this session's stop asks the broker to discard the session:
+    /// set by [`Self::end_session_and_join`] before it signals the stop.
+    session_end_requested: AtomicBool,
+
+    /// Whether the supervisor has written the DISCONNECT that ends the
+    /// session at the broker.
+    session_end_written: AtomicBool,
+
+    /// Whether the supervisor's next CONNECT is a clean start: set for a
+    /// client a reload adds, before its supervisor is spawned, and cleared at
+    /// its first CONNACK. A body respawned before that CONNACK finds it still
+    /// set.
+    clean_start_pending: AtomicBool,
 }
 
 /// The supervisor recorded on a handle.
@@ -568,16 +701,49 @@ impl MqttClientHandle {
             connection_epoch: AtomicU64::new(0),
             egress_wake: Notify::new(),
             qos2_inbound_warned: AtomicBool::new(false),
-            pending_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            deferred_subscribes: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            subscribe_wake: Notify::new(),
+            pending_subscribes: std::sync::Mutex::new(VecDeque::new()),
+            pending_unsubscribes: std::sync::Mutex::new(VecDeque::new()),
+            filter_requests: std::sync::Mutex::new(VecDeque::new()),
+            filter_wake: Notify::new(),
             inflight_subscribes: Mutex::new(HashMap::new()),
+            inflight_unsubscribes: Mutex::new(HashMap::new()),
+            request_order: std::sync::Mutex::new(RequestOrder::default()),
             subscribe_outcomes: Mutex::new(HashMap::new()),
             stop_tx,
             supervisor: Mutex::new(SupervisorSlot::NotSpawned),
             egress_reader: std::sync::Mutex::new(ReaderSlot::Never),
             egress_reader_live: watch::Sender::new(false),
+            session_end_requested: AtomicBool::new(false),
+            session_end_written: AtomicBool::new(false),
+            clean_start_pending: AtomicBool::new(false),
         })
+    }
+
+    /// Make the supervisor's next CONNECT, and every one up to the first
+    /// CONNACK, a clean start.
+    pub(crate) fn require_clean_start(&self) {
+        self.clean_start_pending.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the next CONNECT is a clean start this handle requires.
+    pub(crate) fn clean_start_pending(&self) -> bool {
+        self.clean_start_pending.load(Ordering::SeqCst)
+    }
+
+    /// Clear the clean-start requirement at a CONNACK; returns whether it was
+    /// set.
+    pub(crate) fn clear_clean_start(&self) -> bool {
+        self.clean_start_pending.swap(false, Ordering::SeqCst)
+    }
+
+    /// Whether this session's stop asks the broker to discard the session.
+    pub(crate) fn session_end_requested(&self) -> bool {
+        self.session_end_requested.load(Ordering::SeqCst)
+    }
+
+    /// Record that the session-ending DISCONNECT was written.
+    pub(crate) fn record_session_end_written(&self) {
+        self.session_end_written.store(true, Ordering::SeqCst);
     }
 
     /// The longest a stop of this session waits for the broker: the client's
@@ -600,8 +766,9 @@ impl MqttClientHandle {
     ///
     /// A new entry takes the identifier derived from its filter. If the filter
     /// already exists, its existing entry is returned unchanged and the set is
-    /// not grown (idempotent). Does not touch the broker — the caller issues the
-    /// SUBSCRIBE on the live client.
+    /// not grown (idempotent). The filter is asserted from then on. Does not
+    /// touch the broker — the caller names the filter to the supervisor with
+    /// [`Self::request_settle`].
     pub async fn add_subscription(&self, topic_filter: String) -> IngressSubscription {
         let mut set = self.subscriptions.write().await;
         let held = set.get(&topic_filter).is_some();
@@ -613,7 +780,9 @@ impl MqttClientHandle {
     }
 
     /// Remove the subscription for `topic_filter` from the runtime set if present,
-    /// returning `true` if a matching entry was removed. Does not touch the broker.
+    /// returning `true` if a matching entry was removed. The filter stays
+    /// asserted until the broker answers its UNSUBSCRIBE. Does not touch the
+    /// broker.
     ///
     /// The broker's answer for the filter goes with it, whether or not an entry
     /// was present: a filter being taken down is not a filter granted on this
@@ -622,6 +791,16 @@ impl MqttClientHandle {
         let removed = self.subscriptions.write().await.remove(topic_filter);
         self.forget_outcome(topic_filter).await;
         removed
+    }
+
+    /// Ask the supervisor to settle `topic_filter` at its next free slot, and
+    /// wake it.
+    pub fn request_settle(&self, topic_filter: String) {
+        self.filter_requests
+            .lock()
+            .expect(FILTER_REQUESTS_POISONED)
+            .push_back(topic_filter);
+        self.filter_wake.notify_one();
     }
 
     /// Log at `warn` when `entry`, just placed in `set`, shares its identifier
@@ -760,6 +939,33 @@ impl MqttClientHandle {
                 // session: its reader has exited and its supervisor has ended.
             }
             SupervisorSlot::Joined => {}
+        }
+    }
+
+    /// [`Self::stop_and_join`], asking the broker to discard the session: a
+    /// connected client whose `session_expiry_secs` is above 0 ends its
+    /// connection with a DISCONNECT carrying Session Expiry Interval 0. A
+    /// client declared with expiry 0 sends the plain DISCONNECT, since the
+    /// broker discards its session when the connection closes.
+    ///
+    /// A session the stop could not end that way — no connection at the stop,
+    /// or the DISCONNECT not written — stays at the broker until it expires,
+    /// and that is logged at `warn` with the expiry.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::stop_and_join`].
+    pub async fn end_session_and_join(&self) {
+        self.session_end_requested.store(true, Ordering::SeqCst);
+        self.stop_and_join().await;
+        let expiry_secs = self.config.identity.session_expiry_secs;
+        if expiry_secs > 0 && !self.session_end_written.load(Ordering::SeqCst) {
+            tracing::warn!(
+                client = %self.config.identity.slug,
+                session_expiry_secs = expiry_secs,
+                "MQTT session not ended at the broker: no session-ending DISCONNECT was written; \
+                 the broker keeps the session until its expiry",
+            );
         }
     }
 
@@ -945,6 +1151,40 @@ mod tests {
         let mut set = IngressSubscriptionSet::new(vec![entry("a/#")]);
         set.add("a/b".into());
         assert_eq!(set.clone(), set);
+    }
+
+    /// The asserted filters: seeded from the held ones, grown by `add`, kept
+    /// by `remove`, carried by a clone, and made the held ones by a reset.
+    #[test]
+    fn the_asserted_filters_follow_the_held_ones_and_outlive_a_removal() {
+        let mut set = IngressSubscriptionSet::new(vec![entry("a/1"), entry("a/2")]);
+        assert!(set.is_asserted("a/1") && set.is_asserted("a/2"));
+        set.add("a/3".into());
+        assert!(set.is_asserted("a/3"));
+        assert!(set.remove("a/2"));
+        assert!(
+            set.is_asserted("a/2"),
+            "a removal leaves the filter asserted"
+        );
+        assert_eq!(set.withdrawn(), ["a/2"]);
+
+        let clone = set.clone();
+        assert_eq!(clone.withdrawn(), ["a/2"]);
+        assert_eq!(clone, set);
+
+        assert!(
+            !set.withdraw_asserted("a/1"),
+            "a held filter stays asserted"
+        );
+        set.reset_asserted();
+        assert!(!set.is_asserted("a/2"));
+        assert!(set.withdrawn().is_empty());
+        assert!(set.is_asserted("a/1") && set.is_asserted("a/3"));
+
+        set.mark_asserted("a/9");
+        assert_eq!(set.withdrawn(), ["a/9"]);
+        assert!(set.withdraw_asserted("a/9"));
+        assert!(set.withdrawn().is_empty());
     }
 
     #[test]

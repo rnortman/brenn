@@ -432,19 +432,15 @@ pub enum UnsubscribeActivation {
     /// durable-row delete (done by the lib core) is the whole operation.
     LocalOnly,
     /// `mqtt:` unsubscribe that removed the **last** subscriber on the filter; the
-    /// client was live and the broker UNSUBSCRIBE went out now. The route was
-    /// dropped from the router table.
+    /// client is connected and its supervisor sends the broker UNSUBSCRIBE at its
+    /// next free slot. The route was dropped from the router table.
     MqttUnsubscribedLive,
     /// `mqtt:` unsubscribe that removed the last subscriber; the client is
-    /// currently disconnected. The filter is removed from the reconnect set (so a
-    /// future reconnect will not re-subscribe it) and the route was dropped; no
-    /// live UNSUBSCRIBE was needed. Not an error.
+    /// currently disconnected. The subscription is removed here and the route
+    /// was dropped; the broker is told at the next connection this process makes
+    /// for the client, if the broker kept the session. A restart before then
+    /// leaves the filter in that session. Not an error.
     MqttDeferredDisconnected,
-    /// `mqtt:` unsubscribe that removed the last subscriber; the client was live
-    /// but the broker UNSUBSCRIBE *send* failed. The reconnect set no longer
-    /// carries the filter and the route was dropped; the broker keeps delivering
-    /// until the next reconnect drops it. Carries the client error.
-    MqttSendFailed(String),
     /// `mqtt:` unsubscribe where **other subscribers remain** on the filter; the
     /// broker subscription, the reconnect-set entry, and the `IngressRoute` are all
     /// left in place. The caller's own dynamic sub was
@@ -453,17 +449,12 @@ pub enum UnsubscribeActivation {
 }
 
 impl UnsubscribeActivation {
-    /// The LLM-facing status string for this outcome. Pure — the
-    /// caller logs a warn separately for [`Self::MqttSendFailed`]. The caller's
-    /// durable sub + directory subscriber are already gone and the filter was
-    /// dropped from the reconnect set even on a send failure, so the removal is
-    /// reported as done (`unsubscribed`); the next reconnect simply will not
-    /// re-subscribe the filter (test-5 pins this).
+    /// The LLM-facing status string for this outcome. Pure.
     pub fn status_str(&self) -> &'static str {
         match self {
-            UnsubscribeActivation::LocalOnly
-            | UnsubscribeActivation::MqttUnsubscribedLive
-            | UnsubscribeActivation::MqttSendFailed(_) => "unsubscribed",
+            UnsubscribeActivation::LocalOnly | UnsubscribeActivation::MqttUnsubscribedLive => {
+                "unsubscribed"
+            }
             UnsubscribeActivation::MqttOthersRemain => "unsubscribed_others_remain",
             UnsubscribeActivation::MqttDeferredDisconnected => "unsubscribed_pending_reconnect",
         }
@@ -603,7 +594,6 @@ pub async fn unsubscribe_dynamic_activated(
         IngressUnsubscribeOutcome::DeferredDisconnected => {
             UnsubscribeActivation::MqttDeferredDisconnected
         }
-        IngressUnsubscribeOutcome::SendFailed(e) => UnsubscribeActivation::MqttSendFailed(e),
     })
 }
 
@@ -787,6 +777,7 @@ mod tests {
                 "sensors/kitchen/temp",
                 InboundPayload::new("22.5", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -873,6 +864,7 @@ mod tests {
                         &topic,
                         InboundPayload::new("v", None),
                         1,
+                        false,
                         InboundRouting::BySubscription(vec![filter.to_string()]),
                     )
                     .await;
@@ -931,6 +923,7 @@ mod tests {
                 "sensors/kitchen/temp",
                 InboundPayload::new("22.5", None),
                 0,
+                false,
                 InboundRouting::ByTopic,
             )
             .await;
@@ -1595,7 +1588,14 @@ mod tests {
     ) -> i64 {
         let router = bridge.mqtt_event_router().clone();
         router
-            .deliver_inbound(client, topic, InboundPayload::new("v", None), 0, routing)
+            .deliver_inbound(
+                client,
+                topic,
+                InboundPayload::new("v", None),
+                0,
+                false,
+                routing,
+            )
             .await;
         let conn = bridge.messenger().unwrap().db().lock().await;
         conn.query_row(
@@ -1650,11 +1650,6 @@ mod tests {
         assert_eq!(
             UnsubscribeActivation::MqttDeferredDisconnected.status_str(),
             "unsubscribed_pending_reconnect"
-        );
-        assert_eq!(
-            UnsubscribeActivation::MqttSendFailed("queue full".to_string()).status_str(),
-            "unsubscribed",
-            "a failed UNSUBSCRIBE send still removed the subscription"
         );
     }
 

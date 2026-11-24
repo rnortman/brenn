@@ -740,11 +740,13 @@ fn messaging_virtual_tools(enabled: bool, mqtt: bool, has_shell: bool) -> Vec<Vi
                 "MessageSubscribe) so the durable subscription and any broker SUBSCRIBE do ",
                 "not linger.\n\n",
                 "Success: `{ ok: true, address, status }` where `status` is one of ",
-                "`\"unsubscribed\"` (removed; for `mqtt:` the broker UNSUBSCRIBE went out or ",
-                "was not needed), `\"unsubscribed_others_remain\"` (your sub removed but other ",
+                "`\"unsubscribed\"` (removed; for `mqtt:` the broker UNSUBSCRIBE is on its way ",
+                "or was not needed), `\"unsubscribed_others_remain\"` (your sub removed but other ",
                 "subscribers keep the `mqtt:` filter/broker subscription alive), or ",
                 "`\"unsubscribed_pending_reconnect\"` (mqtt client currently disconnected; the ",
-                "filter is dropped from the reconnect set). Errors: `{ ok: false, error }`."
+                "subscription is removed here and the broker is told at the next connection this ",
+                "process makes for the client; a restart before then leaves the filter in a ",
+                "session the broker kept). Errors: `{ ok: false, error }`."
             )
             .to_string(),
             input_schema: serde_json::json!({

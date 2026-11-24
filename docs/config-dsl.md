@@ -2323,7 +2323,17 @@ Five more declarations, each a body of attrs:
   was away, and publishes that were in flight are completed rather than sent
   again (`docs/message-bus.md` §2.7.3, "QoS across a reconnect"). It is a
   maximum the broker may shorten; an outage longer than it ends as a new
-  session.
+  session. A kept session queues only what the broker delivers at QoS 1; the
+  retained replay at each connection brings the rest of the client's retained
+  topics up to date. A new process resumes the session with whatever filters
+  an earlier process left in it, and cannot withdraw one it never holds
+  itself; a reload that removes the client ends the session, and one that
+  declares it again starts a clean one. An expiry above 0 adds a second way
+  for a retained topic published at more than one QoS to leave its channel on
+  an older value than the broker's — a value queued during the outage
+  arriving after the replay of a newer one — beside the way that needs no
+  kept session; the rule that avoids both, one QoS per retained topic, is in
+  `docs/message-bus.md`'s *Retained replay*.
 
   `stop_wait_secs` (default 60) is the longest a stop of the client's session
   — a server shutdown, a reload that changes the client, or one that removes
@@ -3166,10 +3176,15 @@ Three further refusals come from the wiring rather than from a section:
 - An `mqtt:` channel converges its broker subscription and its ingress route
   with it: the filter is subscribed or unsubscribed on the live session and the
   route is added or removed, and the status body's `mqtt_subscribed`,
-  `mqtt_unsubscribed`, `mqtt_deferred` and `mqtt_failed` say which. A filter the
-  broker could not be told about now — the client is disconnected, or its event
-  loop is dying — is in `mqtt_deferred`: it is in the reconnect-survival set and
-  the supervisor asserts it on the next connect, so the reload still applied.
+  `mqtt_unsubscribed`, `mqtt_deferred`, `mqtt_unsubscribe_deferred` and
+  `mqtt_failed` say which. A subscribed filter the broker could not be told
+  about now — the client is disconnected, or its event loop is dying — is in
+  `mqtt_deferred`: it is held and the supervisor subscribes it on the next
+  connect, so the reload still applied. An unsubscribed filter whose
+  UNSUBSCRIBE could not go out because the client is disconnected is in
+  `mqtt_unsubscribe_deferred`: the filter stays asserted, and the next
+  connection this process makes for the client withdraws it if the broker kept
+  the session; a restart before then leaves it in that session.
   Editing a client's `qos` restarts the client, whose first connect subscribes
   every filter it holds again at the new QoS, with no UNSUBSCRIBE: each of
   those filters is in `mqtt_subscribed` and not in `mqtt_unsubscribed`,

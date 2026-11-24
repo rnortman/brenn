@@ -134,12 +134,17 @@ impl CapturingRouter {
 
 #[async_trait::async_trait]
 impl MqttEventRouter for CapturingRouter {
+    fn ready(&self) -> bool {
+        true
+    }
+
     async fn deliver_inbound(
         &self,
         client_slug: &str,
         topic: &str,
         payload: InboundPayload,
         qos: u8,
+        _retained: bool,
         routing: InboundRouting,
     ) {
         self.hold.pass(topic).await;

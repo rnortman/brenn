@@ -4,6 +4,34 @@ All notable changes to Brenn are documented here.
 
 ## [Unreleased]
 
+- **Behaviour change:** MQTT clients now handle a session the broker kept
+  (`session_expiry_secs` above 0) correctly on the receiving side. Nothing
+  changes for clients left at the default expiry of 0:
+  - Messages the broker queued while Brenn was down are no longer lost at
+    boot. Before, ones that arrived before Brenn's inbound routing was ready
+    were dropped after the broker had already been told they were received.
+  - Reconnecting no longer fills a channel with copies of values it already
+    has. The broker still resends each topic's retained (last-known) value on
+    every subscribe, so a value that changed while Brenn was away still
+    arrives. But a resent value that matches the newest one the channel
+    holds for that topic is not added again. Live messages are added as
+    before. A subscriber that relied on getting a new message on every
+    reconnect or repeated subscribe no longer gets one.
+  - A filter unsubscribed while the client is disconnected is now withdrawn
+    at the broker on the next connection that finds the kept session.
+    Before, Brenn never sent the withdrawal and the broker went on
+    delivering. `MessageUnsubscribe`'s `unsubscribed_pending_reconnect`
+    result now means exactly this. Known gap: a restart before that
+    connection still leaves the filter in the broker's session, and so does
+    a filter a previous process held and this one does not
+    (`mqtt-deferred-unsubscribe-not-withdrawn`).
+  - An `mqtt_client` removed by a config reload ends its broker session
+    instead of leaving it to queue messages until it expires. One added by a
+    reload starts clean, discarding anything the broker kept under that
+    slug. A server boot still resumes a kept session.
+- **Upgrade note:** the reload status body gains `mqtt_unsubscribe_deferred`,
+  which lists unsubscribes waiting for the client's next connection.
+  `mqtt_deferred` no longer lists them.
 - **Upgrade note:** `mqtt_client { qos = 2 }` no longer loads; set it to 1.
   Brenn's MQTT client library forgets, on every lost connection, which QoS 2
   messages it has received, so subscribing at 2 could deliver a message twice

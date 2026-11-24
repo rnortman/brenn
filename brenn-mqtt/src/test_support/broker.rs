@@ -57,6 +57,25 @@ log_type all
 persistence false
 ";
 
+/// [`DEFAULT_CONF_TEMPLATE`] with persistence on, into the broker's temp
+/// directory, so a broker stopped by
+/// [`BrokerHarness::stop_keeping_sessions`] and started again by
+/// [`BrokerHarness::restart`] still holds every session it kept.
+pub const PERSISTENT_CONF_TEMPLATE: &str = "\
+listener __PORT__ 127.0.0.1
+protocol mqtt
+cafile   __CA_PEM__
+certfile __SERVER_CRT__
+keyfile  __SERVER_KEY__
+require_certificate false
+allow_anonymous true
+acl_file __ACL__
+log_dest file __LOG__
+log_type all
+persistence true
+persistence_location __DIR__/
+";
+
 /// The ACL every template references as `__ACL__`.
 ///
 /// The general section applies to anonymous clients only, so each authenticated
@@ -180,13 +199,24 @@ impl BrokerHarness {
         )
     }
 
+    /// Spawn `mosquitto` on [`PERSISTENT_CONF_TEMPLATE`]: the default broker,
+    /// keeping its sessions across [`stop_keeping_sessions`](Self::stop_keeping_sessions)
+    /// and [`restart`](Self::restart).
+    ///
+    /// # Panics
+    ///
+    /// Same as [`BrokerHarness::start`].
+    pub fn start_persistent() -> Self {
+        Self::start_with(PERSISTENT_CONF_TEMPLATE, &[("acl", DEFAULT_ACL.as_bytes())])
+    }
+
     /// Spawn `mosquitto` on `template`, with `extras` written beside it.
     ///
     /// Each `(name, bytes)` pair is written into the broker's temp directory as
     /// `name` at mode 0600 and substituted into the template wherever
     /// `__NAME__` appears — so a template naming `acl_file __ACL__` is served by
-    /// an extra called `acl`. The TLS material and `__PORT__` / `__LOG__` are
-    /// always substituted.
+    /// an extra called `acl`. The TLS material and `__PORT__` / `__LOG__` /
+    /// `__DIR__` (the temp directory itself) are always substituted.
     ///
     /// The template must contain `log_dest file __LOG__` and a `log_type` that
     /// includes `information` (`all` does): readiness is the broker's
@@ -227,6 +257,7 @@ impl BrokerHarness {
             ("__SERVER_CRT__".to_string(), path_str(tmp, "server.crt")),
             ("__SERVER_KEY__".to_string(), path_str(tmp, "server.key")),
             ("__LOG__".to_string(), log_path.display().to_string()),
+            ("__DIR__".to_string(), tmp.display().to_string()),
         ];
         for (name, bytes) in extras {
             let path = tmp.join(name);
@@ -350,6 +381,40 @@ impl BrokerHarness {
         }
         self.child = None;
         eprintln!("[BrokerHarness] mosquitto stopped");
+    }
+
+    /// Stop the broker with `SIGTERM` and wait for it to exit: an orderly
+    /// shutdown, which closes every client's connection and, on a broker
+    /// started with persistence ([`start_persistent`](Self::start_persistent)),
+    /// writes its sessions to disk for [`restart`](Self::restart) to read back.
+    /// [`stop`](Self::stop)'s `SIGKILL` writes nothing.
+    ///
+    /// # Panics
+    ///
+    /// The broker is not running, the signal is refused, or the broker does not
+    /// exit within 5 seconds.
+    pub fn stop_keeping_sessions(&mut self) {
+        self.signal(libc::SIGTERM, "terminate");
+        let child = self
+            .child
+            .as_mut()
+            .expect("BrokerHarness::stop_keeping_sessions on a stopped broker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(e) => panic!("try_wait failed for mosquitto after SIGTERM: {e}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mosquitto did not exit within 5s of SIGTERM\nBroker log tail:\n{}",
+                self.log_tail()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        self.child = None;
+        eprintln!("[BrokerHarness] mosquitto stopped, sessions kept");
     }
 
     /// Freeze the broker with `SIGSTOP`: its connections stay open and it
@@ -672,6 +737,35 @@ pub fn log_records_disconnect_after(log: &str, client_id: &str, ack: &str) -> bo
         }
     }
     false
+}
+
+/// Whether `log` records the broker accepting a connection from `client_id`:
+/// mosquitto's `New client connected from <addr> as <id> (p5, c0, k30).`
+///
+/// The wording is the one [`log_records_disconnect_before_reconnect`] reads
+/// as a connect, pinned with it by
+/// `the_disconnect_matcher_reads_a_live_brokers_wording` in `brenn-mqtt`'s
+/// integration suite.
+pub fn log_records_connect(log: &str, client_id: &str) -> bool {
+    let connected = format!(" as {client_id} (");
+    log.lines().any(|line| line.contains(&connected))
+}
+
+/// Whether `log` records the broker answering a CONNECT from `client_id` with
+/// a CONNACK whose Session Present flag is `session_present` and whose reason
+/// is Success — [`session_client_id`](super::client::session_client_id) for a
+/// brenn session.
+///
+/// At `log_type all` mosquitto writes `Sending CONNACK to <id> (<flag>, <reason>)`,
+/// the flag being the CONNACK's acknowledge flags, which hold Session Present
+/// alone. The id is matched up to the bracket, so one client id that is a
+/// prefix of another is not it.
+pub fn log_records_connack(log: &str, client_id: &str, session_present: bool) -> bool {
+    let sending = format!(
+        "Sending CONNACK to {client_id} ({}, 0)",
+        u8::from(session_present)
+    );
+    log.lines().any(|line| line.ends_with(&sending))
 }
 
 /// Whether `log` records the broker sending a PUBLISH on `topic` to

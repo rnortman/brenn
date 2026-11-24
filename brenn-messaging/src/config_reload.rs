@@ -178,12 +178,17 @@ pub struct StatusDelta {
     /// `mqtt:<client>:<filter>` for every broker subscription this reload
     /// withdrew.
     pub mqtt_unsubscribed: Vec<String>,
-    /// The subset of the two lists above the broker did not take at commit
+    /// The subset of `mqtt_subscribed` the broker did not take at commit
     /// time, and will on the supervisor's next connect: the client was
     /// disconnected, or the send failed on a session whose event loop is
-    /// already dying. Either way the reconnect re-asserts the whole set — so
+    /// already dying. Either way the reconnect asserts every held filter — so
     /// this is "not yet", not "failed".
     pub mqtt_deferred: Vec<String>,
+    /// The subset of `mqtt_unsubscribed` whose UNSUBSCRIBE did not go out at
+    /// commit time because the client was disconnected. The filter is
+    /// withdrawn at the next connection this process makes for the client, if
+    /// the broker kept the session; a restart before then leaves it there.
+    pub mqtt_unsubscribe_deferred: Vec<String>,
     /// The subset of `mqtt_subscribed` no connect in this process will assert:
     /// the client's supervisor gave up on an authoritative failure (bad
     /// credentials, a rejected TLS chain) and is not retrying. The filter is

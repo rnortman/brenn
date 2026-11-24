@@ -232,13 +232,20 @@ pub async fn spawn_client_with_config(
     config: Arc<MqttClientConfig>,
     static_filters: Vec<String>,
 ) -> SpawnedClient {
-    let client_slug = config.identity.slug.clone();
-
     let subs: Vec<IngressSubscription> = static_filters
         .into_iter()
         .map(IngressSubscription::new)
         .collect();
+    spawn_client_arriving(config, ArrivingFilters::Declared(subs)).await
+}
 
+/// [`spawn_client_with_config`] with the arrival's filters given as
+/// `arriving`, on a service of its own.
+pub async fn spawn_client_arriving(
+    config: Arc<MqttClientConfig>,
+    arriving: ArrivingFilters<'_>,
+) -> SpawnedClient {
+    let client_slug = config.identity.slug.clone();
     let svc = MqttService::new();
     let (router, rx) = CapturingRouter::new();
     let faults = router.faults();
@@ -246,8 +253,7 @@ pub async fn spawn_client_with_config(
     let router_arc: Arc<dyn MqttEventRouter> = Arc::new(router);
     svc.set_router(router_arc.clone()).await;
 
-    let handle =
-        register_and_spawn(&svc, config, ArrivingFilters::Declared(subs), router_arc).await;
+    let handle = register_and_spawn(&svc, config, arriving, router_arc).await;
 
     SpawnedClient {
         svc,

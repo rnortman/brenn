@@ -2,17 +2,18 @@
 
 ## `mqtt-retained-replay-repeated-on-resubscribe`
 
-Every reconnect re-asserts every filter, and a second subscriber's
-SUBSCRIBE to a filter already held is sent again with the stored
-identifier; with "send retained on every subscribe"
-(`brenn-mqtt/src/connection.rs`, `subscribe_request`) the broker
-replays the filter's retained messages into its channel again each
-time, so the channel's window takes repeated copies of values it
-already holds. Suppressing that replay was a non-goal of the routing
-cycle, with no reason given. Done when the repeated replay is
-suppressed where the channel already holds it (e.g. retain handling
-"send only on new subscription" with what that means for a resumed or
-discarded session), or this is closed as not wanted.
+A replayed retained message whose value its channel already holds as the
+newest for the topic adds no row (`brenn-server/src/mqtt_router.rs`,
+`deliver_inbound`), except a non-text payload on a wrapped channel: the
+wrapper holds a placeholder and not the bytes, so there is nothing to
+compare and the replay is appended on every reconnect and every repeated
+SUBSCRIBE. Closing it needs something in the wrapper to compare, which is a
+change to a shape components read. The replay itself stays: it is what
+brings a channel a retained value the broker's session did not queue (one
+published at QoS 0, to a `qos = 0` client, or lost to the broker's queue
+limit), so copies are kept out on Brenn's side or not at all. Done when a
+repeated non-text replay on a wrapped channel adds no row, or this is
+closed as not wanted.
 
 ## `mqtt-inbound-retain-flag-not-on-envelope`
 
@@ -23,16 +24,6 @@ Identifiers), so a subscriber cannot tell a retained replay from a
 live publish. Reading it was a non-goal of the routing cycle, with no
 reason given. Done when the flag reaches the subscriber with a test,
 or this is closed as not wanted.
-
-## `mqtt-receive-maximum-unset`
-
-Brenn sets no Receive Maximum on CONNECT; mosquitto's defaults (20 in
-flight, 1000 queued per client) then bound a retained burst, and the
-broker drops over them telling the client nothing. Setting a Receive
-Maximum, or any other CONNECT change, was a non-goal of the routing
-cycle, with no reason given. Done when Brenn states a Receive Maximum
-suited to its serial inbound path, or this is closed as not wanted
-because the broker's queue, not Brenn's, is the bound.
 
 ## `mqtt-refused-status-alert-test-sees-two-alerts`
 
@@ -741,9 +732,38 @@ stays lost regardless: a QoS 0 message, and any message when the broker keeps
 no session (a session expiry of 0, an expired session, a broker restarted
 without persistence). Done = a stop or crash staged between receipt and
 routing leaves the message sent again by the broker on a kept session, pinned
-by a test against the real broker. Code site
-(`TODO(mqtt-inbound-acked-before-routed)`): the drop-time log in
+by a test against the real broker. With acknowledgement after routing, a
+Receive Maximum on CONNECT becomes the bound on what the broker has
+outstanding to Brenn's serial inbound path, and that work chooses it. Code
+site (`TODO(mqtt-inbound-acked-before-routed)`): the drop-time log in
 `drop_event_loop`, `brenn-mqtt/src/connection.rs`.
+
+## `mqtt-lost-events-incoming-test-flaky`
+
+`an_incoming_qos0_among_the_lost_events_arrives_once` and
+`an_incoming_qos1_among_the_lost_events_arrives` in
+`brenn-mqtt/tests/session_resume.rs` fail now and then (8 of 40 runs of the
+binary at one commit) at the assertion that the message
+was delivered after the reconnect's CONNACK: the router received it from the
+live connection, before the loss, so the row did not exercise the lost
+connection's events at all. The row relies on the client library
+(`rumqttc-v5-next` 0.33.2) reading the PUBLISH and the end of the connection
+in one batch, and its `Network::readb` takes a packet after the first only if
+it is already readable (`framed.rs`, `now_or_never`). The packet relay logs a
+cut before it writes the packet and closes the sockets
+(`tests/common/packet_relay.rs`, `forward`), so the test can release the
+supervisor before the end of the connection has left the relay. Waiting for a
+relay record logged after both sockets are closed was tried and still failed
+5 of 40 runs, so that ordering is not the whole cause. Waiting for the
+reconnect's CONNACK before the assertion is not a fix: the assertion exists to
+tell a delivery from the lost events apart from one before the loss.
+`a_stop_while_the_lost_events_are_passed_on_disconnects` stands on the same
+mechanism. `make check` is the pre-commit gate, and a test that fails there at
+random teaches retry-until-green. Done = the cause is found and the rows hold
+the message among the lost connection's events deterministically, passing
+reliably under the full `make check`; a retry is not a fix. Code site
+(`TODO(mqtt-lost-events-incoming-test-flaky)`): the reconnect assertion in
+`incoming_among_the_lost_events_row`.
 
 ## `mqtt-publish-acl-ops-config`
 
@@ -786,6 +806,23 @@ mismatch is part of the finding out. Done = a QoS 2 message whose PUBREC
 succeeded is never reported to the operator or to a `status_to` as
 rejected.
 
+## `mqtt-quota-exceeded-told-rejected`
+
+A broker that answers a publish with reason 0x97 (Quota exceeded) has not
+taken the message and is saying "not now"; `notice_outcome`
+(`brenn-mqtt/src/state.rs`) maps it to `Rejected`, so the sender's
+`status_to` reads `rejected` and the operator is alerted as for an ACL
+mismatch. It is reachable after an unclean end: QoS 2 exchanges a dead
+client left half-finished at the broker count against the broker's receive
+maximum until their packet identifiers are reused, and a new client that
+fills its own in-flight limit then overruns it (seen in the session spike:
+one publish in 24). The work: treat a quota refusal as not sent — hold the
+message and hand it again under its lifetime check — or say why not, and
+give it its own operator text. Done = a publish refused with 0x97 is
+delivered once the quota frees, pinned by a test, or this is closed as not
+wanted. Code site (`TODO(mqtt-quota-exceeded-told-rejected)`): the PUBREC
+refusal arm of `notice_outcome`.
+
 ## `mqtt-replay-over-smaller-receive-maximum-unverified`
 
 On a resumed session the client library (`rumqttc-v5-next` 0.33.2) replays
@@ -817,7 +854,10 @@ real-broker row if the staging can be made deterministic, otherwise the real
 event loop against a scripted MQTT peer, which the test support does not
 have — with and without a kept session, and fix or pin what is seen. Done =
 both cases are pinned by a test that runs the library, or this is closed as
-not reachable. Code site (`TODO(mqtt-replayed-subscribe-unverified)`):
+not reachable. The UNSUBSCRIBE FIFO (`pending_unsubscribes`) rests on the
+same reading, and a misbound UNSUBACK would take the wrong filter out of the
+asserted set, so a filter the broker still holds would not be withdrawn
+again. Code site (`TODO(mqtt-replayed-subscribe-unverified)`):
 `subscribe_bookkeeping_at_connack` in `brenn-mqtt/src/connection.rs`.
 
 ## `mqtt-retained-replay-shortfall-cause-unconfirmed`
@@ -854,6 +894,23 @@ the cause fixed where it lives.
 Code site (`TODO(mqtt-retained-replay-shortfall-cause-unconfirmed)`):
 `brenn-bootstrap/src/reload/mqtt_broker_tests.rs`, at
 `a_new_narrow_subscription_receives_every_retained_message_once`.
+
+## `mqtt-session-expiry-ops-config`
+
+Brenn keeps its MQTT client state across reconnects and meets a kept broker
+session correctly, but both production clients are declared with no
+`session_expiry_secs`, so every reconnect in production still starts a new
+session: a QoS 1 publish in flight at a loss is sent again as a new publish,
+a QoS 2 one is reported unknown, and messages published while Brenn restarts
+are missed. The production configuration is in the private ops annex, which
+the make-mqtt-great-again workflow may not change. The work: choose an
+expiry per client for the outage it should survive (a deploy's restart at
+the least), set it, and on the deploy that carries it check the broker's
+persistence settings and its per-client queue limit, which bound what a kept
+session can hold. Done = each production MQTT client states a session
+expiry above 0, or this is closed as not wanted. Code site
+(`TODO(mqtt-session-expiry-ops-config)`): `session_expiry_secs` in
+`brenn-lib/src/mqtt/config.rs`.
 
 ## `mqtt-stack-history-rewrite-before-push`
 
@@ -1168,6 +1225,31 @@ against the current one (or against the subset definition with its documented
 enumeration test is in the tree. Code site
 (`TODO(efficiency-covers-allocates-two-vecs-per-call-on-ingress-path)`):
 `brenn-lib/src/mqtt/topic_filter.rs`, `covers`.
+
+## `efficiency-replay-compare-parses-every-window-body-under-db-lock`
+
+A retained MQTT message replayed by the broker is compared against its
+channel's newest row for the same topic before it is appended. The read,
+`newest_retained_for_mqtt_topic`, walks the channel's newest
+`min(retain_depth, 1024)` retained rows until one's topic matches. On a wrapped
+channel the topic is inside the stored `MqttEnvelope` body, so each row walked
+has its whole body JSON-parsed (`json_valid`, then `json_extract`), and it runs
+under the messaging db lock that every publish and read takes. Each lookup is
+bounded by the 1024-row cap; a standalone SQLite run of the query over 1024
+rows of 4 KB wrapped bodies took about 3 ms when nothing matched, and about
+0.3 ms over 100 rows. A reconnect of a wide filter (hundreds of retained
+topics, as a Home Assistant discovery prefix has) on a deep or unbounded
+channel therefore spends hundreds of milliseconds of db-lock time in
+millisecond-sized holds. Making the lookup one index probe means storing the
+MQTT topic where the store can index it — a column, or a generated column over
+both stored shapes, with an index on `(channel_uuid, topic, retained_seq)` —
+which puts one transport's field into the generic message store's schema and
+needs a migration; that trade, against keeping the store transport-agnostic,
+wants a design ruling. Done when the replay comparison reads no message body
+to find its row and the store test that pins the topic in both shapes still
+passes. Code site
+(`TODO(efficiency-replay-compare-parses-every-window-body-under-db-lock)`):
+`brenn-messaging-store/src/db/bus.rs`, `newest_retained_for_mqtt_topic`.
 
 ## `efficiency-surface-type-check-recompiles-every-kind-every-scan`
 
@@ -5425,69 +5507,48 @@ matches a fresh boot with the row folded.
 
 ## `mqtt-deferred-unsubscribe-not-withdrawn`
 
-An ingress UNSUBSCRIBE issued while the client's session is disconnected — or
-whose send fails — is never sent to the broker, and nothing sends it later.
-`MqttService::unsubscribe_filter` takes the filter out of the reconnect-survival
-set and answers `DeferredDisconnected` / `SendFailed`; the supervisor's
-reconnect asserts the surviving set and withdraws nothing. The session is
-persistent (`clean_start(false)` with a session expiry, `connection.rs`), so the
-broker resumes it with its filter set intact.
+A process that resumes a broker session the broker kept does not know which
+filters an earlier process asserted in it. The handle's asserted set
+(`IngressSubscriptionSet`) is seeded with the filters the new process holds
+and gains only the filters it comes to hold, so a filter that this process
+never holds — a removed static subscription, a stored dynamic subscription
+the boot fold holds dormant because the ACL no longer covers it, a
+withdrawal still pending when the earlier process ended — is never
+withdrawn. It stays in the session for as long as the session lives,
+through every reconnect and every reload successor, which inherits the same
+set. While the client is connected each copy for it is received,
+acknowledged and dropped with a `warn` (its Subscription Identifier names no
+held filter, except where it shares one with a held filter covering the
+topic: `docs/message-bus.md`, "Two filters with one identifier"); while the
+client is away its QoS 1 copies are queued at the broker against the
+client's queue limit, where they can crowd out messages for filters the
+client does hold. MQTT offers no way to list a session's filters.
 
-Consequence: the broker keeps publishing every message matching that filter for
-as long as the session lives, and brenn discards them: each copy carries the
-withdrawn filter's Subscription Identifier, which the client's subscription
-set no longer holds. Not a leak, and bounded by the topic's traffic —
-unbounded wasted ingress on a `#`-shaped filter. The reload's status body is
-the second half: it reports the address in `mqtt_deferred`, which reads as
-"converged, just not yet", and the filter is in fact still at the broker. Both
-callers are affected — reload's ingress walk
-(`brenn-bootstrap/src/reload/commit.rs`, `record_unsubscribe`) and the runtime
-`MessageUnsubscribe` (`brenn-server/src/mqtt_subscribe.rs`).
+What must outlive the process is the set of filters a SUBSCRIBE has been
+submitted for. It changes at three points, all on the supervisor: a filter
+joins it before its SUBSCRIBE is submitted, leaves it at the UNSUBACK that
+takes it out of the asserted set, and the set is replaced at a CONNACK that
+reports no session. A new handle's asserted set would be seeded with the
+record as well as with what it holds. The work includes deciding where the
+record lives on the bus (a host-minted per-client channel, or a declared
+state channel), what a set too large for one message and a rate-refused
+write do, what a session met with no record does (a clean start is the
+candidate), and removing the record with a removed client.
 
-Since inbound routing follows the Subscription Identifier, and a filter's
-identifier is derived from its filter string, a copy the broker sends for a
-filter this process does not hold carries an identifier the client's
-subscription set does not hold and is dropped with a `warn`. The one
-exception is a leftover filter that shares its identifier with a held
-filter covering the topic (`docs/message-bus.md`, "Two filters with one
-identifier"): that channel receives the message a second time.
+Code site (`TODO(mqtt-deferred-unsubscribe-not-withdrawn)`): the
+session-present settle in `subscribe_bookkeeping_at_connack`,
+`brenn-mqtt/src/connection.rs`.
 
-Doing it is a supervisor contract, which is why this is an entry and not a
-patch: the handle needs a pending-withdrawals set — filters removed from
-`subscriptions` while no client was installed, or whose send failed — that the
-reconnect drains with UNSUBSCRIBEs when the broker reports `session_present`,
-cleared on send, and reconciled against a filter re-subscribed in the meantime.
-The status vocabulary follows: a deferred withdrawal is a different fact from a
-deferred assertion and should not share `mqtt_deferred`'s wording.
-
-A restart has the same outcome with no UNSUBSCRIBE ever requested: a filter the
-previous run asserted, whose channel the new run does not route (a stored dynamic
-subscription the boot fold holds dormant because the ACL no longer covers it, a
-removed static subscription), stays in the resumed session. The
-pending-withdrawals set above starts empty in the new process, so it does not
-cover this case; MQTT offers no way to list a session's filters, so withdrawing
-them needs the asserted set to outlive the process.
-
-A kept client adds a third way: on a resumed session the client library
-replays a SUBSCRIBE that was submitted and not yet written when the
-connection was lost, even if its filter was withdrawn during the outage, so
-the broker then holds a filter this process does not. The pending-withdrawals
-set must cover it.
-
-Code sites (`TODO(mqtt-deferred-unsubscribe-not-withdrawn)`):
-`brenn-mqtt/src/service.rs`, at `unsubscribe_filter`'s disconnected arm.
-
-Done = a withdrawal issued while disconnected reaches the broker on the next
-connect, observed the way the removal cases observe the live one (the broker's
-own `Received UNSUBSCRIBE` record), and the status body says which of the two
-things a deferral was.
+Done = a second process that no longer holds a filter the first asserted
+withdraws it, seen as the broker's `Received UNSUBSCRIBE`, or this is closed
+as not wanted.
 
 ## `mqtt-disconnect-lost-to-reset`
 
 A stop that lands while broker-to-client bytes are unread — SUBACKs for
 SUBSCRIBEs just sent, a retained delivery, ordinary inbound traffic — can
 lose its DISCONNECT at the broker. The supervisor's stop path requests the
-DISCONNECT with `try_disconnect_now`, rumqttc writes it at the next poll and
+DISCONNECT on rumqttc's immediate channel, rumqttc writes it at the next poll and
 returns `RequestsDone`, and the `EventLoop` is dropped, which closes the
 socket with data still in its receive buffer; the kernel then sends RST
 instead of FIN, and the broker discards what it had not yet read, the
@@ -5495,7 +5556,9 @@ DISCONNECT among it, and records the session as ended abnormally (mosquitto
 2.1.2 logs "disconnected due to out of memory"). Consequences: a configured
 Last Will is published on a graceful stop or reload; the reload handover is
 ordered by the reset rather than by the orderly DISCONNECT
-`register_and_spawn`'s doc describes. The stop services the connection only
+`register_and_spawn`'s doc describes; for a client a reload removes, the
+lost packet is the one that ends the session, which then stays at the broker
+until it expires. The stop services the connection only
 while an egress reader is settling its in-flight messages, so a session with
 nothing in flight goes straight to the DISCONNECT with whatever the broker
 has just sent — SUBACKs among it — unread; and nothing after `RequestsDone`

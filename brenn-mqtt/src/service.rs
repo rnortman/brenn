@@ -13,12 +13,9 @@ use std::sync::{Arc, Weak};
 
 use tokio::sync::RwLock;
 
-use crate::connection::{assert_ingress_unsubscribe, unsendable_filter};
+use crate::connection::unsendable_filter;
 use crate::payload::InboundPayload;
-use crate::state::{
-    ConnectorHealthLabel, DEFERRED_SUBSCRIBES_POISONED, MqttClientHandle, SubAckOutcome,
-    SupervisorState,
-};
+use crate::state::{ConnectorHealthLabel, MqttClientHandle, SubAckOutcome, SupervisorState};
 use brenn_lib::messaging::Urgency;
 use brenn_lib::mqtt::config::MqttClientConfig;
 use brenn_lib::panic_util::join_set_reraising;
@@ -67,6 +64,13 @@ pub enum SessionFault {
 /// and the subscriptions the broker sent the copy for.
 #[async_trait::async_trait]
 pub trait MqttEventRouter: Send + Sync + 'static {
+    /// Whether a delivery made now would be routed. A supervisor is spawned
+    /// only against a router that answers `true`
+    /// ([`crate::UnspawnedSession::spawn`] panics otherwise), because a message
+    /// the broker hands over is acknowledged on receipt and a router that
+    /// cannot route it loses it.
+    fn ready(&self) -> bool;
+
     /// Deliver an inbound MQTT message arriving on `client_slug`.
     ///
     /// With [`InboundRouting::BySubscription`] the router publishes the
@@ -74,13 +78,17 @@ pub trait MqttEventRouter: Send + Sync + 'static {
     /// filter covers `topic`, and into no other channel. With
     /// [`InboundRouting::ByTopic`] it publishes into every channel on this
     /// client whose filter covers `topic`. `qos` is the QoS at which the broker
-    /// actually delivered this PUBLISH.
+    /// actually delivered this PUBLISH. `retained` is the PUBLISH's RETAIN flag
+    /// as received; Brenn subscribes with Retain As Published 0, so it is set
+    /// on a retained message the broker sends because of a SUBSCRIBE and clear
+    /// on every message it forwards.
     async fn deliver_inbound(
         &self,
         client_slug: &str,
         topic: &str,
         payload: InboundPayload,
         qos: u8,
+        retained: bool,
         routing: InboundRouting,
     );
 
@@ -117,19 +125,18 @@ pub enum IngressSubscribeOutcome {
 /// Outcome of a runtime ingress UNSUBSCRIBE ([`MqttService::unsubscribe_filter`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngressUnsubscribeOutcome {
-    /// The client was live and the UNSUBSCRIBE was sent now.
+    /// The client is connected and its supervisor has the request: the
+    /// UNSUBSCRIBE goes out at its next free slot.
     UnsubscribedLive,
-    /// The client is currently disconnected, so no UNSUBSCRIBE was sent. The
-    /// filter is out of the reconnect set, so the next reconnect does not
-    /// re-assert it — but the session is persistent (`clean_start(false)` with
-    /// a session expiry), so the broker resumes it holding the filter and keeps
-    /// publishing on it. Nothing in the process converges that; see
-    /// `TODO(mqtt-deferred-unsubscribe-not-withdrawn)` at
-    /// [`MqttService::unsubscribe_filter`].
+    /// The client has no connection. The filter is withdrawn at the next
+    /// connection this process makes for the client, if the broker still holds
+    /// the session then; if it holds none there is nothing to withdraw. True
+    /// whether the supervisor is in backoff, has not connected yet, or has
+    /// failed for good, when the next connection is a reload successor's, which
+    /// inherits the filter. A process that ends before that connection leaves
+    /// the filter in a session the broker kept; see
+    /// `TODO(mqtt-deferred-unsubscribe-not-withdrawn)`.
     DeferredDisconnected,
-    /// The client was live but the UNSUBSCRIBE *send* failed. Carries the client
-    /// error string.
-    SendFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -540,20 +547,17 @@ impl MqttService {
             // Only the supervisor submits a SUBSCRIBE, so the order in which
             // the event loop takes SUBSCRIBEs is the order the supervisor
             // records them for attribution, across a reconnect too.
-            handle
-                .deferred_subscribes
-                .lock()
-                .expect(DEFERRED_SUBSCRIBES_POISONED)
-                .push_back(sub);
-            handle.subscribe_wake.notify_one();
+            handle.request_settle(sub.topic_filter);
             IngressSubscribeOutcome::SubscribedLive
         };
         Some(outcome)
     }
 
-    /// Remove `topic_filter` from `client_slug`'s reconnect-survival set and issue
-    /// the broker UNSUBSCRIBE now if the client is live. The inverse of
-    /// [`Self::subscribe_filter`].
+    /// Remove `topic_filter` from `client_slug`'s held set and, if the client
+    /// has a connection, name the filter to its supervisor, which sends the
+    /// broker UNSUBSCRIBE at its next free slot. With no connection nothing is
+    /// named: the filter stays asserted, and the next connection that finds the
+    /// broker's session withdraws it. The inverse of [`Self::subscribe_filter`].
     ///
     /// **The caller must only call this when the removed subscriber was the last
     /// subscriber on the filter.**
@@ -584,18 +588,15 @@ impl MqttService {
                 topic_filter,
                 "unsubscribe_filter: filter absent from the reconnect set while a durable \
                  dynamic row existed — state inconsistency (durable table vs in-memory set); \
-                 sending broker UNSUBSCRIBE anyway"
+                 the supervisor withdraws it if it is asserted"
             );
         }
-        let client = handle.client.lock().await.clone();
-        let outcome = match client {
-            // TODO(mqtt-deferred-unsubscribe-not-withdrawn): the filter stays
-            // at the broker for the life of the persistent session.
-            None => IngressUnsubscribeOutcome::DeferredDisconnected,
-            Some(client) => match assert_ingress_unsubscribe(&client, topic_filter).await {
-                Ok(()) => IngressUnsubscribeOutcome::UnsubscribedLive,
-                Err(e) => IngressUnsubscribeOutcome::SendFailed(e),
-            },
+        let connected = handle.client.lock().await.is_some();
+        let outcome = if connected {
+            handle.request_settle(topic_filter.to_string());
+            IngressUnsubscribeOutcome::UnsubscribedLive
+        } else {
+            IngressUnsubscribeOutcome::DeferredDisconnected
         };
         Some(outcome)
     }
@@ -656,14 +657,6 @@ mod tests {
         let mut config = brenn_lib::mqtt::test_support::test_client_config(client);
         config.identity.qos = qos;
         MqttClientHandle::new(Arc::new(config), vec![], tx)
-    }
-
-    /// An `AsyncClient` whose eventloop has been dropped: every request send fails
-    /// with a closed-channel `ClientError`. Never connects to anything.
-    fn dead_live_client() -> rumqttc::AsyncClient {
-        let (client, eventloop) = unpolled_client(1);
-        drop(eventloop);
-        client
     }
 
     /// A client whose eventloop is still alive: a request send lands in its
@@ -807,7 +800,7 @@ mod tests {
             "a refused filter is never pushed for attribution",
         );
         assert!(
-            handle.deferred_subscribes.lock().unwrap().is_empty(),
+            handle.filter_requests.lock().unwrap().is_empty(),
             "and never handed to the supervisor",
         );
     }
@@ -828,15 +821,15 @@ mod tests {
         let second = svc.subscribe_filter("home", "sensors/b".to_string()).await;
         assert_eq!(first, Some(IngressSubscribeOutcome::SubscribedLive));
         assert_eq!(second, Some(IngressSubscribeOutcome::SubscribedLive));
-        let deferred: Vec<String> = handle
-            .deferred_subscribes
+        let requested: Vec<String> = handle
+            .filter_requests
             .lock()
             .unwrap()
             .iter()
-            .map(|s| s.topic_filter.clone())
+            .cloned()
             .collect();
         assert_eq!(
-            deferred,
+            requested,
             vec!["sensors/a".to_string(), "sensors/b".to_string()],
             "both subscribes are in the supervisor's hands, in order",
         );
@@ -846,7 +839,7 @@ mod tests {
         );
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            handle.subscribe_wake.notified(),
+            handle.filter_wake.notified(),
         )
         .await
         .expect("the hand-off wakes the supervisor");
@@ -1019,33 +1012,75 @@ mod tests {
         );
     }
 
+    /// With a client installed, a withdrawal is handed to the supervisor: the
+    /// filter leaves the held set, stays asserted, is queued for the
+    /// supervisor with a wake, and nothing is put on the request channel.
     #[tokio::test]
-    async fn unsubscribe_filter_dead_client_reports_sendfailed_and_removes() {
+    async fn unsubscribe_filter_with_a_client_hands_the_withdrawal_to_the_supervisor() {
         let svc = MqttService::new();
         let handle = make_handle("home");
         handle.add_subscription("sensors/+/temp".to_string()).await;
-        *handle.client.lock().await = Some(dead_live_client());
+        let (client, mut eventloop) = live_client();
+        *handle.client.lock().await = Some(client);
         svc.add_client(handle.clone());
 
         let outcome = svc.unsubscribe_filter("home", "sensors/+/temp").await;
-        match outcome {
-            Some(IngressUnsubscribeOutcome::SendFailed(msg)) => assert!(
-                !msg.is_empty(),
-                "SendFailed must carry the stringified client error"
-            ),
-            other => panic!("expected SendFailed, got {other:?}"),
-        }
-        // Reconnect-set removal precedes the live send, so the filter is gone
-        // despite the failed UNSUBSCRIBE — the next reconnect will not re-assert it.
+        assert_eq!(outcome, Some(IngressUnsubscribeOutcome::UnsubscribedLive));
+        let set = handle.subscriptions.read().await;
         assert!(
-            handle
-                .subscriptions
-                .read()
-                .await
-                .iter()
-                .all(|s| s.topic_filter != "sensors/+/temp"),
-            "a send-failed unsubscribe still removes the filter from the reconnect set"
+            set.get("sensors/+/temp").is_none(),
+            "the filter is no longer held"
         );
+        assert!(
+            set.is_asserted("sensors/+/temp"),
+            "the filter stays asserted until the broker answers its UNSUBSCRIBE",
+        );
+        drop(set);
+        assert_eq!(
+            handle
+                .filter_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec!["sensors/+/temp"],
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.filter_wake.notified(),
+        )
+        .await
+        .expect("the hand-off wakes the supervisor");
+        eventloop.clean();
+        assert_eq!(eventloop.pending_len(), 0, "only the supervisor submits");
+    }
+
+    /// With no client installed a withdrawal is deferred whether the
+    /// supervisor is retrying or has failed for good: the filter stays
+    /// asserted for the next connection, and nothing is queued, since that
+    /// connection settles every asserted filter.
+    #[tokio::test]
+    async fn unsubscribe_filter_without_a_client_defers_in_backoff_and_failed_alike() {
+        for failed in [false, true] {
+            let svc = MqttService::new();
+            let handle = make_handle("home");
+            handle.add_subscription("sensors/#".to_string()).await;
+            if failed {
+                *handle.supervisor_state.write().await = SupervisorState::Failed {
+                    reason: "bad credentials".to_string(),
+                };
+            }
+            svc.add_client(handle.clone());
+
+            let outcome = svc.unsubscribe_filter("home", "sensors/#").await;
+            assert_eq!(
+                outcome,
+                Some(IngressUnsubscribeOutcome::DeferredDisconnected),
+                "failed: {failed}",
+            );
+            assert!(handle.subscriptions.read().await.is_asserted("sensors/#"));
+            assert!(handle.filter_requests.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

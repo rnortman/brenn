@@ -20,6 +20,7 @@ use brenn_mqtt::service::{InboundRouting, MqttEventRouter};
 use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 use brenn_mqtt::state::ConnectorHealthLabel;
 use brenn_mqtt::state::IngressSubscription;
+use brenn_mqtt::test_support::broker::log_records_connack;
 use brenn_mqtt::test_support::client::wait_for_filter_acked;
 use brenn_mqtt::{ArrivingFilters, MqttClientHandle, MqttService, register_and_spawn};
 use common::{
@@ -882,6 +883,16 @@ async fn the_matchers_read_a_live_brokers_wording() {
              UNSUBSCRIBE uses: {granted}",
         );
     }
+    // The client asked for no session expiry, so its first CONNACK reports
+    // none, and a matcher that ignored the flag would read it either way.
+    assert!(
+        log_records_connack(&granted, &subscriber, false),
+        "the CONNACK to {subscriber} is not read as one without a session: {granted}",
+    );
+    assert!(
+        !log_records_connack(&granted, &subscriber, true),
+        "the CONNACK to {subscriber} read as one with a session: {granted}",
+    );
     // A strict prefix of the subscriber's id, so the substring is in the log
     // and only the bracket that opens the packet's fields keeps it out. An id
     // absent from the log would pass against any matcher that read the
@@ -890,6 +901,10 @@ async fn the_matchers_read_a_live_brokers_wording() {
     assert!(
         !log_records_publish_to_subscriber(&granted, prefix_of_subscriber, kept),
         "a send to {subscriber} read as a send to {prefix_of_subscriber}: {granted}",
+    );
+    assert!(
+        !log_records_connack(&granted, prefix_of_subscriber, false),
+        "a CONNACK to {subscriber} read as one to {prefix_of_subscriber}: {granted}",
     );
 
     // What the broker appends from here is the withdrawal's own record.
@@ -1153,12 +1168,17 @@ struct PanicOnceRouter {
 
 #[async_trait::async_trait]
 impl MqttEventRouter for PanicOnceRouter {
+    fn ready(&self) -> bool {
+        true
+    }
+
     async fn deliver_inbound(
         &self,
         _client_slug: &str,
         _topic: &str,
         payload: InboundPayload,
         _qos: u8,
+        _retained: bool,
         _routing: InboundRouting,
     ) {
         if payload.bytes.as_ref() == b"panic"
@@ -1436,11 +1456,11 @@ async fn stop_right_after_a_large_connect_ends_the_session() {
     .await;
 }
 
-/// A subscribe handed to the supervisor through the deferral queue is sent by
-/// the supervisor at its next poll return. The case puts the entry on the queue
-/// itself, so the deferred path is taken on every run rather than when a live
-/// subscribe happens to meet a full request channel, and then wakes the
-/// session's poll with a delivery on its static filter.
+/// A filter request placed on the supervisor's queue is settled by the
+/// supervisor at its next poll return. The case puts the filter on the queue
+/// itself, without the wake `request_settle` sends, so the queue is drained by
+/// the poll return alone, and then wakes the session's poll with a delivery on
+/// its static filter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deferred_subscribe_is_sent_at_the_next_poll() {
     broker_gate!();
@@ -1471,15 +1491,15 @@ async fn a_deferred_subscribe_is_sent_at_the_next_poll() {
     )
     .await;
 
-    // Registered first, as `subscribe_filter` does before it defers: the SUBACK
-    // arm records a grant only for a filter in the session's set.
+    // Registered first, as `subscribe_filter` does before it names the filter:
+    // the supervisor subscribes a filter only while the session's set holds it.
     let handed = "brenn/itest/deferred/handed/#";
     let sub = handle.add_subscription(handed.to_string()).await;
     handle
-        .deferred_subscribes
+        .filter_requests
         .lock()
-        .expect("deferred_subscribes poisoned")
-        .push_back(sub);
+        .expect("filter_requests poisoned")
+        .push_back(sub.topic_filter);
 
     let (pubc, mut ack_rx) = direct_publisher_acked(harness.port, ca).await;
     let probe = "brenn/itest/deferred/wake/probe";
@@ -1502,9 +1522,9 @@ async fn a_deferred_subscribe_is_sent_at_the_next_poll() {
     .await;
     assert!(
         handle
-            .deferred_subscribes
+            .filter_requests
             .lock()
-            .expect("deferred_subscribes poisoned")
+            .expect("filter_requests poisoned")
             .is_empty()
     );
 

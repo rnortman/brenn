@@ -1441,22 +1441,8 @@ async fn execute_unsubscribe(
     let outcome =
         crate::mqtt_subscribe::unsubscribe_dynamic_activated(bridge, &app_slug, &address).await;
 
-    use crate::mqtt_subscribe::UnsubscribeActivation;
     match outcome {
         Ok(activation) => {
-            // The caller's durable sub + directory subscriber are already gone and
-            // the filter was dropped from the reconnect set even on a send failure;
-            // only the live broker UNSUBSCRIBE *send* failed. The status string
-            // (pure mapping) reports the removal as done; the warn is logged here.
-            if let UnsubscribeActivation::MqttSendFailed(ref e) = activation {
-                tracing::warn!(
-                    tool = tool_name,
-                    address = %sanitize_untrusted_str(&address, MAX_LOGGED_UNTRUSTED_BYTES),
-                    error = %e,
-                    "MessageUnsubscribe: broker UNSUBSCRIBE send failed; subscription already \
-                     removed, reconnect will not re-subscribe"
-                );
-            }
             let status = activation.status_str();
             let resp = MessageUnsubscribeOk {
                 address: &address,
@@ -4485,6 +4471,7 @@ mod tests {
                 "home",
                 brenn_messaging::IngressMessage::Wrapped(body.to_owned()),
                 brenn_lib::messaging::Urgency::Normal,
+                brenn_messaging::IngressAppend::Always,
             )
             .await;
 
@@ -4919,6 +4906,7 @@ mod tests {
                         transport: transport.clone(),
                     },
                     brenn_lib::messaging::Urgency::Normal,
+                    brenn_messaging::IngressAppend::Always,
                 )
                 .await;
         }

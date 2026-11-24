@@ -737,7 +737,7 @@ fn system_publisher_bare_channel(label: &str, channel_address: &str) -> String {
 /// SUBSCRIBE and no route). The caller (`bootstrap/mod.rs`) converts each into a
 /// `ResolvedMqttIngressChannel` — filling `urgency` from the client's
 /// `[[mqtt_client]]` — and appends it to the ingress-channel list threaded into
-/// `start_mqtt`/`wire_mqtt_state`, so the SUBSCRIBE and the route are rebuilt.
+/// `build_mqtt`/`wire_and_spawn`, so the SUBSCRIBE and the route are rebuilt.
 pub struct DynamicMqttIngress {
     pub channel_address: String,
     pub channel_uuid: uuid::Uuid,

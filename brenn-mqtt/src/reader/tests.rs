@@ -591,12 +591,17 @@ struct NoRoutes;
 
 #[async_trait]
 impl crate::service::MqttEventRouter for NoRoutes {
+    fn ready(&self) -> bool {
+        true
+    }
+
     async fn deliver_inbound(
         &self,
         _client_slug: &str,
         _topic: &str,
         _payload: crate::payload::InboundPayload,
         _qos: u8,
+        _retained: bool,
         _routing: crate::service::InboundRouting,
     ) {
         panic!("the in-process broker sends no inbound publish");

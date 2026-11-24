@@ -26,9 +26,9 @@ use brenn_mqtt::broker_gate;
 use brenn_mqtt::state::ConnectorHealthLabel;
 use brenn_mqtt::test_support::{
     AUTH_CREDENTIALS, BrokerHarness, ROTATED_CREDENTIALS, await_puback, certs, connection_epoch,
-    direct_publisher_acked, direct_publisher_acked_as, log_records_disconnect,
-    log_records_publish_to_subscriber, log_records_subscribe_at, log_records_unsubscribe,
-    session_client_id,
+    direct_publisher_acked, direct_publisher_acked_as, log_records_connack, log_records_connect,
+    log_records_disconnect, log_records_publish_to_subscriber, log_records_subscribe_at,
+    log_records_unsubscribe, session_client_id,
 };
 use rumqttc::mqttbytes::QoS;
 
@@ -61,6 +61,23 @@ fn client_block_at(port: u16, ca_file: &std::path::Path, qos: u8) -> String {
     url = "mqtts://127.0.0.1:{port}";
     ca_file = "{ca}";
     qos = {qos};
+}}
+"#,
+        ca = ca_file.display(),
+    )
+}
+
+/// The `mqtt_client` declaration of the kept-session cases: [`client_block`]
+/// asking the broker to keep the session for a minute after a connection
+/// ends, and retrying a lost broker at least every two seconds.
+fn kept_client_block(port: u16, ca_file: &std::path::Path) -> String {
+    format!(
+        r#"mqtt_client ha {{
+    url = "mqtts://127.0.0.1:{port}";
+    ca_file = "{ca}";
+    qos = 1;
+    session_expiry_secs = 60;
+    reconnect_backoff_max_secs = 2;
 }}
 "#,
         ca = ca_file.display(),
@@ -156,7 +173,19 @@ async fn boot_connected(
 /// carries credentials, or whose secret files had to exist before the document
 /// naming them.
 async fn boot_connected_on(tree: &Tree, components: &std::path::Path) -> Booted {
-    let booted = boot_declared(tree, components).await;
+    boot_connected_over(tree, components, None, None).await
+}
+
+/// [`boot_connected_on`] over a store a previous boot left, when `db` names
+/// one, and with a look at the broker between building the MQTT sessions and
+/// wiring them, when `before_mqtt_wiring` is one.
+async fn boot_connected_over(
+    tree: &Tree,
+    components: &std::path::Path,
+    db: Option<brenn_db::Db>,
+    before_mqtt_wiring: Option<Box<dyn FnOnce() + Send>>,
+) -> Booted {
+    let booted = boot_declared_over(tree, components, db, before_mqtt_wiring).await;
     let (service, _) = booted.mqtt.clone();
     brenn_mqtt::test_support::wait_for_health(
         &service,
@@ -172,6 +201,17 @@ async fn boot_connected_on(tree: &Tree, components: &std::path::Path) -> Booted 
 /// Boot `tree` over the live subsystem without waiting on any session: the
 /// shape for a document that declares no client at all.
 async fn boot_declared(tree: &Tree, components: &std::path::Path) -> Booted {
+    boot_declared_over(tree, components, None, None).await
+}
+
+/// [`boot_declared`] over the store `db` names, if any, running
+/// `before_mqtt_wiring`, if any, where `BootFixture::before_mqtt_wiring` says.
+async fn boot_declared_over(
+    tree: &Tree,
+    components: &std::path::Path,
+    db: Option<brenn_db::Db>,
+    before_mqtt_wiring: Option<Box<dyn FnOnce() + Send>>,
+) -> Booted {
     // A broker-only document declares no component and so stages no module,
     // and there is then no package to install; the reload that brings the first
     // component installs it. Read off the tree rather than off `topics`, so the
@@ -182,8 +222,10 @@ async fn boot_declared(tree: &Tree, components: &std::path::Path) -> Booted {
     boot_with(
         tree,
         BootFixture {
+            db,
             components_roots: vec![components.to_path_buf()],
             mqtt_live: true,
+            before_mqtt_wiring,
             dispatcher: true,
             ..BootFixture::default()
         },
@@ -294,16 +336,11 @@ async fn note_if_filter_lost(service: &brenn_mqtt::MqttService, client: &str, to
 /// log records it processing brenn's UNSUBSCRIBE for `topic_filter`.
 ///
 /// The removal direction's counterpart of [`await_filter_at_broker`], and it
-/// treats a deferral as a failure where the arrival side tolerates one. The
-/// asymmetry is the packets': a deferred SUBSCRIBE is re-asserted by the
-/// supervisor's reconnect, so the arrival claim can still be proven after a
-/// wait, whereas a deferred UNSUBSCRIBE is never sent — the filter only leaves
-/// the reconnect-survival set — and the reconnect re-asserts subscriptions and
-/// unsubscribes nothing. The session is persistent (`clean_start(false)` with a
-/// session expiry), so the broker keeps the filter across the reconnect and the
-/// claim is *false* for that run rather than merely unobserved. Waiting ten
-/// seconds for a line that cannot appear, and then reporting a regression, is
-/// the failure mode this asserts its way out of.
+/// tolerates a deferral as that one does: a withdrawal deferred on a session
+/// drop stays asserted, and the reconnect that finds the broker's session
+/// sends its UNSUBSCRIBE, so the claim can still be proven after a wait. A
+/// reconnect that finds no session sends none, and the broker then holds no
+/// filter either; that is the residual this wait cannot close.
 ///
 /// Why the broker's log at all: the UNSUBACK is not attributed to its filter
 /// in-process, so brenn's own state cannot answer whether the broker acted.
@@ -324,13 +361,16 @@ async fn await_unsubscribe_at_broker(
     topic_filter: &str,
 ) {
     assert_no_failed_filters(status);
-    assert!(
-        !status.delta.mqtt_deferred.contains(&address.to_string()),
-        "the session dropped during the reload, so the UNSUBSCRIBE for {address} was never sent \
-         and this run cannot make the case's claim; this is not a regression in \
-         unsubscribe_filter: {:?}",
-        status.delta.mqtt_deferred,
-    );
+    if status
+        .delta
+        .mqtt_unsubscribe_deferred
+        .contains(&address.to_string())
+    {
+        eprintln!(
+            "mqtt_live: the UNSUBSCRIBE for {address} deferred on a session drop; waiting for \
+             the reconnect that finds the session to send it",
+        );
+    }
     harness
         .wait_for_log(
             since,
@@ -642,7 +682,7 @@ async fn a_binding_removed_by_reload_stops_receiving_from_the_broker() {
 /// side has to be boot's. Under the plan-only fixture the filter set and the
 /// route table are transcribed from the plan, which would make the comparison a
 /// comparison against the plan; only `mqtt_live` builds them the way
-/// `start_mqtt` and `wire_mqtt_state` do, and that needs a broker.
+/// `build_mqtt` and `wire_and_spawn` do, and that needs a broker.
 ///
 /// The two processes never overlap on the broker: the comparison helper stops
 /// the reload side's supervisors once its snapshot is taken and before the
@@ -1956,6 +1996,13 @@ async fn a_new_narrow_subscription_receives_every_retained_message_once() {
 /// give `rs/b` the number `rs/#` had, and the message would land in the `rs/b`
 /// channel and not in the `rs/#` one. The case proves the session was resumed
 /// by itself: without it the down-time message never arrives.
+///
+/// The second process is booted the way `run_server` boots, and the case looks
+/// in between its two MQTT steps: once the client directory and the egress
+/// readers are in place and before the router has its state, no supervisor is
+/// spawned (the fixture asserts that on every live boot) and the broker has
+/// accepted no connection from the client, so the backlog it holds has not
+/// started to flow. After the wiring, the backlog reaches its channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resumed_sessions_backlog_reaches_the_channel_it_was_queued_for() {
     broker_gate!();
@@ -1966,21 +2013,11 @@ async fn a_resumed_sessions_backlog_reaches_the_channel_it_was_queued_for() {
     let wide_address = format!("mqtt:{CLIENT}:{wide}");
     let narrow_address = format!("mqtt:{CLIENT}:{narrow}");
 
-    let harness = BrokerHarness::start();
+    let harness = Arc::new(BrokerHarness::start());
     let ca_dir = tempfile::tempdir().expect("a directory for the CA");
     let ca_file = ca_dir.path().join("ca.pem");
     std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
-    let block = format!(
-        r#"mqtt_client ha {{
-    url = "mqtts://127.0.0.1:{port}";
-    ca_file = "{ca}";
-    qos = 1;
-    session_expiry_secs = 60;
-}}
-"#,
-        port = harness.port,
-        ca = ca_file.display(),
-    );
+    let block = kept_client_block(harness.port, &ca_file);
 
     let first_components = tempfile::tempdir().expect("a components root");
     let first_tree = Tree::holding(&document_over_a_declared_client(&block, &[&wide]));
@@ -2006,7 +2043,33 @@ async fn a_resumed_sessions_backlog_reaches_the_channel_it_was_queued_for() {
 
     let second_components = tempfile::tempdir().expect("a components root");
     let second_tree = Tree::holding(&document_over_a_declared_client(&block, &[&narrow, &wide]));
-    let second = boot_connected_on(&second_tree, second_components.path()).await;
+    let since_second = harness.log_len();
+    let looked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let look = {
+        let harness = Arc::clone(&harness);
+        let looked = Arc::clone(&looked);
+        let session_id = session_client_id(CLIENT);
+        move || {
+            let window = harness.log()[since_second..].to_string();
+            assert!(
+                !log_records_connect(&window, &session_id),
+                "the broker accepted a connection from {session_id} before the router had its \
+                 state: {window}",
+            );
+            looked.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    };
+    let second = boot_connected_over(
+        &second_tree,
+        second_components.path(),
+        None,
+        Some(Box::new(look)),
+    )
+    .await;
+    assert!(
+        looked.load(std::sync::atomic::Ordering::SeqCst),
+        "the boot never reached the place between building and wiring its MQTT sessions",
+    );
     let (service, _) = second.mqtt.clone();
     for filter in [&narrow, &wide] {
         brenn_mqtt::test_support::wait_for_filter_acked(
@@ -2310,6 +2373,466 @@ async fn a_reloads_qos_move_resubscribes_a_dynamic_only_filter() {
         !log_records_subscribe_at(&window, &session_id, &topic, 0),
         "a SUBSCRIBE after the qos edit went out at qos 0: {window}",
     );
+
+    booted.stop_mqtt();
+}
+
+// ── a kept session's retained replay and withdrawals, at the broker ────────
+
+/// The payload text of each ingress envelope in `bodies` on `topic`, in order.
+fn texts_on(bodies: &[String], topic: &str) -> Vec<String> {
+    bodies
+        .iter()
+        .filter_map(|body| {
+            let envelope: serde_json::Value =
+                serde_json::from_str(body).expect("the ingress envelope is JSON");
+            (envelope["topic"] == topic).then(|| {
+                envelope["payload"]["text"]
+                    .as_str()
+                    .expect("the envelope carries a text payload")
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
+/// Publish a live `end` on `barrier`, and poll until `address` holds a row
+/// on that topic carrying it; answer with every row the channel then holds.
+///
+/// A barrier published after the broker has logged sending every message the
+/// case waits on is written to the session behind them, and one connection's
+/// deliveries are routed in the order they arrive, so once the barrier's row
+/// is in the channel every message before it has been compared and stored or
+/// skipped.
+async fn rows_through_barrier(
+    booted: &Booted,
+    publisher: &rumqttc::AsyncClient,
+    acks: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    address: &str,
+    barrier: &str,
+) -> Vec<String> {
+    publisher
+        .publish(
+            barrier.to_string(),
+            QoS::AtLeastOnce,
+            false,
+            b"end".to_vec(),
+        )
+        .await
+        .expect("the broker took the barrier");
+    await_puback(acks, "the barrier's publish").await;
+    let messenger = &booted.messenger;
+    brenn_mqtt::test_support::poll_until(
+        BROKER_WAIT_SECS,
+        || async {
+            let bodies = bodies_on(messenger, address).await;
+            texts_on(&bodies, barrier)
+                .iter()
+                .any(|text| text == "end")
+                .then_some(bodies)
+        },
+        || async {
+            let bodies = bodies_on(messenger, address).await;
+            format!("the barrier on {barrier} never reached {address}: {bodies:?}")
+        },
+    )
+    .await
+}
+
+/// A process that resumes a session the broker kept brings its channel up to
+/// the broker's retained values, and adds no copy of one it already holds.
+///
+/// Three retained topics under one filter, held by a first process; then, while
+/// no process is connected, one topic changes at QoS 0, which the session does
+/// not queue, one changes at QoS 1, which it does, and one does not change. A
+/// second process boots over the first one's store, resumes the session, and
+/// subscribes again, so the broker replays all three.
+///
+/// - The QoS 0 change reaches the channel through the replay alone: its newest
+///   row is the new value.
+/// - The unchanged topic is replayed — the broker's log shows the SUBSCRIBE and
+///   the PUBLISH — and the channel holds its value once: the row is absent
+///   because it was compared, not because it was never sent.
+/// - The QoS 1 change arrives twice, queued and replayed, in an order the
+///   broker does not promise: its newest row is the new value, held once or
+///   twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_session_brings_the_brokers_retained_values_and_no_copy() {
+    broker_gate!();
+
+    let wide = format!("{TOPIC_PREFIX}/kr/#");
+    let changed = format!("{TOPIC_PREFIX}/kr/changed");
+    let same = format!("{TOPIC_PREFIX}/kr/same");
+    let queued = format!("{TOPIC_PREFIX}/kr/queued");
+    let barrier = format!("{TOPIC_PREFIX}/kr/end");
+    // Outside the filter: a QoS 1 publish behind the QoS 0 one, whose PUBACK
+    // says the broker has taken the QoS 0 one too.
+    let sync = format!("{TOPIC_PREFIX}/kr-sync");
+    let address = format!("mqtt:{CLIENT}:{wide}");
+    let session_id = session_client_id(CLIENT);
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let tree = Tree::holding(&document_over_a_declared_client(
+        &kept_client_block(harness.port, &ca_file),
+        &[&wide],
+    ));
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    for (topic, value) in [(&changed, "v1"), (&same, "s"), (&queued, "q1")] {
+        publisher
+            .publish(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                true,
+                value.as_bytes().to_vec(),
+            )
+            .await
+            .expect("the broker took the retained publish");
+        await_puback(&mut acks, "a retained publish").await;
+    }
+
+    let db = brenn_server::test_support::init_db_memory();
+    let first_components = tempfile::tempdir().expect("a components root");
+    let first = boot_connected_over(&tree, first_components.path(), Some(db.clone()), None).await;
+    rows_until(&first, &address, 3, "the first process's replay").await;
+    let since_first = harness.log_len();
+    super::mqtt_egress_tests::shut_down(first).await;
+
+    publisher
+        .publish(changed.clone(), QoS::AtMostOnce, true, b"v2".to_vec())
+        .await
+        .expect("the broker took the QoS 0 retained publish");
+    publisher
+        .publish(sync.clone(), QoS::AtLeastOnce, false, b"sync".to_vec())
+        .await
+        .expect("the broker took the sync publish");
+    await_puback(&mut acks, "the publish behind the QoS 0 one").await;
+    publisher
+        .publish(queued.clone(), QoS::AtLeastOnce, true, b"q2".to_vec())
+        .await
+        .expect("the broker took the QoS 1 retained publish");
+    await_puback(&mut acks, "the queued retained publish").await;
+
+    let since_second = harness.log_len();
+    let second_components = tempfile::tempdir().expect("a components root");
+    let second = boot_connected_over(&tree, second_components.path(), Some(db), None).await;
+    let window = harness
+        .wait_for_log(
+            since_second,
+            BROKER_WAIT_SECS,
+            "the second process never resumed the session, subscribed and had every retained \
+             topic replayed",
+            |log| {
+                log_records_connack(log, &session_id, true)
+                    && log_records_subscribe_at(log, &session_id, &wide, 1)
+                    && [&changed, &same, &queued]
+                        .iter()
+                        .all(|topic| log_records_publish_to_subscriber(log, &session_id, topic))
+            },
+        )
+        .await;
+    assert!(
+        brenn_mqtt::test_support::log_records_disconnect_before_reconnect(
+            &harness.log()[since_first..],
+            &session_id
+        ),
+        "the second process connected under {session_id} before the first one's DISCONNECT, so \
+         the broker took the session over: {window}",
+    );
+
+    let bodies = rows_through_barrier(&second, &publisher, &mut acks, &address, &barrier).await;
+    let changed_texts = texts_on(&bodies, &changed);
+    assert_eq!(
+        changed_texts.last().map(String::as_str),
+        Some("v2"),
+        "the value changed at QoS 0 reached the channel through the replay: {bodies:?}",
+    );
+    assert_eq!(
+        texts_on(&bodies, &same),
+        vec!["s".to_string()],
+        "the unchanged value was replayed and is held once: {bodies:?}",
+    );
+    let queued_texts = texts_on(&bodies, &queued);
+    assert_eq!(
+        queued_texts.last().map(String::as_str),
+        Some("q2"),
+        "the value changed at QoS 1 is the newest row for its topic: {bodies:?}",
+    );
+    let new_copies = queued_texts.iter().filter(|text| *text == "q2").count();
+    assert!(
+        (1..=2).contains(&new_copies),
+        "the queued value and its replay leave it once or twice, never more: {bodies:?}",
+    );
+
+    second.stop_mqtt();
+}
+
+/// The broker declaration with the session kept, and two reader agents each
+/// granted a runtime `mqtt:` subscribe on `covered`, holding nothing static.
+fn kept_dynamic_only(port: u16, ca_file: &std::path::Path, covered: &str, second: &str) -> String {
+    document_with_agent(
+        &kept_client_block(port, ca_file),
+        &dynamic_reader_agent(covered, "", &[READER, second]),
+    )
+}
+
+/// A filter added to a kept session takes its retained messages once, and a
+/// second subscriber joining the filter — a second SUBSCRIBE, and a second
+/// replay at the broker — adds no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_subscriber_to_a_held_filter_adds_no_replayed_row() {
+    broker_gate!();
+
+    const SECOND: &str = "second-reader";
+    let filter = format!("{TOPIC_PREFIX}/kd/+");
+    let barrier = format!("{TOPIC_PREFIX}/kd/end");
+    let retained: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|leaf| format!("{TOPIC_PREFIX}/kd/{leaf}"))
+        .collect();
+    let address = format!("mqtt:{CLIENT}:{filter}");
+    let session_id = session_client_id(CLIENT);
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let components = tempfile::tempdir().expect("a components root");
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    for topic in &retained {
+        publisher
+            .publish(topic.clone(), QoS::AtLeastOnce, true, b"held".to_vec())
+            .await
+            .expect("the broker took the retained publish");
+        await_puback(&mut acks, "a retained publish").await;
+    }
+
+    let tree = Tree::holding(&kept_dynamic_only(harness.port, &ca_file, &address, SECOND));
+    let booted = boot_connected_on(&tree, components.path()).await;
+    assert_eq!(
+        runtime_subscribe(&booted, READER, &address).await,
+        "subscribed",
+        "the session was live for the first subscriber",
+    );
+    let first = rows_until(&booted, &address, retained.len(), "the first replay").await;
+    let mut first_topics = topics_of(&first);
+    first_topics.sort();
+    assert_eq!(
+        first_topics, retained,
+        "each retained value once: {first:?}"
+    );
+
+    let before_second = harness.log_len();
+    assert_eq!(
+        runtime_subscribe(&booted, SECOND, &address).await,
+        "subscribed",
+        "the session was live for the second subscriber",
+    );
+    harness
+        .wait_for_log(
+            before_second,
+            BROKER_WAIT_SECS,
+            &format!("the second subscriber's SUBSCRIBE for {filter} was never replayed to"),
+            |log| {
+                log_records_subscribe_at(log, &session_id, &filter, 1)
+                    && retained
+                        .iter()
+                        .all(|topic| log_records_publish_to_subscriber(log, &session_id, topic))
+            },
+        )
+        .await;
+
+    let bodies = rows_through_barrier(&booted, &publisher, &mut acks, &address, &barrier).await;
+    let mut topics = topics_of(&bodies);
+    topics.sort();
+    let mut expected = retained.clone();
+    expected.push(barrier.clone());
+    expected.sort();
+    assert_eq!(
+        topics, expected,
+        "the second replay added no row, and the barrier is the only new one: {bodies:?}",
+    );
+
+    booted.stop_mqtt();
+}
+
+/// A client whose session expiry is 0, restarted by a reload that changes its
+/// declaration: the successor's CONNACK reports no session, every filter is
+/// subscribed again, the broker replays each retained value, and each is in
+/// its channel once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_without_the_session_leaves_each_retained_value_once() {
+    broker_gate!();
+
+    let first = format!("{TOPIC_PREFIX}/ns/a");
+    let second = format!("{TOPIC_PREFIX}/ns/b");
+    let session_id = session_client_id(CLIENT);
+
+    let harness = BrokerHarness::start();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let components = tempfile::tempdir().expect("a components root");
+    let block = client_block(harness.port, &ca_file);
+    let changed_block = block.replace("qos = 1;", "qos = 1;\n    stop_wait_secs = 5;");
+    assert_ne!(block, changed_block, "the reload changes the client");
+
+    let (publisher, mut acks) = direct_publisher_acked(harness.port, certs::ca_pem_bytes()).await;
+    for topic in [&first, &second] {
+        publisher
+            .publish(topic.clone(), QoS::AtLeastOnce, true, b"held".to_vec())
+            .await
+            .expect("the broker took the retained publish");
+        await_puback(&mut acks, "a retained publish").await;
+    }
+
+    let tree = Tree::holding(&document_over_a_declared_client(&block, &[&first, &second]));
+    let mut booted = boot_connected_on(&tree, components.path()).await;
+    for topic in [&first, &second] {
+        rows_until(
+            &booted,
+            &format!("mqtt:{CLIENT}:{topic}"),
+            1,
+            "the boot's replay",
+        )
+        .await;
+    }
+
+    let before_reload = harness.log_len();
+    tree.write(&document_over_a_declared_client(
+        &changed_block,
+        &[&first, &second],
+    ));
+    install_package(components.path(), &staged_module(&tree));
+    booted.driver.reload(TriggerSource::Signal).await;
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(status.delta.mqtt_clients_changed, vec![CLIENT.to_string()]);
+
+    harness
+        .wait_for_log(
+            before_reload,
+            BROKER_WAIT_SECS,
+            "the successor never connected without a session, subscribed both filters and had \
+             both retained values replayed",
+            |log| {
+                log_records_connack(log, &session_id, false)
+                    && [&first, &second].iter().all(|topic| {
+                        log_records_subscribe_at(log, &session_id, topic, 1)
+                            && log_records_publish_to_subscriber(log, &session_id, topic)
+                    })
+            },
+        )
+        .await;
+    let window = harness.log()[before_reload..].to_string();
+    assert!(
+        !log_records_connack(&window, &session_id, true),
+        "a connection after the reload found a session at expiry 0: {window}",
+    );
+
+    for topic in [&first, &second] {
+        let address = format!("mqtt:{CLIENT}:{topic}");
+        let bodies = rows_through_barrier(&booted, &publisher, &mut acks, &address, topic).await;
+        assert_eq!(
+            texts_on(&bodies, topic),
+            vec!["held".to_string(), "end".to_string()],
+            "the retained value once, then the barrier: {bodies:?}",
+        );
+    }
+
+    booted.stop_mqtt();
+}
+
+/// A reload that withdraws a filter while the client's broker is down reports
+/// the withdrawal as deferred — in `mqtt_unsubscribe_deferred`, not in
+/// `mqtt_deferred` — and the UNSUBSCRIBE reaches the broker on the connection
+/// that resumes the session once the broker is back.
+///
+/// The broker keeps its sessions across the stop (persistence on, an orderly
+/// shutdown), which is what a broker restarted under a kept session looks like
+/// to a client: without it the session would be gone and there would be nothing
+/// to withdraw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_deferred_while_the_broker_is_down_is_sent_when_it_returns() {
+    broker_gate!();
+
+    let kept = format!("{TOPIC_PREFIX}/dw/kept");
+    let dropped = format!("{TOPIC_PREFIX}/dw/dropped");
+    let dropped_address = format!("mqtt:{CLIENT}:{dropped}");
+    let session_id = session_client_id(CLIENT);
+
+    let mut harness = BrokerHarness::start_persistent();
+    let ca_dir = tempfile::tempdir().expect("a directory for the CA");
+    let ca_file = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_file, certs::ca_pem()).expect("the CA is writable");
+    let components = tempfile::tempdir().expect("a components root");
+    let block = kept_client_block(harness.port, &ca_file);
+
+    let tree = Tree::holding(&document_over_a_declared_client(&block, &[&kept, &dropped]));
+    let mut booted = boot_connected_on(&tree, components.path()).await;
+    let (service, _) = booted.mqtt.clone();
+    for filter in [&kept, &dropped] {
+        brenn_mqtt::test_support::wait_for_filter_acked(
+            &service,
+            CLIENT,
+            filter,
+            BROKER_WAIT_SECS,
+            &format!("the broker never granted {filter}"),
+        )
+        .await;
+    }
+
+    harness.stop_keeping_sessions();
+    brenn_mqtt::test_support::wait_for_health(
+        &service,
+        CLIENT,
+        &[ConnectorHealthLabel::Disconnected],
+        BROKER_WAIT_SECS,
+        "the client never saw its broker go",
+    )
+    .await;
+
+    tree.write(&document_over_a_declared_client(&block, &[&kept]));
+    install_package(components.path(), &staged_module(&tree));
+    booted.driver.reload(TriggerSource::Signal).await;
+    let status = booted.last_status().await;
+    assert_eq!(status.outcome, Outcome::Applied, "{:?}", status.refusals);
+    assert_eq!(
+        status.delta.mqtt_unsubscribed,
+        vec![dropped_address.clone()]
+    );
+    assert_eq!(
+        status.delta.mqtt_unsubscribe_deferred,
+        vec![dropped_address.clone()],
+        "the withdrawal made with no connection is reported deferred",
+    );
+    assert!(
+        status.delta.mqtt_deferred.is_empty(),
+        "a deferred withdrawal is not a deferred assertion: {:?}",
+        status.delta.mqtt_deferred,
+    );
+    assert_no_failed_filters(&status);
+
+    let before_restart = harness.log_len();
+    harness.restart();
+    harness
+        .wait_for_log(
+            before_restart,
+            3 * BROKER_WAIT_SECS,
+            &format!(
+                "the client never resumed its session and withdrew {dropped} once the broker was \
+                 back"
+            ),
+            |log| {
+                log_records_connack(log, &session_id, true)
+                    && log_records_unsubscribe(log, &session_id, &dropped)
+            },
+        )
+        .await;
 
     booted.stop_mqtt();
 }

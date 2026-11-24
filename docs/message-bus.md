@@ -1545,15 +1545,57 @@ channel whose filter does not match it.
   filter's copy as a second row.
 - *Across a restart.* With a non-zero `session_expiry_secs` the broker keeps
   the session while Brenn is down and delivers what it queued when Brenn
-  returns. Each queued message reaches the channel of the filter it was queued
-  for, if this process holds that filter; one queued for a filter no longer
-  held is dropped with a `warn`.
-- *Retained replay.* The retained messages the broker sends for a new
-  subscription reach that subscription's channel only; a wider channel the
-  client already holds does not receive them. A second subscriber joining a
-  filter already held makes the broker replay into the shared channel again,
-  and every reconnect replays the retained messages of every filter into its
-  own channel again; both add rows that repeat earlier ones.
+  returns — only what it delivers at QoS 1; the retained replay below brings
+  the rest up to date. Each queued message reaches the channel of the filter it
+  was queued for, if this process holds that filter; one queued for a filter no
+  longer held is dropped with a `warn`. A new process does not know which
+  filters an earlier one asserted in the session it resumes, so a filter an
+  earlier process left there and this one never holds stays in the session
+  until the session ends, on every connection of this process and of its
+  reload successors (`TODO(mqtt-deferred-unsubscribe-not-withdrawn)`): its
+  copies are dropped with that `warn` while Brenn is connected, and while
+  Brenn is away the broker queues its QoS 1 messages against the client's
+  queue limit. Removing the client by one reload and declaring it again by
+  another ends the session and starts a clean one (§2.7.3, "Sessions that end
+  and start on purpose").
+- *Withdrawing a filter.* When the last subscriber of an `mqtt:` filter goes,
+  the filter leaves the client's held set and the client's connection sends
+  its UNSUBSCRIBE at once. One that could not go out — the client was
+  disconnected, or had not connected yet — goes out at the next connection
+  this process makes for the client that finds the broker's session; a
+  connection that finds no session has nothing to withdraw. A filter
+  withdrawn and subscribed again before that connection is subscribed and not
+  withdrawn. A process that ends before that connection leaves the filter to
+  the *Across a restart* bullet.
+- *Retained replay.* Every connection and every SUBSCRIBE — a reconnect, a
+  resumed session, a second subscriber joining a filter already held — makes
+  the broker replay the filter's retained messages, and they reach that
+  subscription's channel only; a wider channel the client already holds does
+  not receive them. The replay is what brings a channel a retained value the
+  broker's session did not queue: one published at QoS 0, to a `qos = 0`
+  client, or lost to the broker's per-client queue limit. A replayed message
+  (Brenn subscribes with Retain As Published off, so the broker marks a
+  message RETAIN only when it sends it because of a SUBSCRIBE) adds no row when
+  the channel's newest row for its topic holds the same value; a live message
+  is always added. On a raw channel the same value is the same body bytes and
+  content type; on a wrapped channel it is the same payload text. QoS and
+  receive time are not compared. The comparison gains nothing in three places,
+  where the replay is added as before: a non-text payload on a wrapped channel,
+  whose wrapper holds a placeholder and no bytes
+  (`TODO(mqtt-retained-replay-repeated-on-resubscribe)`); a topic whose newest
+  row is more than the channel's `retain_depth`, or 1024, rows back; and a
+  filter with more retained topics than its channel's depth, whose replay
+  turns the window over. For every topic the channel's newest row is the same
+  with the comparison as without it. Two things a channel read as state can
+  still miss. A retained value cleared while Brenn was away is not seen: MQTT
+  replays values, not their absence, and nothing marks the end of a replay. And
+  a retained topic published at more than one QoS can leave its channel ending
+  on a value older than the broker's, because the broker orders nothing across
+  QoS: on any connection, when a newer QoS 0 publish arrives ahead of the
+  QoS 1 replay of the value it replaced, and on a kept session also when a
+  value queued at QoS 1 during an outage arrives after the replay of a newer
+  one. A retained topic a channel is read from as state should be published at
+  one QoS, whatever the client's session expiry.
 - *A broker without Subscription Identifiers.* When the broker's CONNACK says
   it does not support them, SUBSCRIBEs carry none and messages are routed by
   topic into every covering channel; overlapping filters then deliver a message
@@ -1995,6 +2037,37 @@ only once what is in flight is below the new connection's limit. The library's
 replay of a PUBLISH does not set the DUP flag, which MQTT 5 requires on a
 re-delivery (MQTT-3.3.1-1); it does not change what a subscriber receives, and
 Brenn cannot set it.
+
+**Filters across a reconnect.** Every connection settles the client's filters
+by what its CONNACK says. With no session the broker holds nothing: every
+filter the client holds is subscribed, and nothing is withdrawn. With the
+session present every filter the client holds is subscribed again — the
+retained replay depends on it — and every filter this process asserted in the
+session and no longer holds is withdrawn, including one withdrawn while the
+client was disconnected and one the MQTT library replayed from the lost
+connection after it was withdrawn. A filter leaves that account when the
+broker answers its UNSUBSCRIBE with Success or No subscription existed; a
+refusal is logged at `error` and the filter is withdrawn again at the next
+connection that finds the session.
+
+**Sessions that end and start on purpose.** A client a reload removes ends its
+session at the broker: when it is connected and its `session_expiry_secs` is
+above 0, its last DISCONNECT carries Session Expiry Interval 0, and the broker
+discards the session and its queue. A client declared with expiry 0 sends the
+plain DISCONNECT, as at any stop. A removed client with no connection at that
+moment — in backoff, or failed — cannot tell the broker anything, and the same
+holds when the DISCONNECT is not written within the stop bound or is lost to
+the socket's reset (`TODO(mqtt-disconnect-lost-to-reset)`): the session stays
+at the broker until it expires, and the stop logs that at `warn` with the
+expiry. A client a reload adds starts clean: every CONNECT up to its first
+CONNACK asks for a new session, so whatever the broker kept under the slug for
+an earlier declaration — its filters, its queued messages — is discarded
+before the commit adds the client's filters. A reload that changes the client
+before that first CONNACK keeps the clean start; after it the client resumes
+its session as any other. A server shutdown and a reload that changes a
+client keep the session. A session the broker kept is met by a later boot
+that declares the slug and resumed, with whatever filters it holds (*Across a
+restart*, §2.7.1).
 
 **What the MQTT library decides across a reconnect.** Two limits of a kept
 client, stated here and only here:

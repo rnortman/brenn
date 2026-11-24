@@ -296,3 +296,145 @@ fn a_stored_transport_that_does_not_parse_panics_on_read() {
     .unwrap();
     load_envelope_by_uuid(&conn, row.uuid);
 }
+
+// --- the newest retained row for an MQTT topic ---
+
+fn mqtt_meta_on(topic: &str) -> TransportMeta {
+    TransportMeta::Mqtt(MqttTransport {
+        client_slug: "broker".to_string(),
+        topic: topic.to_string(),
+        qos: 1,
+        received_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+    })
+}
+
+fn wrapper_on(topic: &str, text: &str) -> MessageBody {
+    MessageBody::text(
+        serde_json::to_string(&brenn_lib::messaging::MqttEnvelope {
+            client_slug: "broker".to_string(),
+            topic: topic.to_string(),
+            payload: brenn_lib::messaging::MqttPayloadBody::Text {
+                text: text.to_string(),
+            },
+            received_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            qos: 1,
+        })
+        .unwrap(),
+    )
+}
+
+fn newest_for(conn: &Connection, ch: Uuid, depth: Depth, topic: &str) -> Option<Uuid> {
+    newest_retained_for_mqtt_topic(conn, ch, depth, topic).map(|e| e.message_id)
+}
+
+/// A raw row is found by the topic in its transport metadata, a wrapped row by
+/// the topic in its body; the newest of several for one topic is returned, and
+/// rows for other topics, a text row that is not JSON, and JSON without a
+/// topic match nothing.
+#[test]
+fn the_newest_row_for_a_topic_is_found_in_either_shape() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let ch = channel(&conn, "mqtt:broker:cam/#", ChannelScheme::Mqtt);
+    let mqtt = ChannelScheme::Mqtt;
+    let unbounded = Depth::Unbounded;
+
+    assert_eq!(newest_for(&conn, ch, unbounded, "cam/front"), None);
+
+    let raw_meta = mqtt_meta_on("cam/front");
+    let raw = insert(&conn, ch, mqtt, &binary(NOT_UTF8), None, Some(&raw_meta));
+    assert_eq!(
+        newest_for(&conn, ch, unbounded, "cam/front"),
+        Some(raw.uuid)
+    );
+    let found = newest_retained_for_mqtt_topic(&conn, ch, unbounded, "cam/front").unwrap();
+    assert_eq!(found.body, binary(NOT_UTF8));
+    assert_eq!(found.transport, Some(raw_meta));
+
+    let wrapped = insert(&conn, ch, mqtt, &wrapper_on("cam/front", "on"), None, None);
+    assert_eq!(
+        newest_for(&conn, ch, unbounded, "cam/front"),
+        Some(wrapped.uuid)
+    );
+
+    insert(&conn, ch, mqtt, &wrapper_on("cam/back", "x"), None, None);
+    let other_meta = mqtt_meta_on("cam/side");
+    insert(&conn, ch, mqtt, &binary(NOT_UTF8), None, Some(&other_meta));
+    insert(&conn, ch, mqtt, &MessageBody::text("cam/front"), None, None);
+    insert(&conn, ch, mqtt, &MessageBody::text("{\"a\":1}"), None, None);
+    assert_eq!(
+        newest_for(&conn, ch, unbounded, "cam/front"),
+        Some(wrapped.uuid),
+        "newer rows for other topics or for none do not hide it"
+    );
+    assert_eq!(newest_for(&conn, ch, unbounded, "cam/nowhere"), None);
+}
+
+/// Rows on another channel are not read.
+#[test]
+fn the_newest_row_for_a_topic_is_read_on_its_channel_only() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let ch = channel(&conn, "mqtt:broker:cam/#", ChannelScheme::Mqtt);
+    let other = channel(&conn, "mqtt:broker:cam/+", ChannelScheme::Mqtt);
+    insert(
+        &conn,
+        other,
+        ChannelScheme::Mqtt,
+        &wrapper_on("cam/front", "on"),
+        None,
+        None,
+    );
+    assert_eq!(newest_for(&conn, ch, Depth::Unbounded, "cam/front"), None);
+}
+
+/// Only the newest `depth` retained rows are scanned: a topic whose newest row
+/// lies further back is not found.
+#[test]
+fn a_row_past_the_depth_is_not_found() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let ch = channel(&conn, "mqtt:broker:cam/#", ChannelScheme::Mqtt);
+    let mqtt = ChannelScheme::Mqtt;
+    let front = insert(&conn, ch, mqtt, &wrapper_on("cam/front", "on"), None, None);
+    insert(&conn, ch, mqtt, &wrapper_on("cam/back", "x"), None, None);
+
+    assert_eq!(
+        newest_for(&conn, ch, Depth::Bounded(2), "cam/front"),
+        Some(front.uuid)
+    );
+    assert_eq!(newest_for(&conn, ch, Depth::Bounded(1), "cam/front"), None);
+}
+
+/// An unbounded or deeper channel is scanned to `RETAINED_REPLAY_SCAN_ROWS`
+/// rows and no further.
+#[test]
+fn a_row_past_the_scan_bound_is_not_found() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let ch = channel(&conn, "mqtt:broker:cam/#", ChannelScheme::Mqtt);
+    let mqtt = ChannelScheme::Mqtt;
+    let front = insert(&conn, ch, mqtt, &wrapper_on("cam/front", "on"), None, None);
+    let filler = wrapper_on("cam/back", "x");
+    for _ in 1..RETAINED_REPLAY_SCAN_ROWS {
+        insert(&conn, ch, mqtt, &filler, None, None);
+    }
+    for depth in [
+        Depth::Unbounded,
+        Depth::Bounded(RETAINED_REPLAY_SCAN_ROWS + 5),
+    ] {
+        assert_eq!(
+            newest_for(&conn, ch, depth, "cam/front"),
+            Some(front.uuid),
+            "the bound's last row"
+        );
+    }
+
+    insert(&conn, ch, mqtt, &filler, None, None);
+    for depth in [
+        Depth::Unbounded,
+        Depth::Bounded(RETAINED_REPLAY_SCAN_ROWS + 5),
+    ] {
+        assert_eq!(newest_for(&conn, ch, depth, "cam/front"), None, "{depth:?}");
+    }
+}

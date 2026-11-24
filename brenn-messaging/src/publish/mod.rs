@@ -1744,6 +1744,22 @@ pub enum IngressMessage {
     },
 }
 
+/// Whether a transport ingress publish always appends its row, or skips it when
+/// it would repeat the channel's newest row for its MQTT topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressAppend {
+    /// Append the row.
+    Always,
+    /// Append the row unless, among the channel's newest
+    /// `min(retain_depth, RETAINED_REPLAY_SCAN_ROWS)` retained rows, the newest
+    /// whose MQTT topic is this message's holds the same value. On a raw
+    /// channel the same value is the same body bytes and content type on a row
+    /// of the raw shape; on a wrapped channel it is the same payload text on a
+    /// row of the wrapped shape, so a binary placeholder is never the same
+    /// value. Only an `mqtt:` channel takes it.
+    UnlessRepeatsNewestForTopic,
+}
+
 impl Messenger {
     /// Host-originated transport ingress publish.
     ///
@@ -1756,6 +1772,11 @@ impl Messenger {
     /// The adaptor reads the shape from, sizes the body against
     /// [`max_body_bytes`](Self::max_body_bytes), and publishes on the one
     /// `channel` entry it hands here, so every refusal below is a host bug.
+    ///
+    /// With [`IngressAppend::UnlessRepeatsNewestForTopic`] the channel's newest
+    /// row for the message's topic is read inside the insert's transaction, and
+    /// a message that repeats it is not written. Returns whether the row was
+    /// written.
     ///
     /// Returns once the durable DB insert of the message + pending-push rows
     /// commits. Panics on any DB error (fail-fast; axum's per-task panic handler
@@ -1772,7 +1793,9 @@ impl Messenger {
     ///   channel;
     /// - `Wrapped` whose text does not parse as the scheme's wrapper struct;
     /// - `Raw` whose `transport` is of another scheme than the channel's;
-    /// - `Raw` whose body is longer than the body cap.
+    /// - `Raw` whose body is longer than the body cap;
+    /// - [`IngressAppend::UnlessRepeatsNewestForTopic`] on a channel that is
+    ///   not `mqtt:`.
     pub async fn publish_transport_ingress(
         &self,
         channel: Arc<super::ChannelEntry>,
@@ -1780,7 +1803,8 @@ impl Messenger {
         sender: &str,
         message: IngressMessage,
         urgency: Urgency,
-    ) {
+        append: IngressAppend,
+    ) -> bool {
         let publish_ts_ns = db::utc_to_ns(Utc::now());
         let scheme = channel.transport_type;
         if !matches!(scheme, ChannelScheme::Webhook | ChannelScheme::Mqtt) {
@@ -1791,7 +1815,7 @@ impl Messenger {
             );
         }
         let non_text = channel.resolved_channel.non_text;
-        let (body, transport) = match message {
+        let (body, transport, wrapper) = match message {
             IngressMessage::Wrapped(text) => {
                 assert!(
                     !non_text,
@@ -1811,17 +1835,19 @@ impl Messenger {
                             channel.address
                         )
                     });
+                    (super::MessageBody::text(text), None, None)
                 } else {
-                    serde_json::from_str::<super::MqttEnvelope>(&text).unwrap_or_else(|e| {
-                        panic!(
-                            "publish_transport_ingress: host built a malformed MqttEnvelope for \
-                             channel '{}' — this is a host-internal bug, not an attacker \
-                             input: {e}",
-                            channel.address
-                        )
-                    });
+                    let envelope = serde_json::from_str::<super::MqttEnvelope>(&text)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "publish_transport_ingress: host built a malformed MqttEnvelope \
+                                 for channel '{}' — this is a host-internal bug, not an \
+                                 attacker input: {e}",
+                                channel.address
+                            )
+                        });
+                    (super::MessageBody::text(text), None, Some(envelope))
                 }
-                (super::MessageBody::text(text), None)
             }
             IngressMessage::Raw { body, transport } => {
                 assert!(
@@ -1857,18 +1883,54 @@ impl Messenger {
                     body.summary(),
                     channel.address
                 );
-                (body, Some(transport))
+                (body, Some(transport), None)
             }
         };
 
         // DB work: insert the message row under one lock. No budget decrement
         // and no sender gate. No deliver_after / delivery_deadline for transport
         // ingress — both are None (always immediate).
+        let topic = match append {
+            IngressAppend::Always => None,
+            IngressAppend::UnlessRepeatsNewestForTopic => {
+                assert_eq!(
+                    scheme,
+                    ChannelScheme::Mqtt,
+                    "publish_transport_ingress: a conditional append on channel '{}', which is \
+                     not an mqtt: channel",
+                    channel.address
+                );
+                Some(match (&transport, &wrapper) {
+                    (Some(super::TransportMeta::Mqtt(meta)), None) => meta.topic.clone(),
+                    (None, Some(envelope)) => envelope.topic.clone(),
+                    _ => unreachable!("an mqtt: ingress message is raw with metadata or wrapped"),
+                })
+            }
+        };
+
         {
             let conn = self.db.lock().await;
             let tx = conn
                 .unchecked_transaction()
                 .expect("messaging: begin transport ingress tx");
+            if let Some(topic) = &topic
+                && let Some(newest) = db::newest_retained_for_mqtt_topic(
+                    &tx,
+                    channel.uuid,
+                    channel.resolved_channel.retain_depth,
+                    topic,
+                )
+                && repeats_newest(
+                    &channel.address,
+                    &body,
+                    transport.as_ref(),
+                    wrapper.as_ref(),
+                    &newest,
+                )
+            {
+                tx.commit().expect("messaging: commit transport ingress tx");
+                return false;
+            }
             self.insert_message(
                 &tx,
                 &channel,
@@ -1889,6 +1951,59 @@ impl Messenger {
 
         // Signal the background dispatcher. All dispatch is off-stack (R1).
         self.dispatch_kick();
+        true
+    }
+}
+
+/// Whether an `mqtt:` ingress message holds the value of `newest`, the
+/// channel's newest stored row for its topic: on the raw shape the same body
+/// (bytes and content type) on a raw row, on the wrapped shape the same payload
+/// text on a wrapped row. Any other pairing is a different value.
+///
+/// A transport-less row the topic lookup found on `channel` that does not read
+/// as an [`super::MqttEnvelope`] — one written before a change to the envelope
+/// — is a different value, logged at `error`. The message is then appended and
+/// becomes the newest row for its topic, so the line comes once per topic.
+fn repeats_newest(
+    channel: &str,
+    body: &super::MessageBody,
+    transport: Option<&super::TransportMeta>,
+    wrapper: Option<&super::MqttEnvelope>,
+    newest: &super::MessageEnvelope,
+) -> bool {
+    match (transport, wrapper) {
+        (Some(_), None) => {
+            matches!(newest.transport, Some(super::TransportMeta::Mqtt(_))) && newest.body == *body
+        }
+        (None, Some(wrapper)) => {
+            let Some(text) = wrapper.payload.text() else {
+                return false;
+            };
+            if newest.transport.is_some() {
+                return false;
+            }
+            let stored = match newest.body.as_text() {
+                Some(stored) => {
+                    serde_json::from_str::<super::MqttEnvelope>(stored).map_err(|e| e.to_string())
+                }
+                None => Err(format!("a {} body, not text", newest.body.summary())),
+            };
+            match stored {
+                Ok(stored) => stored.payload.text() == Some(text),
+                Err(error) => {
+                    tracing::error!(
+                        channel,
+                        topic = %wrapper.topic,
+                        message_id = %newest.message_id,
+                        error = %error,
+                        "the newest stored row for an MQTT topic does not read as an MQTT \
+                         envelope; the retained message is appended without comparing",
+                    );
+                    false
+                }
+            }
+        }
+        _ => unreachable!("an mqtt: ingress message is raw with metadata or wrapped"),
     }
 }
 

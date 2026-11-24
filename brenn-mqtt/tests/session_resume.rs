@@ -23,19 +23,23 @@ use std::time::Duration;
 
 use brenn_envelope::MqttExpiry;
 use brenn_lib::mqtt::config::TlsVersionMin;
+use brenn_mqtt::ArrivingFilters;
 use brenn_mqtt::broker_gate;
 use brenn_mqtt::reader::{EgressMessage, EgressReport, Sent, UnknownCause};
-use brenn_mqtt::service::SessionFault;
+use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome, SessionFault};
 use brenn_mqtt::state::ConnectorHealthLabel;
-use brenn_mqtt::test_support::client::wait_for_filter_acked;
+use brenn_mqtt::test_support::broker::{
+    log_records_connack, log_records_subscribe_at, log_records_unsubscribe,
+};
+use brenn_mqtt::test_support::client::{session_client_id, wait_for_filter_acked};
 use common::{
     BrokerHarness, DEFAULT_ACL, DEFAULT_CONF_TEMPLATE, Egress, SpawnedClient, await_puback, certs,
-    direct_publisher_acked, direct_subscriber_every, spawn_client_with_config, test_client_config,
-    wait_for_health,
+    direct_publisher_acked, direct_subscriber_every, spawn_client_arriving,
+    spawn_client_with_config, test_client_config, wait_for_health,
 };
 use packet_relay::{
     CONNACK, CONNECT, Cut, DISCONNECT, Dir, Fate, PUBACK, PUBCOMP, PUBLISH, PUBREC, PUBREL, Packet,
-    PacketRelay, SUBSCRIBE,
+    PacketRelay, SUBSCRIBE, UNSUBSCRIBE,
 };
 use tokio::sync::mpsc;
 
@@ -1143,6 +1147,8 @@ async fn incoming_among_the_lost_events_row(name: &str, qos: u8) -> usize {
     rig.spawned.hold.release();
     assert_eq!(rig.delivered("the held message").await, b"hold");
     assert_eq!(rig.delivered("the message").await, b"m1");
+    // TODO(mqtt-lost-events-incoming-test-flaky): the message is sometimes
+    // delivered from the live connection, before the loss, and this fails.
     let reconnected = rig
         .relay
         .log()
@@ -1592,4 +1598,389 @@ async fn a_second_unsolicited_ack_gives_up() {
         "a CONNECT after the give-up; relay log:\n{}",
         rig.relay.dump()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sessions that end and start on purpose
+// ---------------------------------------------------------------------------
+
+impl Rig {
+    /// The DISCONNECT the client sent on connection `conn`, once the relay
+    /// has logged it: the stop returns when the packet is written, which can
+    /// be before the relay has read it.
+    async fn disconnect_on(&self, conn: usize) -> Packet {
+        self.relay
+            .wait_for(15, "the stop's DISCONNECT at the relay", |p| {
+                p.conn == conn && p.is(Dir::ClientToBroker, DISCONNECT)
+            })
+            .await;
+        let disconnects = self.relay.forwarded(conn, Dir::ClientToBroker, DISCONNECT);
+        assert_eq!(
+            disconnects.len(),
+            1,
+            "conn{conn}'s DISCONNECT; relay log:\n{}",
+            self.relay.dump()
+        );
+        disconnects[0].clone()
+    }
+
+    /// Bring a new client up under the case's slug, through the relay, as
+    /// `arriving` says, and return it with the number of the first connection
+    /// after `after` that the broker accepted.
+    async fn arrive_after(
+        &self,
+        after: usize,
+        arriving: ArrivingFilters<'_>,
+    ) -> (SpawnedClient, usize) {
+        let arrived = spawn_client_arriving(self.spawned.handle.config.clone(), arriving).await;
+        self.relay
+            .wait_for(15, "the arriving client's CONNACK", |p| {
+                p.conn > after && p.is(Dir::BrokerToClient, CONNACK)
+            })
+            .await;
+        (arrived, self.next_accepted(after))
+    }
+}
+
+/// A removed client's stop ends its session: its DISCONNECT carries Session
+/// Expiry Interval 0, and a new client under the slug that asks to resume
+/// finds no session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_clients_session_is_gone() {
+    broker_gate!();
+    let rig = Rig::start("end1").await;
+    let first = rig.next_accepted(0);
+    rig.spawned.handle.end_session_and_join().await;
+    assert_eq!(
+        rig.disconnect_on(first).await.session_expiry,
+        Some(0),
+        "the session-ending DISCONNECT; relay log:\n{}",
+        rig.relay.dump()
+    );
+
+    let (next, conn) = rig
+        .arrive_after(first, ArrivingFilters::Declared(Vec::new()))
+        .await;
+    let (connect, connack) = rig.handshake(conn);
+    assert_eq!(
+        connect.clean_start,
+        Some(false),
+        "the new client asks to resume"
+    );
+    assert_eq!(
+        connack.session_present,
+        Some(false),
+        "the broker discarded the session; relay log:\n{}",
+        rig.relay.dump()
+    );
+    next.handle.stop_and_join().await;
+}
+
+/// A stop that keeps the session sends the plain DISCONNECT, and a new client
+/// under the slug gets the session back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_sessions_stop_leaves_it_to_resume() {
+    broker_gate!();
+    let rig = Rig::start("keep1").await;
+    let first = rig.next_accepted(0);
+    rig.spawned.handle.stop_and_join().await;
+    assert_eq!(
+        rig.disconnect_on(first).await.session_expiry,
+        None,
+        "the plain DISCONNECT; relay log:\n{}",
+        rig.relay.dump()
+    );
+
+    let (next, conn) = rig
+        .arrive_after(first, ArrivingFilters::Declared(Vec::new()))
+        .await;
+    let (connect, connack) = rig.handshake(conn);
+    assert_eq!(
+        connect.clean_start,
+        Some(false),
+        "the new client asks to resume"
+    );
+    assert_eq!(
+        connack.session_present,
+        Some(true),
+        "the broker kept the session; relay log:\n{}",
+        rig.relay.dump()
+    );
+    next.handle.stop_and_join().await;
+}
+
+/// A client a reload adds, on a slug whose session the broker kept with a
+/// message queued in it, starts clean: its CONNECT has Clean Start, its
+/// CONNACK reports no session, and the queued message is not sent to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reload_added_client_starts_clean() {
+    broker_gate!();
+    let rig = Rig::start_inbound("added1").await;
+    let first = rig.next_accepted(0);
+    rig.spawned.handle.stop_and_join().await;
+    assert_eq!(rig.disconnect_on(first).await.session_expiry, None);
+    rig.publish_inbound(1, b"queued").await;
+
+    let (added, conn) = rig.arrive_after(first, ArrivingFilters::Added).await;
+    let (connect, connack) = rig.handshake(conn);
+    assert_eq!(
+        connect.clean_start,
+        Some(true),
+        "the added client's CONNECT"
+    );
+    assert_eq!(
+        connack.session_present,
+        Some(false),
+        "the added client's CONNACK; relay log:\n{}",
+        rig.relay.dump()
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        rig.relay
+            .forwarded(conn, Dir::BrokerToClient, PUBLISH)
+            .is_empty(),
+        "the old session's queue reached the added client; relay log:\n{}",
+        rig.relay.dump()
+    );
+    added.handle.stop_and_join().await;
+}
+
+// ---------------------------------------------------------------------------
+// Withdrawals made while the client is disconnected
+// ---------------------------------------------------------------------------
+
+impl Rig {
+    /// Sever the client's connection with the relay refusing new ones, and
+    /// wait for the supervisor to have seen the loss.
+    async fn hold_off(&self) {
+        self.relay.refuse(true).await;
+        self.relay.sever();
+        self.wait_health(
+            ConnectorHealthLabel::Disconnected,
+            "the client never saw its connection go",
+        )
+        .await;
+    }
+
+    /// The MQTT client id the case's session connects as.
+    fn session_id(&self) -> String {
+        session_client_id(&self.spawned.client_slug)
+    }
+
+    /// Withdraw the case's inbound filter from `client`, which has no
+    /// connection, and assert it is answered as deferred.
+    async fn withdraw_disconnected(&self, client: &SpawnedClient) {
+        assert_eq!(
+            client
+                .svc
+                .unsubscribe_filter(&client.client_slug, &inbound_topic(&self.topic))
+                .await,
+            Some(IngressUnsubscribeOutcome::DeferredDisconnected),
+            "a withdrawal with no connection is deferred",
+        );
+    }
+
+    /// Wait for the broker's log past `since` to record a CONNACK to the case's
+    /// session reporting `session_present`, and whatever else `also` asks;
+    /// answer with that window.
+    async fn await_broker(
+        &self,
+        since: usize,
+        session_present: bool,
+        what: &str,
+        also: impl Fn(&str) -> bool,
+    ) -> String {
+        let id = self.session_id();
+        self.broker
+            .wait_for_log(since, 15, what, |log| {
+                log_records_connack(log, &id, session_present) && also(log)
+            })
+            .await
+    }
+}
+
+/// A withdrawal made while the client is disconnected reaches the broker on
+/// the connection that resumes the session, and the filter delivers no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_while_disconnected_reaches_the_broker() {
+    broker_gate!();
+    let mut rig = Rig::start_inbound("wd1").await;
+    let inbound = inbound_topic(&rig.topic);
+    let lost = rig.next_accepted(0);
+    rig.hold_off().await;
+    rig.withdraw_disconnected(&rig.spawned).await;
+
+    let since = rig.broker.log_len();
+    rig.relay.refuse(false).await;
+    let id = rig.session_id();
+    rig.await_broker(
+        since,
+        true,
+        &format!("the resumed connection never withdrew {inbound}"),
+        |log| log_records_unsubscribe(log, &id, &inbound),
+    )
+    .await;
+    let resumed = rig.assert_resumed_after(lost);
+    assert_eq!(
+        rig.relay
+            .forwarded(resumed, Dir::ClientToBroker, UNSUBSCRIBE)
+            .len(),
+        1,
+        "one UNSUBSCRIBE on the resumed connection; relay log:\n{}",
+        rig.relay.dump()
+    );
+
+    rig.publish_inbound(1, b"after").await;
+    rig.no_more_deliveries().await;
+    rig.spawned.handle.stop_and_join().await;
+}
+
+/// A filter a new handle was registered with and withdrew before its first
+/// connection — while an earlier client under the slug left a session holding
+/// it — is withdrawn on that first connection, which finds the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_before_the_first_connection_reaches_the_broker() {
+    broker_gate!();
+    let rig = Rig::start_inbound("wd2").await;
+    let inbound = inbound_topic(&rig.topic);
+    let first = rig.next_accepted(0);
+    rig.spawned.handle.stop_and_join().await;
+
+    rig.relay.refuse(true).await;
+    let next =
+        spawn_client_with_config(rig.spawned.handle.config.clone(), vec![inbound.clone()]).await;
+    rig.withdraw_disconnected(&next).await;
+
+    let since = rig.broker.log_len();
+    rig.relay.refuse(false).await;
+    let id = rig.session_id();
+    rig.await_broker(
+        since,
+        true,
+        &format!("the new handle's first connection never withdrew {inbound}"),
+        |log| log_records_unsubscribe(log, &id, &inbound),
+    )
+    .await;
+    let connected = rig.next_accepted(first);
+    let (connect, _) = rig.handshake(connected);
+    assert_eq!(
+        connect.clean_start,
+        Some(false),
+        "the new handle asks to resume"
+    );
+    assert!(
+        rig.relay
+            .forwarded(connected, Dir::ClientToBroker, SUBSCRIBE)
+            .is_empty(),
+        "the withdrawn filter was subscribed again; relay log:\n{}",
+        rig.relay.dump()
+    );
+    next.handle.stop_and_join().await;
+}
+
+/// A withdrawal made while disconnected, met by a connection whose CONNACK
+/// reports no session, sends nothing: the broker holds nothing to withdraw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_met_by_no_session_sends_nothing() {
+    broker_gate!();
+    let mut rig = Rig::start_inbound("wd3").await;
+    let lost = rig.next_accepted(0);
+    rig.stop_broker().await;
+    rig.wait_health(
+        ConnectorHealthLabel::Disconnected,
+        "the client never saw its broker go",
+    )
+    .await;
+    rig.withdraw_disconnected(&rig.spawned).await;
+
+    let since = rig.broker.log_len();
+    rig.restart_broker().await;
+    rig.await_broker(
+        since,
+        false,
+        "the client never reconnected to the restarted broker",
+        |_| true,
+    )
+    .await;
+    // The broker logs its CONNACK before the relay has passed it on.
+    rig.relay
+        .wait_for(15, "the reconnect's CONNACK at the relay", |p| {
+            p.conn > lost && p.is(Dir::BrokerToClient, CONNACK)
+        })
+        .await;
+    let reconnected = rig.next_accepted(lost);
+    // Room for an UNSUBSCRIBE the settle would have sent behind the CONNACK.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        rig.relay
+            .forwarded(reconnected, Dir::ClientToBroker, UNSUBSCRIBE)
+            .is_empty(),
+        "an UNSUBSCRIBE to a broker holding no session; relay log:\n{}",
+        rig.relay.dump()
+    );
+    assert!(
+        !log_records_unsubscribe(
+            &rig.broker.log()[since..],
+            &rig.session_id(),
+            &inbound_topic(&rig.topic)
+        ),
+        "the broker received an UNSUBSCRIBE after the restart"
+    );
+    rig.spawned.handle.stop_and_join().await;
+}
+
+/// A filter withdrawn and subscribed again while disconnected is subscribed,
+/// and not withdrawn, on the resumed connection, and delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filter_withdrawn_and_held_again_while_disconnected_is_only_subscribed() {
+    broker_gate!();
+    let mut rig = Rig::start_inbound("wd4").await;
+    let inbound = inbound_topic(&rig.topic);
+    let lost = rig.next_accepted(0);
+    rig.hold_off().await;
+    rig.withdraw_disconnected(&rig.spawned).await;
+    assert_eq!(
+        rig.spawned
+            .svc
+            .subscribe_filter(&rig.spawned.client_slug, inbound.clone())
+            .await,
+        Some(IngressSubscribeOutcome::DeferredDisconnected),
+        "the filter held again with no connection",
+    );
+
+    let since = rig.broker.log_len();
+    rig.relay.refuse(false).await;
+    let id = rig.session_id();
+    let window = rig
+        .await_broker(
+            since,
+            true,
+            &format!("the resumed connection never subscribed {inbound}"),
+            |log| log_records_subscribe_at(log, &id, &inbound, 1),
+        )
+        .await;
+    assert!(
+        !log_records_unsubscribe(&window, &id, &inbound),
+        "the filter held again was withdrawn: {window}"
+    );
+    let resumed = rig.assert_resumed_after(lost);
+    assert!(
+        rig.relay
+            .forwarded(resumed, Dir::ClientToBroker, UNSUBSCRIBE)
+            .is_empty(),
+        "an UNSUBSCRIBE on the resumed connection; relay log:\n{}",
+        rig.relay.dump()
+    );
+    wait_for_filter_acked(
+        &rig.spawned.svc,
+        &rig.spawned.client_slug,
+        &inbound,
+        10,
+        "the filter held again was never granted",
+    )
+    .await;
+
+    rig.publish_inbound(1, b"back").await;
+    assert_eq!(rig.delivered("the filter held again").await, b"back");
+    rig.spawned.handle.stop_and_join().await;
 }

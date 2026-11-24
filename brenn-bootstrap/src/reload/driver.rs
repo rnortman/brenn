@@ -440,6 +440,12 @@ impl ReloadDriver {
         }
     }
 
+    /// Whether the MQTT event router this driver commits against can deliver:
+    /// whether boot has given it its state.
+    pub(crate) fn mqtt_router_ready(&self) -> bool {
+        brenn_mqtt::MqttEventRouter::ready(&*self.env.mqtt_event_router)
+    }
+
     /// Decide what the document on disk would do to this process.
     ///
     /// Reads the tree, the components roots and nothing else; writes nothing at
@@ -1571,6 +1577,7 @@ impl ReloadDriver {
         // every moved filter listed in both, so replacing that with the ones
         // that actually deferred or failed only shrinks it.
         applied.delta.mqtt_deferred = report.mqtt.deferred;
+        applied.delta.mqtt_unsubscribe_deferred = report.mqtt.unsubscribe_deferred;
         applied.delta.mqtt_failed = report.mqtt.failed;
         applied.delta.sessions_retired = report.sessions_retired;
         applied.delta.sessions_retire_pending = report.sessions_retire_pending;
@@ -2450,14 +2457,36 @@ channel scratch at "ephemeral:scratch" {{
         (service, router)
     }
 
-    /// The MQTT subsystem boot builds, over a broker that is really listening.
+    /// What [`live_mqtt_runtime`] leaves for boot's `wire_and_spawn` step.
+    struct LiveMqttWiring {
+        state: brenn_server::state::AppState,
+        ingress: Vec<brenn_lib::mqtt::config::ResolvedMqttIngressChannel>,
+        sessions: Vec<brenn_mqtt::UnspawnedSession>,
+    }
+
+    impl LiveMqttWiring {
+        /// Wire the router and spawn every registered session, as boot does
+        /// after the client directory and the egress readers are in place.
+        async fn wire_and_spawn(
+            self,
+            service: &Arc<brenn_mqtt::MqttService>,
+            router: &Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
+        ) {
+            crate::mqtt::wire_and_spawn(service, router, self.state, &self.ingress, self.sessions)
+                .await;
+        }
+    }
+
+    /// The MQTT subsystem boot builds, over a broker that is really listening,
+    /// up to the point where boot installs the client directory and starts the
+    /// egress readers; [`LiveMqttWiring::wire_and_spawn`] is boot's next step.
     ///
-    /// This is `start_mqtt` and `wire_mqtt_state` themselves rather than a
-    /// fixture-shaped imitation of them: the question a live case asks is
-    /// whether a filter the reload SUBSCRIBEs on is one the process then
-    /// receives on, and an imitation of the wiring is the one thing that cannot
-    /// answer it.
-    async fn live_mqtt_runtime(
+    /// This is `build_mqtt` and `wire_and_spawn` themselves, in boot's order,
+    /// rather than a fixture-shaped imitation of them: the question a live case
+    /// asks is whether a filter the reload SUBSCRIBEs on is one the process
+    /// then receives on, and an imitation of the wiring is the one thing that
+    /// cannot answer it.
+    fn live_mqtt_runtime(
         config: &BrennConfig,
         plan: &MessagingPlan,
         dynamic_ingress: &[brenn_messaging_boot::DynamicMqttIngress],
@@ -2466,6 +2495,7 @@ channel scratch at "ephemeral:scratch" {{
     ) -> (
         Arc<brenn_mqtt::MqttService>,
         Arc<brenn_server::mqtt_router::MqttEventRouterImpl>,
+        LiveMqttWiring,
     ) {
         let clients = brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients);
         // Without the kept dynamic rows a dormant row revived by a reload would
@@ -2473,15 +2503,22 @@ channel scratch at "ephemeral:scratch" {{
         // the case about revoking one would have nothing to revoke.
         let ingress =
             crate::mqtt::boot_ingress(&plan.mqtt_ingress_channels, &clients, dynamic_ingress);
-        let result = crate::mqtt::start_mqtt(&ingress, &clients).await;
+        let (result, sessions) = crate::mqtt::build_mqtt(&ingress, &clients);
         // The state the router delivers through must carry the messenger this
         // process publishes with: an inbound packet reaches the bus through it,
         // and a state without one panics the delivery path on the first
         // message.
         let mut state = brenn_server::test_support::state::test_state(db);
         state.messenger = Some(messenger.clone());
-        crate::mqtt::wire_mqtt_state(&result.service, &result.event_router, state, &ingress).await;
-        (result.service, result.event_router)
+        (
+            result.service,
+            result.event_router,
+            LiveMqttWiring {
+                state,
+                ingress,
+                sessions,
+            },
+        )
     }
 
     /// A fixture document's agent map, resolved as boot resolves it.
@@ -2541,6 +2578,11 @@ channel scratch at "ephemeral:scratch" {{
         /// no connection, so every SUBSCRIBE defers and no packet moves. That
         /// is the shape the cases about the *plan* want.
         pub(crate) mqtt_live: bool,
+        /// Run at the place boot reaches between building the MQTT sessions
+        /// and wiring them — after the client directory and the egress readers,
+        /// before the router has its state and any supervisor is spawned — for
+        /// a case that looks at the broker from there. Only with `mqtt_live`.
+        pub(crate) before_mqtt_wiring: Option<Box<dyn FnOnce() + Send>>,
         /// Run a dispatcher over this process. Off by default: a published row
         /// is then stored and nobody is woken, so nothing advances a cursor
         /// behind a test's back — which is what the oracle's comparison of two
@@ -2578,9 +2620,14 @@ channel scratch at "ephemeral:scratch" {{
             surface_assets,
             surface_bundle,
             mqtt_live,
+            before_mqtt_wiring,
             dispatcher,
             executor,
         } = fixture;
+        assert!(
+            mqtt_live || before_mqtt_wiring.is_none(),
+            "before_mqtt_wiring needs mqtt_live: the stand-in runtime has no wiring step",
+        );
         // The roots every load below reads are the mounts document's, exactly
         // as `run_server` derives them: a record read out of a path the reload
         // would not name is a baseline that disagrees with every candidate.
@@ -2717,22 +2764,23 @@ channel scratch at "ephemeral:scratch" {{
         // process a fresh boot of its own document does not match — and the
         // reload would read the gap as a client to add.
         let mqtt = if mqtt_live {
-            live_mqtt_runtime(
+            let (service, router, wiring) = live_mqtt_runtime(
                 &document.config,
                 &plan,
                 &result.dynamic_mqtt_ingress,
                 &db,
                 &messenger,
-            )
-            .await
+            );
+            (service, router, Some(wiring))
         } else {
-            mqtt_runtime(
+            let (service, router) = mqtt_runtime(
                 &plan,
                 &brenn_lib::mqtt::config::resolve_clients(&document.config.mqtt_clients),
                 &result.dynamic_mqtt_ingress,
                 &db,
             )
-            .await
+            .await;
+            (service, router, None)
         };
         messenger.install_mqtt_clients(mqtt.0.clone());
         let mqtt_egress = crate::mqtt::start_mqtt_egress(
@@ -2742,6 +2790,26 @@ channel scratch at "ephemeral:scratch" {{
             egress_notify,
         )
         .await;
+        // Boot's order: the router gets its state and the supervisors are
+        // spawned after the directory and the egress readers, before anything
+        // can open the reload doors.
+        if let Some(wiring) = mqtt.2 {
+            for slug in mqtt.0.client_slugs() {
+                let handle = mqtt
+                    .0
+                    .get_client(&slug)
+                    .expect("a listed client is registered");
+                assert!(
+                    !handle.supervisor_spawned().await,
+                    "client {slug:?} has a supervisor before the router has its state",
+                );
+            }
+            if let Some(look) = before_mqtt_wiring {
+                look();
+            }
+            wiring.wire_and_spawn(&mqtt.0, &mqtt.1).await;
+        }
+        let mqtt = (mqtt.0, mqtt.1);
 
         // The async tool executor's grant table: the plan's own value, installed
         // where the executor's spec exists — which is when some consumer holds
@@ -7193,6 +7261,42 @@ channel extra at "brenn:extra" {
             vec!["brenn:extra".to_string()]
         );
         assert!(live_addresses(&messenger).contains(&"brenn:extra".to_string()));
+    }
+
+    /// The fixture's driver with its MQTT event router replaced by one that
+    /// never had its state: what a boot that opened the doors before
+    /// `wire_and_spawn` would hand the doors.
+    async fn driver_over_an_unwired_router() -> ReloadDriver {
+        let tree = Tree::holding(&document(""));
+        let Booted { mut driver, .. } = boot(&tree, Vec::new()).await;
+        driver.env.mqtt_event_router =
+            Arc::new(brenn_server::mqtt_router::MqttEventRouterImpl::new());
+        assert!(!driver.mqtt_router_ready());
+        driver
+    }
+
+    /// `spawn_driver` over an unwired router panics on the caller's task,
+    /// whether or not a reload request would ever arrive.
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(
+        expected = "the reload doors were opened before the MQTT event router had its state: \
+                    `wire_and_spawn` must run before `spawn_driver`"
+    )]
+    async fn spawn_driver_over_an_unwired_mqtt_router_panics() {
+        let driver = driver_over_an_unwired_router().await;
+        let _requests = super::super::doors::spawn_driver(driver);
+    }
+
+    /// `spawn_driver_on` makes the same check.
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(
+        expected = "the reload doors were opened before the MQTT event router had its state: \
+                    `wire_and_spawn` must run before `spawn_driver`"
+    )]
+    async fn spawn_driver_on_over_an_unwired_mqtt_router_panics() {
+        let driver = driver_over_an_unwired_router().await;
+        let (_requests, rx) = super::super::doors::trigger_channel();
+        super::super::doors::spawn_driver_on(driver, rx);
     }
 
     /// Two triggers with no reload in flight are two reloads; coalescing

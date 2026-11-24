@@ -897,11 +897,7 @@ pub async fn run_server(
         guard.alert_dispatcher.clone(),
     );
 
-    // MQTT service: build a MqttService with one unified supervisor per declared
-    // `[[mqtt_client]]`. Each session carries both the publish and the
-    // ingress-delivery paths.
-    //
-    let mqtt_result = mqtt::start_mqtt(&mqtt_ingress_channels, &mqtt_clients).await;
+    let (mqtt_result, mqtt_sessions) = mqtt::build_mqtt(&mqtt_ingress_channels, &mqtt_clients);
     // The bus admits an `mqtt:` publish against the service's client registry,
     // which reload keeps current.
     if let Some(messenger) = messaging_result.messenger.as_ref() {
@@ -1213,6 +1209,7 @@ pub async fn run_server(
     // holds stay alive, since dropping one stops that consumer's task.
     let mut consumer_registry = consumers::ConsumerRegistry::new();
     let mut reload_requests: Option<reload::doors::ReloadRequests> = None;
+    let mut mqtt_egress: Option<std::sync::Arc<brenn_server::mqtt_egress::MqttEgressHub>> = None;
     if let (Some(messenger), Some(router)) = (
         messaging_result.messenger.as_ref(),
         messaging_result.router.as_ref(),
@@ -1231,20 +1228,22 @@ pub async fn run_server(
 
         // Before anything can publish to an egress channel, for the reason the
         // executor's position is taken above.
-        let mqtt_egress = mqtt::start_mqtt_egress(
-            &mqtt_result.service,
-            messenger.clone(),
-            guard.alert_dispatcher.clone(),
-            system_notifier(
-                &system_notifiers,
-                brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT,
-            )
-            .expect(
-                "the MQTT egress spec is derived in every plan and always gets a parked-notify \
+        mqtt_egress = Some(
+            mqtt::start_mqtt_egress(
+                &mqtt_result.service,
+                messenger.clone(),
+                guard.alert_dispatcher.clone(),
+                system_notifier(
+                    &system_notifiers,
+                    brenn_messaging::mqtt_outbound::MQTT_OUTBOUND_COMPONENT,
+                )
+                .expect(
+                    "the MQTT egress spec is derived in every plan and always gets a parked-notify \
                  binding",
-            ),
-        )
-        .await;
+                ),
+            )
+            .await,
+        );
 
         reload::status::attach_and_publish_booted(
             &messaging_result.system_participants,
@@ -1335,7 +1334,34 @@ pub async fn run_server(
                 .expect("the inbox exists only when the epoch handle does");
             conversation_epoch::spawn_epoch_drain(inbox, reconciler);
         }
+    }
 
+    // MQTT: give the event router its `AppState` and routes, then spawn every
+    // client's supervisor. Here and nowhere else, because:
+    // - an inbound message is committed through `state.messenger`, so the
+    //   router needs the `AppState` the messaging router was given above;
+    // - the egress readers above need registered handles and nothing more;
+    // - the reload doors below take requests whose commit adds and removes
+    //   routes and stops supervisors, so the router must have its state and
+    //   every boot supervisor must be spawned before they open.
+    // Runs whether or not messaging is configured: a document can declare
+    // clients and no messaging, and then has an empty route table.
+    mqtt::wire_and_spawn(
+        &mqtt_result.service,
+        &mqtt_result.event_router,
+        state.clone(),
+        &mqtt_ingress_channels,
+        mqtt_sessions,
+    )
+    .await;
+
+    if let (Some(messenger), Some(router)) = (
+        messaging_result.messenger.as_ref(),
+        messaging_result.router.as_ref(),
+    ) {
+        let mqtt_egress = mqtt_egress
+            .take()
+            .expect("the egress hub is started in the block above, on the same condition");
         // Last: the driver takes the consumer registry, so nothing may start
         // a consumer after this point.
         if let Some(notify) = reload_notify {
@@ -1393,18 +1419,6 @@ pub async fn run_server(
     // Opened whether or not the facility is declared: the stream was installed
     // at the top of boot and something has to drain it.
     reload::doors::spawn_signal_door(usr1, reload_requests);
-
-    // MQTT: inject AppState into the event router so inbound messages can
-    // call `submit_ingress`. The supervisors are already running; they won't
-    // call `deliver_inbound` until they have an active connection and receive
-    // a publish from the broker, which is after this point.
-    mqtt::wire_mqtt_state(
-        &mqtt_result.service,
-        &mqtt_result.event_router,
-        state.clone(),
-        &mqtt_ingress_channels,
-    )
-    .await;
 
     // Webhook: inject AppState into the event router.
     webhook::wire_webhook_state(

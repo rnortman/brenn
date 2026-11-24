@@ -40,6 +40,7 @@ pub const PUBREL: u8 = 6;
 pub const PUBCOMP: u8 = 7;
 pub const SUBSCRIBE: u8 = 8;
 pub const SUBACK: u8 = 9;
+pub const UNSUBSCRIBE: u8 = 10;
 pub const DISCONNECT: u8 = 14;
 
 /// The SUBACK reason code Not authorized.
@@ -99,6 +100,8 @@ pub struct Packet {
     pub clean_start: Option<bool>,
     /// A CONNACK's Session Present flag.
     pub session_present: Option<bool>,
+    /// A DISCONNECT's Session Expiry Interval property.
+    pub session_expiry: Option<u32>,
 }
 
 impl Packet {
@@ -116,6 +119,7 @@ impl Packet {
             expiry: None,
             clean_start: None,
             session_present: None,
+            session_expiry: None,
         }
     }
 
@@ -666,10 +670,39 @@ fn describe(conn: usize, dir: Dir, bytes: Vec<u8>) -> Packet {
         PUBACK..=SUBACK => {
             packet.pkid = Some(be16(body));
         }
+        // A reason code alone, or nothing, carries no properties.
+        DISCONNECT if body.len() > 1 => {
+            let (props_len, used) = varint(&body[1..]);
+            let at = 1 + used;
+            packet.session_expiry = disconnect_session_expiry(&body[at..at + props_len]);
+        }
         _ => {}
     }
     packet.bytes = bytes;
     packet
+}
+
+/// The Session Expiry Interval among a DISCONNECT's properties.
+fn disconnect_session_expiry(mut props: &[u8]) -> Option<u32> {
+    let mut expiry = None;
+    while let Some((&id, rest)) = props.split_first() {
+        let skip = match id {
+            0x11 => {
+                expiry = Some(u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]));
+                4
+            }
+            // Server Reference, Reason String.
+            0x1c | 0x1f => 2 + usize::from(be16(rest)),
+            // User Property: two strings.
+            0x26 => {
+                let key = 2 + usize::from(be16(rest));
+                key + 2 + usize::from(be16(&rest[key..]))
+            }
+            other => panic!("PacketRelay: unknown DISCONNECT property {other:#04x}"),
+        };
+        props = &rest[skip..];
+    }
+    expiry
 }
 
 /// The Message Expiry Interval among a PUBLISH's properties.
